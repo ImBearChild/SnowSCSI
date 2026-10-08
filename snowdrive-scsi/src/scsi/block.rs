@@ -255,14 +255,17 @@ impl<D: FlatData> BlockDevice<D> {
         if let Err(e) = self.check_bounds(actual, buf.len()) {
             let cap = self.backend.capacity();
             crate::warn!(
-                "READ bounds: off={actual} len={} capacity={cap} err={e:?}",
-                buf.len()
+                "READ bounds: off={} len={} capacity={} err={:?}",
+                actual,
+                buf.len(),
+                cap,
+                e
             );
             self.set_sense(SenseKey::MediumError, 0x11, 0);
             return XferOutcome::Error(XferError::Storage(e));
         }
         if let Err(e) = self.backend.read_at(actual, buf) {
-            crate::warn!("READ backend: off={actual} len={} err={e:?}", buf.len());
+            crate::warn!("READ backend: off={} len={} err={:?}", actual, buf.len(), e);
             self.set_sense(SenseKey::MediumError, 0x11, 0);
             return XferOutcome::Error(XferError::Storage(e));
         }
@@ -312,14 +315,22 @@ impl<D: FlatData> BlockDevice<D> {
         if let Err(e) = self.check_bounds(actual, buf.len()) {
             let cap = self.backend.capacity();
             crate::warn!(
-                "WRITE bounds: off={actual} len={} capacity={cap} err={e:?}",
-                buf.len()
+                "WRITE bounds: off={} len={} capacity={} err={:?}",
+                actual,
+                buf.len(),
+                cap,
+                e
             );
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
             return XferOutcome::Error(XferError::Storage(e));
         }
         if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
-            crate::warn!("WRITE backend: off={actual} len={} err={e:?}", buf.len());
+            crate::warn!(
+                "WRITE backend: off={} len={} err={:?}",
+                actual,
+                buf.len(),
+                e
+            );
             // Read-only plane masquerading as writable through the
             // blanket impl: the backend's policy rejection
             // surfaces as NotWritable, not a medium fault.

@@ -8,6 +8,7 @@ use crate::usb::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};
 
 /// Data-phase direction carried by a [`Cbw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BotDir {
     /// Host → device (bulk OUT data phase, direction bit 0).
     DataOut,
@@ -82,6 +83,7 @@ impl Cbw {
 
 /// CSW status code (BOT §5.2 Table 5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum CswStatus {
     /// Command Passed ("good status").

@@ -83,6 +83,7 @@ pub mod asc {
 
 /// Sense key (SPC-4 §4.5.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum SenseKey {
     None = 0x00,

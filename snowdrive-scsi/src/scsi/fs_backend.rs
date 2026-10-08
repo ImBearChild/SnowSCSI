@@ -67,7 +67,7 @@ impl FsStorage for StdFsBackend {
             .create(opts.create)
             .truncate(opts.truncate);
         let file = oopts.open(&full).map_err(|e| {
-            crate::warn!("std fs open {:?} failed: {e}", full);
+            crate::warn!("std fs open {:?} failed: {}", full, e);
             match e.kind() {
                 std::io::ErrorKind::NotFound => FsError::NotFound,
                 other => FsError::Io(map_io_err(other)),
@@ -154,7 +154,7 @@ impl embedded_io::Read for StdFile {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         use std::io::Read;
         Read::read(&mut self.file, buf).map_err(|e| {
-            crate::warn!("std file read({} bytes) failed: {e}", buf.len());
+            crate::warn!("std file read({} bytes) failed: {}", buf.len(), e);
             map_io_err(e.kind())
         })
     }
@@ -165,7 +165,7 @@ impl embedded_io::Write for StdFile {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         use std::io::Write;
         Write::write(&mut self.file, buf).map_err(|e| {
-            crate::warn!("std file write({} bytes) failed: {e}", buf.len());
+            crate::warn!("std file write({} bytes) failed: {}", buf.len(), e);
             map_io_err(e.kind())
         })
     }
@@ -173,7 +173,7 @@ impl embedded_io::Write for StdFile {
     fn flush(&mut self) -> Result<(), Self::Error> {
         use std::io::Write;
         Write::flush(&mut self.file).map_err(|e| {
-            crate::warn!("std file flush failed: {e}");
+            crate::warn!("std file flush failed: {}", e);
             map_io_err(e.kind())
         })
     }
@@ -189,7 +189,7 @@ impl embedded_io::Seek for StdFile {
             embedded_io::SeekFrom::End(off) => std::io::SeekFrom::End(off),
         };
         Seek::seek(&mut self.file, std_pos).map_err(|e| {
-            crate::warn!("std file seek({std_pos:?}) failed: {e}");
+            crate::warn!("std file seek({:?}) failed: {}", std_pos, e);
             map_io_err(e.kind())
         })
     }

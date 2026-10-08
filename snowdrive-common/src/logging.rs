@@ -13,18 +13,28 @@
 #[cfg(all(feature = "log", feature = "defmt"))]
 compile_error!("You may not enable both `log` and `defmt` features.");
 
+// `std` + `defmt` is unsupported: `std::io::Error` (formatted by the std-only
+// backends) cannot implement `defmt::Format`. The macro definitions below also
+// fall back to the no-op branch in this combination, so this is the *only*
+// error the build reports.
+#[cfg(all(feature = "std", feature = "defmt"))]
+compile_error!(
+    "defmt is no_std-only: `std` + `defmt` is unsupported (`std::io::Error` \
+     cannot implement `defmt::Format`). Disable `std` or `defmt`."
+);
+
 #[macro_export]
 macro_rules! trace {
     ($s:literal $(, $x:expr)* $(,)?) => {{
         #[cfg(feature = "log")]
         ::log::trace!($s $(, $x)*);
-        #[cfg(feature = "defmt")]
+        #[cfg(all(feature = "defmt", not(feature = "std")))]
         ::defmt::trace!($s $(, $x)*);
         // `if false` keeps the branch type-checked (so implicit format-string
         // captures like `info!("{peer}")` still count as *uses* of the
         // variables — a plain `let _ = (&$x,)*` would leave them unused) at
         // zero runtime cost.
-        #[cfg(not(any(feature = "log", feature = "defmt")))]
+        #[cfg(not(any(feature = "log", all(feature = "defmt", not(feature = "std")))))]
         if false {
             ::core::panic!($s $(, $x)*);
         }
@@ -36,9 +46,9 @@ macro_rules! debug {
     ($s:literal $(, $x:expr)* $(,)?) => {{
         #[cfg(feature = "log")]
         ::log::debug!($s $(, $x)*);
-        #[cfg(feature = "defmt")]
+        #[cfg(all(feature = "defmt", not(feature = "std")))]
         ::defmt::debug!($s $(, $x)*);
-        #[cfg(not(any(feature = "log", feature = "defmt")))]
+        #[cfg(not(any(feature = "log", all(feature = "defmt", not(feature = "std")))))]
         if false {
             ::core::panic!($s $(, $x)*);
         }
@@ -50,9 +60,9 @@ macro_rules! info {
     ($s:literal $(, $x:expr)* $(,)?) => {{
         #[cfg(feature = "log")]
         ::log::info!($s $(, $x)*);
-        #[cfg(feature = "defmt")]
+        #[cfg(all(feature = "defmt", not(feature = "std")))]
         ::defmt::info!($s $(, $x)*);
-        #[cfg(not(any(feature = "log", feature = "defmt")))]
+        #[cfg(not(any(feature = "log", all(feature = "defmt", not(feature = "std")))))]
         if false {
             ::core::panic!($s $(, $x)*);
         }
@@ -64,9 +74,9 @@ macro_rules! warn {
     ($s:literal $(, $x:expr)* $(,)?) => {{
         #[cfg(feature = "log")]
         ::log::warn!($s $(, $x)*);
-        #[cfg(feature = "defmt")]
+        #[cfg(all(feature = "defmt", not(feature = "std")))]
         ::defmt::warn!($s $(, $x)*);
-        #[cfg(not(any(feature = "log", feature = "defmt")))]
+        #[cfg(not(any(feature = "log", all(feature = "defmt", not(feature = "std")))))]
         if false {
             ::core::panic!($s $(, $x)*);
         }
@@ -78,9 +88,9 @@ macro_rules! error {
     ($s:literal $(, $x:expr)* $(,)?) => {{
         #[cfg(feature = "log")]
         ::log::error!($s $(, $x)*);
-        #[cfg(feature = "defmt")]
+        #[cfg(all(feature = "defmt", not(feature = "std")))]
         ::defmt::error!($s $(, $x)*);
-        #[cfg(not(any(feature = "log", feature = "defmt")))]
+        #[cfg(not(any(feature = "log", all(feature = "defmt", not(feature = "std")))))]
         if false {
             ::core::panic!($s $(, $x)*);
         }

@@ -14,6 +14,7 @@ use embedded_io::ErrorKind as IoErrorKind;
 
 /// Block-storage error (no_std, `core::error::Error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum StorageError {
     /// `offset + len` exceeds the backend capacity.
     OutOfBounds,

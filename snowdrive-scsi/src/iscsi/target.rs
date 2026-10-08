@@ -91,6 +91,7 @@ impl core::error::Error for TargetError {}
 
 /// Login phase stage (RFC 3720 §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum LoginStage {
     Security,
     OpParam,
@@ -1871,12 +1872,16 @@ fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<u32, ()> 
     while got < BHS_SIZE {
         match conn.read(&mut raw[got..]) {
             Ok(0) => {
-                crate::warn!("recv: BHS EOF after {got}/{BHS_SIZE} bytes (peer closed)");
+                crate::warn!(
+                    "recv: BHS EOF after {}/{} bytes (peer closed)",
+                    got,
+                    BHS_SIZE
+                );
                 return Err(());
             }
             Ok(n) => got += n,
             Err(_) => {
-                crate::warn!("recv: BHS I/O error after {got}/{BHS_SIZE} bytes");
+                crate::warn!("recv: BHS I/O error after {}/{} bytes", got, BHS_SIZE);
                 return Err(());
             }
         }
@@ -1897,21 +1902,33 @@ fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<u32, ()> 
         ahs
     );
     if ahs > 0 && skip(conn, ahs * 4).is_err() {
-        crate::warn!("recv: connection closed while reading AHS ({ahs}*4 bytes)");
+        crate::warn!(
+            "recv: connection closed while reading AHS ({}*4 bytes)",
+            ahs
+        );
         return Err(());
     }
     if dsl <= work.len() - BHS_SIZE {
         if read_exact(conn, &mut work[BHS_SIZE..BHS_SIZE + dsl]).is_err() {
-            crate::warn!("recv: connection closed while reading data segment (dsl={dsl})");
+            crate::warn!(
+                "recv: connection closed while reading data segment (dsl={})",
+                dsl
+            );
             return Err(());
         }
     } else if skip(conn, dsl).is_err() {
-        crate::warn!("recv: connection closed while discarding oversized data segment (dsl={dsl})");
+        crate::warn!(
+            "recv: connection closed while discarding oversized data segment (dsl={})",
+            dsl
+        );
         return Err(());
     }
     let pad = pdu_pad_len(dsl as u32) as usize;
     if pad > 0 && skip(conn, pad).is_err() {
-        crate::warn!("recv: connection closed while reading padding (pad={pad})");
+        crate::warn!(
+            "recv: connection closed while reading padding (pad={})",
+            pad
+        );
         return Err(());
     }
     Ok(dsl as u32)

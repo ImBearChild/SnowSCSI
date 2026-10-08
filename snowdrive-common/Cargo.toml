@@ -9,7 +9,7 @@ description = "SnowDrive common: storage seams + logging macros"
 default = ["std"]
 std = ["embedded-io/std"]
 log = ["dep:log"]
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "embedded-io/defmt"]
 bundle = ["dep:ini_core"]
 
 [dependencies]

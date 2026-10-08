@@ -16,7 +16,7 @@ livefs = ["cdrom"]
 usb = ["scsi"]
 bundle = ["snowdrive-common/bundle"]
 log = ["dep:log", "snowdrive-common/log"]
-defmt = ["dep:defmt", "snowdrive-common/defmt"]
+defmt = ["dep:defmt", "embedded-io/defmt", "snowdrive-common/defmt"]
 
 [dependencies]
 embedded-io = "0.7"

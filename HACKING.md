@@ -68,12 +68,20 @@ snowdrive-scsi ──▶ snowdrive-common              │
 Feature maps:
 
 - **`snowdrive-common`** — `std` (default), `log`, `defmt`. No feature gate on
-  the crate itself; the seams are always compiled.
+  the crate itself; the seams are always compiled. `defmt` forwards to
+  `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
+  `std` + `defmt` is rejected at compile time (see below).
 - **`snowdrive-disc`** — `std` (default).
 - **`snowdrive-scsi`** — `std` (default), `scsi`, `udfrw`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
-  `log`, `defmt`. No platform-specific dependencies: the Linux FunctionFS
+  `log`, `defmt`. `defmt` forwards to `embedded-io/defmt` and
+  `snowdrive-common/defmt` (no `snowdrive-disc` propagation: that crate has
+  no `defmt` feature). `std` + `defmt` is unsupported — `std::io::Error`
+  cannot implement `defmt::Format` — and is guarded by a `compile_error!` in
+  `snowdrive-common/src/logging.rs` (the `defmt` macro branch is also
+  `no_std`-only, so the guard is the single reported error). No
+  platform-specific dependencies: the Linux FunctionFS
   USB bridge lives only in `snowdrive-cli`, which declares its own
   Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
@@ -275,6 +283,10 @@ Notes:
    *compiled*, never linted), so lint them explicitly
 7. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
    `no_std`-clean (feature-gated std surface only)
+8. `cargo build -p snowdrive-scsi --no-default-features --features
+   'scsi,cdrom,usb,udfrw,defmt'` — the `defmt` backend must stay buildable
+   `no_std` (it is rejected together with `std`; see the guard in
+   `snowdrive-common/src/logging.rs`)
 
 ## Code Formatting
 

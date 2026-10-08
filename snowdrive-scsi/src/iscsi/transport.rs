@@ -55,7 +55,7 @@ impl embedded_io::Read for TcpConn {
         match std::io::Read::read(&mut self.stream, buf) {
             Ok(n) => Ok(n),
             Err(e) => {
-                crate::debug!("tcp read error: {e}");
+                crate::debug!("tcp read error: {}", e);
                 Err(e)
             }
         }
@@ -107,7 +107,7 @@ pub fn serve<D: ScsiDevice>(
                 continue;
             }
         };
-        crate::info!("accepted connection from {peer}");
+        crate::info!("accepted connection from {}", peer);
         let mut conn = match TcpConn::new(stream, read_timeout) {
             Ok(c) => c,
             Err(e) => {
@@ -117,7 +117,7 @@ pub fn serve<D: ScsiDevice>(
         };
         let mut session = IscsiSession::new();
         match serve_conn(&mut conn, work, &mut session, devs) {
-            Ok(()) => crate::info!("connection from {peer} ended"),
+            Ok(()) => crate::info!("connection from {} ended", peer),
             Err(e) => return Err(e),
         }
     }
