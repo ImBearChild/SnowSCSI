@@ -36,9 +36,11 @@ use crate::usb::{CBW_LEN, CSW_LEN};
 /// Data-Out overrun drain wait (mirrors the PC driver's 50ms ctrl poll).
 const STEP_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// USB bulk endpoint max packet size (high-speed, 512 B; full-speed is 64 B,
-/// but FunctionFS high-speed enumeration is the only tested path — the 512
-/// value is hard-wired and documented here for that transport).
+/// Default USB bulk endpoint max packet size (high-speed, 512 B; full-speed is
+/// 64 B). FunctionFS high-speed enumeration is the only tested path, so this
+/// remains the default; Full-Speed devices (e.g. the ESP32-S3 internal PHY)
+/// override it per session with [`BotSession::with_bulk_mps`] /
+/// [`BotSession::set_bulk_mps`].
 /// A Data-In phase that ends on a full-MPS packet is not a short packet, so a
 /// shortfall whose length is a multiple of the MPS — including zero bytes —
 /// must be closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)), or padded
@@ -195,6 +197,10 @@ pub struct BotSession {
     num_luns: u8,
     invalid_lun_sense: Option<Sense>,
     pending_ua: Option<Sense>,
+    /// Bulk endpoint max packet size in bytes used for the Data-In ZLP
+    /// decision ([`BOT_BULK_MPS`] by default; 64 for Full-Speed, 512 for
+    /// High-Speed). Stored as `u64` to match the transfer counter domain.
+    bulk_mps: u64,
 }
 
 impl Default for BotSession {
@@ -221,7 +227,35 @@ impl BotSession {
             num_luns: num_luns.clamp(1, 16) as u8,
             invalid_lun_sense: None,
             pending_ua: None,
+            bulk_mps: BOT_BULK_MPS,
         }
+    }
+
+    /// Override the bulk endpoint max packet size used for the Data-In ZLP
+    /// decision (builder style). The value is the USB bulk endpoint's
+    /// `wMaxPacketSize`: **64** for Full-Speed, **512** for High-Speed.
+    ///
+    /// `0` is rejected and the default ([`BOT_BULK_MPS`]) is kept instead.
+    pub fn with_bulk_mps(mut self, mps: u16) -> Self {
+        self.set_bulk_mps(mps);
+        self
+    }
+
+    /// Set the bulk endpoint max packet size used for the Data-In ZLP decision
+    /// (see [`with_bulk_mps`](Self::with_bulk_mps)). `0` is rejected and the
+    /// default ([`BOT_BULK_MPS`]) is kept instead.
+    pub fn set_bulk_mps(&mut self, mps: u16) {
+        self.bulk_mps = if mps == 0 {
+            BOT_BULK_MPS
+        } else {
+            u64::from(mps)
+        };
+    }
+
+    /// The bulk endpoint max packet size currently used for the Data-In ZLP
+    /// decision (64 for Full-Speed, 512 for High-Speed by default).
+    pub fn bulk_mps(&self) -> u16 {
+        self.bulk_mps as u16
     }
 
     /// The session's current need (Copy; the driver polls the matching
@@ -730,7 +764,7 @@ impl BotSession {
             status,
         };
         csw.write(&mut self.csw);
-        if actual < declared && actual.is_multiple_of(BOT_BULK_MPS) {
+        if actual < declared && actual.is_multiple_of(self.bulk_mps) {
             self.state = BotState::CswZlp;
             SessionStep::NeedIn(&[])
         } else {
@@ -811,6 +845,8 @@ impl BotSession {
                     // to declared (BOT §6.7.2 alternative to STALL); for small
                     // control transfers (INQUIRY/VPD/MODE SENSE ≤96B) keep short
                     // packet without STALL/pad — disc bad must not reset drive.
+                    // NB: the 512 threshold is a block-vs-control-transfer
+                    // heuristic, independent of the endpoint MPS (`bulk_mps`).
                     if transfer_len < expected && transfer_len >= 512 {
                         let remaining = expected - sent;
                         let chunk = (remaining as usize).min(data.len());
@@ -830,7 +866,8 @@ impl BotSession {
                 let next = ((transfer_len - sent) as usize).min(data.len());
                 if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
                     // On xfer error, pad only for data blocks; small control
-                    // transfers keep short packet.
+                    // transfers keep short packet. (512 is the block-vs-control
+                    // heuristic, independent of the endpoint MPS.)
                     if sent < expected && sent >= 512 {
                         let remaining = expected - sent;
                         let chunk = (remaining as usize).min(data.len());
@@ -1276,6 +1313,28 @@ mod tests {
         assert_eq!(BotSession::with_luns(1).max_lun(), 0);
         assert_eq!(BotSession::with_luns(3).max_lun(), 2);
         assert_eq!(BotSession::with_luns(17).max_lun(), 15);
+    }
+
+    #[test]
+    fn bulk_mps_default_and_override() {
+        // Default is the documented high-speed 512.
+        assert_eq!(BotSession::new().bulk_mps(), 512);
+        assert_eq!(BotSession::with_luns(2).bulk_mps(), 512);
+
+        // Builder override (Full-Speed 64).
+        assert_eq!(BotSession::new().with_bulk_mps(64).bulk_mps(), 64);
+
+        // Mutating setter.
+        let mut s = BotSession::new();
+        s.set_bulk_mps(64);
+        assert_eq!(s.bulk_mps(), 64);
+        s.set_bulk_mps(512);
+        assert_eq!(s.bulk_mps(), 512);
+
+        // 0 is rejected and falls back to the default.
+        assert_eq!(BotSession::new().with_bulk_mps(0).bulk_mps(), 512);
+        s.set_bulk_mps(0);
+        assert_eq!(s.bulk_mps(), 512);
     }
 
     #[test]
