@@ -49,7 +49,8 @@ impl core::error::Error for BotIoErr {}
 /// capability probing: STALL is a single optional capability used only for
 /// invalid CBWs (the "capability vs policy" split, §4.7). Data-phase errors
 /// are never expressed through STALL — they use short packets + CSW
-/// status/residue instead.
+/// status/residue instead (see the [`target`](crate::usb::target) module's
+/// "Data-In shortfall policy" for the rationale and the BOT §6.7.2 deviation).
 #[allow(clippy::result_unit_err)]
 pub trait BotIo {
     /// Non-blocking attempt to receive bulk OUT into `buf`. Returns the

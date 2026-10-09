@@ -432,7 +432,9 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut io = MockBotIo::new();
     let mut stalled = false;
 
-    // INQUIRY alloc 95 truncates the 96-byte response; host declared 192 → padded fill + residue (BOT §6.7.2 alternative to STALL).
+    // INQUIRY alloc 95 truncates the 96-byte response; host declared 192 → a
+    // short packet + residue (no pad, no STALL; see the core's "Data-In
+    // shortfall policy").
     let cdb = [0x12, 0, 0, 0, 95, 0];
     let r = run_command(
         &mut s,
