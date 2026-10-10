@@ -62,6 +62,7 @@ pub use gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 pub use io::{BotIo, BotIoErr};
 pub use target::{
     BotSession, BotStepResult, BotTargetError, SessionEvent, SessionNeed, SessionStep,
+    ShortfallPolicy, MAX_PAD,
 };
 
 /// Command Block Wrapper signature (`"USBC"`, BOT §5.1) — stored little

@@ -41,10 +41,16 @@ pub enum CtrlReq<A: CtrlAck, R: CtrlReply> {
     GetMaxLun { reply: R },
     /// Link-level event (bind / enable / disable) — equivalent to a reset.
     LinkReset,
-    /// CLEAR FEATURE(ENDPOINT_HALT) on a bulk endpoint (USB 2.0 §9.4.1).
-    /// The driver must call `BotSession::clear_feature_halt()` to clear a
-    /// STALL condition preserved across a BotReset (BOT §3.1).
-    ClearFeatureHalt,
+    /// CLEAR FEATURE(ENDPOINT_HALT) on a bulk endpoint (USB 2.0 §9.4.1);
+    /// `addr` is the setup packet's `wIndex` endpoint address. The driver must
+    /// call [`BotSession::clear_feature_halt`] to clear a STALL condition
+    /// preserved across a BotReset (BOT §3.1) **and** to release a
+    /// `ShortfallPolicy::Short` data-phase STALL — but only when `addr` is its
+    /// own Bulk-In endpoint (the address is platform knowledge the core does
+    /// not store); a clear for any other endpoint is ignored.
+    ///
+    /// [`BotSession::clear_feature_halt`]: crate::usb::target::BotSession::clear_feature_halt
+    ClearFeatureHalt { addr: u8 },
 }
 
 /// The control-plane driver seam.

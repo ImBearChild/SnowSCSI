@@ -2,7 +2,8 @@
 //!
 //! [`BotIo`] is the transport-facing half of the BOT abstraction: bulk OUT
 //! receive (non-blocking + timeout variants) and bulk IN send, plus the
-//! optional STALL capability used *only* for invalid CBWs (BOT §6.6.1).
+//! optional STALL capabilities — `stall_both` for invalid CBWs (BOT §6.6.1)
+//! and `stall_in` for a `ShortfallPolicy::Short` Data-In shortfall (§6.7.2).
 //! The protocol core (`crate::usb::target::BotSession`) never touches this
 //! trait directly — it is driven by
 //! [`SessionEvent`](crate::usb::target::SessionEvent)s. Drivers (PC FunctionFS
@@ -69,6 +70,21 @@ pub trait BotIo {
     /// CBW only). Unavailable by default; a transport without endpoint
     /// STALL falls back to dropping the invalid CBW.
     fn stall_both(&mut self) -> Result<(), ()> {
+        Err(())
+    }
+
+    /// Optional capability: STALL the Bulk-In (data) endpoint for a Data-In
+    /// shortfall (BOT §6.7.2). Unavailable by default; a driver selecting
+    /// [`ShortfallPolicy::Short`] must implement it.
+    ///
+    /// On `Err(())` the driver **must** abort the transaction deterministically
+    /// by calling [`BotSession::reset`]: the mismatch exits loudly via the
+    /// driver's fatal log rather than by a silent host timeout. Used only by
+    /// `Short`; `Pad` and `ShortNoStall` never STALL.
+    ///
+    /// [`ShortfallPolicy::Short`]: crate::usb::target::ShortfallPolicy::Short
+    /// [`BotSession::reset`]: crate::usb::target::BotSession::reset
+    fn stall_in(&mut self) -> Result<(), ()> {
         Err(())
     }
 }

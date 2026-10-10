@@ -15,46 +15,59 @@
 //! Design invariants (§4 / §3.7 / §3.8):
 //! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled
 //!   in an internal buffer; the caller's `data` area holds only SCSI data.
-//! - STALL is used only for invalid CBWs. Data-In shortfall (BOT §6.7.2)
-//!   never pads and never STALLs: the phase ends with a short packet (plus a
-//!   ZLP when the produced length is a multiple of the bulk MPS) and the
-//!   missing bytes are reported via CSW residue — see "Data-In shortfall
-//!   policy" below.
+//! - STALL is used for invalid CBWs (both pipes) and, under
+//!   [`ShortfallPolicy::Short`], for a Data-In shortfall (Bulk-In only).
 //! - Data-Out host overrun is drained to a short packet so leftover bytes
 //!   never corrupt the next CBW.
 //! - After a reset the session injects a UNIT ATTENTION: delivered on the
 //!   next TEST UNIT READY (Failed CSW), cleared by REQUEST SENSE.
 //!
-//! ## Data-In shortfall policy: short packet, no pad, no STALL
+//! ## Data-In shortfall policy ([`ShortfallPolicy`])
 //!
-//! BOT §6.7.2 (cases (4)/(5), the host's `dCBWDataTransferLength` exceeding
-//! the data the device intends to send) lets the device either send fill data
-//! to pad up to `dCBWDataTransferLength`, or end with a short packet and STALL
-//! the Bulk-In pipe. We do neither: the phase is ended with a short packet
-//! (with a ZLP first when the produced length is a multiple of the bulk MPS,
-//! including zero) and the shortfall is reported in `dCSWDataResidue`. This is
-//! a deliberate, documented deviation from §6.7.2:
+//! BOT §6.7.2 (cases (4)/(5): the host's `dCBWDataTransferLength` exceeding
+//! the data the device intends to send) lets the device either pad fill data up
+//! to `dCBWDataTransferLength`, or end with a short packet **and STALL** the
+//! Bulk-In pipe. A plain short packet without the STALL skips that *shall* and
+//! is therefore outside the specification (the BOT spec calls un-outlined
+//! behaviour indeterminate). The session selects one of three behaviours, whose
+//! rationale is on [`ShortfallPolicy`]:
 //!
-//! - embassy-usb (the ESP32-S3 example) does not expose endpoint STALL to a
-//!   class (`Bus` lives inside the private `UsbDevice`), so the embedded
-//!   target cannot STALL.
-//! - Linux FunctionFS *can* STALL (`snowdrive-cli`'s `FfsBot::stall_both`
-//!   calls `halt()` on both endpoints), but the core keeps one
-//!   transport-independent policy so behavior is deterministic across drivers
-//!   — and identical to mainline Linux's gadget, which never pads.
-//! - Mainstream hosts accept a short Data-In phase: BOT requires the host to
-//!   derive the received length from `dCBWDataTransferLength` −
-//!   `dCSWDataResidue`, and Linux/Windows/macOS, UEFI/BIOS, FreeBSD and U-Boot
-//!   all do. Mainline Linux's own USB gadget does exactly this and
-//!   acknowledges the deviation:
+//! - [`ShortfallPolicy::ShortNoStall`] (default, max-compat): the phase ends
+//!   with a short packet (plus a ZLP when the produced length is a multiple of
+//!   the bulk MPS, including zero) and reports the shortfall in
+//!   `dCSWDataResidue`. This is the deliberate, documented deviation — verified
+//!   benign on Linux usb-storage, UEFI/EDK2, FreeBSD and U-Boot. Mainline
+//!   Linux's own gadget does the same and admits it:
 //!   "This violates the Bulk-Only Transport specification, which requires us
 //!   to pad the data if we don't halt the endpoint. Presumably nobody will
 //!   mind." — `drivers/usb/gadget/function/f_mass_storage.c`, `finish_reply()`.
+//! - [`ShortfallPolicy::Short`] (conformant): the short packet is followed by a
+//!   Bulk-In STALL; the withheld CSW is sent once the host clears the halt. It
+//!   needs a driver that implements `BotIo::stall_in` *and* services
+//!   `CtrlReq::ClearFeatureHalt`; a `stall_in` failure aborts the transaction
+//!   via [`BotSession::reset`].
+//! - [`ShortfallPolicy::Pad`] (conformant up to the cap): fill zeros up to
+//!   `dCBWDataTransferLength`, capped at [`MAX_PAD`]. The fill is not "relevant"
+//!   data, so the residue stays `declared − produced`. A cap-exhausted pad ends
+//!   like `ShortNoStall`. `Pad` never touches the control plane.
 //!
-//! The ZLP is mandatory: a bulk-IN transfer only ends on the requested byte
-//! count, a short packet, or an error, so an MPS-multiple shortfall (including
-//! zero bytes) must be terminated with a ZLP or the host never sees the end of
-//! the data phase.
+//! The ZLP is mandatory whenever the data phase ends on a shortfall whose wire
+//! length is an exact multiple of the MPS: a bulk-IN transfer only ends on the
+//! requested byte count, a short packet, or an error, so an MPS-multiple
+//! shortfall (including zero bytes) must be terminated with a ZLP (or, for
+//! `Short`, the STALL) or the host never sees the end of the data phase.
+//!
+//! Residue is always `declared − produced` (the *relevant* data actually sent);
+//! `Pad` fill bytes are not relevant, so a fully padded phase still reports a
+//! non-zero residue.
+//!
+//! ## `step()` constraint
+//!
+//! [`BotSession::step`] does not service the control plane, so it pre-rejects
+//! [`ShortfallPolicy::Short`] with [`BotStepResult::Unsupported`] at entry,
+//! before any wire effect. Drive `Short` with a `need()`/`poll()` loop that
+//! handles [`SessionNeed::NeedStall`]. `ShortNoStall` and `Pad` are fully
+//! drivable by `step()`.
 
 use core::time::Duration;
 
@@ -77,6 +90,80 @@ const STEP_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 /// shortfall whose length is a multiple of the MPS — including zero bytes —
 /// must be closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)).
 const BOT_BULK_MPS: u64 = 512;
+
+/// Maximum number of fill bytes a single `ShortfallPolicy::Pad` data phase
+/// will send. A `dCBWDataTransferLength` far beyond the produced data
+/// (host bug or hostile host) degrades to the `ShortNoStall` ending once this
+/// many fill bytes have gone out, so a garbage CBW cannot trigger an unbounded
+/// zero pour. Units: bytes.
+pub const MAX_PAD: u64 = 64 * 1024;
+
+/// Zero source for `ShortfallPolicy::Pad` fill, emitted through
+/// [`BotSession::out_slice`]. `4096` is a multiple of every realistic bulk MPS
+/// (64 Full-Speed, 512 High-Speed), so intermediate fill chunks are full-MPS
+/// packets; only a chunk reaching the (possibly non-aligned) pad target is a
+/// short packet, which is correct because it is the final transfer.
+const ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
+
+/// Policy for ending a Data-In command's data stage when a shortfall of
+/// relevant data occurs (BOT §6.7.2). The default (`ShortNoStall`) is the
+/// max-compat deviation; `Short` and `Pad` are the conformant modes. The
+/// caller knows its transport, so the selected variant is the capability
+/// declaration; a `Short`-without-`stall_in` mismatch exits through the
+/// reset route (the driver calls [`BotSession::reset`]), never silently.
+///
+/// ## Choice logic (why exactly three values)
+///
+/// Conformance alone never demands `Pad` — a conformant ending (short packet
+/// plus STALL) is available at any shortfall size; the split exists where
+/// callers *cannot* stall. Per value:
+///
+/// - `ShortNoStall` — default. Runs unaided on any transport (no halt
+///   capability, no clear observability required); the deliberate deviation
+///   for all shortfall sizes, S3-validated. For devices whose shortfalls are
+///   almost all large Data-phase errors, this is the semantically honest
+///   choice.
+/// - `Short` — opt-in for stall-capable transports *with* clear observability
+///   (both legs). Any shortfall size; enters the host's halt/clear recovery
+///   flow (per-host software path, verified benign on Linux/EDK2/FreeBSD/
+///   U-Boot).
+/// - `Pad` — opt-in for stall-less transports. Near-free for the structural
+///   small shortfalls that occur routinely (INQUIRY/REQUEST SENSE/MODE SENSE:
+///   tens to ~200 bytes ≈ one FS packet), and avoids the halt/clear/recovery
+///   path entirely (`-EBADMSG`-flavoured quirk risk included). Large
+///   shortfalls are capped by [`MAX_PAD`] and degrade to the `ShortNoStall`
+///   ending, so a garbage `dCBWDataTransferLength` cannot turn into an
+///   unbounded zero pour. The policy is "pad small, never flood" — conformant
+///   precisely where it matters most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShortfallPolicy {
+    /// Conformant below the fill cap: pad fill zeros up to
+    /// `dCBWDataTransferLength`, sending at most [`MAX_PAD`] fill bytes (the
+    /// fill is not "relevant" data — residue stays `declared − produced`).
+    /// Pure bulk state machine (no control plane) — unconditionally: a
+    /// shortfall that exhausts the cap ends like `ShortNoStall` (short packet
+    /// plus CSW), so `Pad` is explicitly non-conformant above the cap and never
+    /// touches the stall path.
+    ///
+    /// The fill is delivered without a premature short packet: the final
+    /// relevant chunk is zero-extended in-buffer to the next bulk-MPS boundary
+    /// before it is sent, so a shortfall whose relevant length is not a
+    /// multiple of the MPS (e.g. a 95-byte INQUIRY against a declared 192) is
+    /// still filled to `dCBWDataTransferLength` conformantly, rather than
+    /// leaking a short packet that would terminate the host's bulk-IN before
+    /// the fill.
+    Pad,
+    /// Conformant: short packet then STALL Bulk-In; the CSW is sent after the
+    /// host clears the halt. Requires a driver that implements `stall_in`
+    /// *and* services `CtrlReq::ClearFeatureHalt` — missed `stall_in` failures
+    /// abort via [`BotSession::reset`].
+    Short,
+    /// Non-conformant, default: plain short packet, no STALL. Runs unaided on
+    /// any transport (no stall capability, no clear observability required);
+    /// the S3-validated behaviour.
+    #[default]
+    ShortNoStall,
+}
 
 /// One bulk I/O completion fed from the driver to the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +191,12 @@ pub enum SessionStep<'a> {
     NeedOut { len: usize, probe: bool },
     /// Send these bytes (chunk from `data`, or the internal CSW).
     NeedIn(&'a [u8]),
+    /// STALL the Bulk-In endpoint, then wait for the host's
+    /// CLEAR_FEATURE(ENDPOINT_HALT) before the CSW (`ShortfallPolicy::Short`;
+    /// see the module-level "Data-In shortfall policy"). The driver calls
+    /// `BotIo::stall_in` once, then calls [`BotSession::clear_feature_halt`]
+    /// when the (pre-filtered) clear arrives.
+    NeedStall,
     /// The transaction ended; the driver stops feeding bulk events.
     Done(BotStepResult),
 }
@@ -115,6 +208,8 @@ pub enum SessionNeed {
     NeedOut { len: usize, probe: bool },
     /// Send `len` bytes (fetch via [`BotSession::out_slice`]).
     NeedIn { len: usize },
+    /// STALL the Bulk-In endpoint (see [`SessionStep::NeedStall`]).
+    NeedStall,
     /// Transaction ended; the driver stops feeding bulk events.
     Done(BotStepResult),
 }
@@ -130,6 +225,11 @@ pub enum BotStepResult {
     Closed,
     /// Caller bug (buffer too small / impossible event).
     Error(BotTargetError),
+    /// The selected [`ShortfallPolicy`] cannot be driven by the blocking
+    /// [`BotSession::step`] wrapper. Emitted only by `step()` and only for
+    /// `Short` (which needs a `need()`/`poll()` loop that services the
+    /// control plane); returned at entry, before any wire effect.
+    Unsupported,
 }
 
 /// Core-level error (no_std).
@@ -200,10 +300,43 @@ enum BotState {
     },
     /// CSW pending in the internal buffer.
     Csw,
+    /// Data-In pad: send fill zeros to reach `declared` (BOT §6.7.2
+    /// alternative to STALL), capped at [`MAX_PAD`] fill bytes. `produced` is
+    /// the relevant data already sent (the residue basis, `declared −
+    /// produced`); `wire` is the total bytes actually sent so far (relevant +
+    /// fill, excluding the pending `chunk`); `chunk` is the next fill chunk
+    /// length, served from an internal zero source. A cap-exhausted pad ends
+    /// `ShortNoStall`-style (short packet + CSW, no STALL).
+    DataInPad {
+        tag: u32,
+        declared: u64,
+        produced: u64,
+        wire: u64,
+        status: CswStatus,
+        chunk: usize,
+    },
     /// CSW pending, but a zero-length packet must terminate the data phase
     /// first (a shortfall whose length is a multiple of the bulk MPS,
-    /// including zero bytes — see [`finish_data_in`]).
-    CswZlp,
+    /// including zero bytes — see [`finish_data_in`]). Carries the shortfall
+    /// payload so the terminating `InSent` can enter [`BotState::DataInStall`]
+    /// under `ShortfallPolicy::Short`.
+    CswZlp {
+        tag: u32,
+        declared: u64,
+        actual: u64,
+        status: CswStatus,
+    },
+    /// Halted after sending a Data-In shortfall under `ShortfallPolicy::Short`
+    /// (`need()` returns `NeedStall`); purely "awaiting
+    /// CLEAR_FEATURE(ENDPOINT_HALT)". Holds the CSW payload that
+    /// [`BotSession::clear_feature_halt`] turns into the CSW. Distinct from the
+    /// invalid-CBW terminal [`BotState::Stalled`].
+    DataInStall {
+        tag: u32,
+        declared: u64,
+        actual: u64,
+        status: CswStatus,
+    },
     /// Frozen after an invalid CBW; only `reset()` unfreezes.
     Stalled,
 }
@@ -219,9 +352,12 @@ pub struct BotSession {
     invalid_lun_sense: Option<Sense>,
     pending_ua: Option<Sense>,
     /// Bulk endpoint max packet size in bytes used for the Data-In ZLP
-    /// decision ([`BOT_BULK_MPS`] by default; 64 for Full-Speed, 512 for
+    /// decision (`BOT_BULK_MPS` by default; 64 for Full-Speed, 512 for
     /// High-Speed). Stored as `u64` to match the transfer counter domain.
     bulk_mps: u64,
+    /// How a Data-In shortfall ends (default `ShortNoStall`; see
+    /// [`ShortfallPolicy`]).
+    shortfall: ShortfallPolicy,
 }
 
 impl Default for BotSession {
@@ -249,6 +385,7 @@ impl BotSession {
             invalid_lun_sense: None,
             pending_ua: None,
             bulk_mps: BOT_BULK_MPS,
+            shortfall: ShortfallPolicy::default(),
         }
     }
 
@@ -256,7 +393,7 @@ impl BotSession {
     /// decision (builder style). The value is the USB bulk endpoint's
     /// `wMaxPacketSize`: **64** for Full-Speed, **512** for High-Speed.
     ///
-    /// `0` is rejected and the default ([`BOT_BULK_MPS`]) is kept instead.
+    /// `0` is rejected and the default (`BOT_BULK_MPS`) is kept instead.
     pub fn with_bulk_mps(mut self, mps: u16) -> Self {
         self.set_bulk_mps(mps);
         self
@@ -264,7 +401,7 @@ impl BotSession {
 
     /// Set the bulk endpoint max packet size used for the Data-In ZLP decision
     /// (see [`with_bulk_mps`](Self::with_bulk_mps)). `0` is rejected and the
-    /// default ([`BOT_BULK_MPS`]) is kept instead.
+    /// default (`BOT_BULK_MPS`) is kept instead.
     pub fn set_bulk_mps(&mut self, mps: u16) {
         self.bulk_mps = if mps == 0 {
             BOT_BULK_MPS
@@ -277,6 +414,23 @@ impl BotSession {
     /// decision (64 for Full-Speed, 512 for High-Speed by default).
     pub fn bulk_mps(&self) -> u16 {
         self.bulk_mps as u16
+    }
+
+    /// Select the Data-In shortfall policy (builder style; see
+    /// [`ShortfallPolicy`]). Defaults to `ShortNoStall`.
+    pub fn with_shortfall(mut self, policy: ShortfallPolicy) -> Self {
+        self.set_shortfall(policy);
+        self
+    }
+
+    /// Set the Data-In shortfall policy (see [`with_shortfall`](Self::with_shortfall)).
+    pub fn set_shortfall(&mut self, policy: ShortfallPolicy) {
+        self.shortfall = policy;
+    }
+
+    /// The session's current Data-In shortfall policy.
+    pub fn shortfall(&self) -> ShortfallPolicy {
+        self.shortfall
     }
 
     /// The session's current need (Copy; the driver polls the matching
@@ -301,7 +455,9 @@ impl BotSession {
                 probe: true,
             },
             BotState::Csw => SessionNeed::NeedIn { len: CSW_LEN },
-            BotState::CswZlp => SessionNeed::NeedIn { len: 0 },
+            BotState::CswZlp { .. } => SessionNeed::NeedIn { len: 0 },
+            BotState::DataInPad { chunk, .. } => SessionNeed::NeedIn { len: chunk },
+            BotState::DataInStall { .. } => SessionNeed::NeedStall,
             BotState::Stalled => SessionNeed::Done(BotStepResult::Stalled),
         }
     }
@@ -312,6 +468,7 @@ impl BotSession {
         match self.state {
             BotState::Csw => &self.csw[..],
             BotState::DataIn { chunk, .. } => &data[..chunk],
+            BotState::DataInPad { chunk, .. } => &ZERO_CHUNK[..chunk],
             _ => &[],
         }
     }
@@ -346,9 +503,24 @@ impl BotSession {
     ///
     /// Per BOT §3.1, the host must send this request after a BotReset that
     /// preserved a STALL condition to resume normal operation.
+    ///
+    /// Also ends the transient data-phase stall left by a
+    /// `ShortfallPolicy::Short` shortfall (`DataInStall`): the withheld CSW is
+    /// sent. Drivers pre-filter the request to their own Bulk-In endpoint
+    /// address; the core advances on any call.
     pub fn clear_feature_halt(&mut self) {
-        if matches!(self.state, BotState::Stalled) {
-            self.state = BotState::Command { got: 0 };
+        match self.state {
+            BotState::Stalled => self.state = BotState::Command { got: 0 },
+            BotState::DataInStall {
+                tag,
+                declared,
+                actual,
+                status,
+            } => {
+                self.store_csw(tag, declared - actual, status);
+                self.state = BotState::Csw;
+            }
+            _ => {}
         }
     }
 
@@ -370,7 +542,9 @@ impl BotSession {
             BotState::ParamOut { .. } => self.poll_param_out(ev, data, devs),
             BotState::DataOutOverrun { .. } => self.poll_overrun(ev),
             BotState::Csw => self.poll_csw(ev),
-            BotState::CswZlp => self.poll_csw_zlp(ev),
+            BotState::CswZlp { .. } => self.poll_csw_zlp(ev),
+            BotState::DataInPad { .. } => self.poll_data_in_pad(ev),
+            BotState::DataInStall { .. } => self.poll_data_in_stall(ev),
         }
     }
 
@@ -384,6 +558,12 @@ impl BotSession {
         recv: &mut [u8],
         devs: &mut [D],
     ) -> BotStepResult {
+        // `Short` needs a control plane (STALL + CLEAR_FEATURE observation)
+        // that `step()` does not service. Pre-reject at entry, before any wire
+        // effect, so a mid-phase exit can never leave the wire in a half-phase.
+        if self.shortfall == ShortfallPolicy::Short {
+            return BotStepResult::Unsupported;
+        }
         if data.len() < crate::MIN_DATA_LEN {
             return BotStepResult::Error(BotTargetError::WorkBufTooSmall);
         }
@@ -425,6 +605,11 @@ impl BotSession {
                     if let SessionStep::Done(r) = step {
                         return r;
                     }
+                }
+                SessionNeed::NeedStall => {
+                    // Unreachable: `Short` (the only policy that stalls) was
+                    // pre-rejected above; `Pad`/`ShortNoStall` never stall.
+                    return BotStepResult::Unsupported;
                 }
                 SessionNeed::Done(r) => return r,
             }
@@ -591,7 +776,10 @@ impl BotSession {
                 if actual == 0 {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
-                let chunk = (actual as usize).min(data.len());
+                let mut chunk = (actual as usize).min(data.len());
+                if chunk as u64 == actual {
+                    chunk += self.merge_pad_boundary(data, chunk, declared, actual);
+                }
                 self.state = BotState::DataIn {
                     expected: declared,
                     transfer_len: actual,
@@ -617,12 +805,15 @@ impl BotSession {
                 if actual == 0 {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
-                let chunk = (actual as usize).min(data.len());
+                let mut chunk = (actual as usize).min(data.len());
                 match devs[lun].xfer_out(0, &mut data[..chunk]) {
                     XferOutcome::Ok => {}
                     XferOutcome::Error(_) => {
                         return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
                     }
+                }
+                if chunk as u64 == actual {
+                    chunk += self.merge_pad_boundary(data, chunk, declared, actual);
                 }
                 self.state = BotState::DataIn {
                     expected: declared,
@@ -718,7 +909,10 @@ impl BotSession {
         if actual == 0 {
             return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
         }
-        let chunk = (actual as usize).min(data.len());
+        let mut chunk = (actual as usize).min(data.len());
+        if chunk as u64 == actual {
+            chunk += self.merge_pad_boundary(data, chunk, declared, actual);
+        }
         self.state = BotState::DataIn {
             expected: declared,
             transfer_len: actual,
@@ -730,13 +924,9 @@ impl BotSession {
         SessionStep::NeedIn(&data[..chunk])
     }
 
-    /// Assemble the CSW into the internal buffer and move to the CSW state.
-    fn finish_csw_bot<'a>(
-        &'a mut self,
-        tag: u32,
-        residue: u64,
-        status: CswStatus,
-    ) -> SessionStep<'a> {
+    /// Write the CSW for `(tag, residue, status)` into the internal buffer.
+    /// Does not change the state. Residue is clamped to `u32` (BOT §5.2).
+    fn store_csw(&mut self, tag: u32, residue: u64, status: CswStatus) {
         // BOT §5.2: dCSWDataResidue is 32-bit; CBW dCBWDataTransferLength is 32-bit,
         // so residue <= declared <= u32::MAX in practice. Clamp with warn if larger.
         let residue_u32 = u32::try_from(residue).unwrap_or_else(|_| {
@@ -749,17 +939,198 @@ impl BotSession {
             status,
         };
         csw.write(&mut self.csw);
+    }
+
+    /// Assemble the CSW into the internal buffer and move to the CSW state.
+    fn finish_csw_bot<'a>(
+        &'a mut self,
+        tag: u32,
+        residue: u64,
+        status: CswStatus,
+    ) -> SessionStep<'a> {
+        self.store_csw(tag, residue, status);
         self.state = BotState::Csw;
         SessionStep::NeedIn(&self.csw[..])
     }
 
+    /// Plain shortfall ending: the short packet is already on the wire; report
+    /// the shortfall via `dCSWDataResidue` and send the CSW (with a ZLP first
+    /// when the produced length is an MPS multiple, so a full-MPS last packet
+    /// is terminated). No padding, no STALL.
+    fn finish_short_fall<'a>(
+        &'a mut self,
+        tag: u32,
+        declared: u64,
+        actual: u64,
+        status: CswStatus,
+    ) -> SessionStep<'a> {
+        crate::debug!(
+            "bot csw tag={} residue={} status={:?}",
+            tag,
+            declared - actual,
+            status
+        );
+        self.store_csw(tag, declared - actual, status);
+        if actual < declared && actual.is_multiple_of(self.bulk_mps) {
+            self.state = BotState::CswZlp {
+                tag,
+                declared,
+                actual,
+                status,
+            };
+            SessionStep::NeedIn(&[])
+        } else {
+            self.state = BotState::Csw;
+            SessionStep::NeedIn(&self.csw[..])
+        }
+    }
+
+    /// `ShortfallPolicy::Short` ending: the short packet is on the wire; when it
+    /// was a full-MPS last packet, terminate it with a ZLP first. Then STALL
+    /// Bulk-In and wait for CLEAR_FEATURE (`DataInStall`), which releases the
+    /// withheld CSW.
+    fn finish_short_stall<'a>(
+        &'a mut self,
+        tag: u32,
+        declared: u64,
+        actual: u64,
+        status: CswStatus,
+    ) -> SessionStep<'a> {
+        crate::debug!(
+            "bot csw (stall) tag={} residue={} status={:?}",
+            tag,
+            declared - actual,
+            status
+        );
+        self.store_csw(tag, declared - actual, status);
+        if actual.is_multiple_of(self.bulk_mps) {
+            self.state = BotState::CswZlp {
+                tag,
+                declared,
+                actual,
+                status,
+            };
+            SessionStep::NeedIn(&[])
+        } else {
+            self.state = BotState::DataInStall {
+                tag,
+                declared,
+                actual,
+                status,
+            };
+            SessionStep::NeedStall
+        }
+    }
+
+    /// Zero-extend the final relevant Data-In chunk in `data` to the next
+    /// bulk-MPS boundary under `ShortfallPolicy::Pad`, so the host never sees a
+    /// premature short packet before the fill. Bounded by the fill budget
+    /// (`declared − produced`, capped at [`MAX_PAD`]) and the remaining buffer;
+    /// returns the number of fill bytes merged. A no-op for other policies or
+    /// when there is no shortfall. Requires an MPS-aligned work buffer for the
+    /// boundary to fit; callers degrade gracefully otherwise (see
+    /// [`end_shortfall_data_in`]).
+    fn merge_pad_boundary(
+        &self,
+        data: &mut [u8],
+        chunk: usize,
+        declared: u64,
+        produced: u64,
+    ) -> usize {
+        if self.shortfall != ShortfallPolicy::Pad || produced >= declared {
+            return 0;
+        }
+        let budget = (declared - produced).min(MAX_PAD);
+        let mps = self.bulk_mps.max(1);
+        let rem = chunk as u64 % mps;
+        let boundary = if rem == 0 { 0 } else { mps - rem };
+        let room = data.len().saturating_sub(chunk) as u64;
+        let merge = boundary.min(budget).min(room) as usize;
+        if merge > 0 {
+            data[chunk..chunk + merge].fill(0);
+        }
+        merge
+    }
+
+    /// Pad a Data-In shortfall to `declared` (capped at [`MAX_PAD`]) or, once
+    /// the cap/alignment forbids it, end `ShortNoStall`-style. `produced` is
+    /// the relevant data sent; `wire` is the total already on the wire
+    /// (relevant + any boundary-merged fill). Residue is `declared − produced`
+    /// (the fill is *not* relevant data).
+    fn end_shortfall_data_in<'a>(
+        &'a mut self,
+        tag: u32,
+        declared: u64,
+        produced: u64,
+        wire: u64,
+        status: CswStatus,
+    ) -> SessionStep<'a> {
+        let mps = self.bulk_mps.max(1);
+        // A non-MPS-multiple wire length below `declared` means a short packet
+        // already terminated the host's bulk-IN (e.g. a non-MPS-aligned work
+        // buffer blocked the boundary merge); appending fill now would corrupt
+        // the CSW. End ShortNoStall-style.
+        if wire < declared && !wire.is_multiple_of(mps) {
+            return self.finish_short_fall(tag, declared, produced, status);
+        }
+        let target = declared.min(produced + MAX_PAD);
+        if wire >= target {
+            return self.write_pad_csw(tag, declared, produced, wire, status);
+        }
+        let chunk = ((target - wire) as usize).min(ZERO_CHUNK.len());
+        self.state = BotState::DataInPad {
+            tag,
+            declared,
+            produced,
+            wire,
+            status,
+            chunk,
+        };
+        SessionStep::NeedIn(&ZERO_CHUNK[..chunk])
+    }
+
+    /// Send the CSW after a completed `Pad` fill. A fully-filled phase
+    /// (`wire == declared`) sends the CSW directly; a cap-exhausted phase
+    /// (`wire < declared`) ends like `ShortNoStall` — with a ZLP first when the
+    /// wire length is an MPS multiple, no STALL.
+    fn write_pad_csw<'a>(
+        &'a mut self,
+        tag: u32,
+        declared: u64,
+        produced: u64,
+        wire: u64,
+        status: CswStatus,
+    ) -> SessionStep<'a> {
+        crate::debug!(
+            "bot csw (pad) tag={} residue={} wire={} status={:?}",
+            tag,
+            declared - produced,
+            wire,
+            status
+        );
+        self.store_csw(tag, declared - produced, status);
+        if wire < declared && wire.is_multiple_of(self.bulk_mps) {
+            self.state = BotState::CswZlp {
+                tag,
+                declared,
+                actual: produced,
+                status,
+            };
+            SessionStep::NeedIn(&[])
+        } else {
+            self.state = BotState::Csw;
+            SessionStep::NeedIn(&self.csw[..])
+        }
+    }
+
     /// End a Data-In (or no-data) phase with the CSW.
     ///
-    /// If fewer than `declared` bytes were produced, the shortfall is reported
-    /// via `dCSWDataResidue` and the phase ends with a short packet; when the
-    /// produced length is a multiple of the bulk MPS (including zero) a ZLP is
-    /// sent first so the host sees the end of the data phase. No padding and no
-    /// STALL — see the module-level "Data-In shortfall policy". Residue is
+    /// If fewer than `declared` bytes were produced, the shortfall is resolved
+    /// per the session's [`ShortfallPolicy`]: `Pad` fills to `declared` (capped
+    /// at [`MAX_PAD`]), `Short` ENDs the phase with a short packet then STALLs
+    /// Bulk-In, and `ShortNoStall` (the default) reports the shortfall via
+    /// `dCSWDataResidue` and sends a short packet. A produced length that is a
+    /// multiple of the bulk MPS is terminated with a ZLP first. Residue is
     /// 32-bit (BOT §5.2); truncation is guarded (declared is 32-bit).
     fn finish_data_in<'a>(
         &'a mut self,
@@ -769,29 +1140,18 @@ impl BotSession {
         status: CswStatus,
     ) -> SessionStep<'a> {
         let actual = actual.min(declared);
-        crate::debug!(
-            "bot csw tag={} residue={} status={:?}",
-            tag,
-            declared - actual,
-            status
-        );
-        let residue_u32 = u32::try_from(declared - actual).unwrap_or_else(|_| {
-            crate::warn!("bot: residue {} truncated", declared - actual);
-            u32::MAX
-        });
-        let csw = Csw {
-            tag,
-            residue: residue_u32,
-            status,
-        };
-        csw.write(&mut self.csw);
-        if actual < declared && actual.is_multiple_of(self.bulk_mps) {
-            self.state = BotState::CswZlp;
-            SessionStep::NeedIn(&[])
-        } else {
-            self.state = BotState::Csw;
-            SessionStep::NeedIn(&self.csw[..])
+        if actual < declared {
+            return match self.shortfall {
+                ShortfallPolicy::Pad => {
+                    self.end_shortfall_data_in(tag, declared, actual, actual, status)
+                }
+                ShortfallPolicy::Short => self.finish_short_stall(tag, declared, actual, status),
+                ShortfallPolicy::ShortNoStall => {
+                    self.finish_short_fall(tag, declared, actual, status)
+                }
+            };
         }
+        self.finish_short_fall(tag, declared, actual, status)
     }
 
     /// End a transaction, first resolving the data phase the CBW declared
@@ -862,19 +1222,38 @@ impl BotSession {
         match ev {
             SessionEvent::InSent => {
                 if sent >= transfer_len {
-                    // Whole transfer sent: end the phase with a short packet
-                    // (plus a ZLP when the produced length is an MPS multiple)
-                    // and report the shortfall via CSW residue. Never pad,
-                    // never STALL — see the module-level "Data-In shortfall
-                    // policy".
+                    // Relevant data complete. `sent` may exceed `transfer_len`
+                    // when `Pad` boundary-merged fill zeros into the final chunk.
+                    if transfer_len < expected && self.shortfall == ShortfallPolicy::Pad {
+                        return self.end_shortfall_data_in(
+                            tag,
+                            expected,
+                            transfer_len,
+                            sent,
+                            CswStatus::Passed,
+                        );
+                    }
                     return self.finish_data_in(tag, expected, transfer_len, CswStatus::Passed);
                 }
-                let next = ((transfer_len - sent) as usize).min(data.len());
+                let remaining = transfer_len - sent;
+                let mut next = (remaining as usize).min(data.len());
                 if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
-                    // Transfer failed midway: end with a short packet (plus a
-                    // ZLP when `sent` is an MPS multiple) and a Failed CSW; no
-                    // pad, no STALL.
+                    // Transfer failed midway.
+                    if sent < expected && self.shortfall == ShortfallPolicy::Pad {
+                        return self.end_shortfall_data_in(
+                            tag,
+                            expected,
+                            sent,
+                            sent,
+                            CswStatus::Failed,
+                        );
+                    }
                     return self.finish_data_in(tag, expected, sent, CswStatus::Failed);
+                }
+                if next as u64 == remaining {
+                    // Final relevant chunk: boundary-merge Pad fill in-buffer so
+                    // the host never sees a premature short packet.
+                    next += self.merge_pad_boundary(data, next, expected, transfer_len);
                 }
                 self.state = BotState::DataIn {
                     expected,
@@ -891,6 +1270,57 @@ impl BotSession {
                 SessionStep::NeedIn(&data[..chunk])
             }
         }
+    }
+
+    // ── Data-In pad (ShortfallPolicy::Pad) ──────────────────────────
+
+    fn poll_data_in_pad<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+        let st = self.state;
+        let BotState::DataInPad {
+            tag,
+            declared,
+            produced,
+            wire,
+            status,
+            chunk,
+        } = st
+        else {
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+        };
+        match ev {
+            SessionEvent::InSent => {
+                let wire = wire + chunk as u64;
+                let target = declared.min(produced + MAX_PAD);
+                if wire >= target {
+                    return self.write_pad_csw(tag, declared, produced, wire, status);
+                }
+                let next = ((target - wire) as usize).min(ZERO_CHUNK.len());
+                self.state = BotState::DataInPad {
+                    tag,
+                    declared,
+                    produced,
+                    wire,
+                    status,
+                    chunk: next,
+                };
+                SessionStep::NeedIn(&ZERO_CHUNK[..next])
+            }
+            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
+                // No-op: still need to send the pending fill chunk.
+                SessionStep::NeedIn(&ZERO_CHUNK[..chunk])
+            }
+        }
+    }
+
+    // ── Data-In stall (ShortfallPolicy::Short) ──────────────────────
+
+    /// Transient halted state: the shortfall's short packet (and any ZLP) is on
+    /// the wire and the Bulk-In endpoint is STALLed. Bulk events are ignored
+    /// (the endpoint is halted, so none should arrive); `need()` keeps asking
+    /// for the STALL until [`BotSession::clear_feature_halt`] releases the CSW.
+    /// A driver whose `BotIo::stall_in` fails calls [`BotSession::reset`].
+    fn poll_data_in_stall<'a>(&'a mut self, _ev: SessionEvent<'_>) -> SessionStep<'a> {
+        SessionStep::NeedStall
     }
 
     // ── Data-Out phase ──────────────────────────────────────────────
@@ -1136,12 +1566,33 @@ impl BotSession {
     }
 
     /// The zero-length packet that terminates a short Data-In phase has been
-    /// sent; the CSW follows.
+    /// sent; under `ShortfallPolicy::Short` the phase then STALLs (`DataInStall`)
+    /// instead of sending the CSW immediately.
     fn poll_csw_zlp<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+        let st = self.state;
+        let BotState::CswZlp {
+            tag,
+            declared,
+            actual,
+            status,
+        } = st
+        else {
+            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+        };
         match ev {
             SessionEvent::InSent => {
-                self.state = BotState::Csw;
-                SessionStep::NeedIn(&self.csw[..])
+                if self.shortfall == ShortfallPolicy::Short && actual < declared {
+                    self.state = BotState::DataInStall {
+                        tag,
+                        declared,
+                        actual,
+                        status,
+                    };
+                    SessionStep::NeedStall
+                } else {
+                    self.state = BotState::Csw;
+                    SessionStep::NeedIn(&self.csw[..])
+                }
             }
             SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => SessionStep::NeedIn(&[]),
         }
@@ -1571,7 +2022,7 @@ mod tests {
     fn zero_data_data_in_sends_zlp_then_csw() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
         let mut data = work();
 
         // READ(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
@@ -1607,7 +2058,7 @@ mod tests {
     fn mps_multiple_shortfall_sends_zlp_then_csw() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
         let mut data = work();
 
         // READ(10) count 1 → 512 data bytes, while CBW declared 1024. The
@@ -1993,7 +2444,7 @@ mod tests {
     fn host_asks_for_more_data_gets_short_packet_and_residue() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
         let mut data = work();
 
         // INQUIRY data is 96 bytes, but the host declared 192.
@@ -2116,5 +2567,325 @@ mod tests {
         let mut check = [0u8; 512];
         read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
+    }
+
+    // ── Data-In shortfall policy ────────────────────────────────────
+
+    /// A 10-byte READ(10) CDB for `blocks` blocks at LBA 0.
+    fn read10(blocks: u16) -> [u8; 10] {
+        let mut cdb = [0u8; 10];
+        cdb[0] = scsi_op::READ_10;
+        cdb[7] = (blocks >> 8) as u8;
+        cdb[8] = (blocks & 0xFF) as u8;
+        cdb
+    }
+
+    #[test]
+    fn default_shortfall_is_short_no_stall() {
+        assert_eq!(ShortfallPolicy::default(), ShortfallPolicy::ShortNoStall);
+        // The default session uses the max-compat policy.
+        assert_eq!(BotSession::new().shortfall(), ShortfallPolicy::ShortNoStall);
+        let mut s = BotSession::new();
+        s.set_shortfall(ShortfallPolicy::Pad);
+        assert_eq!(s.shortfall(), ShortfallPolicy::Pad);
+        assert_eq!(
+            BotSession::new()
+                .with_shortfall(ShortfallPolicy::Short)
+                .shortfall(),
+            ShortfallPolicy::Short
+        );
+    }
+
+    #[test]
+    fn pad_fills_shortfall_to_declared_with_relevant_residue() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+        let mut data = work();
+
+        // READ(10) 1 block = 512 bytes; host declared 1024.
+        let raw = raw_cbw(1, 1024, 0x80, 0, &read10(1));
+        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+            other => panic!("expected 512 relevant bytes, got {other:?}"),
+        }
+        // Fill zeros up to `declared`.
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 512);
+                assert!(bytes.iter().all(|&b| b == 0), "fill must be zeros");
+            }
+            other => panic!("expected 512 fill bytes, got {other:?}"),
+        }
+        // Then the CSW; residue is the *relevant* shortfall, not 0.
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 1);
+        assert_eq!(residue, 1024 - 512);
+        assert_eq!(status, 0x00);
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::Done(BotStepResult::Processed)
+        );
+    }
+
+    #[test]
+    fn pad_mps_multiple_shortfall_has_no_stray_trailer() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+        let mut data = work();
+
+        // READ(10) 2 blocks = 1024 bytes (2 MPS); host declared 2048.
+        let raw = raw_cbw(2, 2048, 0x80, 0, &read10(2));
+        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 1024),
+            other => panic!("expected 1024 relevant bytes, got {other:?}"),
+        }
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 1024),
+            other => panic!("expected 1024 fill bytes, got {other:?}"),
+        }
+        // Fully filled to declared → CSW directly (no ZLP/stray trailer).
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, residue, status) = read_csw(&mut s, &mut data); // asserts CSW length
+        assert_eq!(residue, 2048 - 1024);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn pad_non_mps_aligned_shortfall_still_fills() {
+        // A 95-byte INQUIRY against a declared 192: the final relevant chunk is
+        // zero-extended in-buffer to declared, so the host never sees a
+        // premature short packet.
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+        let mut data = work();
+
+        let raw = raw_cbw(3, 192, 0x80, 0, &inquiry_cdb(95));
+        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => {
+                assert_eq!(bytes.len(), 192, "one transfer reaching declared");
+                assert_eq!(bytes[0] & 0x1F, 0x00); // INQUIRY payload
+                assert!(bytes[95..].iter().all(|&b| b == 0), "tail is fill");
+            }
+            other => panic!("expected a single 192-byte transfer, got {other:?}"),
+        }
+        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+            SessionStep::NeedIn(_) => {}
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 192 - 95);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn pad_cap_hit_ends_short_no_stall() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+        let mut data = vec![0u8; 64 * 1024];
+        let mut recv = work();
+
+        // READ(10) 1 block (512 produced); declared far past produced + MAX_PAD.
+        let declared = 512 + MAX_PAD as u32 + 512;
+        let raw = raw_cbw(4, declared, 0x80, 0, &read10(1));
+        let mut io = ScriptIo::new(&raw);
+        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
+        assert_eq!(r, BotStepResult::Processed);
+
+        // 512 relevant + exactly MAX_PAD fill + ZLP (wire is MPS-multiple) + CSW.
+        let wire = 512 + MAX_PAD as usize;
+        let sent = io.sent.borrow();
+        assert_eq!(sent.len(), wire + CSW_LEN, "no STALL, no oversized pour");
+        let csw = &sent[sent.len() - CSW_LEN..];
+        assert_eq!(&csw[..4], b"USBS");
+        assert_eq!(
+            u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]),
+            declared - 512
+        );
+        assert_eq!(csw[12], 0x00);
+    }
+
+    #[test]
+    fn step_drives_pad_to_declared() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+        let mut data = work();
+        let mut recv = work();
+
+        let raw = raw_cbw(5, 1024, 0x80, 0, &read10(1));
+        let mut io = ScriptIo::new(&raw);
+        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
+        assert_eq!(r, BotStepResult::Processed);
+        // 512 relevant + 512 fill + CSW.
+        assert_eq!(io.sent.borrow().len(), 512 + 512 + CSW_LEN);
+    }
+
+    #[test]
+    fn short_shortfall_zlp_stall_clear_then_csw() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+        let mut data = work();
+
+        // READ 1 block (512, an MPS multiple) vs declared 1024.
+        let raw = raw_cbw(6, 1024, 0x80, 0, &read10(1));
+        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+            other => panic!("expected 512 relevant bytes, got {other:?}"),
+        }
+        // 512 % MPS == 0 → a ZLP first.
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::NeedIn(&[])
+        );
+        assert_eq!(s.need(), SessionNeed::NeedIn { len: 0 });
+        // Then the STALL.
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::NeedStall
+        );
+        assert_eq!(s.need(), SessionNeed::NeedStall);
+        // Bulk events are ignored while halted.
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::NeedStall
+        );
+        assert_eq!(
+            s.poll(SessionEvent::OutRecv { data: &[] }, &mut data, &mut devs),
+            SessionStep::NeedStall
+        );
+        // CLEAR_FEATURE releases the withheld CSW.
+        s.clear_feature_halt();
+        assert_eq!(s.need(), SessionNeed::NeedIn { len: CSW_LEN });
+        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(tag, 6);
+        assert_eq!(residue, 1024 - 512);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn short_non_mps_shortfall_stalls_without_zlp() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+        let mut data = work();
+
+        let raw = raw_cbw(7, 192, 0x80, 0, &inquiry_cdb(95));
+        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+            other => panic!("expected 95 relevant bytes, got {other:?}"),
+        }
+        // 95 % MPS != 0: the short packet already terminated the read → STALL
+        // directly, no ZLP.
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::NeedStall
+        );
+        s.clear_feature_halt();
+        let (_, residue, status) = read_csw(&mut s, &mut data);
+        assert_eq!(residue, 192 - 95);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn short_bot_reset_in_data_in_stall_aborts() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+        let mut data = work();
+
+        let raw = raw_cbw(8, 192, 0x80, 0, &inquiry_cdb(95));
+        s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        assert_eq!(
+            s.poll(SessionEvent::InSent, &mut data, &mut devs),
+            SessionStep::NeedStall
+        );
+
+        // Bot Reset aborts the transaction; the CSW is dropped.
+        s.reset();
+        assert_eq!(
+            s.need(),
+            SessionNeed::NeedOut {
+                len: CBW_LEN,
+                probe: false
+            }
+        );
+        // A later (stale) clear is a no-op: no CSW is emitted.
+        s.clear_feature_halt();
+        assert_eq!(
+            s.need(),
+            SessionNeed::NeedOut {
+                len: CBW_LEN,
+                probe: false
+            }
+        );
+    }
+
+    #[test]
+    fn step_rejects_short_before_any_wire_effect() {
+        let mut ram = vec![0u8; 64 * 1024];
+        let mut devs = [test_dev(&mut ram)];
+        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+        let mut data = work();
+        let mut recv = work();
+
+        // Even an exact-length command (no shortfall) is rejected at entry.
+        let raw = raw_cbw(9, 96, 0x80, 0, &inquiry_cdb(96));
+        let mut io = ScriptIo::new(&raw);
+        assert_eq!(
+            s.step(&mut io, &mut data, &mut recv, &mut devs),
+            BotStepResult::Unsupported
+        );
+        assert!(io.sent.borrow().is_empty(), "no wire effect");
+        assert_eq!(
+            s.need(),
+            SessionNeed::NeedOut {
+                len: CBW_LEN,
+                probe: false
+            }
+        );
+    }
+
+    #[test]
+    fn exact_length_transfer_unaffected_by_policy() {
+        for policy in [
+            ShortfallPolicy::Pad,
+            ShortfallPolicy::Short,
+            ShortfallPolicy::ShortNoStall,
+        ] {
+            let mut ram = vec![0u8; 64 * 1024];
+            let mut devs = [test_dev(&mut ram)];
+            let mut s = BotSession::new().with_shortfall(policy);
+            let mut data = work();
+
+            // INQUIRY alloc 96, declared 96: no shortfall.
+            let raw = raw_cbw(10, 96, 0x80, 0, &inquiry_cdb(96));
+            match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
+                SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
+                other => panic!("[{policy:?}] expected 96 bytes, got {other:?}"),
+            }
+            match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
+                SessionStep::NeedIn(_) => {}
+                other => panic!("[{policy:?}] expected CSW, got {other:?}"),
+            }
+            let (_, residue, status) = read_csw(&mut s, &mut data);
+            assert_eq!(residue, 0, "[{policy:?}] exact transfer has no residue");
+            assert_eq!(status, 0x00);
+            assert_eq!(
+                s.poll(SessionEvent::InSent, &mut data, &mut devs),
+                SessionStep::Done(BotStepResult::Processed)
+            );
+        }
     }
 }

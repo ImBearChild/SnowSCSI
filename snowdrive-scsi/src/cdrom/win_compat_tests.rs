@@ -324,6 +324,9 @@ mod enumeration_sequence {
             );
             match session.need() {
                 SessionNeed::Done(_) => break,
+                SessionNeed::NeedStall => {
+                    panic!("unexpected NeedStall in a non-Short session");
+                }
                 // CSW sent: the core is back in Command phase waiting for
                 // the next CBW — transaction complete.
                 SessionNeed::NeedOut {
