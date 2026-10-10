@@ -154,10 +154,6 @@ fn drive_until_done(
     }
 }
 
-/// The mock driver's own Bulk-In endpoint address, used to filter
-/// CLEAR_FEATURE(ENDPOINT_HALT) before the core.
-const BULK_IN_ADDR: u8 = 0x82;
-
 /// Handle one queued control request the way serve_bot does (§6.3).
 fn serve_ctrl_once(session: &mut BotSession, gadget: &mut MockGadget) -> bool {
     if let Some(req) = gadget.try_next_ctrl() {
@@ -170,12 +166,6 @@ fn serve_ctrl_once(session: &mut BotSession, gadget: &mut MockGadget) -> bool {
                 reply.send(&[session.max_lun()]).unwrap();
             }
             CtrlReq::LinkReset => session.reset(),
-            CtrlReq::ClearFeatureHalt { addr } => {
-                // Only our own Bulk-In address releases the halt.
-                if addr == BULK_IN_ADDR {
-                    session.clear_feature_halt();
-                }
-            }
         }
         true
     } else {
@@ -1176,8 +1166,9 @@ fn opcode_report_luns_synthesized() {
 // ── 10. Data-In shortfall policy: Short / Pad / ShortNoStall ────────
 
 /// Drive a `Short`-policy transaction to completion, servicing one `stall_in`
-/// on `NeedStall` and then the matching CLEAR_FEATURE. Returns `None` when
-/// `stall_in` failed and the loop aborted via `reset()`.
+/// on `NeedStall` and then releasing the stall (no CLEAR_FEATURE event exists
+/// to wait for). Returns `None` when `stall_in` failed and the loop aborted
+/// via `reset()`.
 fn drive_short(
     session: &mut BotSession,
     io: &mut MockBotIo,
@@ -1221,8 +1212,8 @@ fn drive_short(
                     session.reset();
                     return None;
                 }
-                // Host's CLEAR_FEATURE(ENDPOINT_HALT) for our Bulk-In.
-                session.clear_feature_halt();
+                // Release the stall; the withheld CSW follows.
+                session.stall_applied();
             }
             SessionNeed::Done(r) => return Some(r),
         }
@@ -1230,7 +1221,7 @@ fn drive_short(
 }
 
 #[test]
-fn short_policy_stalls_then_clear_releases_csw() {
+fn short_policy_stalls_then_applied_releases_csw() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
@@ -1304,35 +1295,6 @@ fn short_policy_stall_failure_resets_transaction() {
     );
     // Only the 512 relevant bytes went out; the withheld CSW was dropped.
     assert_eq!(io.in_.len(), 512, "no CSW emitted on the abort");
-}
-
-#[test]
-fn clear_feature_foreign_endpoint_is_ignored() {
-    let mut ram = vec![0u8; 64 * 1024];
-    let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
-    let mut gadget = MockGadget::new();
-    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
-
-    // Reach the halted transient state.
-    let cdb = [0x12, 0, 0, 0, 95, 0];
-    let raw = raw_cbw(4, 192, 0x80, 0, &cdb);
-    s.poll(SessionEvent::OutRecv { data: &raw }, &mut work, &mut luns);
-    assert_eq!(
-        s.poll(SessionEvent::InSent, &mut work, &mut luns),
-        SessionStep::NeedStall
-    );
-
-    // A clear for another endpoint (0x01 = Bulk-Out) is ignored.
-    gadget.inject(CtrlReq::ClearFeatureHalt { addr: 0x01 });
-    assert!(serve_ctrl_once(&mut s, &mut gadget));
-    assert_eq!(s.need(), SessionNeed::NeedStall, "foreign clear ignored");
-
-    // The matching Bulk-In clear releases the CSW.
-    gadget.inject(CtrlReq::ClearFeatureHalt { addr: BULK_IN_ADDR });
-    assert!(serve_ctrl_once(&mut s, &mut gadget));
-    assert_eq!(s.need(), SessionNeed::NeedIn { len: CSW_LEN });
 }
 
 #[test]
