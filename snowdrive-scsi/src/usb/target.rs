@@ -42,10 +42,12 @@
 //!   to pad the data if we don't halt the endpoint. Presumably nobody will
 //!   mind." — `drivers/usb/gadget/function/f_mass_storage.c`, `finish_reply()`.
 //! - [`ShortfallPolicy::Short`] (conformant): the short packet is followed by a
-//!   Bulk-In STALL; the withheld CSW is sent once the host clears the halt. It
-//!   needs a driver that implements `BotIo::stall_in` *and* services
-//!   `CtrlReq::ClearFeatureHalt`; a `stall_in` failure aborts the transaction
-//!   via [`BotSession::reset`].
+//!   Bulk-In STALL; the CSW is queued straight away and reaches the host once
+//!   it clears the halt (handled by the USB core). It needs a driver that
+//!   implements `BotIo::stall_in` — retrying transient `-EAGAIN` (the endpoint
+//!   cannot be halted while a request is queued or the FIFO still holds
+//!   uncollected bytes) — and then calls [`BotSession::stall_applied`]. A real
+//!   `stall_in` failure aborts the transaction via [`BotSession::reset`].
 //! - [`ShortfallPolicy::Pad`] (conformant up to the cap): fill zeros up to
 //!   `dCBWDataTransferLength`, capped at [`MAX_PAD`]. The fill is not "relevant"
 //!   data, so the residue stays `declared − produced`. A cap-exhausted pad ends
@@ -153,10 +155,11 @@ pub enum ShortfallPolicy {
     /// leaking a short packet that would terminate the host's bulk-IN before
     /// the fill.
     Pad,
-    /// Conformant: short packet then STALL Bulk-In; the CSW is sent after the
-    /// host clears the halt. Requires a driver that implements `stall_in`
-    /// *and* services `CtrlReq::ClearFeatureHalt` — missed `stall_in` failures
-    /// abort via [`BotSession::reset`].
+    /// Conformant: short packet then STALL Bulk-In; the withheld CSW is queued
+    /// immediately and delivered once the host clears the halt. Requires a
+    /// driver that implements `stall_in` (retrying transient `-EAGAIN`) and
+    /// then calls [`BotSession::stall_applied`]; a real `stall_in` failure
+    /// aborts via [`BotSession::reset`].
     Short,
     /// Non-conformant, default: plain short packet, no STALL. Runs unaided on
     /// any transport (no stall capability, no clear observability required);
@@ -191,11 +194,10 @@ pub enum SessionStep<'a> {
     NeedOut { len: usize, probe: bool },
     /// Send these bytes (chunk from `data`, or the internal CSW).
     NeedIn(&'a [u8]),
-    /// STALL the Bulk-In endpoint, then wait for the host's
-    /// CLEAR_FEATURE(ENDPOINT_HALT) before the CSW (`ShortfallPolicy::Short`;
-    /// see the module-level "Data-In shortfall policy"). The driver calls
-    /// `BotIo::stall_in` once, then calls [`BotSession::clear_feature_halt`]
-    /// when the (pre-filtered) clear arrives.
+    /// STALL the Bulk-In endpoint (`ShortfallPolicy::Short`; see the
+    /// module-level "Data-In shortfall policy"). The driver calls
+    /// `BotIo::stall_in` (retrying transient `-EAGAIN`), then
+    /// [`BotSession::stall_applied`] to release the withheld CSW.
     NeedStall,
     /// The transaction ended; the driver stops feeding bulk events.
     Done(BotStepResult),
@@ -326,11 +328,13 @@ enum BotState {
         actual: u64,
         status: CswStatus,
     },
-    /// Halted after sending a Data-In shortfall under `ShortfallPolicy::Short`
-    /// (`need()` returns `NeedStall`); purely "awaiting
-    /// CLEAR_FEATURE(ENDPOINT_HALT)". Holds the CSW payload that
-    /// [`BotSession::clear_feature_halt`] turns into the CSW. Distinct from the
-    /// invalid-CBW terminal [`BotState::Stalled`].
+    /// The CSW is pending, but the driver must first STALL Bulk-In
+    /// (`ShortfallPolicy::Short`): `need()` returns `NeedStall`. Holds the CSW
+    /// payload that [`BotSession::stall_applied`] turns into the CSW once the
+    /// driver has set the halt. The host's CLEAR_FEATURE is handled by the USB
+    /// core and is not observable here, so this state is released by the driver
+    /// (see [`stall_applied`](BotSession::stall_applied)), not by an event.
+    /// Distinct from the invalid-CBW terminal [`BotState::Stalled`].
     DataInStall {
         tag: u32,
         declared: u64,
@@ -502,25 +506,26 @@ impl BotSession {
     /// (USB 2.0 §9.4.1) and return to the Command phase.
     ///
     /// Per BOT §3.1, the host must send this request after a BotReset that
-    /// preserved a STALL condition to resume normal operation.
-    ///
-    /// Also ends the transient data-phase stall left by a
-    /// `ShortfallPolicy::Short` shortfall (`DataInStall`): the withheld CSW is
-    /// sent. Drivers pre-filter the request to their own Bulk-In endpoint
-    /// address; the core advances on any call.
+    /// preserved a STALL condition to resume normal operation. This is only
+    /// meaningful for transports that can observe the host's CLEAR_FEATURE (a
+    /// platform-level capability); a data-phase STALL left by a
+    /// `ShortfallPolicy::Short` shortfall is released with
+    /// [`stall_applied`](Self::stall_applied) instead.
     pub fn clear_feature_halt(&mut self) {
-        match self.state {
-            BotState::Stalled => self.state = BotState::Command { got: 0 },
-            BotState::DataInStall {
-                tag,
-                declared,
-                actual,
-                status,
-            } => {
-                self.store_csw(tag, declared - actual, status);
-                self.state = BotState::Csw;
-            }
-            _ => {}
+        if matches!(self.state, BotState::Stalled) {
+            self.state = BotState::Command { got: 0 };
+        }
+    }
+
+    /// Release the data-phase STALL entered by a `ShortfallPolicy::Short`
+    /// shortfall. The driver calls this immediately after [`BotIo::stall_in`]
+    /// succeeds: the host's CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB
+    /// core and is **not** observable by the function, so the core does not
+    /// wait for an event — the withheld CSW is queued straight away and reaches
+    /// the host once it clears the halt. No-op outside the `DataInStall` state.
+    pub fn stall_applied(&mut self) {
+        if matches!(self.state, BotState::DataInStall { .. }) {
+            self.state = BotState::Csw;
         }
     }
 
@@ -558,9 +563,9 @@ impl BotSession {
         recv: &mut [u8],
         devs: &mut [D],
     ) -> BotStepResult {
-        // `Short` needs a control plane (STALL + CLEAR_FEATURE observation)
-        // that `step()` does not service. Pre-reject at entry, before any wire
-        // effect, so a mid-phase exit can never leave the wire in a half-phase.
+        // `Short` needs the `stall_in` capability that `step()` does not
+        // service. Pre-reject at entry, before any wire effect, so a mid-phase
+        // exit can never leave the wire in a half-phase.
         if self.shortfall == ShortfallPolicy::Short {
             return BotStepResult::Unsupported;
         }
@@ -986,9 +991,9 @@ impl BotSession {
     }
 
     /// `ShortfallPolicy::Short` ending: the short packet is on the wire; when it
-    /// was a full-MPS last packet, terminate it with a ZLP first. Then STALL
-    /// Bulk-In and wait for CLEAR_FEATURE (`DataInStall`), which releases the
-    /// withheld CSW.
+    /// was a full-MPS last packet, terminate it with a ZLP first. Then the phase
+    /// STALLs Bulk-In (`DataInStall`); the driver sets the halt and calls
+    /// [`BotSession::stall_applied`], which releases the withheld CSW.
     fn finish_short_stall<'a>(
         &'a mut self,
         tag: u32,
@@ -1314,11 +1319,12 @@ impl BotSession {
 
     // ── Data-In stall (ShortfallPolicy::Short) ──────────────────────
 
-    /// Transient halted state: the shortfall's short packet (and any ZLP) is on
-    /// the wire and the Bulk-In endpoint is STALLed. Bulk events are ignored
-    /// (the endpoint is halted, so none should arrive); `need()` keeps asking
-    /// for the STALL until [`BotSession::clear_feature_halt`] releases the CSW.
-    /// A driver whose `BotIo::stall_in` fails calls [`BotSession::reset`].
+    /// Transient stall state: the shortfall's short packet (and any ZLP) is on
+    /// the wire and the driver is about to STALL Bulk-In. Bulk events are
+    /// ignored (the endpoint is halted, so none should arrive); `need()` keeps
+    /// asking for the STALL until the driver calls
+    /// [`BotSession::stall_applied`], which releases the CSW. A driver whose
+    /// `BotIo::stall_in` fails calls [`BotSession::reset`].
     fn poll_data_in_stall<'a>(&'a mut self, _ev: SessionEvent<'_>) -> SessionStep<'a> {
         SessionStep::NeedStall
     }
@@ -2732,7 +2738,7 @@ mod tests {
     }
 
     #[test]
-    fn short_shortfall_zlp_stall_clear_then_csw() {
+    fn short_shortfall_zlp_stall_applied_then_csw() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
@@ -2756,7 +2762,7 @@ mod tests {
             SessionStep::NeedStall
         );
         assert_eq!(s.need(), SessionNeed::NeedStall);
-        // Bulk events are ignored while halted.
+        // Bulk events are ignored while stalled.
         assert_eq!(
             s.poll(SessionEvent::InSent, &mut data, &mut devs),
             SessionStep::NeedStall
@@ -2765,8 +2771,8 @@ mod tests {
             s.poll(SessionEvent::OutRecv { data: &[] }, &mut data, &mut devs),
             SessionStep::NeedStall
         );
-        // CLEAR_FEATURE releases the withheld CSW.
-        s.clear_feature_halt();
+        // The driver releases the stall (no CLEAR_FEATURE event to wait for).
+        s.stall_applied();
         assert_eq!(s.need(), SessionNeed::NeedIn { len: CSW_LEN });
         let (tag, residue, status) = read_csw(&mut s, &mut data);
         assert_eq!(tag, 6);
@@ -2792,7 +2798,7 @@ mod tests {
             s.poll(SessionEvent::InSent, &mut data, &mut devs),
             SessionStep::NeedStall
         );
-        s.clear_feature_halt();
+        s.stall_applied();
         let (_, residue, status) = read_csw(&mut s, &mut data);
         assert_eq!(residue, 192 - 95);
         assert_eq!(status, 0x00);
@@ -2821,8 +2827,8 @@ mod tests {
                 probe: false
             }
         );
-        // A later (stale) clear is a no-op: no CSW is emitted.
-        s.clear_feature_halt();
+        // A later (stale) release is a no-op: no CSW is emitted.
+        s.stall_applied();
         assert_eq!(
             s.need(),
             SessionNeed::NeedOut {

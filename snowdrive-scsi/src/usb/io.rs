@@ -77,13 +77,21 @@ pub trait BotIo {
     /// shortfall (BOT §6.7.2). Unavailable by default; a driver selecting
     /// [`ShortfallPolicy::Short`] must implement it.
     ///
-    /// On `Err(())` the driver **must** abort the transaction deterministically
-    /// by calling [`BotSession::reset`]: the mismatch exits loudly via the
-    /// driver's fatal log rather than by a silent host timeout. Used only by
-    /// `Short`; `Pad` and `ShortNoStall` never STALL.
+    /// The driver must **retry the transient `-EAGAIN`** (the endpoint cannot
+    /// be halted while a request is queued or the FIFO still holds bytes the
+    /// host has not collected) until the halt is set or a bounded deadline
+    /// expires. On success the driver calls [`BotSession::stall_applied`]; the
+    /// core does **not** wait for the host's CLEAR_FEATURE (the USB core handles
+    /// it and it is not observable here) — the withheld CSW is queued
+    /// immediately and delivered once the halt clears. On `Err(())` the driver
+    /// **must** abort the transaction deterministically by calling
+    /// [`BotSession::reset`].
+    ///
+    /// Used only by `Short`; `Pad` and `ShortNoStall` never STALL.
     ///
     /// [`ShortfallPolicy::Short`]: crate::usb::target::ShortfallPolicy::Short
     /// [`BotSession::reset`]: crate::usb::target::BotSession::reset
+    /// [`BotSession::stall_applied`]: crate::usb::target::BotSession::stall_applied
     fn stall_in(&mut self) -> Result<(), ()> {
         Err(())
     }
