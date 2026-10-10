@@ -23,12 +23,17 @@ pub struct MockBotIo {
     pub stall_count: u32,
     /// Whether `stall_both` reports success (default: yes).
     pub stall_available: bool,
+    /// Number of times `stall_in` succeeded.
+    pub stall_in_count: u32,
+    /// Whether `stall_in` reports success (default: yes).
+    pub stall_in_available: bool,
 }
 
 impl MockBotIo {
     pub fn new() -> Self {
         Self {
             stall_available: true,
+            stall_in_available: true,
             ..Default::default()
         }
     }
@@ -36,6 +41,12 @@ impl MockBotIo {
     /// Queue host → device bytes (a CBW or a Data-Out chunk).
     pub fn feed_out(&mut self, bytes: &[u8]) {
         self.out.extend(bytes);
+    }
+
+    /// Whether `stall_in` reports success (default: yes).
+    pub fn set_stall_in(mut self, available: bool) -> Self {
+        self.stall_in_available = available;
+        self
     }
 
     /// Drain and return everything the device has sent so far.
@@ -72,6 +83,15 @@ impl BotIo for MockBotIo {
     fn stall_both(&mut self) -> Result<(), ()> {
         if self.stall_available {
             self.stall_count += 1;
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn stall_in(&mut self) -> Result<(), ()> {
+        if self.stall_in_available {
+            self.stall_in_count += 1;
             Ok(())
         } else {
             Err(())

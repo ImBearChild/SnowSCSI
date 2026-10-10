@@ -13,7 +13,7 @@ use snowdrive_scsi::scsi::block::BlockDevice;
 use snowdrive_scsi::scsi::device::ScsiDevice;
 use snowdrive_scsi::usb::{
     BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
-    SessionNeed, SessionStep, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
+    SessionNeed, SessionStep, ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
 };
 use std::sync::atomic::Ordering;
 
@@ -130,6 +130,9 @@ fn serve_once(
             None
         }
         SessionNeed::Done(BotStepResult::Stalled) => on_stalled(session, io, stalled),
+        // `Short` needs a control-plane driver; the dedicated shortfall tests
+        // drive it explicitly. `serve_once` is only used by non-`Short` tests.
+        SessionNeed::NeedStall => panic!("NeedStall: drive ShortfallPolicy::Short explicitly"),
         SessionNeed::Done(r) => Some(r),
     }
 }
@@ -151,6 +154,10 @@ fn drive_until_done(
     }
 }
 
+/// The mock driver's own Bulk-In endpoint address, used to filter
+/// CLEAR_FEATURE(ENDPOINT_HALT) before the core.
+const BULK_IN_ADDR: u8 = 0x82;
+
 /// Handle one queued control request the way serve_bot does (§6.3).
 fn serve_ctrl_once(session: &mut BotSession, gadget: &mut MockGadget) -> bool {
     if let Some(req) = gadget.try_next_ctrl() {
@@ -163,7 +170,12 @@ fn serve_ctrl_once(session: &mut BotSession, gadget: &mut MockGadget) -> bool {
                 reply.send(&[session.max_lun()]).unwrap();
             }
             CtrlReq::LinkReset => session.reset(),
-            CtrlReq::ClearFeatureHalt => session.clear_feature_halt(),
+            CtrlReq::ClearFeatureHalt { addr } => {
+                // Only our own Bulk-In address releases the halt.
+                if addr == BULK_IN_ADDR {
+                    session.clear_feature_halt();
+                }
+            }
         }
         true
     } else {
@@ -335,7 +347,7 @@ fn command_sequence_read_and_write_verify_backend() {
 fn command_sequence_mode_sense_and_request_sense_clear() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new();
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
     macro_rules! luns {
         () => {{
             let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
@@ -420,7 +432,7 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
 fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new();
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
     macro_rules! luns {
         () => {{
             let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
@@ -458,7 +470,7 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
 fn phase_error_on_direction_mismatch() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new();
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
     macro_rules! luns {
         () => {{
             let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
@@ -943,7 +955,7 @@ fn bot_reset_interrupts_data_phase() {
 fn mode_sense_10_and_prevent_allow() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new();
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
     macro_rules! luns {
         () => {{
             let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
@@ -993,7 +1005,7 @@ fn mode_sense_10_and_prevent_allow() {
 fn request_sense_with_large_allocation_is_short_packet() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut dev = block_device(&mut ram);
-    let mut s = BotSession::new();
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
     macro_rules! luns {
         () => {{
             let mut d: [&mut dyn ScsiDevice; 1] = [&mut dev];
@@ -1159,4 +1171,200 @@ fn opcode_report_luns_synthesized() {
     assert_eq!(u32::from_be_bytes([sent[0], sent[1], sent[2], sent[3]]), 8);
     assert_eq!(sent[8], 0x00); // address method 00b
     assert_eq!(sent[9], 0x00); // LUN id 0
+}
+
+// ── 10. Data-In shortfall policy: Short / Pad / ShortNoStall ────────
+
+/// Drive a `Short`-policy transaction to completion, servicing one `stall_in`
+/// on `NeedStall` and then the matching CLEAR_FEATURE. Returns `None` when
+/// `stall_in` failed and the loop aborted via `reset()`.
+fn drive_short(
+    session: &mut BotSession,
+    io: &mut MockBotIo,
+    work: &mut [u8],
+    recv: &mut [u8],
+    devs: &mut [&mut dyn ScsiDevice],
+) -> Option<BotStepResult> {
+    let mut stalled_once = false;
+    loop {
+        match session.need() {
+            SessionNeed::NeedOut { len, probe } => match io.try_recv_out(&mut recv[..len]) {
+                Ok(n) => {
+                    let step = session.poll(SessionEvent::OutRecv { data: &recv[..n] }, work, devs);
+                    if let SessionStep::Done(r) = step {
+                        return Some(r);
+                    }
+                }
+                Err(BotIoErr::WouldBlock) => {
+                    assert!(probe, "mock out-queue ran dry on a blocking receive");
+                    let step = session.poll(SessionEvent::OutIdle, work, devs);
+                    if let SessionStep::Done(r) = step {
+                        return Some(r);
+                    }
+                }
+                Err(_) => panic!("mock bulk-OUT I/O error"),
+            },
+            SessionNeed::NeedIn { len } => {
+                let bytes = session.out_slice(&work[..]);
+                assert_eq!(bytes.len(), len);
+                io.send_in(bytes).unwrap();
+                let step = session.poll(SessionEvent::InSent, work, devs);
+                if let SessionStep::Done(r) = step {
+                    return Some(r);
+                }
+            }
+            SessionNeed::NeedStall => {
+                assert!(!stalled_once, "stall was not released");
+                stalled_once = true;
+                if io.stall_in().is_err() {
+                    // Abort deterministically.
+                    session.reset();
+                    return None;
+                }
+                // Host's CLEAR_FEATURE(ENDPOINT_HALT) for our Bulk-In.
+                session.clear_feature_halt();
+            }
+            SessionNeed::Done(r) => return Some(r),
+        }
+    }
+}
+
+#[test]
+fn short_policy_stalls_then_clear_releases_csw() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut dev = block_device(&mut ram);
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
+
+    // READ(10) 1 block (512, an MPS multiple) vs declared 1024.
+    let cdb = rw10(0x28, 0, 1);
+    io.feed_out(&raw_cbw(1, 1024, 0x80, 0, &cdb));
+    assert_eq!(
+        drive_short(&mut s, &mut io, &mut work, &mut recv, &mut luns),
+        Some(BotStepResult::Processed)
+    );
+
+    // 512 relevant + a ZLP (empty → adds nothing) + CSW; no padding, no stall_both.
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 512 + CSW_LEN, "no pad, no stray bytes");
+    assert_eq!(csw_fields(&sent), (1, 1024 - 512, 0x00));
+    assert_eq!(io.stall_in_count, 1, "Bulk-In STALLed once");
+    assert_eq!(io.stall_count, 0, "stall_both unused for a shortfall");
+}
+
+#[test]
+fn short_policy_non_mps_shortfall_stalls_without_zlp() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut dev = block_device(&mut ram);
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
+
+    // INQUIRY alloc 95 vs declared 192: the short packet ends the read.
+    let cdb = [0x12, 0, 0, 0, 95, 0];
+    io.feed_out(&raw_cbw(2, 192, 0x80, 0, &cdb));
+    assert_eq!(
+        drive_short(&mut s, &mut io, &mut work, &mut recv, &mut luns),
+        Some(BotStepResult::Processed)
+    );
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 95 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (2, 192 - 95, 0x00));
+    assert_eq!(io.stall_in_count, 1);
+}
+
+#[test]
+fn short_policy_stall_failure_resets_transaction() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut dev = block_device(&mut ram);
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new().set_stall_in(false);
+    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
+
+    let cdb = rw10(0x28, 0, 1);
+    io.feed_out(&raw_cbw(3, 1024, 0x80, 0, &cdb));
+    // `stall_in` unavailable → the driver aborts via reset.
+    assert_eq!(
+        drive_short(&mut s, &mut io, &mut work, &mut recv, &mut luns),
+        None
+    );
+    assert_eq!(
+        s.need(),
+        SessionNeed::NeedOut {
+            len: CBW_LEN,
+            probe: false
+        }
+    );
+    // Only the 512 relevant bytes went out; the withheld CSW was dropped.
+    assert_eq!(io.in_.len(), 512, "no CSW emitted on the abort");
+}
+
+#[test]
+fn clear_feature_foreign_endpoint_is_ignored() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut dev = block_device(&mut ram);
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut gadget = MockGadget::new();
+    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
+
+    // Reach the halted transient state.
+    let cdb = [0x12, 0, 0, 0, 95, 0];
+    let raw = raw_cbw(4, 192, 0x80, 0, &cdb);
+    s.poll(SessionEvent::OutRecv { data: &raw }, &mut work, &mut luns);
+    assert_eq!(
+        s.poll(SessionEvent::InSent, &mut work, &mut luns),
+        SessionStep::NeedStall
+    );
+
+    // A clear for another endpoint (0x01 = Bulk-Out) is ignored.
+    gadget.inject(CtrlReq::ClearFeatureHalt { addr: 0x01 });
+    assert!(serve_ctrl_once(&mut s, &mut gadget));
+    assert_eq!(s.need(), SessionNeed::NeedStall, "foreign clear ignored");
+
+    // The matching Bulk-In clear releases the CSW.
+    gadget.inject(CtrlReq::ClearFeatureHalt { addr: BULK_IN_ADDR });
+    assert!(serve_ctrl_once(&mut s, &mut gadget));
+    assert_eq!(s.need(), SessionNeed::NeedIn { len: CSW_LEN });
+}
+
+#[test]
+fn default_policy_is_short_no_stall() {
+    assert_eq!(ShortfallPolicy::default(), ShortfallPolicy::ShortNoStall);
+    assert_eq!(BotSession::new().shortfall(), ShortfallPolicy::ShortNoStall);
+
+    // The default ending is the plain short packet (no STALL, no pad).
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut dev = block_device(&mut ram);
+    let mut s = BotSession::new(); // no selector: exercise the default
+    let mut work = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut recv = [0u8; snowdrive_scsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+    let mut stalled = false;
+    let mut luns: [&mut dyn ScsiDevice; 1] = [&mut dev];
+
+    // INQUIRY alloc 95 vs declared 192.
+    let cdb = [0x12, 0, 0, 0, 95, 0];
+    io.feed_out(&raw_cbw(5, 192, 0x80, 0, &cdb));
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut recv,
+        &mut luns,
+        &mut stalled,
+    );
+    assert_eq!(r, BotStepResult::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 95 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (5, 192 - 95, 0x00));
+    assert_eq!(io.stall_count, 0);
+    assert_eq!(io.stall_in_count, 0);
 }
