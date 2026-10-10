@@ -143,17 +143,12 @@ struct ServeArgs {
     )]
     usb: Option<String>,
 
-    /// Data-In shortfall policy for `--usb`: `short-no-stall` (default;
-    /// max-compat: plain short packet, no STALL), `pad` (conformant: fill zeros
-    /// to `dCBWDataTransferLength`, capped — needs no control plane), or
-    /// `short` (conformant: short packet + STALL Bulk-In, CSW after
-    /// CLEAR_FEATURE — **not usable over Linux FunctionFS** with the current
-    /// stack; the first shortfall aborts via reset).
-    #[arg(
-        long = "usb-shortfall",
-        value_name = "MODE",
-        default_value = "short-no-stall"
-    )]
+    /// Data-In shortfall policy for `--usb`: `short` (default; conformant:
+    /// short packet + STALL Bulk-In, then the CSW once the host clears the
+    /// halt), `pad` (conformant: fill zeros to `dCBWDataTransferLength`,
+    /// capped — needs no control plane), or `short-no-stall` (max-compat: plain
+    /// short packet, no STALL).
+    #[arg(long = "usb-shortfall", value_name = "MODE", default_value = "short")]
     usb_shortfall: String,
 
     /// USB vendor ID (hex).
@@ -1096,20 +1091,12 @@ fn run_serve_usb(
 
     let mut ffs_bot = FfsBot::new(ep_out, ep_in);
     let mut ffs_gadget = FfsGadget { custom };
-    // Data-In shortfall policy (`--usb-shortfall`). `short` requests the
-    // conformant short packet + STALL Bulk-In ending, but the Linux FunctionFS
-    // stack does not provide a reliable STALL + CLEAR_FEATURE observation with
-    // the current usb-gadget crate, so it will abort via reset on the first
-    // shortfall; `pad` and the default `short-no-stall` need no control plane.
+    // Data-In shortfall policy (`--usb-shortfall`): `short` (conformant short
+    // packet + STALL Bulk-In), `pad` (conformant fill, no control plane), or
+    // `short-no-stall` (max-compat short packet, no STALL).
     let shortfall = match args.usb_shortfall.as_str() {
         "pad" => ShortfallPolicy::Pad,
-        "short" => {
-            log::warn!(
-                "--usb-shortfall short: the conformant STALL ending is not usable over \
-                 Linux FunctionFS with the current usb-gadget crate; a shortfall aborts via reset"
-            );
-            ShortfallPolicy::Short
-        }
+        "short" => ShortfallPolicy::Short,
         "short-no-stall" => ShortfallPolicy::ShortNoStall,
         other => {
             eprintln!(
@@ -1421,44 +1408,50 @@ impl BotIo for FfsBot {
     }
 
     /// STALL the Bulk-In endpoint for a `ShortfallPolicy::Short` Data-In
-    /// shortfall (BOT §6.7.2). Mirrors the IN side of `stall_both`
-    /// (`discard_fifo()` then `halt()`), mapping **only** the benign
-    /// `-EBADMSG` (errno 74) success quirk to `Ok(())`; every other errno is a
-    /// real fault and becomes `Err(())` so the serve loop reaches the reset
-    /// abort instead of swallowing it.
-    ///
-    /// **Not currently selected by the CLI.** Verification (dummy_hcd + Linux
-    /// 6.18) showed the requested STALL is not reliably seen by the host and
-    /// `CLEAR_FEATURE(ENDPOINT_HALT)` is not reliably observable through
-    /// FunctionFS with this crate, so the serve loop wedges in `DataInStall`;
-    /// the CLI therefore runs `ShortNoStall`. Kept as the platform half of the
-    /// [`BotIo::stall_in`] seam.
+    /// shortfall (BOT §6.7.2). `usb_ep_set_halt` returns `-EAGAIN` while a
+    /// request is still queued or the FIFO holds bytes the host has not
+    /// collected, so retry within a bounded budget (draining in-flight sends
+    /// first) exactly like the in-kernel `halt_bulk_in_endpoint`. The benign
+    /// `-EBADMSG` (errno 74) success quirk is `Ok(())`; a real fault, or the
+    /// deadline, is `Err(())` so the serve loop aborts via reset.
     fn stall_in(&mut self) -> Result<(), ()> {
-        let control = self.in_.control().map_err(|e| {
-            log::error!("bulk-IN control unavailable: {e}");
-        })?;
-        // Empty the endpoint request queue first (crate doc for `halt`).
-        let _ = control.discard_fifo();
-        match control.halt() {
-            Ok(()) => Ok(()),
-            // halt() reports success as Err(-EBADMSG) (errno 74).
-            Err(e) if e.raw_os_error() == Some(74) => Ok(()),
-            Err(e) => {
-                log::error!("bulk-IN endpoint halt failed: {e}");
-                Err(())
+        // `usb_ep_set_halt` is a synchronous control op: it returns -EAGAIN
+        // while a request is still queued or the FIFO holds bytes the host has
+        // not collected. Retry within a bounded budget, draining in-flight
+        // sends first (mirrors the kernel's `halt_bulk_in_endpoint`).
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            while !self.in_.is_empty() {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                let _ = self.in_.flush_timeout(Duration::from_millis(10));
+            }
+            let control = self.in_.control().map_err(|e| {
+                log::error!("bulk-IN control unavailable: {e}");
+            })?;
+            let _ = control.discard_fifo();
+            match control.halt() {
+                Ok(()) => return Ok(()),
+                // halt() reports success as Err(-EBADMSG) (errno 74).
+                Err(e) if e.raw_os_error() == Some(74) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(11) => {
+                    // -EAGAIN: transient (endpoint still busy) — let it drain
+                    // and retry, exactly like the in-kernel gadget.
+                    if std::time::Instant::now() >= deadline {
+                        log::error!("bulk-IN endpoint halt timed out (-EAGAIN)");
+                        return Err(());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => {
+                    log::error!("bulk-IN endpoint halt failed: {e}");
+                    return Err(());
+                }
             }
         }
     }
 }
-
-/// Bulk-In endpoint address as assigned by the `Custom` descriptor builder in
-/// [`run_serve_usb`]: endpoints are numbered in declaration order, so the bulk
-/// OUT (declared first) is `0x01` and the bulk IN (declared second) is `0x82`.
-/// The CLI is the one that built the descriptors, so it owns this knowledge
-/// and filters CLEAR_FEATURE(ENDPOINT_HALT) on it before calling
-/// `BotSession::clear_feature_halt`.
-#[cfg(target_os = "linux")]
-const BULK_IN_EP_ADDR: u8 = 0x82;
 
 #[cfg(target_os = "linux")]
 /// Bulk-Only Reset ack handle: completing the control status stage is the
@@ -1526,22 +1519,6 @@ impl<'a> Gadget<'a> for FfsGadget {
                     },
                 })
             }
-            // CLEAR FEATURE(ENDPOINT_HALT): bmRequestType 0x02 = Recipient=
-            // Endpoint, Host-to-Device, Standard. request=0x01 (CLEAR_FEATURE),
-            // value=0x00 (ENDPOINT_HALT). index=endpoint address.
-            // BOT §3.1: BotReset preserves STALL; the host must send this to
-            // clear it and resume operation.
-            Event::SetupHostToDevice(receiver)
-                if receiver.ctrl_req().request_type == 0x02
-                    && receiver.ctrl_req().request == 0x01
-                    && receiver.ctrl_req().value == 0x00 =>
-            {
-                // wIndex is the endpoint address; the serve loop filters it to
-                // our own Bulk-In.
-                Some(CtrlReq::ClearFeatureHalt {
-                    addr: receiver.ctrl_req().index as u8,
-                })
-            }
             Event::Bind | Event::Enable | Event::Disable => Some(CtrlReq::LinkReset),
             _ => None,
         }
@@ -1564,12 +1541,6 @@ fn serve_bot(
         return Err(format!("work buffer smaller than {MIN_DATA_LEN}"));
     }
     let mut stalled = false;
-    // Dedicated transient-STALL dedupe for `ShortfallPolicy::Short`: the data
-    // stall is a *recurring* need (unlike the terminal invalid-CBW `stalled`),
-    // so sharing a flag would suppress a later STALL. Set when `stall_in()` is
-    // attempted; cleared on a matching CLEAR_FEATURE, any reset, disconnect, or
-    // a `stall_in` failure abort.
-    let mut stalled_short = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -1580,7 +1551,6 @@ fn serve_bot(
                 CtrlReq::BotReset { ack } => {
                     session.reset();
                     ack.ack();
-                    stalled_short = false;
                     // BOT §3.1: BotReset preserves STALL. The core keeps the
                     // STALLed state; clear_feature_halt() transitions out.
                     // Only clear our local flag if the core did not stay STALLed.
@@ -1595,18 +1565,8 @@ fn serve_bot(
                 }
                 CtrlReq::LinkReset => {
                     session.reset();
-                    stalled_short = false;
                     if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
                         stalled = false;
-                    }
-                }
-                CtrlReq::ClearFeatureHalt { addr } => {
-                    // Only our own Bulk-In endpoint releases the halt; a clear
-                    // for any other endpoint is ignored.
-                    if addr == BULK_IN_EP_ADDR {
-                        session.clear_feature_halt();
-                        stalled = false;
-                        stalled_short = false;
                     }
                 }
             }
@@ -1653,7 +1613,6 @@ fn serve_bot(
                         log::info!("USB host disconnected; resetting session");
                         session.reset();
                         stalled = false;
-                        stalled_short = false;
                     }
                     Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
                 }
@@ -1669,7 +1628,6 @@ fn serve_bot(
                         log::info!("USB host disconnected; resetting session");
                         session.reset();
                         stalled = false;
-                        stalled_short = false;
                         continue;
                     }
                     Err(BotIoErr::Io) => return Err("bulk IN send failed".to_string()),
@@ -1683,20 +1641,22 @@ fn serve_bot(
                 }
             }
             SessionNeed::NeedStall => {
-                if !stalled_short {
-                    match ffs_bot.stall_in() {
-                        Ok(()) => stalled_short = true,
-                        Err(()) => {
-                            // A `Short`-without-`stall_in` mismatch aborts
-                            // deterministically (reset drops the withheld CSW).
-                            log::error!(
-                                "fatal: ShortfallPolicy::Short selected but bulk-IN STALL \
-                                 unavailable; aborting transaction"
-                            );
-                            session.reset();
-                            stalled = false;
-                            stalled_short = false;
-                        }
+                // `Short`: set the Bulk-In halt (the driver retries transient
+                // -EAGAIN inside `stall_in`), then release the withheld CSW.
+                // The core does not wait for the host's CLEAR_FEATURE — the USB
+                // core handles it and it is not observable here; the CSW is
+                // queued immediately and delivered once the halt clears.
+                match ffs_bot.stall_in() {
+                    Ok(()) => session.stall_applied(),
+                    Err(()) => {
+                        // A `Short`-without-`stall_in` mismatch aborts
+                        // deterministically (reset drops the withheld CSW).
+                        log::error!(
+                            "fatal: ShortfallPolicy::Short selected but bulk-IN STALL \
+                             unavailable; aborting transaction"
+                        );
+                        session.reset();
+                        stalled = false;
                     }
                 }
             }
@@ -1970,7 +1930,7 @@ mod tests {
             other => panic!("expected Serve, got {other:?}"),
         }
         match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--block", "ram=1M"]).unwrap() {
-            Cli::Serve(a) => assert_eq!(a.usb_shortfall, "short-no-stall"),
+            Cli::Serve(a) => assert_eq!(a.usb_shortfall, "short"),
             other => panic!("expected Serve, got {other:?}"),
         }
     }
