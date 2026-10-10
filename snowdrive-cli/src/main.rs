@@ -143,6 +143,19 @@ struct ServeArgs {
     )]
     usb: Option<String>,
 
+    /// Data-In shortfall policy for `--usb`: `short-no-stall` (default;
+    /// max-compat: plain short packet, no STALL), `pad` (conformant: fill zeros
+    /// to `dCBWDataTransferLength`, capped — needs no control plane), or
+    /// `short` (conformant: short packet + STALL Bulk-In, CSW after
+    /// CLEAR_FEATURE — **not usable over Linux FunctionFS** with the current
+    /// stack; the first shortfall aborts via reset).
+    #[arg(
+        long = "usb-shortfall",
+        value_name = "MODE",
+        default_value = "short-no-stall"
+    )]
+    usb_shortfall: String,
+
     /// USB vendor ID (hex).
     #[arg(long = "vid", value_name = "VID", default_value = "1209", value_parser = parse_hex_u16)]
     vid: u16,
@@ -1083,13 +1096,30 @@ fn run_serve_usb(
 
     let mut ffs_bot = FfsBot::new(ep_out, ep_in);
     let mut ffs_gadget = FfsGadget { custom };
-    // The function's control plane does not provide a reliable Bulk-In STALL +
-    // CLEAR_FEATURE(ENDPOINT_HALT) observation over Linux FunctionFS with the
-    // current usb-gadget crate, so select the max-compat default (a plain short
-    // packet, no STALL). The `stall_in` seam remains for transports that can
-    // implement it.
-    let mut session =
-        BotSession::with_luns(luns.len()).with_shortfall(ShortfallPolicy::ShortNoStall);
+    // Data-In shortfall policy (`--usb-shortfall`). `short` requests the
+    // conformant short packet + STALL Bulk-In ending, but the Linux FunctionFS
+    // stack does not provide a reliable STALL + CLEAR_FEATURE observation with
+    // the current usb-gadget crate, so it will abort via reset on the first
+    // shortfall; `pad` and the default `short-no-stall` need no control plane.
+    let shortfall = match args.usb_shortfall.as_str() {
+        "pad" => ShortfallPolicy::Pad,
+        "short" => {
+            log::warn!(
+                "--usb-shortfall short: the conformant STALL ending is not usable over \
+                 Linux FunctionFS with the current usb-gadget crate; a shortfall aborts via reset"
+            );
+            ShortfallPolicy::Short
+        }
+        "short-no-stall" => ShortfallPolicy::ShortNoStall,
+        other => {
+            eprintln!(
+                "snowdrive: invalid --usb-shortfall '{other}' \
+                 (expected pad, short, or short-no-stall)"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut session = BotSession::with_luns(luns.len()).with_shortfall(shortfall);
     let mut work = vec![0u8; work_size];
     let mut recv = vec![0u8; round_up_mps(work_size)];
 
@@ -1921,6 +1951,28 @@ mod tests {
             Cli::try_parse_from(["snowdrive", "serve", "--usb", "--iscsi", "127.0.0.1:3260"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cli_usb_shortfall_parses_and_defaults() {
+        match Cli::try_parse_from([
+            "snowdrive",
+            "serve",
+            "--usb",
+            "--block",
+            "ram=1M",
+            "--usb-shortfall",
+            "pad",
+        ])
+        .unwrap()
+        {
+            Cli::Serve(a) => assert_eq!(a.usb_shortfall, "pad"),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+        match Cli::try_parse_from(["snowdrive", "serve", "--usb", "--block", "ram=1M"]).unwrap() {
+            Cli::Serve(a) => assert_eq!(a.usb_shortfall, "short-no-stall"),
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 
     #[test]
