@@ -1,7 +1,7 @@
 //! SCSI core: opcodes, sense keys, sense data and CDB field parsing.
 //!
-//! Field layouts and sense format follow SBC-3 / SPC-4 (see `__REF_SBC3.pdf.md`,
-//! `__REF_SPC3.pdf.md`). Sense data uses the fixed format (response code 70h).
+//! Field layouts and sense format follow SBC-3 / SPC-4. Sense data uses the
+//! fixed format (response code 70h).
 
 /// SCSI operation codes (SPC-4 §7.3, SBC-3 §5).
 pub mod op {

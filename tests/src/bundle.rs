@@ -1,4 +1,4 @@
-//! FlatBundle integration tests (`__FLAT_BUN.md` §7.2).
+//! FlatBundle integration tests.
 //!
 //! Unlike the `snowdrive-common` unit tests (in-memory mock FS), these drive
 //! a **real** `StdFsBackend` over an on-disk directory — exercising the

@@ -5,7 +5,7 @@
 //! [`FsStorage`] seam — no proprietary binary format, on-demand physical
 //! allocation, and the FAT32 4 GiB limit is sidestepped per chunk.
 //!
-//! Design (see `__FLAT_BUN.md`):
+//! Design notes:
 //! - **`FsStorage` root = the bundle directory.** Chunks and `BUNDLE` are
 //!   opened by relative path (`"000000.img"`, `"BUNDLE"`) from the root, same
 //!   as `LiveData`'s scanner. The bundle holds **no `dir` field**.
@@ -20,7 +20,7 @@
 //!   too, and are only probed read-only (a hole read never creates a file).
 //! - **Best-effort `sync`:** the `FsStorage`/`embedded_io` seams cap durability
 //!   at OS page cache (`flush`). True fsync requires extending the seam; this
-//!   implementation guarantees page-cache visibility only (`__FLAT_BUN.md` §3.5).
+//!   implementation guarantees page-cache visibility only.
 //!
 //! # Feature gating
 //!
@@ -96,7 +96,7 @@ struct ChunkSlot<F: FsStorage> {
 
 /// Directory-chunked, random-writable block plane over an [`FsStorage`].
 ///
-/// `F`'s root **is** the bundle directory (`__FLAT_BUN.md` §1.2): chunks are
+/// `F`'s root **is** the bundle directory: chunks are
 /// `"{:06}.img"` relative to it, the optional header is `"BUNDLE"`.
 pub struct FlatBundle<F: FsStorage> {
     fs: F,
@@ -220,7 +220,7 @@ impl<F: FsStorage> FlatBundle<F> {
     }
 
     /// Open an existing (or header-less) bundle, merging the `BUNDLE` header
-    /// with caller overrides (caller wins per-field, `__FLAT_BUN.md` §4.2).
+    /// with caller overrides (caller wins per-field).
     ///
     /// - `chunk_override` / `size_override` / `sector_override`: optional
     ///   caller values that override the header (or fill in for a missing
@@ -469,7 +469,7 @@ impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
     }
 }
 
-/// Validate bundle geometry (`__FLAT_BUN.md` §3.4).
+/// Validate bundle geometry.
 fn validate_geometry(
     chunk_size: u64,
     virtual_size: u64,

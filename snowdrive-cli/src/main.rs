@@ -755,7 +755,7 @@ fn build_devices<'a>(
                         return Err(());
                     }
                     // The FsStorage seam has no mkdir — the host (CLI) owns
-                    // directory creation (__FLAT_BUN.md §4.2/§5.2).
+                    // directory creation.
                     std::fs::create_dir_all(dir).map_err(|e| {
                         eprintln!("snowdrive: bundle: failed to create directory {dir}: {e}");
                     })?;
