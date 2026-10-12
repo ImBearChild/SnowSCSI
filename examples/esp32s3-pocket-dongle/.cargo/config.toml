@@ -1,0 +1,12 @@
+# Keep user/runtime settings in esp-config.toml.
+include = ["esp-config.toml"]
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3 --log-format defmt"
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+[unstable]
+build-std = ["core"]
