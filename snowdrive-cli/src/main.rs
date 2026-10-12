@@ -61,7 +61,7 @@ use spec::{Backing, DeviceRole, DeviceSpec};
 #[cfg(target_os = "linux")]
 use snowdrive_scsi::usb::{
     BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
-    SessionNeed, SessionStep,
+    SessionNeed, SessionStep, ShortfallPolicy,
 };
 #[cfg(target_os = "linux")]
 use usb_gadget::function::custom::{
@@ -1083,7 +1083,13 @@ fn run_serve_usb(
 
     let mut ffs_bot = FfsBot::new(ep_out, ep_in);
     let mut ffs_gadget = FfsGadget { custom };
-    let mut session = BotSession::with_luns(luns.len());
+    // The function's control plane does not provide a reliable Bulk-In STALL +
+    // CLEAR_FEATURE(ENDPOINT_HALT) observation over Linux FunctionFS with the
+    // current usb-gadget crate, so select the max-compat default (a plain short
+    // packet, no STALL). The `stall_in` seam remains for transports that can
+    // implement it.
+    let mut session =
+        BotSession::with_luns(luns.len()).with_shortfall(ShortfallPolicy::ShortNoStall);
     let mut work = vec![0u8; work_size];
     let mut recv = vec![0u8; round_up_mps(work_size)];
 
@@ -1383,7 +1389,46 @@ impl BotIo for FfsBot {
         });
         Ok(())
     }
+
+    /// STALL the Bulk-In endpoint for a `ShortfallPolicy::Short` Data-In
+    /// shortfall (BOT §6.7.2). Mirrors the IN side of `stall_both`
+    /// (`discard_fifo()` then `halt()`), mapping **only** the benign
+    /// `-EBADMSG` (errno 74) success quirk to `Ok(())`; every other errno is a
+    /// real fault and becomes `Err(())` so the serve loop reaches the reset
+    /// abort instead of swallowing it.
+    ///
+    /// **Not currently selected by the CLI.** Verification (dummy_hcd + Linux
+    /// 6.18) showed the requested STALL is not reliably seen by the host and
+    /// `CLEAR_FEATURE(ENDPOINT_HALT)` is not reliably observable through
+    /// FunctionFS with this crate, so the serve loop wedges in `DataInStall`;
+    /// the CLI therefore runs `ShortNoStall`. Kept as the platform half of the
+    /// [`BotIo::stall_in`] seam.
+    fn stall_in(&mut self) -> Result<(), ()> {
+        let control = self.in_.control().map_err(|e| {
+            log::error!("bulk-IN control unavailable: {e}");
+        })?;
+        // Empty the endpoint request queue first (crate doc for `halt`).
+        let _ = control.discard_fifo();
+        match control.halt() {
+            Ok(()) => Ok(()),
+            // halt() reports success as Err(-EBADMSG) (errno 74).
+            Err(e) if e.raw_os_error() == Some(74) => Ok(()),
+            Err(e) => {
+                log::error!("bulk-IN endpoint halt failed: {e}");
+                Err(())
+            }
+        }
+    }
 }
+
+/// Bulk-In endpoint address as assigned by the `Custom` descriptor builder in
+/// [`run_serve_usb`]: endpoints are numbered in declaration order, so the bulk
+/// OUT (declared first) is `0x01` and the bulk IN (declared second) is `0x82`.
+/// The CLI is the one that built the descriptors, so it owns this knowledge
+/// and filters CLEAR_FEATURE(ENDPOINT_HALT) on it before calling
+/// `BotSession::clear_feature_halt`.
+#[cfg(target_os = "linux")]
+const BULK_IN_EP_ADDR: u8 = 0x82;
 
 #[cfg(target_os = "linux")]
 /// Bulk-Only Reset ack handle: completing the control status stage is the
@@ -1461,7 +1506,11 @@ impl<'a> Gadget<'a> for FfsGadget {
                     && receiver.ctrl_req().request == 0x01
                     && receiver.ctrl_req().value == 0x00 =>
             {
-                Some(CtrlReq::ClearFeatureHalt)
+                // wIndex is the endpoint address; the serve loop filters it to
+                // our own Bulk-In.
+                Some(CtrlReq::ClearFeatureHalt {
+                    addr: receiver.ctrl_req().index as u8,
+                })
             }
             Event::Bind | Event::Enable | Event::Disable => Some(CtrlReq::LinkReset),
             _ => None,
@@ -1485,6 +1534,12 @@ fn serve_bot(
         return Err(format!("work buffer smaller than {MIN_DATA_LEN}"));
     }
     let mut stalled = false;
+    // Dedicated transient-STALL dedupe for `ShortfallPolicy::Short`: the data
+    // stall is a *recurring* need (unlike the terminal invalid-CBW `stalled`),
+    // so sharing a flag would suppress a later STALL. Set when `stall_in()` is
+    // attempted; cleared on a matching CLEAR_FEATURE, any reset, disconnect, or
+    // a `stall_in` failure abort.
+    let mut stalled_short = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -1495,6 +1550,7 @@ fn serve_bot(
                 CtrlReq::BotReset { ack } => {
                     session.reset();
                     ack.ack();
+                    stalled_short = false;
                     // BOT §3.1: BotReset preserves STALL. The core keeps the
                     // STALLed state; clear_feature_halt() transitions out.
                     // Only clear our local flag if the core did not stay STALLed.
@@ -1509,13 +1565,19 @@ fn serve_bot(
                 }
                 CtrlReq::LinkReset => {
                     session.reset();
+                    stalled_short = false;
                     if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
                         stalled = false;
                     }
                 }
-                CtrlReq::ClearFeatureHalt => {
-                    session.clear_feature_halt();
-                    stalled = false;
+                CtrlReq::ClearFeatureHalt { addr } => {
+                    // Only our own Bulk-In endpoint releases the halt; a clear
+                    // for any other endpoint is ignored.
+                    if addr == BULK_IN_EP_ADDR {
+                        session.clear_feature_halt();
+                        stalled = false;
+                        stalled_short = false;
+                    }
                 }
             }
             continue;
@@ -1561,6 +1623,7 @@ fn serve_bot(
                         log::info!("USB host disconnected; resetting session");
                         session.reset();
                         stalled = false;
+                        stalled_short = false;
                     }
                     Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
                 }
@@ -1576,6 +1639,7 @@ fn serve_bot(
                         log::info!("USB host disconnected; resetting session");
                         session.reset();
                         stalled = false;
+                        stalled_short = false;
                         continue;
                     }
                     Err(BotIoErr::Io) => return Err("bulk IN send failed".to_string()),
@@ -1586,6 +1650,24 @@ fn serve_bot(
                 let step = session.poll(SessionEvent::InSent, work, devs);
                 if let SessionStep::Done(r) = step {
                     handle_done(r, &mut stalled, ffs_bot)?;
+                }
+            }
+            SessionNeed::NeedStall => {
+                if !stalled_short {
+                    match ffs_bot.stall_in() {
+                        Ok(()) => stalled_short = true,
+                        Err(()) => {
+                            // A `Short`-without-`stall_in` mismatch aborts
+                            // deterministically (reset drops the withheld CSW).
+                            log::error!(
+                                "fatal: ShortfallPolicy::Short selected but bulk-IN STALL \
+                                 unavailable; aborting transaction"
+                            );
+                            session.reset();
+                            stalled = false;
+                            stalled_short = false;
+                        }
+                    }
                 }
             }
             SessionNeed::Done(r) => handle_done(r, &mut stalled, ffs_bot)?,
@@ -1609,6 +1691,9 @@ fn handle_done(
             Ok(())
         }
         BotStepResult::Error(e) => Err(format!("BOT core error: {e}")),
+        // Emitted only by the blocking `step()` wrapper, which this poll loop
+        // does not use; unreachable here.
+        BotStepResult::Unsupported => Ok(()),
         BotStepResult::Processed | BotStepResult::Closed => Ok(()),
     }
 }
