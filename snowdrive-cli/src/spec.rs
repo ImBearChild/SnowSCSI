@@ -7,7 +7,7 @@
 //! ```text
 //! SPEC    := <backing>[=<value>][,<opt>...]
 //! backing := img=<file> | imgdir=<dir> | ram=<size> | live=<dir>
-//!          | udfrw=<path|ram:<size>>
+//!          | dvdram=<path|ram:<size>>
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
 //!          | size=<size>
 //! ```
@@ -56,9 +56,9 @@ pub enum Backing {
     Ram { size: u64 },
     /// `live=<dir>` — live ISO9660 over a directory (MMC only).
     Live { dir: String },
-    /// `udfrw=<path>` or `udfrw=ram:<size>` — DVD-RAM (MMC only).
+    /// `dvdram=<path>` or `dvdram=ram:<size>` — DVD-RAM (MMC only).
     /// `path = None` means memory (the size lives in [`PlaneOpts`]).
-    UdfRw { path: Option<String> },
+    DvdRam { path: Option<String> },
 }
 
 /// Plane/geometry options common to a device spec.
@@ -71,7 +71,7 @@ pub struct PlaneOpts {
     /// Chunk size override (`--block imgdir=`).
     pub chunk: Option<u64>,
     /// Virtual size for a new `imgdir=` bundle, or the size of a new
-    /// `udfrw=` file.
+    /// `dvdram=` file.
     pub size: Option<u64>,
 }
 
@@ -112,12 +112,12 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
     let opts = parse_opts(opts_str)?;
     let (backing, implicit_size) = parse_backing(backing_expr)?;
 
-    // `udfrw=ram:<size>` carries its own size and takes no options at all.
-    if matches!(backing, Backing::UdfRw { path: None }) && !opts_str.is_empty() {
-        return Err("udfrw=ram:<size> takes no options".to_string());
+    // `dvdram=ram:<size>` carries its own size and takes no options at all.
+    if matches!(backing, Backing::DvdRam { path: None }) && !opts_str.is_empty() {
+        return Err("dvdram=ram:<size> takes no options".to_string());
     }
     if implicit_size.is_some() && opts.size.is_some() {
-        return Err("size= is not allowed with udfrw=ram:<size>".to_string());
+        return Err("size= is not allowed with dvdram=ram:<size>".to_string());
     }
 
     let profile = parse_block_profile(family, opts.profile.as_deref())?;
@@ -195,16 +195,16 @@ fn parse_backing(expr: &str) -> Result<(Backing, Option<u64>), String> {
             return Err("empty live= path".to_string());
         }
         Ok((Backing::Live { dir: v.to_string() }, None))
-    } else if let Some(v) = expr.strip_prefix("udfrw=") {
+    } else if let Some(v) = expr.strip_prefix("dvdram=") {
         if let Some(sz) = v.strip_prefix("ram:") {
-            let n = parse_size(sz).ok_or_else(|| format!("invalid udfrw RAM size '{sz}'"))?;
-            Ok((Backing::UdfRw { path: None }, Some(n)))
+            let n = parse_size(sz).ok_or_else(|| format!("invalid dvdram RAM size '{sz}'"))?;
+            Ok((Backing::DvdRam { path: None }, Some(n)))
         } else {
             if v.is_empty() {
-                return Err("empty udfrw= path".to_string());
+                return Err("empty dvdram= path".to_string());
             }
             Ok((
-                Backing::UdfRw {
+                Backing::DvdRam {
                     path: Some(v.to_string()),
                 },
                 None,
@@ -212,7 +212,7 @@ fn parse_backing(expr: &str) -> Result<(Backing, Option<u64>), String> {
         }
     } else {
         Err(format!(
-            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, or udfrw="
+            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, or dvdram="
         ))
     }
 }
@@ -225,7 +225,7 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
         ),
         DeviceFamily::Cdrom => matches!(
             backing,
-            Backing::Img { .. } | Backing::Live { .. } | Backing::UdfRw { .. }
+            Backing::Img { .. } | Backing::Live { .. } | Backing::DvdRam { .. }
         ),
     };
     if ok {
@@ -236,7 +236,7 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
         Backing::ImgDir { .. } => "imgdir",
         Backing::Ram { .. } => "ram",
         Backing::Live { .. } => "live",
-        Backing::UdfRw { .. } => "udfrw",
+        Backing::DvdRam { .. } => "dvdram",
     };
     Err(format!("{key}= is not valid for {}", family.flag()))
 }
@@ -248,7 +248,7 @@ fn check_opts(
     opts: &RawOpts,
 ) -> Result<(), String> {
     let is_imgdir = matches!(backing, Backing::ImgDir { .. });
-    let is_udfrw_file = matches!(backing, Backing::UdfRw { path: Some(_) });
+    let is_dvdram_file = matches!(backing, Backing::DvdRam { path: Some(_) });
 
     if opts.sector.is_some() {
         match (family, profile) {
@@ -264,10 +264,10 @@ fn check_opts(
     }
     if opts.size.is_some()
         && !((family == DeviceFamily::Block && is_imgdir)
-            || (family == DeviceFamily::Cdrom && is_udfrw_file))
+            || (family == DeviceFamily::Cdrom && is_dvdram_file))
     {
         return Err(
-            "size= is only valid for --block imgdir=<dir> or --cdrom udfrw=<path>".to_string(),
+            "size= is only valid for --block imgdir=<dir> or --cdrom dvdram=<path>".to_string(),
         );
     }
     Ok(())
@@ -369,8 +369,8 @@ pub fn mounted_paths(specs: &[DeviceSpec]) -> Vec<MountedPath<'_>> {
                 Backing::Img { path } => Some((path.as_str(), kind)),
                 Backing::ImgDir { dir } => Some((dir.as_str(), kind)),
                 Backing::Live { dir } => Some((dir.as_str(), kind)),
-                Backing::UdfRw { path: Some(p) } => Some((p.as_str(), kind)),
-                Backing::UdfRw { path: None } | Backing::Ram { .. } => None,
+                Backing::DvdRam { path: Some(p) } => Some((p.as_str(), kind)),
+                Backing::DvdRam { path: None } | Backing::Ram { .. } => None,
             }
         })
         .collect()
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn block_rejects_cdrom_backings() {
         assert!(block("live=tree").is_err());
-        assert!(block("udfrw=disc.img").is_err());
+        assert!(block("dvdram=disc.img").is_err());
     }
 
     #[test]
@@ -536,20 +536,20 @@ mod tests {
     }
 
     #[test]
-    fn cdrom_udfrw_file_and_ram() {
-        let file = cdrom("udfrw=disc.img").unwrap();
+    fn cdrom_dvdram_file_and_ram() {
+        let file = cdrom("dvdram=disc.img").unwrap();
         assert_eq!(
             file.backing,
-            Backing::UdfRw {
+            Backing::DvdRam {
                 path: Some("disc.img".to_string())
             }
         );
 
-        let new = cdrom("udfrw=disc.img,size=4G").unwrap();
+        let new = cdrom("dvdram=disc.img,size=4G").unwrap();
         assert_eq!(new.plane.size, Some(4 << 30));
 
-        let ram = cdrom("udfrw=ram:16M").unwrap();
-        assert_eq!(ram.backing, Backing::UdfRw { path: None });
+        let ram = cdrom("dvdram=ram:16M").unwrap();
+        assert_eq!(ram.backing, Backing::DvdRam { path: None });
         assert_eq!(ram.plane.size, Some(16 << 20));
     }
 
@@ -563,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn udfrw_ram_takes_no_options() {
-        assert!(cdrom("udfrw=ram:16M,size=8M").is_err());
+    fn dvdram_ram_takes_no_options() {
+        assert!(cdrom("dvdram=ram:16M,size=8M").is_err());
     }
 
     #[test]
@@ -583,7 +583,7 @@ mod tests {
         assert!(block("imgdir=d,size=1M,size=2M").is_err());
         assert!(block("imgdir=d,chunk=1M,chunk=2M").is_err());
         assert!(block("img=x,profile=block,profile=cd").is_err());
-        assert!(cdrom("udfrw=x,size=1M,size=2M").is_err());
+        assert!(cdrom("dvdram=x,size=1M,size=2M").is_err());
     }
 
     #[test]
@@ -633,7 +633,7 @@ mod tests {
     fn dual_mount_ram_not_collected() {
         let specs = parse_all(
             &["ram=1M".to_string(), "imgdir=d".to_string()],
-            &["udfrw=ram:16M".to_string()],
+            &["dvdram=ram:16M".to_string()],
         )
         .unwrap();
         // Only the bundle directory carries a path.

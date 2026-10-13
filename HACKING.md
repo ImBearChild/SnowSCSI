@@ -13,10 +13,10 @@ the `snowdrive` binary lives in `snowdrive-cli`.
 | **SCSI core** | `snowdrive-scsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, UDF volume skeleton |
 | — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `SeekableStorage`/`FsStorage` + logging macros |
 | — SCSI | `snowdrive-scsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
-| — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `UdfRwMedia`), full MMC |
+| — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `DvdRamMedia`), full MMC |
 | — iSCSI | `snowdrive-scsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
 | — USB MSC | `snowdrive-scsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
-| — UDF | `snowdrive-scsi::udfrw` (feature `udfrw`) | Pure UDF 2.01 volume skeleton backing `cdrom::udfrw` |
+| — UDF | `snowdrive-scsi::dvdram` (feature `dvdram`) | Pure UDF 2.01 volume skeleton backing `cdrom::dvdram` |
 | **CLI** | `snowdrive-cli` (`src/main.rs`) | `snowdrive serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowdrive mkisofs` generates an ISO image from a directory |
 | **Tests** | `snowdrive-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
 | **Tools** | `tools/` (not a workspace member) | External Python black-box tests (`ext-test/`) + USB passthrough helper |
@@ -37,12 +37,12 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 │       ├── scsi/                  # feature "scsi": backend, block, device,
 │       │                         #            fs_backend, sbc, spc, scsi
 │       ├── cdrom/                 # feature "cdrom": common, drive, media,
-│       │                         #            udfrw (gated by "udfrw")
+│       │                         #            dvdram (gated by "dvdram")
 │       ├── iscsi/                 # feature "iscsi": conn, pdu, target, transport
 │       ├── usb/                   # feature "usb": bot, gadget, io, target
-│       └── udfrw.rs            # feature "udfrw": UDF 2.01 volume skeleton
+│       └── dvdram.rs            # feature "dvdram": UDF 2.01 volume skeleton
 ├── snowdrive-cli/                 # crate: `snowdrive` binary (src/main.rs)
-│   ├── Cargo.toml                # features: full/std/scsi/udfrw/iscsi/cdrom/livefs/usb/log/defmt
+│   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/log/defmt
 │   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
 ├── tests/                         # crate: snowdrive-tests (integration tests)
 │   ├── Cargo.toml
@@ -72,7 +72,7 @@ Feature maps:
   `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
   `std` + `defmt` is rejected at compile time (see below).
 - **`snowdrive-disc`** — `std` (default).
-- **`snowdrive-scsi`** — `std` (default), `scsi`, `udfrw`,
+- **`snowdrive-scsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
   `log`, `defmt`. `defmt` forwards to `embedded-io/defmt` and
@@ -86,7 +86,7 @@ Feature maps:
   Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowdrive-cli`** — `full` (default) pulls `std` +
-  `scsi`/`udfrw`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
+  `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
   std-only deps (clap/ctrlc/env_logger). Builds against `snowdrive-scsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
@@ -277,14 +277,14 @@ Notes:
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — rustdoc must stay
    warning-free (broken intra-doc links, links to private items, stale
    paths)
-6. `cargo clippy -p snowdrive-scsi --features 'scsi,cdrom,iscsi,usb,udfrw' --
+6. `cargo clippy -p snowdrive-scsi --features 'scsi,cdrom,iscsi,usb,dvdram' --
    -D warnings` — the feature-gated modules are not compiled by the
    workspace-wide pass (dependencies of `snowdrive-tests` are only
    *compiled*, never linted), so lint them explicitly
 7. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
    `no_std`-clean (feature-gated std surface only)
 8. `cargo build -p snowdrive-scsi --no-default-features --features
-   'scsi,cdrom,usb,udfrw,defmt'` — the `defmt` backend must stay buildable
+   'scsi,cdrom,usb,dvdram,defmt'` — the `defmt` backend must stay buildable
    `no_std` (it is rejected together with `std`; see the guard in
    `snowdrive-common/src/logging.rs`)
 

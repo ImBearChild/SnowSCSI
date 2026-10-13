@@ -103,7 +103,7 @@ login/logout itself.)
 - [x] iSCSI transport (TCP), including `--iscsi auto` open-iscsi loopback
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget on Linux): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
-- [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udfrw`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
+- [x] Writable DVD-RAM (`--cdrom dvdram=`, feature `dvdram`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
 - [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`): an ESP32-S3 exposes an SD card as a UDF-RW USB optical drive (`no_std` + embassy)
 
 ## Project Structure
@@ -143,7 +143,7 @@ snowdrive-scsi = { version = "0.1", default-features = false, features = ["std",
 
 # Full feature set (note: `snowdrive-scsi` default is just `std`; opt in explicitly;
 # `log` / `defmt` select the logging backend instead)
-snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "udfrw", "bundle"] }
+snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle"] }
 ```
 
 ## Legacy C Code

@@ -4,7 +4,7 @@
 //! controllers:
 //!
 //! * the USB-OTG (DWC) controller, which drives the UDF-RW gadget (normal
-//!   product mode, [`Mode::Udfrw`]); and
+//!   product mode, [`Mode::DvdRam`]); and
 //! * the USB-Serial-JTAG controller, which the ROM exposes as the
 //!   `esptool`/`espflash` download + console interface ([`Mode::Debug`]).
 //!
@@ -51,7 +51,7 @@ use esp_hal::peripherals::{LPWR, USB_DEVICE, USB_WRAP};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum Mode {
     /// USB-OTG drives the UDF-RW gadget (normal product mode).
-    Udfrw,
+    DvdRam,
     /// USB-Serial-JTAG drives the port (ROM download / `espflash` console).
     Debug,
 }

@@ -678,11 +678,11 @@ fn serve_starts_with_read_only_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `serve --cdrom udfrw=ram:<size>` materializes an in-memory UDF 2.01
+/// `serve --cdrom dvdram=ram:<size>` materializes an in-memory UDF 2.01
 /// DVD+RW, announces 'listening' and exits 0 after SIGINT.
-#[cfg(all(unix, feature = "udfrw"))]
+#[cfg(all(unix, feature = "dvdram"))]
 #[test]
-fn serve_starts_with_udfrw_ram() {
+fn serve_starts_with_dvdram_ram() {
     use std::io::BufRead;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -691,7 +691,7 @@ fn serve_starts_with_udfrw_ram() {
         .args([
             "serve",
             "--cdrom",
-            "udfrw=ram:16M",
+            "dvdram=ram:16M",
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -738,17 +738,17 @@ fn serve_starts_with_udfrw_ram() {
     assert!(status.success(), "snowdrive should exit 0 after SIGINT");
 }
 
-/// `udfrw=<file>` on a blank existing file opens as-is: the device presents a
+/// `dvdram=<file>` on a blank existing file opens as-is: the device presents a
 /// blank random-writable DVD-RAM and the host formats it.
-#[cfg(all(unix, feature = "udfrw"))]
+#[cfg(all(unix, feature = "dvdram"))]
 #[test]
-fn serve_udfrw_file_opens_as_is() {
+fn serve_dvdram_file_opens_as_is() {
     use std::io::BufRead;
     use std::sync::mpsc;
     use std::time::Duration;
 
     let dir = std::env::temp_dir();
-    let img = dir.join(format!("snowdrive_udfrw_{}.img", std::process::id()));
+    let img = dir.join(format!("snowdrive_dvdram_{}.img", std::process::id()));
     let f = std::fs::File::create(&img).unwrap();
     f.set_len(16 * 1024 * 1024).unwrap();
     drop(f);
@@ -759,7 +759,7 @@ fn serve_udfrw_file_opens_as_is() {
         .args([
             "serve",
             "--cdrom",
-            &format!("udfrw={path}"),
+            &format!("dvdram={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])

@@ -9,8 +9,8 @@
 //! - [`CdMedia::Ro`]([`media::CdMedia::Ro`]) — read-only disc over any
 //!   [`FlatData`] source (image, RAM, or live-generated ISO9660 via
 //!   [`LiveData`]);
-//! - [`CdMedia::Rw`]([`media::CdMedia::Rw`]) (feature `udfrw`) — a
-//!   random-writable DVD-RAM: [`UdfRwMedia`] over any writable plane.
+//! - [`CdMedia::Rw`]([`media::CdMedia::Rw`]) (feature `dvdram`) — a
+//!   random-writable DVD-RAM: [`DvdRamMedia`] over any writable plane.
 //!
 //! Discs are loaded/ejected at runtime through the drive's media slot;
 //! ownership round-trips so an application can keep a pool of discs.
@@ -47,22 +47,22 @@
 
 pub mod common;
 pub mod drive;
+#[cfg(feature = "dvdram")]
+pub mod dvdram;
 pub mod media;
-#[cfg(feature = "udfrw")]
-pub mod udfrw;
 
-// Windows-compatibility regression tests require UDF-RW media (udfrw)
+// Windows-compatibility regression tests require UDF-RW media (dvdram)
 // to exercise the DVD-RAM profile that the captured traffic targets.
-#[cfg(all(test, feature = "usb", feature = "udfrw"))]
+#[cfg(all(test, feature = "usb", feature = "dvdram"))]
 mod win_compat_tests;
 
 pub use common::{
     build_get_config_response, build_read_buffer_capacity, build_read_disc_info, CdromCapabilities,
-    CurrentProfile, DiscInfo, MediaState, CDROM_IDENTITY, HYPER_MULTI_CAPS, SECTOR_SIZE,
-    UDFRW_CAPS,
+    CurrentProfile, DiscInfo, MediaState, CDROM_IDENTITY, DVDRAM_CAPS, HYPER_MULTI_CAPS,
+    SECTOR_SIZE,
 };
 pub use drive::CdromDrive;
+#[cfg(feature = "dvdram")]
+pub use dvdram::DvdRamMedia;
 pub use media::{CdLiveFsError, CdMedia, FlatMedia, LiveData, LiveDataBuilder, MediaError, Tray};
 pub use snowdrive_common::seekable_storage::FlatData;
-#[cfg(feature = "udfrw")]
-pub use udfrw::UdfRwMedia;

@@ -1,4 +1,4 @@
-//! `UdfRwMedia` — a random-writable DVD-RAM over any [`WritableFlatData`] byte
+//! `DvdRamMedia` — a random-writable DVD-RAM over any [`WritableFlatData`] byte
 //! plane.
 //!
 //! The device exposes a **blank** rewritable DVD-RAM: FORMAT UNIT clears all
@@ -16,11 +16,11 @@ use crate::common::seekable_storage::{StorageError, WritableFlatData};
 
 /// A random-writable DVD-RAM over a byte plane.
 #[derive(Debug)]
-pub struct UdfRwMedia<D: WritableFlatData> {
+pub struct DvdRamMedia<D: WritableFlatData> {
     backend: D,
 }
 
-impl<D: WritableFlatData> UdfRwMedia<D> {
+impl<D: WritableFlatData> DvdRamMedia<D> {
     /// Open `backend` as an erased, random-writable DVD-RAM.
     ///
     /// Existing content is used as-is (non-destructive); no file system is
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn open_geometry_from_capacity() {
         let mut img = ram(2048 * 4096);
-        let m = UdfRwMedia::open(RamBackend::new(&mut img));
+        let m = DvdRamMedia::open(RamBackend::new(&mut img));
         assert_eq!(m.capacity(), 2048 * 4096);
         assert_eq!(m.max_lba(), 4095);
         assert_eq!(m.lead_out_lba(), 4096);
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn write_data_read_data_roundtrip() {
         let mut img = ram(2048 * 4096);
-        let mut m = UdfRwMedia::open(RamBackend::new(&mut img));
+        let mut m = DvdRamMedia::open(RamBackend::new(&mut img));
         let data = [0xAB; 2048];
         m.write_data(300 * 2048, &data).unwrap();
         let mut out = [0u8; 2048];
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn format_unit_clears_medium() {
         let mut img = ram(2048 * 4096);
-        let mut m = UdfRwMedia::open(RamBackend::new(&mut img));
+        let mut m = DvdRamMedia::open(RamBackend::new(&mut img));
         m.write_data(300 * 2048, &[0xA5; 2048]).unwrap();
         m.format_unit().unwrap();
         // FORMAT UNIT clears all logical blocks.

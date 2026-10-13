@@ -154,9 +154,9 @@ impl<'d> Display<'d> {
 
         // Mode.
         let mode_label = match mode {
-            // The M1 interface names the non-UDFRW variant `Debug`; the current
+            // The M1 interface names the non-DVDRAM variant `Debug`; the current
             // `usb_mode` stub calls it `SerialJtag`, so match the rest loosely.
-            crate::usb_mode::Mode::Udfrw => "UDFRW",
+            crate::usb_mode::Mode::DvdRam => "DVDRAM",
             _ => "DEBUG",
         };
         let _ = write!(line, "MODE: {}", mode_label);

@@ -55,5 +55,5 @@ embedded-hal-bus = "0.3"     # ExclusiveDevice: adapt SpiBus -> SpiDevice for mi
 heapless = "0.9"             # stack string formatting for the LCD
 
 # --- SnowDrive workspace seams (unchanged; no_std) ---
-snowdrive-scsi = { path = "../../snowdrive-scsi", default-features = false, features = ["scsi", "cdrom", "udfrw", "usb", "defmt"] }
+snowdrive-scsi = { path = "../../snowdrive-scsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt"] }
 snowdrive-common = { path = "../../snowdrive-common", default-features = false, features = ["defmt"] }

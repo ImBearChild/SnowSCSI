@@ -41,7 +41,7 @@ pub enum CurrentProfile {
     CdR,
     /// 0x000A — CD-RW.
     CdRw,
-    /// 0x001A — DVD+RW (UdfRw random-writable media).
+    /// 0x001A — DVD+RW (DvdRam random-writable media).
     DvdRw,
 }
 impl CurrentProfile {
@@ -169,14 +169,14 @@ pub struct CdromCapabilities {
     pub read_cdrw: bool,
     pub read_dvd_rom: bool,
     /// Random Writable feature (0x0020): the drive presents a formatted
-    /// random-writable media. Set by the UdfRw device.
+    /// random-writable media. Set by the DvdRam device.
     pub random_writable: bool,
     /// DVD+RW feature (0x002A): write capable DVD+RW media. Set by the
-    /// UdfRw device.
+    /// DvdRam device.
     pub dvd_plus_rw: bool,
     /// Write Protect feature (0x0004): reports the media write-protect
     /// state. Windows treats a drive without this feature as write
-    /// protected; the UdfRw drive reports it with all protection bits
+    /// protected; the DvdRam drive reports it with all protection bits
     /// clear (not write-protected).
     pub write_protect: bool,
     /// Hardware Defect Management feature (0x0024, MMC-6 Table 123
@@ -258,7 +258,7 @@ impl CdromCapabilities {
     }
     /// A full HyperMulti recorder: reads and writes every CD/DVD variant
     /// (CD-R/RW, DVD-ROM/R/RAM/RW/+R/+RW, including dual-layer), backed by a
-    /// writable UDFRW plane.  Capabilities are intrinsic to the drive and do
+    /// writable DVDRAM plane.  Capabilities are intrinsic to the drive and do
     /// NOT depend on the inserted media or the storage backend.
     pub const fn hyper_multi() -> Self {
         Self {
@@ -299,12 +299,12 @@ impl CdromCapabilities {
 }
 /// The capabilities of the read-only CD-ROM devices (flat / livefs).
 pub const READ_ONLY_CDROM_CAPS: CdromCapabilities = CdromCapabilities::read_only_cd_rom();
-/// Capabilities of the UdfRw device: a HyperMulti optical drive that
+/// Capabilities of the DvdRam device: a HyperMulti optical drive that
 /// advertises the full CD/DVD read/write capability set via hyper_multi().
 /// The actual inserted media (DVD-RAM via UDF-RW) still drives the Current
 /// bits in GET CONFIGURATION — this declares what the drive *can* support,
 /// not what the current medium exposes.
-pub const UDFRW_CAPS: CdromCapabilities = CdromCapabilities::hyper_multi();
+pub const DVDRAM_CAPS: CdromCapabilities = CdromCapabilities::hyper_multi();
 /// Full HyperMulti recorder capabilities — the default for the SnowDrive
 /// CD/DVD device.  Reads and writes every CD/DVD variant including
 /// dual-layer; capabilities are intrinsic to the drive and never depend on
@@ -322,8 +322,8 @@ pub const HYPER_MULTI_DESCS: [(u16, u16); 8] = [
     (11080, 11080), // DVD  8x
     (22160, 22160), // DVD 16x
 ];
-/// DVD-RAM write-speed descriptors used by the UDFRW medium view.
-pub const UDFRW_DESCS: [(u16, u16); 1] = [(11080, 11080)];
+/// DVD-RAM write-speed descriptors used by the DVDRAM medium view.
+pub const DVDRAM_DESCS: [(u16, u16); 1] = [(11080, 11080)];
 /// `true` → 1 (const bit packing).
 const fn bit(b: bool) -> u8 {
     b as u8
@@ -444,7 +444,7 @@ pub const fn build_capabilities_page(caps: &CdromCapabilities, descs: &[(u16, u1
 /// CD/DVD device.  Built from the fixed HyperMulti capability model — the
 /// drive's abilities are intrinsic and never depend on the mounted media.
 const CDROM_CAPABILITIES: [u8; 64] = build_capabilities_page(&HYPER_MULTI_CAPS, &HYPER_MULTI_DESCS);
-const UDFRW_CAPABILITIES: [u8; 64] = build_capabilities_page(&UDFRW_CAPS, &UDFRW_DESCS);
+const DVDRAM_CAPABILITIES: [u8; 64] = build_capabilities_page(&DVDRAM_CAPS, &DVDRAM_DESCS);
 /// Return the MODE SENSE page data for `page` (`0x3F` = all pages).
 #[allow(dead_code)]
 pub(crate) fn cdrom_mode_page(page: u8) -> Option<&'static [u8]> {
@@ -464,7 +464,7 @@ pub(crate) fn cdrom_mode_page_for_caps(
         0x0E => Some(&CDROM_AUDIO),
         0x1A => Some(&POWER_CONDITION_PAGE),
         0x1D => Some(&TIMEOUT_PROTECT_PAGE),
-        0x2A if caps.random_writable && !caps.dvd_plus_rw => Some(&UDFRW_CAPABILITIES),
+        0x2A if caps.random_writable && !caps.dvd_plus_rw => Some(&DVDRAM_CAPABILITIES),
         0x2A => Some(&CDROM_CAPABILITIES),
         0x3F => Some(&ALL_CDROM_PAGES),
         _ => None,
@@ -1481,13 +1481,13 @@ mod tests {
         assert_eq!(removable_payload, 0x39);
     }
     #[test]
-    fn cdrom_get_config_udfrw_features_hyper_multi() {
+    fn cdrom_get_config_dvdram_features_hyper_multi() {
         let mut w = work();
         let profile = CurrentProfile::DvdRam;
         let outcome = build_get_config_response(
             &mut w,
             profile,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             0x00,
             0x0000,
             255,
@@ -1516,13 +1516,13 @@ mod tests {
         assert!(!saw_mrw);
     }
     #[test]
-    fn cdrom_get_config_udfrw_write_protect_clear() {
+    fn cdrom_get_config_dvdram_write_protect_clear() {
         let mut w = work();
         let profile = CurrentProfile::DvdRam;
         let outcome = build_get_config_response(
             &mut w,
             profile,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             0x00,
             0x0000,
             255,
@@ -1648,7 +1648,7 @@ mod tests {
         let outcome = build_get_config_response(
             &mut w,
             CurrentProfile::DvdRom,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             0x02,
             0x001F,
             255,
@@ -1673,7 +1673,7 @@ mod tests {
         let outcome = build_get_config_response(
             &mut w,
             CurrentProfile::CdRom,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             0x01,
             0x0000,
             255,
@@ -1882,7 +1882,7 @@ mod tests {
         let outcome = build_get_config_response(
             &mut w,
             CurrentProfile::DvdRam,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             0x00,
             0x0000,
             255,
@@ -1943,7 +1943,7 @@ mod tests {
         let mut tmp = [0u8; 512];
         // Also test via build_get_config_response_for_media path
         let outcome =
-            build_get_config_response_for_media(&mut tmp, &UDFRW_CAPS, &media, 0x00, 0x0000, 512);
+            build_get_config_response_for_media(&mut tmp, &DVDRAM_CAPS, &media, 0x00, 0x0000, 512);
         let mut check = [0u8; 512];
         let n = data_in(outcome, &tmp, &mut check);
         assert!(n > 0);
@@ -2031,7 +2031,7 @@ mod tests {
         let mut tmp2 = [0u8; 512];
         let out2 = build_get_config_response_for_media(
             &mut tmp2,
-            &UDFRW_CAPS,
+            &DVDRAM_CAPS,
             &media_off,
             0x00,
             0x0000,

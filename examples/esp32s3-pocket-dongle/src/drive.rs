@@ -1,15 +1,15 @@
 //! DVD-RAM optical drive over the on-board SD card.
 //!
-//! Mirrors the CLI's `--cdrom udfrw=<dev>` construction path
+//! Mirrors the CLI's `--cdrom dvdram=<dev>` construction path
 //! (`snowdrive-cli/src/main.rs`): open the SD card as a random-writable byte
-//! plane and wrap it in a [`UdfRwMedia`] (a DVD-RAM, PDT `0x05`, profile
+//! plane and wrap it in a [`DvdRamMedia`] (a DVD-RAM, PDT `0x05`, profile
 //! DVD-RAM). The device exposes a **blank** random-writable DVD-RAM; the host
 //! formats it (FORMAT UNIT + its own UDF `mkfs`). This crate never writes
 //! file-system structures.
 
 use snowdrive_scsi::cdrom::drive::CdromDrive;
+use snowdrive_scsi::cdrom::dvdram::DvdRamMedia;
 use snowdrive_scsi::cdrom::media::CdMedia;
-use snowdrive_scsi::cdrom::udfrw::UdfRwMedia;
 use snowdrive_scsi::common::seekable_storage::RwRef;
 use snowdrive_scsi::MIN_DATA_LEN;
 
@@ -30,6 +30,6 @@ pub fn build<'a>(sd: &'a mut SdCard<'_>) -> CdromDrive<'a> {
     // `load` (not `load_quiet`) queues a Unit Attention, which the first
     // TEST UNIT READY reports and consumes — exactly what a real host sees
     // after media insertion.
-    drive.load(CdMedia::Rw(UdfRwMedia::open(RwRef::new(sd))));
+    drive.load(CdMedia::Rw(DvdRamMedia::open(RwRef::new(sd))));
     drive
 }

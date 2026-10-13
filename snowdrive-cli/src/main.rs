@@ -16,7 +16,7 @@
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
 //! - `--cdrom` drives `CdromDrive` (full MMC): `img=<iso>`, `live=<dir>`
 //!   (live ISO9660 over a directory), or
-//!   `udfrw=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
+//!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
 //!   never writes file-system structures).
 //!
@@ -43,9 +43,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser};
 use snowdrive_scsi::cdrom::drive::CdromDrive;
+#[cfg(feature = "dvdram")]
+use snowdrive_scsi::cdrom::dvdram::DvdRamMedia;
 use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
-#[cfg(feature = "udfrw")]
-use snowdrive_scsi::cdrom::udfrw::UdfRwMedia;
 use snowdrive_scsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowdrive_scsi::common::fs_storage::OpenOptions;
@@ -117,7 +117,7 @@ struct ServeArgs {
     block: Vec<String>,
 
     /// CD-ROM device (`CdromDrive`, full MMC): `img=<iso>`, `live=<dir>`
-    /// (live ISO9660 over a directory), or `udfrw=<path|ram:<size>>[,size=…]`
+    /// (live ISO9660 over a directory), or `dvdram=<path|ram:<size>>[,size=…]`
     /// (random-writable DVD-RAM). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
@@ -734,8 +734,8 @@ fn build_devices<'a>(
     for spec in specs {
         let size = match &spec.backing {
             Backing::Ram { size } => Some(*size),
-            #[cfg(feature = "udfrw")]
-            Backing::UdfRw { path: None } => spec.plane.size,
+            #[cfg(feature = "dvdram")]
+            Backing::DvdRam { path: None } => spec.plane.size,
             _ => None,
         };
         if let Some(size) = size {
@@ -851,36 +851,36 @@ fn build_devices<'a>(
                 })?;
                 lives.push(live);
             }
-            #[cfg(feature = "udfrw")]
-            Backing::UdfRw { path } => match path.as_deref() {
+            #[cfg(feature = "dvdram")]
+            Backing::DvdRam { path } => match path.as_deref() {
                 Some(path) => {
                     let existed = Path::new(path).exists();
                     if existed && spec.plane.size.is_some() {
-                        eprintln!("snowdrive: udfrw: size= is only valid for a new file: {path}");
+                        eprintln!("snowdrive: dvdram: size= is only valid for a new file: {path}");
                         return Err(());
                     }
                     if !existed {
                         let Some(sz) = spec.plane.size else {
                             eprintln!(
-                                "snowdrive: udfrw: file not found, use size= to create it: {path}"
+                                "snowdrive: dvdram: file not found, use size= to create it: {path}"
                             );
                             return Err(());
                         };
                         create_sparse(path, sz).map_err(|e| {
-                            eprintln!("snowdrive: udfrw: failed to create {path}: {e}");
+                            eprintln!("snowdrive: dvdram: failed to create {path}: {e}");
                         })?;
                     }
                     let b = FileBackend::open(path, true).map_err(|e| {
-                        eprintln!("snowdrive: udfrw: failed to open {path}: {e}");
+                        eprintln!("snowdrive: dvdram: failed to open {path}: {e}");
                     })?;
                     backends.push(BlockBackend::File(b));
                 }
                 None => {
                     let bytes = spec.plane.size.ok_or_else(|| {
-                        eprintln!("snowdrive: udfrw=ram: requires size=");
+                        eprintln!("snowdrive: dvdram=ram: requires size=");
                     })?;
                     let bytes = usize::try_from(bytes).map_err(|_| {
-                        eprintln!("snowdrive: udfrw=ram: size too large");
+                        eprintln!("snowdrive: dvdram=ram: size too large");
                     })?;
                     let (slot, tail) = ram_cursor.split_first_mut().unwrap();
                     ram_cursor = tail;
@@ -888,9 +888,9 @@ fn build_devices<'a>(
                     backends.push(BlockBackend::Ram(RamBackend::new(slot)));
                 }
             },
-            #[cfg(not(feature = "udfrw"))]
-            Backing::UdfRw { .. } => {
-                eprintln!("snowdrive: udfrw= requires the `udfrw` feature");
+            #[cfg(not(feature = "dvdram"))]
+            Backing::DvdRam { .. } => {
+                eprintln!("snowdrive: dvdram= requires the `dvdram` feature");
                 return Err(());
             }
         }
@@ -988,16 +988,16 @@ fn build_devices<'a>(
                 log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
                 drives.push(drive);
             }
-            #[cfg(feature = "udfrw")]
-            (DeviceRole::MmcCd, Backing::UdfRw { path: _ }) => {
+            #[cfg(feature = "dvdram")]
+            (DeviceRole::MmcCd, Backing::DvdRam { path: _ }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
                 // A blank, random-writable DVD-RAM over the byte plane. The
                 // host formats it (FORMAT UNIT + its own UDF mkfs); the device
                 // never writes file-system structures.
-                let media = UdfRwMedia::open(RwRef::new(be));
-                log::debug!("LUN {lun}: UdfRw DVD-RAM ({} bytes)", media.capacity());
+                let media = DvdRamMedia::open(RwRef::new(be));
+                log::debug!("LUN {lun}: DvdRam DVD-RAM ({} bytes)", media.capacity());
                 let mut drive = CdromDrive::builder()
                     .capabilities(snowdrive_scsi::cdrom::HYPER_MULTI_CAPS)
                     .build();

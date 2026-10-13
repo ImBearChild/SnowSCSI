@@ -2,7 +2,7 @@
 //!
 //! - Type definitions (Track, SessionInfo, DiscState, DiscType, ...).
 //! - `CdMedia` gains inherent methods that `CdromDrive` delegates to;
-//!   `UdfRw` variant is concrete; `MediaEventStatus` for GESN.
+//!   `DvdRam` variant is concrete; `MediaEventStatus` for GESN.
 //!
 //! Types defined here:
 //! - Geometry constants (`MAX_TRACKS`, `SECTOR_SIZE_DATA`, …)
@@ -13,8 +13,8 @@
 //! - `CdMedia` enum with inherent methods for the drive layer
 
 use crate::cdrom::common::{CurrentProfile, MediaState};
-#[cfg(feature = "udfrw")]
-use crate::cdrom::udfrw::UdfRwMedia;
+#[cfg(feature = "dvdram")]
+use crate::cdrom::dvdram::DvdRamMedia;
 use crate::common::seekable_storage::{FlatData, FlatRef, RwRef};
 use crate::scsi::backend::StorageError;
 
@@ -231,7 +231,7 @@ pub enum MediaEventStatus {
 /// concrete media type that provides geometry and a data plane.
 ///
 /// Variants are added incrementally:
-/// - * `UdfRw(…)` (migrated from standalone `UdfRwDevice`)
+/// - * `DvdRam(…)` (migrated from standalone `DvdRamDevice`)
 /// - * `Flat(…)` and `Live(…)`
 /// - * `Bundle(…)`
 #[derive(Debug)]
@@ -242,9 +242,9 @@ pub enum CdMedia<'a> {
     Ro(FlatMedia<FlatRef<'a>>),
 
     /// Random-writable DVD-RAM/RW: a UDF 2.01 volume over an erased
-    /// writable plane (`udfrw` feature).
-    #[cfg(feature = "udfrw")]
-    Rw(UdfRwMedia<RwRef<'a>>),
+    /// writable plane (`dvdram` feature).
+    #[cfg(feature = "dvdram")]
+    Rw(DvdRamMedia<RwRef<'a>>),
 }
 
 /// Physical tray state: at most one disc, either loaded or parked by a
@@ -287,7 +287,7 @@ impl<'a> CdMedia<'a> {
         let profile = self.profile();
         let max_lba = self.max_lba().min(u32::MAX as u64) as u32;
         match self {
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(_) => MediaState {
                 profile,
                 present: true,
@@ -323,7 +323,7 @@ impl<'a> CdMedia<'a> {
     pub fn profile(&self) -> CurrentProfile {
         match self {
             Self::Ro(m) => m.profile(),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(_) => CurrentProfile::DvdRam,
         }
     }
@@ -334,7 +334,7 @@ impl<'a> CdMedia<'a> {
     pub fn max_lba(&self) -> u64 {
         match self {
             Self::Ro(m) => m.max_lba(),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.max_lba(),
         }
     }
@@ -343,7 +343,7 @@ impl<'a> CdMedia<'a> {
     pub fn lead_out_lba(&self) -> u32 {
         match self {
             Self::Ro(m) => m.lead_out_lba(),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.lead_out_lba(),
         }
     }
@@ -352,7 +352,7 @@ impl<'a> CdMedia<'a> {
     pub fn capacity(&self) -> u64 {
         match self {
             Self::Ro(m) => FlatData::capacity(&m.data),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.capacity(),
         }
     }
@@ -363,7 +363,7 @@ impl<'a> CdMedia<'a> {
     pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         match self {
             Self::Ro(m) => m.read_data(offset, buf),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.read_data(offset, buf),
         }
     }
@@ -372,7 +372,7 @@ impl<'a> CdMedia<'a> {
     pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), MediaError> {
         match self {
             Self::Ro(_) => Err(MediaError::WriteProtected),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.write_data(offset, buf).map_err(MediaError::from),
         }
     }
@@ -381,7 +381,7 @@ impl<'a> CdMedia<'a> {
     pub fn sync(&mut self) -> Result<(), MediaError> {
         match self {
             Self::Ro(_) => Ok(()),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.sync().map_err(MediaError::from),
         }
     }
@@ -390,7 +390,7 @@ impl<'a> CdMedia<'a> {
     pub fn format_unit(&mut self) -> Result<(), MediaError> {
         match self {
             Self::Ro(_) => Err(MediaError::WriteProtected),
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.format_unit().map_err(MediaError::from),
         }
     }
@@ -408,7 +408,7 @@ impl<'a> CdMedia<'a> {
     /// Physical format information for READ DVD STRUCTURE format 0.
     pub fn dvd_physical_format(&self) -> Option<DvdPhysicalFormat> {
         match self {
-            #[cfg(feature = "udfrw")]
+            #[cfg(feature = "dvdram")]
             Self::Rw(m) => Some(DvdPhysicalFormat {
                 disk_category_part_version: 0x10, // DVD-RAM, version 0
                 layer_type: 0x04,                 // single-layer, rewritable
@@ -422,12 +422,12 @@ impl<'a> CdMedia<'a> {
 
     /// Whether this media type supports the given READ DVD STRUCTURE format.
     pub fn supports_dvd_structure_format(&self, format: u8) -> bool {
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
             matches!(self, Self::Rw(_))
                 && matches!(format, 0 | 0x08 | 0x09 | 0x0A | 0x0B | 0x30 | 0xC0)
         }
-        #[cfg(not(feature = "udfrw"))]
+        #[cfg(not(feature = "dvdram"))]
         {
             let _ = format;
             false

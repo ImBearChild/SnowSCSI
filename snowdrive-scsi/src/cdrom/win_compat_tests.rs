@@ -1,4 +1,4 @@
-//! Windows-compatibility regression tests for the UdfRw CD-ROM profile.
+//! Windows-compatibility regression tests for the DvdRam CD-ROM profile.
 //!
 //! Captured-traffic background (usbredir → usb-storage on Windows 10):
 //! during enumeration Windows fires a burst of SECURITY PROTOCOL IN (A2h)
@@ -11,8 +11,8 @@
 //! pending-sense gate in [`CdromDrive::do_cmd`].
 
 use crate::cdrom::drive::CdromDrive;
-#[cfg(feature = "udfrw")]
-use crate::cdrom::udfrw::UdfRwMedia;
+#[cfg(feature = "dvdram")]
+use crate::cdrom::dvdram::DvdRamMedia;
 use crate::common::seekable_storage::RwRef;
 use crate::scsi::backend::{BlockBackend, RamBackend};
 use crate::scsi::device::CommandOutcome;
@@ -35,12 +35,12 @@ fn rfc_formattable_descriptor_tdp_is_block_length() {
     let mut img = vec![0u8; 2048 * 204800];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     {
-        let media = UdfRwMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udfrw"))]
+    #[cfg(not(feature = "dvdram"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -71,12 +71,12 @@ fn win_single_cmds_diag() {
     let mut img = vec![0u8; 2048 * 204800];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     {
-        let media = UdfRwMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udfrw"))]
+    #[cfg(not(feature = "dvdram"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     // consume initial UA
@@ -158,12 +158,12 @@ fn win_rejected_probe_does_not_poison_next_command() {
     let mut img = vec![0u8; 2048 * 204800];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     {
-        let media = UdfRwMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udfrw"))]
+    #[cfg(not(feature = "dvdram"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -222,12 +222,12 @@ fn win_ua_still_reports_once() {
     let mut img = vec![0u8; 2048 * 204800];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     {
-        let media = UdfRwMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
-    #[cfg(not(feature = "udfrw"))]
+    #[cfg(not(feature = "dvdram"))]
     dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
 
     let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -372,12 +372,12 @@ mod enumeration_sequence {
         let mut img = vec![0u8; 2048 * 204800];
         let mut dev = CdromDrive::new();
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
         }
-        #[cfg(not(feature = "udfrw"))]
+        #[cfg(not(feature = "dvdram"))]
         dev.load_quiet(CdMedia::ro(&mut bb));
 
         let mut session = BotSession::new();

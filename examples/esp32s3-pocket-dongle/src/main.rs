@@ -3,17 +3,17 @@
 //! Presents the on-board SD card as one whole raw block device to a USB host,
 //! as a UDF-RW (DVD-RAM) optical device driven by `snowdrive-scsi`.
 //!
-//! Boots straight into UDFRW: the USB-OTG gadget runs the Mass Storage
+//! Boots straight into DVDRAM: the USB-OTG gadget runs the Mass Storage
 //! Bulk-Only Transport class ([`msc`]) over the internal Full-Speed PHY. The
 //! SD card is built once into a persistent [`drive`] (the single LUN).
 //!
 //! Pressing BOOT toggles between the two owners of the single internal USB
-//! PHY: the UDFRW gadget (USB-OTG) and the USB-Serial-JTAG debug console (the
+//! PHY: the DVDRAM gadget (USB-OTG) and the USB-Serial-JTAG debug console (the
 //! ROM download / `espflash` interface). Each toggle tears the gadget down
 //! (dropping the `UsbDevice` disables the OTG core), re-muxes the PHY with
 //! [`usb_mode`], and rebuilds. defmt is only emitted while the PHY is on
 //! USB-Serial-JTAG (its FIFO cannot be drained on OTG); the LCD is the only
-//! on-device feedback in UDFRW mode.
+//! on-device feedback in DVDRAM mode.
 //!
 //! This crate is *detached* from the repository workspace (its own empty
 //! `[workspace]` table) and is built with the `esp` (Xtensa) toolchain:
@@ -76,7 +76,7 @@ static WORK: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 /// and the receive scratch at the same time. Also kept off the task stack.
 static RECV: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 
-/// Run the whole UDFRW gadget concurrently: USB stack, BOT loop, LCD refresh.
+/// Run the whole DVDRAM gadget concurrently: USB stack, BOT loop, LCD refresh.
 ///
 /// Never returns. Both `UsbDevice::run` and [`msc::run`] return `!`, so the
 /// `join3` below can only ever be *cancelled*, never completed. The caller
@@ -127,7 +127,7 @@ where
                 if let Some(display) = display.as_mut() {
                     let (rx, tx) = mark.take(msc::rx_bytes(), msc::tx_bytes());
                     display.show(
-                        usb_mode::Mode::Udfrw,
+                        usb_mode::Mode::DvdRam,
                         sd_bytes,
                         msc::usb_connected(),
                         uptime_s(boot),
@@ -172,7 +172,7 @@ async fn main(spawner: Spawner) -> ! {
     // `main` so their non-`'static` borrows (session, drive) stay valid.
     let _ = spawner;
 
-    info!("esp32s3-pocket-dongle: M4 booting (UDFRW/USB-OTG)");
+    info!("esp32s3-pocket-dongle: M4 booting (DVDRAM/USB-OTG)");
 
     // The LCD's SPI interface borrows this staging buffer, so it must be
     // declared (and outlive) the `Display` below.
@@ -191,7 +191,7 @@ async fn main(spawner: Spawner) -> ! {
     // Paint a boot screen as soon as the panel is up (before the slower SD
     // bring-up).
     if let Some(display) = display.as_mut() {
-        display.show(usb_mode::Mode::Udfrw, None, false, uptime_s(boot), None);
+        display.show(usb_mode::Mode::DvdRam, None, false, uptime_s(boot), None);
     }
 
     // SDMMC host + slot 0 on the board's 1-bit/4-bit SD wiring. Bring-up can be
@@ -218,7 +218,7 @@ async fn main(spawner: Spawner) -> ! {
     let Some(mut card) = sd.take() else {
         info!("M4: no SD card; cannot start the USB gadget");
         if let Some(display) = display.as_mut() {
-            display.show(usb_mode::Mode::Udfrw, None, false, uptime_s(boot), None);
+            display.show(usb_mode::Mode::DvdRam, None, false, uptime_s(boot), None);
         }
         loop {
             Timer::after(Duration::from_secs(1)).await;
@@ -241,7 +241,7 @@ async fn main(spawner: Spawner) -> ! {
     // NOTE: `embassy-usb-synopsys-otg` keeps its endpoint-allocator slots in a
     // `'static` `StateStorage` (`State::alloc_slot_write`) that `Bus::drop`
     // never clears, so every rebuild consumes two of the six non-EP0 slots.
-    // The BOOT<->UDFRW toggle is therefore bounded (roughly five re-entries)
+    // The BOOT<->DVDRAM toggle is therefore bounded (roughly five re-entries)
     // until allocation would panic; making it unbounded needs library support
     // (fixed endpoints, or retaining the device across the Debug excursion).
     let work: &'static mut [u8] = WORK.init([0u8; drive::WORK_LEN]);
@@ -256,14 +256,14 @@ async fn main(spawner: Spawner) -> ! {
 
     // ── Runtime mode toggle ──────────────────────────────────────────────
     //
-    // Boot default is UDFRW (the product function). BOOT tears the gadget
+    // Boot default is DVDRAM (the product function). BOOT tears the gadget
     // down and yields the shared PHY to USB-Serial-JTAG for a debug console;
-    // BOOT again rebuilds the UDFRW gadget.
-    let mut mode = usb_mode::Mode::Udfrw;
+    // BOOT again rebuilds the DVDRAM gadget.
+    let mut mode = usb_mode::Mode::DvdRam;
 
     loop {
         match mode {
-            usb_mode::Mode::Udfrw => {
+            usb_mode::Mode::DvdRam => {
                 // Route the shared PHY to OTG before building/polling the
                 // gadget. esp-hal's `Bus::init` re-applies this on the first
                 // poll, but doing it explicitly is what brings the PHY back
@@ -337,7 +337,7 @@ async fn main(spawner: Spawner) -> ! {
                 // line reads `-` until the refresh loop has a first window).
                 if let Some(display) = display.as_mut() {
                     display.show(
-                        usb_mode::Mode::Udfrw,
+                        usb_mode::Mode::DvdRam,
                         sd_bytes,
                         msc::usb_connected(),
                         uptime_s(boot),
@@ -381,7 +381,7 @@ async fn main(spawner: Spawner) -> ! {
                 // before emitting any defmt (its FIFO cannot be drained until
                 // the host has it open).
                 Timer::after(Duration::from_millis(300)).await;
-                info!("mode: DEBUG - PHY on USB-Serial-JTAG; press BOOT for UDFRW");
+                info!("mode: DEBUG - PHY on USB-Serial-JTAG; press BOOT for DVDRAM");
 
                 if let Some(display) = display.as_mut() {
                     display.show(usb_mode::Mode::Debug, sd_bytes, false, uptime_s(boot), None);
@@ -412,14 +412,14 @@ async fn main(spawner: Spawner) -> ! {
                 }
 
                 // Give the console a moment to drain before the mux flips back.
-                info!("mode: leaving DEBUG, rebuilding UDFRW gadget");
+                info!("mode: leaving DEBUG, rebuilding DVDRAM gadget");
                 Timer::after(Duration::from_millis(100)).await;
             }
         }
 
         mode = match mode {
-            usb_mode::Mode::Udfrw => usb_mode::Mode::Debug,
-            usb_mode::Mode::Debug => usb_mode::Mode::Udfrw,
+            usb_mode::Mode::DvdRam => usb_mode::Mode::Debug,
+            usb_mode::Mode::Debug => usb_mode::Mode::DvdRam,
         };
     }
 }

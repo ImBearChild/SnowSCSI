@@ -99,8 +99,8 @@ impl<'a> CdromDrive<'a> {
     /// let mut disc_a = CdMedia::ro(&mut live_data);            // no temporaries
     /// let mut iso = FlatMedia::new(FlatRef::new(img_file));
     /// let mut disc_b = CdMedia::Ro(iso);
-    /// // DVD-RAM over a writable plane (feature `udfrw`):
-    /// // let mut udf = UdfRwMedia::open(RwRef::new(&mut sd_card));
+    /// // DVD-RAM over a writable plane (feature `dvdram`):
+    /// // let mut udf = DvdRamMedia::open(RwRef::new(&mut sd_card));
     /// // let mut disc_c = CdMedia::Rw(udf);
     /// # Ok(())
     /// # }
@@ -704,7 +704,7 @@ impl<'a> CdromDrive<'a> {
                 // ── BLANK (0xA1) — for DVD-RAM alias to FORMAT (BurnAware clear)
                 0xA1 => {
                     if self.is_random_writable() {
-                        #[cfg(feature = "udfrw")]
+                        #[cfg(feature = "dvdram")]
                         {
                             if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
                                 match media.format_unit() {
@@ -722,7 +722,7 @@ impl<'a> CdromDrive<'a> {
                                 self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
                             }
                         }
-                        #[cfg(not(feature = "udfrw"))]
+                        #[cfg(not(feature = "dvdram"))]
                         {
                             self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
                         }
@@ -868,7 +868,7 @@ impl<'a> CdromDrive<'a> {
         // The format runs synchronously in this emulation, so Immed and
         // non-Immed are observably identical: clear now, report GOOD,
         // queue UNIT ATTENTION so the host re-reads DiscInfo/TOC/Capacity.
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
             return match media.format_unit() {
                 Ok(()) => {
@@ -1125,7 +1125,7 @@ impl<'a> CdromDrive<'a> {
         }
         match format {
             0 => {
-                #[cfg(feature = "udfrw")]
+                #[cfg(feature = "dvdram")]
                 if let Some(m) = self.loaded_ref() {
                     if let Some(pf) = m.dvd_physical_format() {
                         let mut buf = [0u8; 28];
@@ -1144,7 +1144,7 @@ impl<'a> CdromDrive<'a> {
             }
             0x08 => {
                 // DVD-RAM DDS — synthetic 2048-byte DDS info (MMC-6 Table 414)
-                #[cfg(feature = "udfrw")]
+                #[cfg(feature = "dvdram")]
                 if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 2052];
@@ -1158,7 +1158,7 @@ impl<'a> CdromDrive<'a> {
             }
             0x09 => {
                 // DVD-RAM Medium Status — 4-byte payload (Table 415)
-                #[cfg(feature = "udfrw")]
+                #[cfg(feature = "dvdram")]
                 if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 8];
@@ -1174,7 +1174,7 @@ impl<'a> CdromDrive<'a> {
             0x0A => {
                 // DVD-RAM Spare Area Information — 12-byte payload (Table 417)
                 // SSA=0 logical model: zero spare counts, no allocation.
-                #[cfg(feature = "udfrw")]
+                #[cfg(feature = "dvdram")]
                 if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 16];
@@ -1189,7 +1189,7 @@ impl<'a> CdromDrive<'a> {
             }
             0x0B => {
                 // DVD-RAM Recording Type — 4-byte payload, Recording Type 0 = general data
-                #[cfg(feature = "udfrw")]
+                #[cfg(feature = "dvdram")]
                 if let Some(m) = self.loaded_ref() {
                     if m.profile() == crate::cdrom::common::CurrentProfile::DvdRam {
                         let mut buf = [0u8; 8];
@@ -1659,7 +1659,7 @@ pub(crate) fn hex_of<'o>(out: &'o mut [u8], data: &[u8]) -> &'o [u8] {
 mod tests {
     use super::*;
     use crate::common::seekable_storage::RwRef;
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
     use crate::scsi::backend::{BlockBackend, RamBackend};
     use crate::scsi::device::{ScsiDevice, XferOutcome};
@@ -1870,12 +1870,12 @@ mod tests {
         let mut img = vec![0u8; 2048 * 204800];
         let mut dev = CdromDrive::new();
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            let media = crate::cdrom::udfrw::UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = crate::cdrom::dvdram::DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
         }
-        #[cfg(not(feature = "udfrw"))]
+        #[cfg(not(feature = "dvdram"))]
         dev.load_quiet(crate::cdrom::media::CdMedia::ro(&mut bb));
         let last = dev.max_lba().min(u32::MAX as u64) as u32;
 
@@ -2185,13 +2185,13 @@ mod tests {
     /// Backend whose `sync` counts invocations through an outer handle,
     /// so the counter stays reachable while the backend itself is owned
     /// by the media stack.
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     struct CountingSyncBackend {
         data: Vec<u8>,
         syncs: std::rc::Rc<core::cell::Cell<u32>>,
     }
 
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     impl FlatData for CountingSyncBackend {
         fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
             let off = off as usize;
@@ -2204,7 +2204,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     impl WritableFlatData for CountingSyncBackend {
         fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
             let off = off as usize;
@@ -2218,21 +2218,21 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "udfrw")]
+    #[cfg(feature = "dvdram")]
     #[test]
     fn sync_reaches_parked_media() {
         // After a SCSI eject the disc sits Parked on the
         // tray until take_media(); shutdown (`ScsiDevice::sync`) and
         // SYNCHRONIZE CACHE must both reach it — the former behavior
         // returned Ok/Status without flushing ⇒ data-loss window.
-        use crate::cdrom::udfrw::UdfRwMedia;
+        use crate::cdrom::dvdram::DvdRamMedia;
 
         let syncs = std::rc::Rc::new(core::cell::Cell::new(0));
         let mut be = CountingSyncBackend {
             data: vec![0u8; 4096 * 2048],
             syncs: std::rc::Rc::clone(&syncs),
         };
-        let media = UdfRwMedia::open(RwRef::new(&mut be));
+        let media = DvdRamMedia::open(RwRef::new(&mut be));
 
         let mut dev = CdromDrive::new();
         let swapped_out = dev.load(CdMedia::Rw(media));
@@ -2294,12 +2294,12 @@ mod tests {
     fn drive_format_unit_rejects_type_01() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 4096 * 2048];
-        // UdfRw requires udfrw feature
-        #[cfg(feature = "udfrw")]
+        // DvdRam requires dvdram feature
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2321,7 +2321,7 @@ mod tests {
                 asc::INVALID_FIELD_IN_PARAMETER_LIST
             );
         }
-        #[cfg(not(feature = "udfrw"))]
+        #[cfg(not(feature = "dvdram"))]
         {
             let _ = (dev, img);
         }
@@ -2332,11 +2332,11 @@ mod tests {
     fn drive_format_unit_rejects_init_pattern() {
         let mut dev = CdromDrive::new();
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2360,7 +2360,7 @@ mod tests {
                 asc::INVALID_FIELD_IN_PARAMETER_LIST
             );
         }
-        #[cfg(not(feature = "udfrw"))]
+        #[cfg(not(feature = "dvdram"))]
         {
             let _ = (dev, img);
         }
@@ -2370,12 +2370,12 @@ mod tests {
     #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_tryout_does_not_clear() {
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Write pattern via xfer_in path
             let mut w = work();
@@ -2433,12 +2433,12 @@ mod tests {
     #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_clears_logical_blocks() {
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Write some data via xfer_in
             {
@@ -2504,12 +2504,12 @@ mod tests {
     #[allow(unused_mut, unused_variables)]
     fn drive_format_unit_dvd_rw_format_compat() {
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Leave a pattern at LBA 1 so we can observe the clear.
             {
@@ -2562,12 +2562,12 @@ mod tests {
     #[allow(unused_mut, unused_variables)]
     fn drive_read_dvd_structure_08_09_0a_0b_for_dvdram() {
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut w = work();
             for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
@@ -2610,12 +2610,12 @@ mod tests {
     fn dvd_ram_always_formatted_no_medium_not_formatted() {
         // Logical DVD-RAM never returns NOT READY/MEDIUM NOT FORMATTED per §2.1
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Immediately after load, TUR is GOOD (no format needed)
             let mut w = work();
@@ -2675,9 +2675,9 @@ mod tests {
     #[allow(unused_mut, unused_variables)]
     fn disc_info_reports_always_formatted() {
         let mut img = vec![0u8; 4096 * 2048];
-        #[cfg(feature = "udfrw")]
+        #[cfg(feature = "dvdram")]
         {
-            use crate::cdrom::udfrw::UdfRwMedia;
+            use crate::cdrom::dvdram::DvdRamMedia;
 
             fn disc_status(dev: &mut CdromDrive<'_>) -> u8 {
                 let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -2693,7 +2693,7 @@ mod tests {
 
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
 
             // Always formatted — 10b "Finalized" (MMC-6 Table 372).
