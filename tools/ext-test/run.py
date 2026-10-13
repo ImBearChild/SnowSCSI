@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Entry point for the SnowDrive external test suite (pure stdlib).
+"""Entry point for the SnowSCSI external test suite (pure stdlib).
 
 Usage:
     python3 tools/ext-test/run.py               # discover + run all tests
     python3 tools/ext-test/run.py TestISO       # filter by name
 
 Environment:
-    SNOWDRIVE_BIN   path to the snowdrive binary (default: target/{debug,release})
+    SNOWSCSI_BIN   path to the snowscsi binary (default: target/{debug,release})
 """
 import os
 import sys

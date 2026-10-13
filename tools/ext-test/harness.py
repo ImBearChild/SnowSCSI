@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Shared helpers for the SnowDrive external test suite.
+"""Shared helpers for the SnowSCSI external test suite.
 
-Pure standard library. The suite treats the `snowdrive` binary as a black
-box: it spawns `snowdrive serve` / `snowdrive mkisofs` as subprocesses and
+Pure standard library. The suite treats the `snowscsi` binary as a black
+box: it spawns `snowscsi serve` / `snowscsi mkisofs` as subprocesses and
 drives them with external tools (`file`, `7z`, `isoinfo`, `bsdtar`,
 `iscsiadm`, ...). Nothing here is compiled into cargo tests.
 
@@ -38,24 +38,24 @@ def have_tool(name):
 
 
 def find_binary():
-    """Locate the `snowdrive` binary.
+    """Locate the `snowscsi` binary.
 
-    `SNOWDRIVE_BIN` overrides; otherwise `target/{debug,release}/snowdrive`
+    `SNOWSCSI_BIN` overrides; otherwise `target/{debug,release}/snowscsi`
     under the repo root (debug preferred, since `cargo build` is the default
     workflow). Raise if none is found.
     """
-    override = os.environ.get("SNOWDRIVE_BIN")
+    override = os.environ.get("SNOWSCSI_BIN")
     if override:
         if not os.path.isfile(override):
-            raise FileNotFoundError(f"SNOWDRIVE_BIN is not a file: {override}")
+            raise FileNotFoundError(f"SNOWSCSI_BIN is not a file: {override}")
         return override
     for profile in ("debug", "release"):
-        cand = os.path.join(REPO_ROOT, "target", profile, "snowdrive")
+        cand = os.path.join(REPO_ROOT, "target", profile, "snowscsi")
         if os.path.isfile(cand):
             return cand
     raise FileNotFoundError(
-        "snowdrive binary not found; build with `cargo build --workspace` "
-        "or set SNOWDRIVE_BIN"
+        "snowscsi binary not found; build with `cargo build --workspace` "
+        "or set SNOWSCSI_BIN"
     )
 
 
@@ -193,7 +193,7 @@ def device_size(dev):
 
 # ── ext4 mount helpers ──────────────────────────────────────────────
 
-def make_mountpoint(prefix="snowdrive"):
+def make_mountpoint(prefix="snowscsi"):
     """Create and return a per-process mountpoint under `/mnt`."""
     path = f"/mnt/{prefix}-{os.getpid()}"
     os.makedirs(path, exist_ok=True)
@@ -415,7 +415,7 @@ def purge_target_sessions(target=TARGET_NAME, timeout=10):
 # ── iSCSI session (manual open-iscsi login) ─────────────────────────
 
 class IscsiSession:
-    """Manually drive one open-iscsi session to a snowdrive target.
+    """Manually drive one open-iscsi session to a snowscsi target.
 
     Register the node explicitly (the target rejects SendTargets), log in,
     and detect the resulting device by a `/sys/class/block` snapshot diff.
@@ -501,7 +501,7 @@ class IscsiSession:
 # ── server lifecycle ────────────────────────────────────────────────
 
 class ServerHandle:
-    """Lifecycle of a `snowdrive serve` subprocess.
+    """Lifecycle of a `snowscsi serve` subprocess.
 
     By default starts the server on an ephemeral loopback port
     (`--iscsi 127.0.0.1:0`) and the caller drives open-iscsi manually (see
@@ -522,11 +522,11 @@ class ServerHandle:
         self.serve_args = list(serve_args)
         self.work_buf_size = work_buf_size
         self.iscsi_auto = iscsi_auto
-        # Log verbosity: 0 info, 1 debug, 2 trace. `SNOWDRIVE_TEST_VERBOSE`
+        # Log verbosity: 0 info, 1 debug, 2 trace. `SNOWSCSI_TEST_VERBOSE`
         # raises it for diagnostics without touching the tests.
         if verbose is None:
             try:
-                verbose = int(os.environ.get("SNOWDRIVE_TEST_VERBOSE", "0"))
+                verbose = int(os.environ.get("SNOWSCSI_TEST_VERBOSE", "0"))
             except ValueError:
                 verbose = 0
         self.verbose = verbose
@@ -552,7 +552,7 @@ class ServerHandle:
             text=True,
         )
         self._reader = threading.Thread(
-            target=self._pump_stderr, name="snowdrive-stderr", daemon=True
+            target=self._pump_stderr, name="snowscsi-stderr", daemon=True
         )
         self._reader.start()
         self._wait_ready()
@@ -586,7 +586,7 @@ class ServerHandle:
             tail = self._tail()
             self._kill()
             raise TimeoutError(
-                f"snowdrive did not announce 'listening' in {timeout}s; "
+                f"snowscsi did not announce 'listening' in {timeout}s; "
                 f"stderr:\n{tail}"
             )
         if self.addr is None:
@@ -594,7 +594,7 @@ class ServerHandle:
             tail = self._tail()
             self._kill()
             raise RuntimeError(
-                f"snowdrive exited early (rc={rc}) before 'listening':\n{tail}"
+                f"snowscsi exited early (rc={rc}) before 'listening':\n{tail}"
             )
 
     def log_tail(self, n=4096):
@@ -635,10 +635,10 @@ class ServerHandle:
                     self.proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self._kill()
-                    raise AssertionError("snowdrive did not exit after SIGINT")
+                    raise AssertionError("snowscsi did not exit after SIGINT")
             if self.proc.returncode != 0:
                 raise AssertionError(
-                    f"snowdrive exited {self.proc.returncode} (expected 0 after "
+                    f"snowscsi exited {self.proc.returncode} (expected 0 after "
                     f"SIGINT); tail:\n{self._tail()}"
                 )
         finally:
@@ -646,8 +646,8 @@ class ServerHandle:
             self.proc = None
 
 
-def run_snowdrive(args, cwd=None, timeout=120):
-    """Run `snowdrive <args...>`, return CompletedProcess (check=False)."""
+def run_snowscsi(args, cwd=None, timeout=120):
+    """Run `snowscsi <args...>`, return CompletedProcess (check=False)."""
     return subprocess.run(
         [find_binary(), *args],
         cwd=cwd,
@@ -658,8 +658,8 @@ def run_snowdrive(args, cwd=None, timeout=120):
 
 
 def mkisofs(src_dir, out_iso, label=None):
-    """Run `snowdrive mkisofs`; return CompletedProcess."""
+    """Run `snowscsi mkisofs`; return CompletedProcess."""
     args = ["mkisofs", src_dir, out_iso]
     if label:
         args += ["--label", label]
-    return run_snowdrive(args)
+    return run_snowscsi(args)

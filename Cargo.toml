@@ -1,9 +1,30 @@
 [workspace]
 resolver = "2"
 members = [
-    "snowdrive-common",
-    "snowdrive-disc",
-    "snowdrive-scsi",
-    "snowdrive-cli",
-    "tests",
+    "snowscsi-common",
+    "snowscsi-iso9660",
+    "snowscsi",
+    "snowscsi-cli",
+    "snowscsi-tests",
 ]
+
+# Shared package metadata — members opt in with `field.workspace = true`.
+# `repository` / `homepage` surface on crates.io and docs.rs.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ImBearChild/SnowSCSI"
+homepage = "https://github.com/ImBearChild/SnowSCSI"
+readme = "README.md"
+
+# Shared dependency versions. Intra-workspace crates carry a `version` (required
+# by `cargo publish`); the `path` is used locally and stripped on the registry.
+[workspace.dependencies]
+snowscsi-common = { version = "0.1.0", path = "snowscsi-common", default-features = false }
+snowscsi-iso9660 = { version = "0.1.0", path = "snowscsi-iso9660", default-features = false }
+snowscsi = { version = "0.1.0", path = "snowscsi", default-features = false }
+embedded-io = "0.7"
+heapless = "0.8"
+log = { version = "0.4", default-features = false }
+defmt = "1"

@@ -41,33 +41,33 @@ tracked by git.
 
 ## Workspace
 
-Multi-crate cargo workspace (resolver = "2"); the `snowdrive` binary lives in
-`snowdrive-cli`. The **full layout, per-crate roles, module map and feature
+Multi-crate cargo workspace (resolver = "2"); the `snowscsi` binary lives in
+`snowscsi-cli`. The **full layout, per-crate roles, module map and feature
 matrices** are documented in `HACKING.md` (Project Structure) — read it before
 making changes. Crate names at a glance:
 
-- `snowdrive-common` — storage seams + logging macros (always available)
-- `snowdrive-disc` — ISO9660/Joliet live-generation algorithms
-- `snowdrive-scsi` — SCSI core + iSCSI + USB MSC + CD-ROM + UDF skeleton
-- `snowdrive-cli` — the `snowdrive` binary (`serve` + `mkisofs`)
-- `tests` (`snowdrive-tests`) — integration tests (the only crate allowing `unsafe`)
+- `snowscsi-common` — storage seams + logging macros (always available)
+- `snowscsi-iso9660` — ISO9660/Joliet live-generation algorithms
+- `snowscsi` — SCSI core + iSCSI + USB MSC + CD-ROM + blank DVD-RAM media
+- `snowscsi-cli` — the `snowscsi` binary (`serve` + `mkisofs`)
+- `snowscsi-tests` — integration tests (the only crate allowing `unsafe`)
 - `tools/` — not a workspace member: external Python black-box tests + helpers
 
 ## Implementation Status
 
 | Component | Status |
 |-----------|--------|
-| `snowdrive-common` | Done — capability ladder `FlatData`(① read) → `WritableFlatData`(② write+sync) → `SeekableStorage`(③ embedded-io entry; blankets lift ③ into ①/②) + erased slot refs `FlatRef`/`RwRef`; plus `FsStorage` seam and logging macros. |
-| `snowdrive-disc` | Done — ISO9660/Joliet live-generation (`live.rs`), moved out of the old `iso9660` module. `LiveData`/`LiveDataBuilder`/`compute_layout`. |
-| `snowdrive-scsi::scsi` | Done — seam-first rewrite: one `BlockDevice<D: FlatData>` with two profiles (`disk()` writable PDT 0x00 / `cdrom()` read-only PDT 0x05, the former `CDBlockDevice`, over ANY plane incl. user backends); transports are generic over `D: ScsiDevice` (+ blanket for `&mut T`) so users implement their own LUNs; the closed `Device` enum is removed. |
-| `snowdrive-scsi::cdrom` | Done — `CdromDrive` dispatches all MMC commands; media types `FlatMedia` (full MMC), `LiveData`/`LiveDataBuilder` (livefs), `DvdRamMedia` (DVD-RAM, `dvdram`). Full MMC surface: READ TOC, GET CONFIGURATION, READ DISC INFORMATION, READ BUFFER CAPACITY, READ CAPACITY, DVD physical format, prevent/allow removal, tray exchange, pending Unit Attention. Legacy `CdromDevice`/`CdLiveFsDevice`/`DvdRamDevice` removed. |
-| `snowdrive-scsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine, BSD `TcpStream` transport behind `std`. Recent fixes: StatSN/DataSN/BufferOffset sequencing and the R2T/Data-In state machine. |
-| `snowdrive-scsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (non-blocking `BotSession::poll`). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowdrive-cli` under `cfg(target_os = "linux")`. |
-| `snowdrive-scsi::dvdram` | Done (feature `dvdram`) — `cdrom::dvdram::DvdRamMedia`, a **blank** random-writable DVD-RAM over any `WritableFlatData`: FORMAT UNIT (zero-fill) + byte-plane read/write; the **host** formats it (the device never writes UDF structures). Exposed via CLI `--cdrom dvdram=`. |
-| `snowdrive-cli` | Done — `serve` (`--block`/`--cdrom` planes + `--iscsi`/`--usb` transports, mutually exclusive; `--iscsi auto` open-iscsi loopback auto-config) and `mkisofs` (directory → ISO image). |
-| `snowdrive-tests` | Done — mock + libiscsi whitebox (`has_libiscsi` gated) + ISO cross-validation. |
-| `snowdrive::capi` | **Removed** — the `capi`/`cbindgen` feature and module no longer exist anywhere in the tree (no C ABI). |
-| `snow9660` | Removed — folded into `snowdrive-cli` as `mkisofs` (the disc crate *generates* ISOs; it does not parse them). |
+| `snowscsi-common` | Done — capability ladder `FlatData`(① read) → `WritableFlatData`(② write+sync) → `SeekableStorage`(③ embedded-io entry; blankets lift ③ into ①/②) + erased slot refs `FlatRef`/`RwRef`; plus `FsStorage` seam and logging macros. |
+| `snowscsi-iso9660` | Done — ISO9660/Joliet live-generation (`live.rs`), moved out of the old `iso9660` module. `LiveData`/`LiveDataBuilder`/`compute_layout`. |
+| `snowscsi::scsi` | Done — seam-first rewrite: one `BlockDevice<D: FlatData>` with two profiles (`disk()` writable PDT 0x00 / `cdrom()` read-only PDT 0x05, the former `CDBlockDevice`, over ANY plane incl. user backends); transports are generic over `D: ScsiDevice` (+ blanket for `&mut T`) so users implement their own LUNs; the closed `Device` enum is removed. |
+| `snowscsi::cdrom` | Done — `CdromDrive` dispatches all MMC commands; media types `FlatMedia` (full MMC), `LiveData`/`LiveDataBuilder` (livefs), `DvdRamMedia` (DVD-RAM, `dvdram`). Full MMC surface: READ TOC, GET CONFIGURATION, READ DISC INFORMATION, READ BUFFER CAPACITY, READ CAPACITY, DVD physical format, prevent/allow removal, tray exchange, pending Unit Attention. Legacy `CdromDevice`/`CdLiveFsDevice`/`DvdRamDevice` removed. |
+| `snowscsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine, BSD `TcpStream` transport behind `std`. Recent fixes: StatSN/DataSN/BufferOffset sequencing and the R2T/Data-In state machine. |
+| `snowscsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (non-blocking `BotSession::poll`). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowscsi-cli` under `cfg(target_os = "linux")`. |
+| `snowscsi::dvdram` | Done (feature `dvdram`) — `cdrom::dvdram::DvdRamMedia`, a **blank** random-writable DVD-RAM over any `WritableFlatData`: FORMAT UNIT (zero-fill) + byte-plane read/write; the **host** formats it (the device never writes UDF structures). Exposed via CLI `--cdrom dvdram=`. |
+| `snowscsi-cli` | Done — `serve` (`--block`/`--cdrom` planes + `--iscsi`/`--usb` transports, mutually exclusive; `--iscsi auto` open-iscsi loopback auto-config) and `mkisofs` (directory → ISO image). |
+| `snowscsi-tests` | Done — mock + libiscsi whitebox (`has_libiscsi` gated) + ISO cross-validation. |
+| `snowscsi::capi` | **Removed** — the `capi`/`cbindgen` feature and module no longer exist anywhere in the tree (no C ABI). |
+| `snow9660` | Removed — folded into `snowscsi-cli` as `mkisofs` (the disc crate *generates* ISOs; it does not parse them). |
 
 ## Legacy C Code
 
@@ -78,31 +78,31 @@ git checkout legacy
 
 ## Agent-Only Context
 
-- **Logging**: `snowdrive-scsi` re-exports `snowdrive-common` as `common` and the
+- **Logging**: `snowscsi` re-exports `snowscsi-common` as `common` and the
   unified logging macros (`trace!`/`debug!`/`info!`/`warn!`/`error!`) at crate
-  root, so `use snowdrive_scsi::{info, common::…};` works. Log output routing is
+  root, so `use snowscsi::{info, common::…};` works. Log output routing is
   the caller's responsibility (the CLI wires `env_logger`). Select `log` vs
   `defmt` via the per-crate `log`/`defmt` features.
 - **Tests**: `cargo test --workspace`. In-process integration tests live in the
-  `tests/` crate (mocks + libiscsi whitebox; some gated on `cfg(has_libiscsi)`).
+  `snowscsi-tests` crate (mocks + libiscsi whitebox; some gated on `cfg(has_libiscsi)`).
   External black-box tests live in `tools/ext-test` (Python, run with
   `python3 tools/ext-test/run.py`; skip without root/tools).
 - **no_std verification**: the lib crates must stay `no_std`-clean without
   `std`:
-  `cargo build -p snowdrive-scsi --no-default-features`,
-  `cargo build -p snowdrive-disc --no-default-features`,
-  `cargo build -p snowdrive-common --no-default-features`.
-  (Known gap: `cargo test -p snowdrive-scsi --no-default-features --features scsi`
+  `cargo build -p snowscsi --no-default-features`,
+  `cargo build -p snowscsi-iso9660 --no-default-features`,
+  `cargo build -p snowscsi-common --no-default-features`.
+  (Known gap: `cargo test -p snowscsi --no-default-features --features scsi`
   does not compile — unit tests use `Vec`/`String` without pulling in `std`.)
 - **Transport layer**: `Conn` trait = blanket impl of `embedded_io::Read + Write`.
-  BSD transport (`TcpStream`) behind `std` feature in `snowdrive-scsi::iscsi`.
-  USB MSC transport: `BotIo`/`Gadget` seams in `snowdrive-scsi::usb` — the
+  BSD transport (`TcpStream`) behind `std` feature in `snowscsi::iscsi`.
+  USB MSC transport: `BotIo`/`Gadget` seams in `snowscsi::usb` — the
   non-blocking `BotSession` core never does platform I/O; the Linux FunctionFS
-  bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives only in `snowdrive-cli`
+  bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives only in `snowscsi-cli`
   under `cfg(target_os = "linux")`.
-- **Red lines**: `#![deny(unsafe_code)]` on `snowdrive-common`, `snowdrive-disc`
-  and `snowdrive-scsi`; `snowdrive-cli` uses `#![forbid(unsafe_code)]`.
-  `snowdrive-tests` is the only crate that allows `unsafe` (libiscsi FFI).
+- **Red lines**: `#![deny(unsafe_code)]` on `snowscsi-common`, `snowscsi-iso9660`
+  and `snowscsi`; `snowscsi-cli` uses `#![forbid(unsafe_code)]`.
+  `snowscsi-tests` is the only crate that allows `unsafe` (libiscsi FFI).
   RFC 3720 only, no RFC 7143. `__*` files never committed.
 - **LUN model**: both transports drive any `D: ScsiDevice` via
   `poll<…, D>(devs: &mut [D])`. Homogeneous arrays use concrete types

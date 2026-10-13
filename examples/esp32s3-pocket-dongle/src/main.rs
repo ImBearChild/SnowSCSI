@@ -1,7 +1,7 @@
 //! ESP32-S3 Pocket-Dongle firmware — M4 integration.
 //!
 //! Presents the on-board SD card as one whole raw block device to a USB host,
-//! as a UDF-RW (DVD-RAM) optical device driven by `snowdrive-scsi`.
+//! as a UDF-RW (DVD-RAM) optical device driven by `snowscsi`.
 //!
 //! Boots straight into DVDRAM: the USB-OTG gadget runs the Mass Storage
 //! Bulk-Only Transport class ([`msc`]) over the internal Full-Speed PHY. The
@@ -43,7 +43,7 @@ use static_cell::StaticCell;
 
 use defmt::info;
 
-use snowdrive_scsi::scsi::device::ScsiDevice;
+use snowscsi::scsi::device::ScsiDevice;
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -95,7 +95,7 @@ async fn gadget<'d, D, S>(
     device: &mut embassy_usb::UsbDevice<'d, D>,
     ep_out: &mut D::EndpointOut,
     ep_in: &mut D::EndpointIn,
-    session: &mut snowdrive_scsi::usb::BotSession,
+    session: &mut snowscsi::usb::BotSession,
     work: &mut [u8],
     recv: &mut [u8],
     devs: &mut [S],
@@ -249,9 +249,9 @@ async fn main(spawner: Spawner) -> ! {
     // One LUN, Full-Speed bulk MPS (64) for the Data-In short-packet decision.
     // The shortfall policy is pinned explicitly to its validated behaviour so a
     // future change to the default cannot move the dongle's wire shape.
-    let mut session = snowdrive_scsi::usb::BotSession::with_luns(1)
+    let mut session = snowscsi::usb::BotSession::with_luns(1)
         .with_bulk_mps(64)
-        .with_shortfall(snowdrive_scsi::usb::ShortfallPolicy::ShortNoStall);
+        .with_shortfall(snowscsi::usb::ShortfallPolicy::ShortNoStall);
     let mut button = button::BootButton::new(peripherals.GPIO0);
 
     // ── Runtime mode toggle ──────────────────────────────────────────────
@@ -288,8 +288,8 @@ async fn main(spawner: Spawner) -> ! {
 
                 let mut handler = msc::MscHandler;
                 let mut usb_config = embassy_usb::Config::new(0x2E8A, 0x000A);
-                usb_config.manufacturer = Some("SnowDrive");
-                usb_config.product = Some("SnowDrive UDF-RW");
+                usb_config.manufacturer = Some("SnowSCSI");
+                usb_config.product = Some("SnowSCSI UDF-RW");
                 usb_config.max_packet_size_0 = 64;
                 // Plain single-function Mass Storage device: no Interface
                 // Association Descriptor (the 0xEF/02/01 default is for
@@ -313,15 +313,15 @@ async fn main(spawner: Spawner) -> ! {
 
                 let (mut ep_out, mut ep_in) = {
                     let mut func = builder.function(
-                        snowdrive_scsi::usb::MSC_CLASS,
-                        snowdrive_scsi::usb::MSC_SUBCLASS,
-                        snowdrive_scsi::usb::MSC_PROTOCOL,
+                        snowscsi::usb::MSC_CLASS,
+                        snowscsi::usb::MSC_SUBCLASS,
+                        snowscsi::usb::MSC_PROTOCOL,
                     );
                     let mut iface = func.interface();
                     let mut alt = iface.alt_setting(
-                        snowdrive_scsi::usb::MSC_CLASS,
-                        snowdrive_scsi::usb::MSC_SUBCLASS,
-                        snowdrive_scsi::usb::MSC_PROTOCOL,
+                        snowscsi::usb::MSC_CLASS,
+                        snowscsi::usb::MSC_SUBCLASS,
+                        snowscsi::usb::MSC_PROTOCOL,
                         None,
                     );
                     let ep_out = alt.endpoint_bulk_out(None, 64);

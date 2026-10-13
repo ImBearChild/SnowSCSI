@@ -54,6 +54,6 @@ embedded-io = "0.7"          # StorageError::Io(ErrorKind) for the SD seam
 embedded-hal-bus = "0.3"     # ExclusiveDevice: adapt SpiBus -> SpiDevice for mipidsi
 heapless = "0.9"             # stack string formatting for the LCD
 
-# --- SnowDrive workspace seams (unchanged; no_std) ---
-snowdrive-scsi = { path = "../../snowdrive-scsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt"] }
-snowdrive-common = { path = "../../snowdrive-common", default-features = false, features = ["defmt"] }
+# --- SnowSCSI workspace seams (unchanged; no_std) ---
+snowscsi = { path = "../../snowscsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt"] }
+snowscsi-common = { path = "../../snowscsi-common", default-features = false, features = ["defmt"] }

@@ -1,36 +1,36 @@
-# Contributing to SnowDrive
+# Contributing to SnowSCSI
 
 ## Project Structure
 
 SCSI device emulation toolkit — a **multi-crate cargo workspace** (resolver = "2").
-The old unified `snowdrive` lib+bin crate has been split into focused crates;
-the `snowdrive` binary lives in `snowdrive-cli`.
+The old unified `snowscsi` lib+bin crate has been split into focused crates;
+the `snowscsi` binary lives in `snowscsi-cli`.
 
 | Component | Crate | Description |
 |-----------|-------|-------------|
-| **Common** | `snowdrive-common` | Zero-alloc `SeekableStorage` / `FsStorage` seams + unified logging macros (always available, no feature gate) |
-| **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
-| **SCSI core** | `snowdrive-scsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, UDF volume skeleton |
-| — storage seams | `snowdrive-scsi::common` (= `snowdrive-common`) | Re-exported `SeekableStorage`/`FsStorage` + logging macros |
-| — SCSI | `snowdrive-scsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
-| — CD-ROM | `snowdrive-scsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `DvdRamMedia`), full MMC |
-| — iSCSI | `snowdrive-scsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
-| — USB MSC | `snowdrive-scsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
-| — UDF | `snowdrive-scsi::dvdram` (feature `dvdram`) | Pure UDF 2.01 volume skeleton backing `cdrom::dvdram` |
-| **CLI** | `snowdrive-cli` (`src/main.rs`) | `snowdrive serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowdrive mkisofs` generates an ISO image from a directory |
-| **Tests** | `snowdrive-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
+| **Common** | `snowscsi-common` | Zero-alloc `SeekableStorage` / `FsStorage` seams + unified logging macros (always available, no feature gate) |
+| **Disc** | `snowscsi-iso9660` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
+| **SCSI core** | `snowscsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, blank (host-formatted) DVD-RAM media |
+| — storage seams | `snowscsi::common` (= `snowscsi-common`) | Re-exported `SeekableStorage`/`FsStorage` + logging macros |
+| — SCSI | `snowscsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
+| — CD-ROM | `snowscsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `DvdRamMedia`), full MMC |
+| — iSCSI | `snowscsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
+| — USB MSC | `snowscsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
+| — DVD-RAM | `snowscsi::dvdram` (feature `dvdram`) | Blank, host-formatted random-writable DVD-RAM media (`cdrom::dvdram::DvdRamMedia`) |
+| **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory |
+| **Tests** | `snowscsi-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
 | **Tools** | `tools/` (not a workspace member) | External Python black-box tests (`ext-test/`) + USB passthrough helper |
 
 ```
-SnowDrive/                          # cargo workspace (resolver = "2")
+SnowSCSI/                          # cargo workspace (resolver = "2")
 ├── Cargo.toml                      # workspace: members listed below
-├── snowdrive-common/               # crate: storage seams + logging macros
+├── snowscsi-common/               # crate: storage seams + logging macros
 │   ├── Cargo.toml
 │   └── src/{lib.rs, seekable_storage.rs, fs_storage.rs, logging.rs}
-├── snowdrive-disc/                 # crate: ISO9660/Joliet live-generation algorithms
+├── snowscsi-iso9660/                 # crate: ISO9660/Joliet live-generation algorithms
 │   ├── Cargo.toml
 │   └── src/{lib.rs, mod.rs, live.rs}
-├── snowdrive-scsi/                 # crate: SCSI core + iSCSI + USB MSC + CD-ROM
+├── snowscsi/                 # crate: SCSI core + iSCSI + USB MSC + CD-ROM
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                 # #![deny(unsafe_code)]; re-exports common + logging macros
@@ -40,11 +40,11 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 │       │                         #            dvdram (gated by "dvdram")
 │       ├── iscsi/                 # feature "iscsi": conn, pdu, target, transport
 │       ├── usb/                   # feature "usb": bot, gadget, io, target
-│       └── dvdram.rs            # feature "dvdram": UDF 2.01 volume skeleton
-├── snowdrive-cli/                 # crate: `snowdrive` binary (src/main.rs)
+│       └── dvdram.rs            # feature "dvdram": blank, host-formatted DVD-RAM media
+├── snowscsi-cli/                 # crate: `snowscsi` binary (src/main.rs)
 │   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/log/defmt
 │   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
-├── tests/                         # crate: snowdrive-tests (integration tests)
+├── tests/                         # crate: snowscsi-tests (integration tests)
 │   ├── Cargo.toml
 │   ├── build.rs                  # probes libiscsi (cfg has_libiscsi), compiles c/iscsi_access.c
 │   ├── c/iscsi_access.c
@@ -57,46 +57,46 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 Dependency chain:
 
 ```
-snowdrive-cli (bin) ──▶ snowdrive-scsi (lib) ◀──┐
+snowscsi-cli (bin) ──▶ snowscsi (lib) ◀──┐
                           ▲                      │
-snowdrive-tests ──────────┘                      │
+snowscsi-tests ──────────┘                      │
                           │                      │
-snowdrive-scsi ──▶ snowdrive-common              │
-               └─▶ snowdrive-disc ──▶ snowdrive-common
+snowscsi ──▶ snowscsi-common              │
+               └─▶ snowscsi-iso9660 ──▶ snowscsi-common
 ```
 
 Feature maps:
 
-- **`snowdrive-common`** — `std` (default), `log`, `defmt`. No feature gate on
+- **`snowscsi-common`** — `std` (default), `log`, `defmt`. No feature gate on
   the crate itself; the seams are always compiled. `defmt` forwards to
   `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
   `std` + `defmt` is rejected at compile time (see below).
-- **`snowdrive-disc`** — `std` (default).
-- **`snowdrive-scsi`** — `std` (default), `scsi`, `dvdram`,
+- **`snowscsi-iso9660`** — `std` (default).
+- **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
   `log`, `defmt`. `defmt` forwards to `embedded-io/defmt` and
-  `snowdrive-common/defmt` (no `snowdrive-disc` propagation: that crate has
+  `snowscsi-common/defmt` (no `snowscsi-iso9660` propagation: that crate has
   no `defmt` feature). `std` + `defmt` is unsupported — `std::io::Error`
   cannot implement `defmt::Format` — and is guarded by a `compile_error!` in
-  `snowdrive-common/src/logging.rs` (the `defmt` macro branch is also
+  `snowscsi-common/src/logging.rs` (the `defmt` macro branch is also
   `no_std`-only, so the guard is the single reported error). No
   platform-specific dependencies: the Linux FunctionFS
-  USB bridge lives only in `snowdrive-cli`, which declares its own
+  USB bridge lives only in `snowscsi-cli`, which declares its own
   Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
-- **`snowdrive-cli`** — `full` (default) pulls `std` +
+- **`snowscsi-cli`** — `full` (default) pulls `std` +
   `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
-  std-only deps (clap/ctrlc/env_logger). Builds against `snowdrive-scsi` with
+  std-only deps (clap/ctrlc/env_logger). Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
   targets.
-- **`tests`** (`snowdrive-tests`) — depends on `snowdrive-scsi` with
+- **`tests`** (`snowscsi-tests`) — depends on `snowscsi` with
   `std, scsi, iscsi, cdrom, livefs, usb`; enables `has_libiscsi`
   only when the `libiscsi` system library is present (probed in `build.rs`).
 
-`snowdrive-scsi`'s `no_std` surface is feature-gated; without `std` it stays
+`snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
 
 ## Commit Messages
@@ -161,20 +161,20 @@ cargo test --workspace
 
 ### External Tool Tests
 
-Beyond the cargo suites, `tools/ext-test/` cross-validates the `snowdrive`
+Beyond the cargo suites, `tools/ext-test/` cross-validates the `snowscsi`
 binary as a **black box** with independent external tools, driven by pure
 standard-library Python (no pytest dependency):
 
-- `tools/ext-test/test_iso.py` — `snowdrive mkisofs` output is read by
+- `tools/ext-test/test_iso.py` — `snowscsi mkisofs` output is read by
   `file`, `isoinfo` (PVD **and** Joliet trees), `7z` and `bsdtar`
   (libarchive); names, sizes and file content must match the source tree.
   Tests skip when a tool is absent.
 - `tools/ext-test/test_iscsi_loopback.py` — a real kernel initiator
-  (`iscsiadm` + `iscsi_tcp`) logs into `snowdrive serve`, formats the RAM
+  (`iscsiadm` + `iscsi_tcp`) logs into `snowscsi serve`, formats the RAM
   disk with ext4, mounts it, writes/reads through the real block layer and
   fsck-checks it. Skipped unless root and the module/daemon are available.
 - `tools/ext-test/test_usb_loopback.py` — a real kernel `usb-storage`
-  initiator attaches to `snowdrive serve --usb` through a `dummy_hcd`
+  initiator attaches to `snowscsi serve --usb` through a `dummy_hcd`
   UDC (FunctionFS gadget) and exercises the same checklist
   (capacity, `dd`/`badblocks` roundtrip, ext4 format/mount/write/fsck,
   read-only backend write protection) via `/dev/sdX`. Skipped unless root,
@@ -195,7 +195,7 @@ sudo -E env PATH=$PATH python3 tools/ext-test/test_iscsi_loopback.py
 sudo -E env PATH=$PATH python3 tools/ext-test/test_usb_loopback.py
 
 # Point at a specific binary (default: target/release or target/debug)
-SNOWDRIVE_BIN=./target/debug/snowdrive python3 tools/ext-test/run.py
+SNOWSCSI_BIN=./target/debug/snowscsi python3 tools/ext-test/run.py
 ```
 
 Design notes:
@@ -223,12 +223,12 @@ package. Entry points under `target/doc/`:
 | Path | Content |
 |------|---------|
 | `index.html` | workspace overview (all crates) |
-| `snowdrive_scsi/index.html` | **main API** — SCSI core, iSCSI, USB MSC, CD-ROM |
-| `snowdrive_common/index.html` | storage seams (`FlatData`/`FsStorage`) + logging macros |
-| `snowdrive_disc/index.html` | ISO9660/Joliet live generation |
+| `snowscsi/index.html` | **main API** — SCSI core, iSCSI, USB MSC, CD-ROM |
+| `snowscsi_common/index.html` | storage seams (`FlatData`/`FsStorage`) + logging macros |
+| `snowscsi_iso9660/index.html` | ISO9660/Joliet live generation |
 
-The `snowdrive-cli` package's binary target carries `doc = false`: its
-docs would be an empty shell named `target/doc/snowdrive/` (after the
+The `snowscsi-cli` package's binary target carries `doc = false`: its
+docs would be an empty shell named `target/doc/snowscsi/` (after the
 *bin* target), which only caused confusion.
 
 ## Code Coverage
@@ -245,7 +245,7 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov --workspace
 
 # Lib-only coverage (exclude the thin bin shell)
-cargo llvm-cov --workspace --ignore-filename-regex 'snowdrive-cli/src/main.rs'
+cargo llvm-cov --workspace --ignore-filename-regex 'snowscsi-cli/src/main.rs'
 
 # HTML report (writes target/llvm-cov-html/)
 cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html
@@ -255,15 +255,15 @@ cargo llvm-cov --workspace --lcov --output-path target/coverage.lcov
 ```
 
 Baseline (Aug 2026, `cargo llvm-cov --workspace`): **TOTAL ~90% lines**, with
-`snowdrive-disc/src/live.rs` (99%), `snowdrive-scsi/src/scsi/spc.rs` (99%),
-`snowdrive-scsi/src/iscsi/pdu.rs` (97%) the strongest modules.
+`snowscsi-iso9660/src/live.rs` (99%), `snowscsi/src/scsi/spc.rs` (99%),
+`snowscsi/src/iscsi/pdu.rs` (97%) the strongest modules.
 
 Notes:
 
-- `--no-default-features` builds only the always-on `snowdrive-common` module
+- `--no-default-features` builds only the always-on `snowscsi-common` module
   (~3%); meaningful feature-matrix runs must enable `--features scsi` etc. on
-  `snowdrive-scsi`.
-- **Pre-existing gap**: `cargo test -p snowdrive-scsi --no-default-features
+  `snowscsi`.
+- **Pre-existing gap**: `cargo test -p snowscsi --no-default-features
   --features scsi` does not compile (unit tests use `Vec`/`String` without
   pulling in `std`). This predates coverage tooling and is a separate bug.
 - Coverage artifacts land under `target/` (already gitignored).
@@ -277,16 +277,16 @@ Notes:
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — rustdoc must stay
    warning-free (broken intra-doc links, links to private items, stale
    paths)
-6. `cargo clippy -p snowdrive-scsi --features 'scsi,cdrom,iscsi,usb,dvdram' --
+6. `cargo clippy -p snowscsi --features 'scsi,cdrom,iscsi,usb,dvdram' --
    -D warnings` — the feature-gated modules are not compiled by the
-   workspace-wide pass (dependencies of `snowdrive-tests` are only
+   workspace-wide pass (dependencies of `snowscsi-tests` are only
    *compiled*, never linted), so lint them explicitly
-7. `cargo build -p snowdrive-scsi --no-default-features` — the lib must stay
+7. `cargo build -p snowscsi --no-default-features` — the lib must stay
    `no_std`-clean (feature-gated std surface only)
-8. `cargo build -p snowdrive-scsi --no-default-features --features
+8. `cargo build -p snowscsi --no-default-features --features
    'scsi,cdrom,usb,dvdram,defmt'` — the `defmt` backend must stay buildable
    `no_std` (it is rejected together with `std`; see the guard in
-   `snowdrive-common/src/logging.rs`)
+   `snowscsi-common/src/logging.rs`)
 
 ## Code Formatting
 

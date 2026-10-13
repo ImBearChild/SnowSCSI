@@ -647,7 +647,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "snowdrive-cli"
+name = "snowscsi"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "embedded-io",
+ "heapless",
+ "log",
+ "snowscsi-common",
+ "snowscsi-iso9660",
+]
+
+[[package]]
+name = "snowscsi-cli"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -657,12 +669,12 @@ dependencies = [
  "env_logger",
  "heapless",
  "log",
- "snowdrive-scsi",
+ "snowscsi",
  "usb-gadget",
 ]
 
 [[package]]
-name = "snowdrive-common"
+name = "snowscsi-common"
 version = "0.1.0"
 dependencies = [
  "defmt",
@@ -673,37 +685,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "snowdrive-disc"
+name = "snowscsi-iso9660"
 version = "0.1.0"
 dependencies = [
  "embedded-io",
  "heapless",
- "snowdrive-common",
+ "snowscsi-common",
 ]
 
 [[package]]
-name = "snowdrive-scsi"
-version = "0.1.0"
-dependencies = [
- "defmt",
- "embedded-io",
- "heapless",
- "log",
- "snowdrive-common",
- "snowdrive-disc",
-]
-
-[[package]]
-name = "snowdrive-tests"
+name = "snowscsi-tests"
 version = "0.1.0"
 dependencies = [
  "cc",
  "embedded-io",
  "iso9660-no-std",
  "pkg-config",
- "snowdrive-common",
- "snowdrive-disc",
- "snowdrive-scsi",
+ "snowscsi",
+ "snowscsi-common",
+ "snowscsi-iso9660",
 ]
 
 [[package]]

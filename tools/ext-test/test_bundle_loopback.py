@@ -62,7 +62,7 @@ class BundleLoopbackTest(unittest.TestCase):
             stop_iscsid()
 
     def setUp(self):
-        self.bundle_dir = tempfile.mkdtemp(prefix="snowdrive-bundle-")
+        self.bundle_dir = tempfile.mkdtemp(prefix="snowscsi-bundle-")
         self.server = ServerHandle(
             "--block", f"imgdir={self.bundle_dir},size={SIZE},chunk={CHUNK}"
         )

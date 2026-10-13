@@ -1,0 +1,23 @@
+[package]
+name = "snowscsi-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Integration tests for SnowSCSI (mock + libiscsi whitebox)"
+# Test harness only — never published to crates.io.
+publish = false
+
+[dependencies]
+snowscsi = { workspace = true, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb", "bundle"] }
+snowscsi-iso9660 = { workspace = true, features = ["std"] }
+snowscsi-common = { workspace = true, features = ["std"] }
+embedded-io.workspace = true
+# Independent ISO9660 reader used to cross-validate the live generator's
+# output (test-only; not a dependency of the library). iso9660-no-std is
+# MIT OR Apache-2.0 with a permissive-only dependency tree (no GPL, no
+# FUSE/system requirements), and auto-selects the Joliet SVD root.
+iso9660-no-std = "0.1"
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1"

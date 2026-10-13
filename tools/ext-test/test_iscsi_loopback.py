@@ -2,7 +2,7 @@
 """Real-kernel iSCSI loopback test (root).
 
 A genuine Linux initiator (`iscsiadm`, the open-iscsi userspace driving the
-`iscsi_tcp` kernel module) logs into `snowdrive serve` over loopback, brings
+`iscsi_tcp` kernel module) logs into `snowscsi serve` over loopback, brings
 the device up as a block device, formats it with ext4, mounts it, writes and
 reads data through the real block layer, and fsck-checks it.
 

@@ -1,0 +1,23 @@
+[package]
+name = "snowscsi-iso9660"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "SnowSCSI disc: ISO9660/Joliet live-generation algorithms"
+keywords = ["iso9660", "joliet", "cdrom", "embedded", "no-std"]
+categories = ["embedded", "no-std", "filesystem"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["std"]
+std = ["embedded-io/std", "snowscsi-common/std"]
+
+[dependencies]
+embedded-io.workspace = true
+heapless.workspace = true
+snowscsi-common.workspace = true

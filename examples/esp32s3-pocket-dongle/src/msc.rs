@@ -1,6 +1,6 @@
 //! USB Mass Storage — Bulk-Only Transport (BOT) class.
 //!
-//! Drives `snowdrive_scsi::usb`'s non-blocking [`BotSession`] with the
+//! Drives `snowscsi::usb`'s non-blocking [`BotSession`] with the
 //! `embassy-usb` bulk endpoints of the ESP32-S3 USB-OTG device controller.
 //! Unlike the Linux FunctionFS driver, the OTG transport is
 //! fully async: the session state machine is fed one [`SessionEvent`] per
@@ -23,8 +23,8 @@ use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestT
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::Handler;
 
-use snowdrive_scsi::scsi::device::ScsiDevice;
-use snowdrive_scsi::usb::{
+use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::usb::{
     BotSession, BotStepResult, BotTargetError, SessionEvent, SessionNeed, SessionStep, BOT_RESET,
     GET_MAX_LUN,
 };
@@ -201,7 +201,7 @@ impl Handler for MscHandler {
 
 /// Run the BOT protocol loop forever over a bulk endpoint pair.
 ///
-/// `work` is the SCSI data region (must be ≥ [`snowdrive_scsi::MIN_DATA_LEN`]);
+/// `work` is the SCSI data region (must be ≥ [`snowscsi::MIN_DATA_LEN`]);
 /// `recv` is the bulk-OUT scratch (≥ `work.len()` and a multiple of the
 /// endpoint MPS is recommended); `devs` is the LUN slice.
 ///
@@ -224,7 +224,7 @@ where
     D: ScsiDevice,
 {
     assert!(
-        work.len() >= snowdrive_scsi::MIN_DATA_LEN,
+        work.len() >= snowscsi::MIN_DATA_LEN,
         "work buffer smaller than MIN_DATA_LEN"
     );
 

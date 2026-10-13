@@ -1,7 +1,7 @@
 //! SD card storage.
 //!
 //! Bridges `esp-hal`'s SDMMC host controller + the `sdio` crate's SD memory
-//! card protocol to `snowdrive_common`'s synchronous storage seams
+//! card protocol to `snowscsi_common`'s synchronous storage seams
 //! ([`FlatData`] + [`WritableFlatData`]).
 //!
 //! # Block geometry (512-byte SD blocks vs. 2048-byte logical sectors)
@@ -33,7 +33,7 @@ use esp_hal::time::Instant;
 use esp_hal::Async;
 use static_cell::StaticCell;
 
-use snowdrive_common::seekable_storage::{FlatData, StorageError, WritableFlatData};
+use snowscsi_common::seekable_storage::{FlatData, StorageError, WritableFlatData};
 
 /// Native SD memory-card block size in bytes.
 pub const SD_BLOCK_SIZE: usize = 512;
@@ -69,7 +69,7 @@ pub enum SdError {
 static HOST: StaticCell<SdHostController<'static>> = StaticCell::new();
 
 /// Number of SD blocks in the aligned batch. 16 × 512 B = 8 KiB, which covers
-/// the full [`snowdrive_scsi::MIN_DATA_LEN`] chunk in one SD command.
+/// the full [`snowscsi::MIN_DATA_LEN`] chunk in one SD command.
 const BATCH_BLOCKS: usize = 16;
 
 /// Batch of SD blocks for multi-block (CMD18/CMD25) transfers. 16 × 512 B

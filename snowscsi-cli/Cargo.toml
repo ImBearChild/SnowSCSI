@@ -1,0 +1,48 @@
+[package]
+name = "snowscsi-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "SnowSCSI CLI: serve + mkisofs"
+keywords = ["scsi", "iscsi", "usb", "cdrom", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "snowscsi"
+path = "src/main.rs"
+# The bin target's rustdoc output lands in target/doc/<bin-name>/ — i.e.
+# target/doc/snowscsi/ — an empty shell (the real API lives in the
+# libraries) whose name shadows nothing but confuses everyone browsing
+# target/doc/. Skip documenting it entirely.
+doc = false
+
+[features]
+default = ["full"]
+full = ["std", "scsi", "iscsi", "dvdram", "cdrom", "livefs", "usb", "bundle", "log",
+        "dep:clap", "dep:ctrlc", "dep:env_logger"]
+std = ["snowscsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
+scsi = ["snowscsi/scsi"]
+dvdram = ["snowscsi/dvdram"]
+iscsi = ["snowscsi/iscsi"]
+cdrom = ["snowscsi/cdrom"]
+livefs = ["snowscsi/livefs"]
+usb = ["snowscsi/usb"]
+bundle = ["snowscsi/bundle"]
+log = ["snowscsi/log", "dep:log"]
+defmt = ["snowscsi/defmt"]
+
+[dependencies]
+snowscsi.workspace = true
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
+env_logger = { version = "0.11", optional = true }
+log = { workspace = true, optional = true }
+embedded-io.workspace = true
+heapless.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+usb-gadget = "1.1"
+bytes = "1"

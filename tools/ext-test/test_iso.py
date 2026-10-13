@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""External-tool cross-validation of `snowdrive mkisofs`.
+"""External-tool cross-validation of `snowscsi mkisofs`.
 
 The Rust suite already cross-checks the live generator against the pure-Rust
 `iso9660-no-std` reader. These tests add independent, spec-strict readers

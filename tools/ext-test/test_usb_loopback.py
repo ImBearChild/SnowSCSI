@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-kernel USB Mass Storage (BOT) loopback test (root).
 
-Spawns `snowdrive serve --usb`, binds a FunctionFS gadget to a `dummy_hcd`
+Spawns `snowscsi serve --usb`, binds a FunctionFS gadget to a `dummy_hcd`
 UDC, and lets the kernel's own `usb-storage` host driver attach and create a
 `/dev/sdX`. Then exercises the §8.3 checklist through the real block layer:
 capacity matches the backend, a `dd`/`badblocks` full-disk roundtrip, ext4
@@ -102,7 +102,7 @@ class UsbLoopbackTest(unittest.TestCase):
         # usb-storage creates is unambiguously ours. Keep this snapshot for
         # the whole test: after a rebind the same device name may reappear.
         self.before = sd_snapshot()
-        fd, self.img = tempfile.mkstemp(prefix="snowdrive-usb-", suffix=".img")
+        fd, self.img = tempfile.mkstemp(prefix="snowscsi-usb-", suffix=".img")
         os.close(fd)
         os.truncate(self.img, IMG_SIZE)
         self.server = UsbServer(self.img)
@@ -182,7 +182,7 @@ class UsbLoopbackTest(unittest.TestCase):
 
 
 class UsbServer:
-    """Lifecycle of `snowdrive serve --usb` over a backend image.
+    """Lifecycle of `snowscsi serve --usb` over a backend image.
 
     No "listening on" line to wait for (unlike iSCSI): readiness is the
     appearance of the host-side device. Shutdown is SIGINT (graceful exit,
@@ -192,7 +192,7 @@ class UsbServer:
 
     def __init__(self, img, read_only=False):
         spec = f"img={img},ro" if read_only else f"img={img}"
-        self.log_path = tempfile.mktemp(prefix="snowdrive-usb-log-")
+        self.log_path = tempfile.mktemp(prefix="snowscsi-usb-log-")
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             [find_binary(), "serve", "--usb", "--block", spec],
@@ -219,10 +219,10 @@ class UsbServer:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
                     self.proc.wait()
-                    raise AssertionError("snowdrive did not exit after SIGINT")
+                    raise AssertionError("snowscsi did not exit after SIGINT")
             if self.proc.returncode != 0:
                 raise AssertionError(
-                    f"snowdrive exited {self.proc.returncode} (expected 0 after "
+                    f"snowscsi exited {self.proc.returncode} (expected 0 after "
                     f"SIGINT); stderr:\n{self.log_tail()}"
                 )
         finally:

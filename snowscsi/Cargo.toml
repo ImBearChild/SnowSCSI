@@ -1,0 +1,37 @@
+[package]
+name = "snowscsi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "SnowSCSI SCSI: core + iSCSI + USB MSC + CD-ROM device emulation"
+keywords = ["scsi", "iscsi", "usb", "cdrom", "no-std"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[package.metadata.docs.rs]
+# `log` and `defmt` are mutually exclusive, so no `all-features`: build every
+# transport/media feature with the `log` backend.
+features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "log"]
+
+[features]
+default = ["std"]
+std = ["embedded-io/std", "snowscsi-common/std", "snowscsi-iso9660/std"]
+scsi = []
+dvdram = []
+iscsi = ["scsi"]
+cdrom = ["scsi"]
+livefs = ["cdrom"]
+usb = ["scsi"]
+bundle = ["snowscsi-common/bundle"]
+log = ["dep:log", "snowscsi-common/log"]
+defmt = ["dep:defmt", "embedded-io/defmt", "snowscsi-common/defmt"]
+
+[dependencies]
+embedded-io.workspace = true
+heapless.workspace = true
+snowscsi-common.workspace = true
+snowscsi-iso9660.workspace = true
+log = { workspace = true, optional = true }
+defmt = { workspace = true, optional = true }
