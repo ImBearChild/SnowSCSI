@@ -16,9 +16,9 @@
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
 //! - `--cdrom` drives `CdromDrive` (full MMC): `img=<iso>`, `live=<dir>`
 //!   (live ISO9660 over a directory), or
-//!   `udfrw=<path|ram:<size>>[,size=…][,mkfs]` (random-writable DVD-RAM;
-//!   `size=` creates a new file and writes the volume structure, `mkfs`
-//!   forces a fresh UDF volume).
+//!   `udfrw=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
+//!   `size=` creates a new zeroed file — the host formats it, the device
+//!   never writes file-system structures).
 //!
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
@@ -45,7 +45,7 @@ use clap::{Args, Parser};
 use snowdrive_scsi::cdrom::drive::CdromDrive;
 use snowdrive_scsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
 #[cfg(feature = "udfrw")]
-use snowdrive_scsi::cdrom::udfrw::{OpenMode, UdfRwMedia, UdfRwOptions};
+use snowdrive_scsi::cdrom::udfrw::UdfRwMedia;
 use snowdrive_scsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowdrive_scsi::common::fs_storage::OpenOptions;
@@ -117,7 +117,7 @@ struct ServeArgs {
     block: Vec<String>,
 
     /// CD-ROM device (`CdromDrive`, full MMC): `img=<iso>`, `live=<dir>`
-    /// (live ISO9660 over a directory), or `udfrw=<path|ram:<size>>[,size=…][,mkfs]`
+    /// (live ISO9660 over a directory), or `udfrw=<path|ram:<size>>[,size=…]`
     /// (random-writable DVD-RAM). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
@@ -989,27 +989,15 @@ fn build_devices<'a>(
                 drives.push(drive);
             }
             #[cfg(feature = "udfrw")]
-            (DeviceRole::MmcCd, Backing::UdfRw { path }) => {
+            (DeviceRole::MmcCd, Backing::UdfRw { path: _ }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowdrive: internal: backend pool exhausted"))?;
-                let label = path
-                    .as_deref()
-                    .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
-                    .unwrap_or("SNOWDRIVE")
-                    .to_string();
-                let mut scratch = [0u8; 256];
-                let opts = UdfRwOptions {
-                    mode: if spec.plane.mkfs {
-                        OpenMode::Materialize
-                    } else {
-                        OpenMode::AsIs
-                    },
-                    scratch: &mut scratch,
-                };
-                let media = UdfRwMedia::open_or_materialize(RwRef::new(be), &label, opts)
-                    .map_err(|e| eprintln!("snowdrive: udfrw: {e}"))?;
-                log::debug!("LUN {lun}: UdfRw DVD+RW ({} bytes)", media.capacity());
+                // A blank, random-writable DVD-RAM over the byte plane. The
+                // host formats it (FORMAT UNIT + its own UDF mkfs); the device
+                // never writes file-system structures.
+                let media = UdfRwMedia::open(RwRef::new(be));
+                log::debug!("LUN {lun}: UdfRw DVD-RAM ({} bytes)", media.capacity());
                 let mut drive = CdromDrive::builder()
                     .capabilities(snowdrive_scsi::cdrom::HYPER_MULTI_CAPS)
                     .build();

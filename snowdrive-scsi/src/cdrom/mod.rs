@@ -65,4 +65,4 @@ pub use drive::CdromDrive;
 pub use media::{CdLiveFsError, CdMedia, FlatMedia, LiveData, LiveDataBuilder, MediaError, Tray};
 pub use snowdrive_common::seekable_storage::FlatData;
 #[cfg(feature = "udfrw")]
-pub use udfrw::{UdfRwError, UdfRwMedia};
+pub use udfrw::UdfRwMedia;

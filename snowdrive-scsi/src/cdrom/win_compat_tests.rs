@@ -33,12 +33,11 @@ fn hex(b: &[u8]) -> String {
 #[test]
 fn rfc_formattable_descriptor_tdp_is_block_length() {
     let mut img = vec![0u8; 2048 * 204800];
-    let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "udfrw")]
     {
-        let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+        let media = UdfRwMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "udfrw"))]
@@ -70,12 +69,11 @@ fn rfc_formattable_descriptor_tdp_is_block_length() {
 #[test]
 fn win_single_cmds_diag() {
     let mut img = vec![0u8; 2048 * 204800];
-    let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "udfrw")]
     {
-        let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+        let media = UdfRwMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "udfrw"))]
@@ -158,12 +156,11 @@ fn win_single_cmds_diag() {
 #[test]
 fn win_rejected_probe_does_not_poison_next_command() {
     let mut img = vec![0u8; 2048 * 204800];
-    let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "udfrw")]
     {
-        let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+        let media = UdfRwMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "udfrw"))]
@@ -223,12 +220,11 @@ fn win_ua_still_reports_once() {
     use crate::scsi::scsi::{asc, Sense, SenseKey};
 
     let mut img = vec![0u8; 2048 * 204800];
-    let mut scratch = [0u8; 256];
     let mut dev = CdromDrive::new();
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "udfrw")]
     {
-        let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+        let media = UdfRwMedia::open(RwRef::new(&mut bb));
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "udfrw"))]
@@ -374,12 +370,11 @@ mod enumeration_sequence {
     fn windows_enumeration_and_format_flow() {
         use crate::cdrom::media::CdMedia;
         let mut img = vec![0u8; 2048 * 204800];
-        let mut scratch = [0u8; 256];
         let mut dev = CdromDrive::new();
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
         #[cfg(feature = "udfrw")]
         {
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
         }
         #[cfg(not(feature = "udfrw"))]
@@ -454,7 +449,12 @@ mod enumeration_sequence {
         // Media query set.
         run!(true, 10, [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[]);
         let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
-        assert_eq!(disc[2] & 0x03, 2, "disc status complete");
+        assert_eq!(
+            disc[2] & 0x03,
+            2,
+            "disc status 10b Finalized (always formatted)"
+        );
+        assert_eq!(disc[2] & 0x0C, 0x0C, "state of last session 11b Complete");
         assert_ne!(disc[2] & 0x10, 0, "erasable");
         let cap = run!(true, 20, [0x23u8, 0, 0, 0, 0, 0, 0, 0, 0x14, 0], &[]);
         assert_eq!(&cap[17..20], &[0x00, 0x08, 0x00], "formattable TDP");
@@ -496,7 +496,7 @@ mod enumeration_sequence {
         assert_eq!(gesn[4], 0x00); // Event Code 0 = NoChg
         assert_eq!(gesn[5], 0x02); // media present
         let disc = run!(true, 36, [0x51u8, 0, 0, 0, 0, 0, 0, 0, 0x24, 0], &[]);
-        assert_eq!(disc[2] & 0x03, 0, "formatted → empty until host writes FS");
+        assert_eq!(disc[2] & 0x03, 2, "medium stays always-formatted (10b)");
 
         // Eject while PREVENT is held: the user intent overrides the lock —
         // tray opens, GOOD, and the medium parks (NOT READY 3Ah/02h after).

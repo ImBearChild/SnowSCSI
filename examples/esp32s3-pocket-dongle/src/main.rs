@@ -225,21 +225,10 @@ async fn main(spawner: Spawner) -> ! {
         }
     };
 
-    // M2: build the DVD-RAM drive over the SD card (non-destructive:
-    // `OpenMode::AsIs`). The drive borrows the card for the rest of `main`.
-    let mut scratch = [0u8; 256];
-    let mut drive = match drive::build(&mut card, "SNOWDRIVE", &mut scratch) {
-        Ok(drive) => drive,
-        Err(e) => {
-            info!("M4: drive build failed: {}", e);
-            if let Some(display) = display.as_mut() {
-                display.show(usb_mode::Mode::Udfrw, sd_bytes, false, uptime_s(boot), None);
-            }
-            loop {
-                Timer::after(Duration::from_secs(1)).await;
-            }
-        }
-    };
+    // Build the DVD-RAM drive over the SD card (non-destructive — the existing
+    // card content is used as-is). The drive borrows the card for the rest of
+    // `main`.
+    let mut drive = drive::build(&mut card);
 
     // ── Persistent per-program state ─────────────────────────────────────
     //

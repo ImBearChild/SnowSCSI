@@ -9,7 +9,7 @@
 //! backing := img=<file> | imgdir=<dir> | ram=<size> | live=<dir>
 //!          | udfrw=<path|ram:<size>>
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
-//!          | size=<size> | mkfs[=true|false]
+//!          | size=<size>
 //! ```
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
@@ -73,8 +73,6 @@ pub struct PlaneOpts {
     /// Virtual size for a new `imgdir=` bundle, or the size of a new
     /// `udfrw=` file.
     pub size: Option<u64>,
-    /// Force a fresh UDF volume (`--cdrom udfrw=`).
-    pub mkfs: bool,
 }
 
 /// One parsed device, ready to be built.
@@ -135,12 +133,6 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
     check_opts(family, profile, &backing, &opts)?;
 
     let size = opts.size.or(implicit_size);
-    if matches!(&backing, Backing::UdfRw { path: Some(_) })
-        && size.is_some()
-        && opts.mkfs == Some(true)
-    {
-        return Err("size= (new file) and mkfs (existing file) are exclusive".to_string());
-    }
 
     let read_only = matches!(role, DeviceRole::BlockCd | DeviceRole::MmcCd) || opts.read_only;
     Ok(DeviceSpec {
@@ -152,7 +144,6 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
             sector: opts.sector.unwrap_or(512),
             chunk: opts.chunk,
             size,
-            mkfs: opts.mkfs.unwrap_or(false),
         },
     })
 }
@@ -279,9 +270,6 @@ fn check_opts(
             "size= is only valid for --block imgdir=<dir> or --cdrom udfrw=<path>".to_string(),
         );
     }
-    if opts.mkfs.is_some() && !(family == DeviceFamily::Cdrom && is_udfrw_file) {
-        return Err("mkfs is only valid for --cdrom udfrw=<path>".to_string());
-    }
     Ok(())
 }
 
@@ -293,7 +281,6 @@ struct RawOpts {
     sector: Option<u32>,
     chunk: Option<u64>,
     size: Option<u64>,
-    mkfs: Option<bool>,
 }
 
 fn parse_opts(s: &str) -> Result<RawOpts, String> {
@@ -332,20 +319,6 @@ fn parse_opts(s: &str) -> Result<RawOpts, String> {
                 return Err("duplicate size=".to_string());
             }
             o.size = Some(parse_size(v).ok_or_else(|| format!("invalid size '{v}'"))?);
-        } else if opt == "mkfs" {
-            if o.mkfs.is_some() {
-                return Err("duplicate mkfs".to_string());
-            }
-            o.mkfs = Some(true);
-        } else if let Some(v) = opt.strip_prefix("mkfs=") {
-            if o.mkfs.is_some() {
-                return Err("duplicate mkfs".to_string());
-            }
-            o.mkfs = Some(match v {
-                "true" => true,
-                "false" => false,
-                _ => return Err(format!("invalid mkfs value '{v}' (true or false)")),
-            });
         } else {
             return Err(format!("unknown option '{opt}'"));
         }
@@ -564,18 +537,16 @@ mod tests {
 
     #[test]
     fn cdrom_udfrw_file_and_ram() {
-        let file = cdrom("udfrw=disc.img,mkfs=true").unwrap();
+        let file = cdrom("udfrw=disc.img").unwrap();
         assert_eq!(
             file.backing,
             Backing::UdfRw {
                 path: Some("disc.img".to_string())
             }
         );
-        assert!(file.plane.mkfs);
 
         let new = cdrom("udfrw=disc.img,size=4G").unwrap();
         assert_eq!(new.plane.size, Some(4 << 30));
-        assert!(!new.plane.mkfs);
 
         let ram = cdrom("udfrw=ram:16M").unwrap();
         assert_eq!(ram.backing, Backing::UdfRw { path: None });
@@ -589,18 +560,11 @@ mod tests {
         assert!(cdrom("img=boot.iso,profile=block").is_err());
         assert!(cdrom("img=boot.iso,sector=512").is_err());
         assert!(cdrom("img=boot.iso,chunk=1M").is_err());
-        assert!(cdrom("img=boot.iso,mkfs").is_err());
     }
 
     #[test]
     fn udfrw_ram_takes_no_options() {
-        assert!(cdrom("udfrw=ram:16M,mkfs").is_err());
         assert!(cdrom("udfrw=ram:16M,size=8M").is_err());
-    }
-
-    #[test]
-    fn udfrw_size_and_mkfs_exclusive() {
-        assert!(cdrom("udfrw=disc.img,size=1M,mkfs=true").is_err());
     }
 
     #[test]
@@ -619,15 +583,7 @@ mod tests {
         assert!(block("imgdir=d,size=1M,size=2M").is_err());
         assert!(block("imgdir=d,chunk=1M,chunk=2M").is_err());
         assert!(block("img=x,profile=block,profile=cd").is_err());
-        assert!(cdrom("udfrw=x,mkfs,mkfs=true").is_err());
-    }
-
-    #[test]
-    fn mkfs_forms() {
-        assert!(cdrom("udfrw=x,mkfs").unwrap().plane.mkfs);
-        assert!(cdrom("udfrw=x,mkfs=true").unwrap().plane.mkfs);
-        assert!(!cdrom("udfrw=x,mkfs=false").unwrap().plane.mkfs);
-        assert!(cdrom("udfrw=x,mkfs=yes").is_err());
+        assert!(cdrom("udfrw=x,size=1M,size=2M").is_err());
     }
 
     #[test]

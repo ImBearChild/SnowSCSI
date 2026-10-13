@@ -14,8 +14,6 @@ use crate::cdrom::common::{
     CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::cdrom::media::{CdMedia, MediaError, Tray};
-#[cfg(feature = "udfrw")]
-use crate::cdrom::udfrw::UdfRwMedia;
 use crate::scsi::device::{
     CommandOutcome, DeviceType, PendingXfer, XferDir, XferError, XferOutcome,
 };
@@ -102,8 +100,7 @@ impl<'a> CdromDrive<'a> {
     /// let mut iso = FlatMedia::new(FlatRef::new(img_file));
     /// let mut disc_b = CdMedia::Ro(iso);
     /// // DVD-RAM over a writable plane (feature `udfrw`):
-    /// // let mut udf = UdfRwMedia::open_or_materialize(
-    /// //     RwRef::new(&mut sd_card), "LABEL", opts)?;
+    /// // let mut udf = UdfRwMedia::open(RwRef::new(&mut sd_card));
     /// // let mut disc_c = CdMedia::Rw(udf);
     /// # Ok(())
     /// # }
@@ -1042,24 +1039,20 @@ impl<'a> CdromDrive<'a> {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
         let alloc = (u16::from(cdb[7]) << 8) | u16::from(cdb[8]);
-        // For DVD-RAM, reflect actual UDF presence: blank (no AVDP) -> empty,
-        // otherwise complete. This makes Windows not prompt “needs format” when
-        // a valid mkudffs image is already present, and makes post-WRITE
-        // verification see a change after the host creates a new filesystem.
-        let has_udf = match self.loaded_mut() {
-            #[cfg(feature = "udfrw")]
-            Some(CdMedia::Rw(ref mut m)) => UdfRwMedia::has_udf(m.backend()),
-            _ => false,
-        };
-        let (disc_status, state_of_last_session, erasable) = if self.is_random_writable() {
-            if has_udf {
-                (2, 3, true) // complete, erasable — has valid UDF
-            } else {
-                (0, 0, true) // empty, erasable — blank formatted
-            }
-        } else {
-            (2, 3, false)
-        };
+        // The emulated medium always has addressable logical blocks — it is
+        // always *formatted* — so it is never blank (MMC-6 Table 498: "Blank
+        // has no meaning" for DVD-RAM). A formatted *rewritable* reports Disc
+        // Status 10b "Finalized" with a Complete last session (Table 372, the
+        // BD-RE analogue; a DVD-RAM is the rewritable class). Disc status is
+        // about the *medium* format, not the file system the host may or may
+        // not have written (FORMAT UNIT != creating a file system).
+        //
+        // NB: 11b "Others" is the value for *write-once* random media (BD-R
+        // RRM, Table 375); real hosts (Linux udisks) refuse to auto-mount a
+        // data disc that reports it.
+        let disc_status = 2; // 10b Finalized
+        let state_of_last_session = 3; // 11b Complete
+        let erasable = self.is_random_writable();
         let info = DiscInfo {
             disc_status,
             state_of_last_session,
@@ -1875,17 +1868,11 @@ mod tests {
     #[test]
     fn drive_get_performance_nominal_descriptor() {
         let mut img = vec![0u8; 2048 * 204800];
-        let mut scratch = [0u8; 256];
         let mut dev = CdromDrive::new();
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
         #[cfg(feature = "udfrw")]
         {
-            let media = crate::cdrom::udfrw::UdfRwMedia::materialize(
-                RwRef::new(&mut bb),
-                "TEST",
-                &mut scratch,
-            )
-            .unwrap();
+            let media = crate::cdrom::udfrw::UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
         }
         #[cfg(not(feature = "udfrw"))]
@@ -2245,8 +2232,7 @@ mod tests {
             data: vec![0u8; 4096 * 2048],
             syncs: std::rc::Rc::clone(&syncs),
         };
-        let mut scratch = [0u8; 256];
-        let media = UdfRwMedia::materialize(RwRef::new(&mut be), "TEST", &mut scratch).unwrap();
+        let media = UdfRwMedia::open(RwRef::new(&mut be));
 
         let mut dev = CdromDrive::new();
         let swapped_out = dev.load(CdMedia::Rw(media));
@@ -2312,9 +2298,8 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2350,9 +2335,8 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2389,10 +2373,9 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Write pattern via xfer_in path
             let mut w = work();
@@ -2453,10 +2436,9 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Write some data via xfer_in
             {
@@ -2525,10 +2507,9 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Leave a pattern at LBA 1 so we can observe the clear.
             {
@@ -2584,10 +2565,9 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             let mut w = work();
             for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
@@ -2633,10 +2613,9 @@ mod tests {
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
             // Immediately after load, TUR is GOOD (no format needed)
             let mut w = work();
@@ -2687,19 +2666,18 @@ mod tests {
         }
     }
 
-    /// Verify READ DISC INFORMATION (51h) reflects actual UDF state:
-    /// materialized UDF → complete, after FORMAT UNIT → empty, after
-    /// WRITE_10 recreating AVDP → complete again. This is the core
-    /// invariant that makes Windows accept the disc and not report
-    /// "format failed".
+    /// READ DISC INFORMATION (51h) reports the emulated medium as always
+    /// formatted: Disc Status 11b ("Others") with a Complete last session —
+    /// MMC-6 says "Blank has no meaning" for DVD-RAM (Table 498), and FORMAT
+    /// UNIT (a device operation) is independent of the host creating a file
+    /// system.
     #[test]
     #[allow(unused_mut, unused_variables)]
-    fn disc_info_reflects_udf_state_transitions() {
+    fn disc_info_reports_always_formatted() {
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "udfrw")]
         {
             use crate::cdrom::udfrw::UdfRwMedia;
-            let img_len = img.len(); // capture before mutable borrow
 
             fn disc_status(dev: &mut CdromDrive<'_>) -> u8 {
                 let mut w = [0u8; crate::MIN_DATA_LEN];
@@ -2713,16 +2691,16 @@ mod tests {
                 buf[2] & 0x03
             }
 
-            let mut scratch = [0u8; 256];
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = UdfRwMedia::materialize(RwRef::new(&mut bb), "TEST", &mut scratch).unwrap();
+            let media = UdfRwMedia::open(RwRef::new(&mut bb));
             dev.load_quiet(CdMedia::Rw(media));
 
-            // 1) Materialized UDF → disc_status 2 (complete)
-            assert_eq!(disc_status(&mut dev), 2, "with UDF: complete");
+            // Always formatted — 10b "Finalized" (MMC-6 Table 372).
+            assert_eq!(disc_status(&mut dev), 2, "always formatted");
 
-            // 2) FORMAT UNIT clears blocks → disc_status 0 (empty)
+            // FORMAT UNIT clears logical blocks but does not change the disc
+            // status: it is a device operation, not a file-system creation.
             let mut cdbf = [0u8; 6];
             cdbf[0] = op::FORMAT_UNIT;
             cdbf[1] = 0x11;
@@ -2740,40 +2718,11 @@ mod tests {
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;
             let _ = dev.do_cmd(&cdb_rs, &mut w).unwrap();
-            assert_eq!(disc_status(&mut dev), 0, "after FORMAT UNIT: empty");
-
-            // 3) Write AVDP at LBA 256 directly via xfer_in
-            let avdp = {
-                use crate::udfrw;
-                let mut sector = [0u8; 2048];
-                let layout = udfrw::compute_layout((img_len / 2048) as u32, "TEST").unwrap();
-                udfrw::gen_sector(&layout, udfrw::AVDP_LBA, &mut sector);
-                sector
-            };
-            // Use WRITE_10 to write AVDP
-            let mut w = work();
-            let mut cdb = [0u8; 10];
-            cdb[0] = op::WRITE_10;
-            cdb[2] = 0;
-            cdb[3] = 0;
-            cdb[4] = 1;
-            cdb[5] = 0; // LBA 256 = 0x00000100
-            cdb[3] = 1; // actually 256 = 0x00000100 => bytes: cdb[2]=0, cdb[3]=0, cdb[4]=1, cdb[5]=0
-            cdb[8] = 1;
-            // Correct LBA encoding: cdb[2..6] = 0x00000100
-            cdb[2] = 0;
-            cdb[3] = 0;
-            cdb[4] = 1;
-            cdb[5] = 0;
-            w[..2048].copy_from_slice(&avdp);
-            let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-            match outcome {
-                CommandOutcome::InXfer { .. } => {
-                    assert_eq!(dev.xfer_in(0, &avdp), XferOutcome::Ok);
-                }
-                _ => panic!("expected InXfer"),
-            }
-            assert_eq!(disc_status(&mut dev), 2, "after write AVDP: complete");
+            assert_eq!(
+                disc_status(&mut dev),
+                2,
+                "still formatted after FORMAT UNIT"
+            );
         }
     }
 }
