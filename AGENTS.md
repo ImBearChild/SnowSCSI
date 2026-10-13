@@ -27,7 +27,7 @@ tracked by git.
 | `__REF_MMC6.pdf.md` | T10/INCITS 522 (MMC-6) | SCSI Multi-Media Commands - 6: READ TOC, GET CONFIGURATION, CD-R/RW commands | http://www.13thmonkey.org/documentation/SCSI/mmc6r02g.pdf |
 | `__REF_ELTORITO.pdf.md` | El Torito | Bootable CD-ROM BIOS specification | http://www.13thmonkey.org/documentation/SCSI/el-torito.pdf |
 | `__REF_USB_MSC_Overview_v1.4.pdf.md` | USB MSC Overview 1.4 | USB Mass Storage Class overview (all transports, command sets) | https://www.usb.org/sites/default/files/Mass_Storage_Specification_Overview_v1.4_2-19-2010.pdf |
-| `__REF_USB_MSC_BulkOnly_v1.0.pdf.md` | USB MSC Bulk-Only 1.0 | Bulk-Only Transport (BBB) — primary MSC transport | https://www.usb.org/sites/default/files/usbmassbulk_10.pdf |
+| `__REF_USB_MSC_BulkOnly_v1.0.md` | USB MSC Bulk-Only 1.0 | Bulk-Only Transport (BBB) — primary MSC transport | https://www.usb.org/sites/default/files/usbmassbulk_10.pdf |
 | `__REF_USB_MSC_CBI_v1.1.pdf.md` | USB MSC CBI 1.1 | Control/Bulk/Interrupt Transport (legacy, floppy only) | https://www.usb.org/sites/default/files/usb_msc_cbi_1.1.pdf |
 | `__REF_USB_MSC_UFI_v1.0.pdf.md` | USB MSC UFI 1.0 | USB Floppy Interface command set (based on SCSI-2) | https://www.usb.org/sites/default/files/usbmass-ufi10.pdf |
 | `__REF_USB_MSC_Bootability_v1.0.pdf.md` | USB MSC Bootability 1.0 | Bootable USB mass storage device specification | https://www.usb.org/sites/default/files/usb_msc_boot_1.0.pdf |
