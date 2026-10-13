@@ -6,15 +6,20 @@ SCSI device emulation toolkit — Rust workspace (cargo).
 
 SnowDrive emulates SCSI storage devices (block devices, CD/DVD-ROM, writable
 DVD-RAM) and exposes them to a host machine over iSCSI (TCP) or USB Mass
-Storage (Bulk-Only Transport, FunctionFS gadget on Linux).
+Storage (Bulk-Only Transport).
+
+The device and transport layers are platform-agnostic, so the same core backs a
+Linux FunctionFS gadget, an iSCSI target, and bare-metal firmware. See
+[`examples/esp32s3-pocket-dongle`](examples/esp32s3-pocket-dongle) — an
+ESP32-S3 that presents its SD card as a UDF-RW USB optical drive. The library
+crates are `no_std` and zero-alloc (no heap, no async runtime).
 
 | Component | Crate | Description |
 |-----------|-------|-------------|
-| **Common** | `snowdrive-common` | Zero-alloc `SeekableStorage` / `FsStorage` seams + unified logging macros |
+| **Common** | `snowdrive-common` | Zero-alloc storage seams (`FlatData` / `WritableFlatData` / `SeekableStorage`, `FsStorage`) + unified logging macros |
 | **Disc** | `snowdrive-disc` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
-| **SCSI core** | `snowdrive-scsi` | SCSI emulation, block/CD-ROM devices, iSCSI target, USB MSC (BOT) core, UDF skeleton |
+| **SCSI core** | `snowdrive-scsi` | SCSI emulation (SBC/SPC/MMC), block/CD-ROM devices, iSCSI target, platform-agnostic USB MSC (BOT) core, empty UDF 2.01 volume ("void" disc) generation |
 | **CLI** | `snowdrive-cli` | `snowdrive serve` runs the iSCSI target or the USB MSC gadget; `snowdrive mkisofs` generates an ISO image from a directory |
-| **Tests** | `snowdrive-tests` | Mock + libiscsi whitebox + ISO cross-validation integration tests |
 
 ## Build
 
@@ -62,6 +67,19 @@ sudo snowdrive serve --usb --cdrom img=out.iso
 required. `--vid` / `--pid` / `--serial` (defaults `0x1209:0x0001` /
 "SNOWSCSI") override the gadget identity.
 
+### Embedded firmware (ESP32-S3)
+
+[`examples/esp32s3-pocket-dongle`](examples/esp32s3-pocket-dongle) runs the SCSI
+core on bare metal: an ESP32-S3 turns its on-board SD card into a **UDF-RW USB
+optical drive** over USB-OTG (Full Speed), with a small SPI status LCD and a
+BOOT-toggled USB-Serial-JTAG debug console. It is a detached crate (not a
+workspace member) built with the `esp` (Xtensa) toolchain:
+
+```bash
+cd examples/esp32s3-pocket-dongle
+cargo +esp build --release   # .cargo/config.toml wires espflash as the runner
+```
+
 ### ISO image generation
 
 ```bash
@@ -80,14 +98,13 @@ login/logout itself.)
 
 ## Project Status
 
-- [x] `snowdrive-scsi` lib: SCSI core + block/CD-ROM devices (SBC/SPC/MMC) + iSCSI target + USB MSC (BOT) core + UDF volume skeleton
+- [x] `snowdrive-scsi` lib: SCSI core + block/CD-ROM devices (SBC/SPC/MMC) + iSCSI target + platform-agnostic USB MSC (BOT) core + empty UDF 2.01 volume generation
 - [x] `snowdrive-cli serve`: `--block` / `--cdrom` device planes + multi-LUN + graceful shutdown
-- [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
+- [x] iSCSI transport (TCP), including `--iscsi auto` open-iscsi loopback
+- [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget on Linux): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
-- [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udfrw`): random-writable UDF-backed medium
-- [ ] Phase 3: Writable optical drive (CD-R) + disc bundle export
-- [ ] Phase 4: Rewritable optical drive (CD-RW)
-- [ ] Phase 5: Advanced features (audio tracks, multi-session, READ CD)
+- [x] Writable DVD-RAM (`--cdrom udfrw=`, feature `udfrw`): random-writable, materialized as an empty UDF 2.01 volume
+- [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`): an ESP32-S3 exposes an SD card as a UDF-RW USB optical drive (`no_std` + embassy)
 
 ## Project Structure
 
@@ -98,9 +115,10 @@ SnowDrive/                          # cargo workspace (resolver = "2")
 ├── snowdrive-disc/                 # ISO9660/Joliet live-generation algorithms
 ├── snowdrive-scsi/                 # SCSI core + iSCSI + USB MSC + CD-ROM + UDF
 │   └── src/{scsi, cdrom, iscsi, usb, udfrw.rs}
-├── snowdrive-cli/                  # `snowdrive` binary (src/main.rs)
-├── tests/                          # snowdrive-tests (integration tests)
-├── tools/                          # NOT a cargo member: ext-test/ + libvirt-usb-helper
+├── snowdrive-cli/                  # `snowdrive` binary (serve + mkisofs)
+├── tests/                          # snowdrive-tests: non-published test harness (integration + whitebox)
+├── tools/                          # NOT a cargo member: ext-test/, libvirt-usb-helper, usbms-pcap.py
+├── examples/esp32s3-pocket-dongle/ # ESP32-S3 firmware: SD card as a UDF-RW USB drive (detached crate)
 ├── LICENSE-APACHE                  # Apache-2.0
 └── LICENSE-MIT                    # MIT
 ```
@@ -123,8 +141,9 @@ snowdrive-scsi = { version = "0.1", default-features = false, features = ["usb"]
 # Live ISO9660 directory backend (CD-ROM)
 snowdrive-scsi = { version = "0.1", default-features = false, features = ["std", "cdrom", "livefs"] }
 
-# Full feature set (note: `snowdrive-scsi` default is just `std`; opt in explicitly)
-snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "iso9660", "udfrw", "cdrom", "livefs", "usb"] }
+# Full feature set (note: `snowdrive-scsi` default is just `std`; opt in explicitly;
+# `log` / `defmt` select the logging backend instead)
+snowdrive-scsi = { version = "0.1", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "udfrw", "bundle"] }
 ```
 
 ## Legacy C Code
