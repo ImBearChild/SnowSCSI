@@ -28,5 +28,8 @@ pub mod golden_usb;
 #[cfg(test)]
 pub mod golden_iscsi;
 
+#[cfg(test)]
+mod store_plane;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;

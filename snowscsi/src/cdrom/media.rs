@@ -206,6 +206,9 @@ impl From<StorageError> for MediaError {
             StorageError::OutOfBounds => Self::OutOfBounds,
             StorageError::NotWritable => Self::WriteProtected,
             StorageError::Io(kind) => Self::Io(kind),
+            // Op/plane model mismatch → INVALID FIELD IN CDB (24h/00h), the
+            // same sense `sense_for_storage_error` assigns to `Unsupported`.
+            StorageError::Unsupported => Self::IllegalField,
         }
     }
 }

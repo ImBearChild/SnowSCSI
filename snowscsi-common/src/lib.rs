@@ -6,6 +6,8 @@
 #![deny(unsafe_code)]
 
 pub mod flat_bundle;
+pub mod fs_plane;
 pub mod fs_storage;
 pub mod logging;
 pub mod seekable_storage;
+pub mod store;

@@ -22,6 +22,11 @@ pub enum StorageError {
     NotWritable,
     /// Underlying I/O failed (file backend).
     Io(IoErrorKind),
+    /// The requested operation is not part of the addressed store plane's
+    /// model (e.g. a filesystem `FileRead` against a block plane, or a block
+    /// `Read` against a filesystem plane). Distinct from [`Self::NotWritable`],
+    /// which is a *policy* rejection of a write the plane could otherwise model.
+    Unsupported,
 }
 
 impl core::fmt::Display for StorageError {
@@ -30,6 +35,7 @@ impl core::fmt::Display for StorageError {
             Self::OutOfBounds => write!(f, "backend access out of bounds"),
             Self::NotWritable => write!(f, "backend is read-only"),
             Self::Io(kind) => write!(f, "backend I/O error: {kind:?}"),
+            Self::Unsupported => write!(f, "operation not supported by this store plane"),
         }
     }
 }
