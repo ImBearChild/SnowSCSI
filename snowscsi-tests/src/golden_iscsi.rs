@@ -1,7 +1,8 @@
 //! Golden wire-level scenarios for iSCSI — `__ASYNC_SEP_PLAN.md` §5.1.
 //!
 //! Each `#[test]` feeds a byte script into [`crate::golden::RecConn`], runs the
-//! existing `serve_conn` driver, renders the recorded trace and calls
+//! library's [`serve_conn`] shell loop (which drives `IscsiSession::poll` over
+//! the `Action`/`Event` protocol), renders the recorded trace and calls
 //! [`crate::golden::bless_or_check`] plus [`crate::golden::assert_well_formed`].
 //!
 //! The five scenarios (A–E, §5.1) are deterministic: a pinned `# config:`
@@ -17,7 +18,8 @@
 
 use snowscsi::common::store::StorePlane;
 use snowscsi::iscsi::pdu::{flag, op, stage, status, BHS_SIZE};
-use snowscsi::iscsi::target::{serve_conn, IscsiSession};
+use snowscsi::iscsi::target::IscsiSession;
+use snowscsi::iscsi::transport::serve_conn;
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::scsi::block::BlockDevice;
 use snowscsi::scsi::device::ScsiDevice;

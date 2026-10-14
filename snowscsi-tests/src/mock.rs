@@ -1,14 +1,17 @@
 //! Step-level iSCSI target integration tests (port of test_iscsi_mock.cpp
 //! semantics). Deterministic, single thread: `MockConn` scripted byte stream
-//! + `Session::step`.
+//! driven through the `poll`/`Action`/`Event` core by a test-local
+//! single-transaction loop (the old `IscsiSession::step` is gone).
 
 #[cfg(test)]
 mod tests {
     use crate::mock_conn::MockConn;
+    use embedded_io::Read as _;
     use snowscsi::common::seekable_storage::RamBackend;
     use snowscsi::common::store::{StoreOp, StorePlane};
+    use snowscsi::iscsi::conn::write_all;
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
-    use snowscsi::iscsi::target::{IscsiSession, LoginStage, StepResult};
+    use snowscsi::iscsi::target::{Action, Event, IscsiSession, LoginStage, TargetError};
     use snowscsi::scsi::block::BlockDevice;
     use snowscsi::scsi::device::{ScsiDevice, Xfer};
     use snowscsi::scsi::Luns;
@@ -16,6 +19,88 @@ mod tests {
 
     /// iSCSI target scratch buffer: BHS header + data area.
     const WORK_LEN: usize = MIN_DATA_LEN + BHS_SIZE;
+
+    /// Outcome of one [`RunOnce::run_once`] transaction, mirroring the old
+    /// `StepResult` semantics.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Outcome {
+        /// A PDU was consumed but nothing was sent (out-of-window CmdSN).
+        Idle,
+        /// A transaction completed and response(s) were sent.
+        Processed,
+        /// The connection should be closed (Logout / peer closed / reject).
+        Closed,
+        /// Internal error (caller bug), e.g. work buffer too small.
+        Error(TargetError),
+    }
+
+    /// Test-local single-transaction driver over the `poll`/`Action`/`Event`
+    /// core (replaces the deleted `IscsiSession::step`).
+    ///
+    /// `MockConn` reports an empty `rx` as a 0-byte read; at a fresh PDU
+    /// boundary that means "no more scripted input" and is reported as
+    /// [`Outcome::Idle`] (or [`Outcome::Processed`] if this call already sent a
+    /// response), matching the old `step` loop's `Idle`/`Processed` split.
+    trait RunOnce {
+        fn run_once<D: ScsiDevice>(
+            &mut self,
+            conn: &mut MockConn,
+            work: &mut [u8],
+            devs: &mut [D],
+            planes: &mut [Option<StorePlane<'_>>],
+        ) -> Outcome;
+    }
+
+    impl RunOnce for IscsiSession {
+        fn run_once<D: ScsiDevice>(
+            &mut self,
+            conn: &mut MockConn,
+            work: &mut [u8],
+            devs: &mut [D],
+            planes: &mut [Option<StorePlane<'_>>],
+        ) -> Outcome {
+            let mut ev = Event::Tick;
+            let mut wrote = false;
+            loop {
+                match self.poll(ev, work, devs) {
+                    Action::HostRecv { len } => {
+                        let mut got = 0usize;
+                        while got < len {
+                            match conn.read(&mut work[got..len]) {
+                                Ok(0) if got == 0 => {
+                                    return if wrote {
+                                        Outcome::Processed
+                                    } else {
+                                        Outcome::Idle
+                                    };
+                                }
+                                Ok(0) => return Outcome::Closed,
+                                Ok(n) => got += n,
+                                Err(_) => return Outcome::Closed,
+                            }
+                        }
+                        ev = Event::HostRecv { len };
+                    }
+                    Action::HostSend { bytes, .. } => {
+                        if write_all(conn, bytes).is_err() {
+                            return Outcome::Closed;
+                        }
+                        wrote = true;
+                        ev = Event::HostSent;
+                    }
+                    Action::Store { lun, op } => {
+                        let result = match planes.get_mut(lun).and_then(|p| p.as_mut()) {
+                            Some(plane) => plane.do_op(op),
+                            None => return Outcome::Error(TargetError::Internal),
+                        };
+                        ev = Event::StoreDone { result };
+                    }
+                    Action::Closed => return Outcome::Closed,
+                    Action::Error(e) => return Outcome::Error(e),
+                }
+            }
+        }
+    }
 
     /// Login parameters as sent by a Linux open-iscsi initiator
     /// (concatenated literals preserve embedded NUL separators).
@@ -119,8 +204,8 @@ mod tests {
         let bhs = login_bhs(text.len() as u32);
         conn.feed_padded(&bhs, text);
         assert_eq!(
-            session.step(conn, work, devs, planes),
-            StepResult::Processed
+            session.run_once(conn, work, devs, planes),
+            Outcome::Processed
         );
         conn.take_pdu().expect("login response")
     }
@@ -279,8 +364,8 @@ mod tests {
         bhs[1] = flag::T_BIT | ((stage::SECURITY & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
         conn.feed(&bhs, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp1, _) = conn.take_pdu().unwrap();
         assert_eq!(resp1[1] & 0x80, 0x80); // T=1
@@ -295,8 +380,8 @@ mod tests {
         bhs[15] = 0x01; // TSIH from stage 1 response
         conn.feed(&bhs, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp2, _) = conn.take_pdu().unwrap();
         assert_eq!((resp2[1] >> 2) & 0x03, stage::OP_PARAM);
@@ -307,8 +392,8 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x9999, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
         assert_eq!(resp[0] & 0x3F, op::SCSI_DATA_IN);
@@ -344,8 +429,8 @@ mod tests {
         let cmd = read10_bhs(0, 18, 0x12345678, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let mut count = 0;
         let mut expected_bo = 0u32;
@@ -397,8 +482,8 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 512, 1024);
         conn.feed_padded(&dout, &out);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
 
         // R2T: remaining 1024 bytes.
@@ -473,8 +558,8 @@ mod tests {
         conn.feed_padded(&dout, &vec![0x7Cu8; 4096]);
 
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
 
         // R2T #1: BO after immediate, DesiredLen bounded by MaxBurstLength.
@@ -514,8 +599,8 @@ mod tests {
         nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
         conn.feed(&nop, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
 
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -546,8 +631,8 @@ mod tests {
         // error, not a session-level protocol failure → the connection
         // stays open (Processed), and the response carries the sense.
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
 
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -582,8 +667,8 @@ mod tests {
         cmd[9] = 0; // would decode to LUN 0 (in range) if mis-read
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Closed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Closed
         );
 
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -611,8 +696,8 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x2222, 5);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Idle
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Idle
         );
         assert!(conn.take_pdu().is_none());
 
@@ -620,8 +705,8 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x3333, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -646,8 +731,8 @@ mod tests {
         bhs[24..28].copy_from_slice(&be32(0x73dd_e21f));
         conn.feed_padded(&bhs, text);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
         assert_eq!(&resp[28..32], &be32(0x73dd_e21f)); // ExpCmdSN = login CmdSN
@@ -657,8 +742,8 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x9999, 0x73dd_e21f);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -667,8 +752,8 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x999A, 0x73dd_e220);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
     }
 
@@ -694,8 +779,8 @@ mod tests {
         tmfr[24..28].copy_from_slice(&be32(9)); // out of window, but I=1
         conn.feed(&tmfr, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
 
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -725,8 +810,8 @@ mod tests {
         tmfr[24..28].copy_from_slice(&be32(7)); // out of window, I=0 → ignore
         conn.feed(&tmfr, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Idle
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Idle
         );
         assert!(conn.take_pdu().is_none());
     }
@@ -750,8 +835,8 @@ mod tests {
         lo[16..20].copy_from_slice(&be32(0xCAFE));
         conn.feed(&lo, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Closed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Closed
         );
 
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -779,8 +864,8 @@ mod tests {
         txt[24..28].copy_from_slice(&be32(1)); // CmdSN (Text uses the window)
         conn.feed(&txt, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Closed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Closed
         );
 
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -813,8 +898,8 @@ mod tests {
         };
         conn.feed_padded(&bhs, text);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         conn.take_pdu().unwrap();
 
@@ -831,8 +916,8 @@ mod tests {
         txt[24..28].copy_from_slice(&be32(1));
         conn.feed_padded(&txt, payload);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::TEXT_RESP);
@@ -862,8 +947,8 @@ mod tests {
         conn.feed(&pdu, &[]);
         conn.feed_bytes(&[0u8; 4]); // the AHS bytes
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Closed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Closed
         );
 
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -895,8 +980,8 @@ mod tests {
         let cmd = write10_bhs(0, 1, itt, 0, 512);
         conn.feed_padded(&cmd, &imm);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
         assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
@@ -908,8 +993,8 @@ mod tests {
         cmd[1] = 0xA0;
         conn.feed_padded(&cmd, &imm);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
         assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
@@ -920,7 +1005,7 @@ mod tests {
 
     #[test]
     fn serve_conn_login_then_logout() {
-        use snowscsi::iscsi::target::serve_conn;
+        use snowscsi::iscsi::transport::serve_conn;
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
@@ -986,8 +1071,8 @@ mod tests {
 
         conn.feed(&report_luns_bhs(0, 0xA1, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1029,8 +1114,8 @@ mod tests {
 
         conn.feed(&report_luns_bhs_select(0, 0xA2, 0, 0x01), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1052,8 +1137,8 @@ mod tests {
 
         conn.feed(&report_luns_bhs_select(0, 0xA3, 0, 0x02), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[3], status::GOOD);
@@ -1075,8 +1160,8 @@ mod tests {
 
         conn.feed(&report_luns_bhs_select(0, 0xA4, 0, 0x03), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
@@ -1132,7 +1217,7 @@ mod tests {
         login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs(0, 0xBEEF, 0), &[]);
-        session.step(&mut conn, &mut work, &mut devs, &mut planes);
+        session.run_once(&mut conn, &mut work, &mut devs, &mut planes);
         let (_, data) = conn.take_pdu().unwrap();
 
         // Replay the kernel's parse loop (drivers/scsi/scsi_scan.c):
@@ -1183,8 +1268,8 @@ mod tests {
 
         conn.feed(&report_luns_bhs(1, 0xCAFE, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
         assert_eq!(&data[..4], &[0, 0, 0, 24]);
@@ -1212,8 +1297,8 @@ mod tests {
         cmd[9] = 5;
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1270,8 +1355,8 @@ mod tests {
         // INQUIRY LUN 0 → PDT 0x00 (disk).
         conn.feed(&inquiry_bhs(0, 96, 0x0101, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1281,8 +1366,8 @@ mod tests {
         // INQUIRY LUN 1 → PDT 0x05 (CD-ROM).
         conn.feed(&inquiry_bhs(1, 96, 0x0102, 1), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1293,8 +1378,8 @@ mod tests {
         read[9] = 1;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1307,8 +1392,8 @@ mod tests {
         write[9] = 1;
         conn.feed(&write, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
@@ -1317,8 +1402,8 @@ mod tests {
         // REPORT LUNS lists both LUNs (target-wide, from LUN 0).
         conn.feed(&report_luns_bhs(0, 0x0401, 4), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
         assert_eq!(&data[..4], &[0, 0, 0, 16]); /* 2 × 8-byte LUN entries */
@@ -1385,8 +1470,8 @@ mod tests {
         for (lun, pdt) in [(0u8, 0x00u8), (1, 0x05), (2, 0x05)] {
             conn.feed(&inquiry_bhs(lun, 96, 0x0100 + lun as u32, lun as u32), &[]);
             assert_eq!(
-                session.step(&mut conn, &mut work, &mut devs, &mut planes),
-                StepResult::Processed
+                session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+                Outcome::Processed
             );
             let (bhs, data) = conn.take_pdu().unwrap();
             assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1399,8 +1484,8 @@ mod tests {
         read[9] = 1;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1413,8 +1498,8 @@ mod tests {
         read[9] = 2;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
@@ -1427,8 +1512,8 @@ mod tests {
         write[9] = 2;
         conn.feed(&write, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
@@ -1437,8 +1522,8 @@ mod tests {
         // REPORT LUNS lists all three LUNs.
         conn.feed(&report_luns_bhs(0, 0x0401, 6), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
         assert_eq!(&data[..4], &[0, 0, 0, 24]); /* 3 × 8-byte LUN entries */
@@ -1448,6 +1533,76 @@ mod tests {
 
         let _ = std::fs::remove_file(&iso);
         let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    /// FORMAT UNIT's whole-disc `Fill` must run through the iSCSI **session**
+    /// agenda (never inline in the device). Pre-fill the plane with a pattern
+    /// so a no-op FORMAT is detectable, drive FORMAT through the session, and
+    /// assert the plane is zero afterwards. (No iSCSI golden fixture exercises
+    /// a non-`None` agenda: they all use `BlockDevice`.)
+    #[test]
+    fn format_unit_zeroes_the_plane_via_the_iscsi_agenda() {
+        use snowscsi::cdrom::dvdram::DvdRamMedia;
+        use snowscsi::cdrom::{CdMedia, CdromDrive, HYPER_MULTI_CAPS};
+
+        let mut ram = vec![0x5Au8; 1 << 20];
+        let mut be = RamBackend::new(&mut ram);
+        let mut drive = CdromDrive::builder().capabilities(HYPER_MULTI_CAPS).build();
+        let _ = drive.load_quiet(CdMedia::Rw(DvdRamMedia::open(&mut be)));
+
+        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
+        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut be))];
+
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
+
+        // Consume CmdSN 0 with a no-data INQUIRY.
+        conn.feed(&inquiry_bhs(0, 96, 0x0100, 0), &[]);
+        assert_eq!(
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
+        );
+        let _ = conn.take_pdu();
+
+        // FORMAT UNIT (0x04) + its 12-byte format parameter list as immediate
+        // data (ImmediateData=Yes).
+        let mut bhs = [0u8; 48];
+        bhs[0] = op::SCSI_CMD;
+        bhs[1] = 0xA1; // F | W | ATTR_SIMPLE
+        bhs[7] = 12; // dsl
+        bhs[16..20].copy_from_slice(&be32(0x0200));
+        bhs[24..28].copy_from_slice(&be32(1)); // CmdSN
+        bhs[28..32].copy_from_slice(&be32(1)); // ExpStatSN
+        bhs[32] = 0x04; // FORMAT UNIT
+        bhs[33] = 0x11; // FMTDAT (matches the USB golden scenario ⑬ CDB)
+        let param = [
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+        ];
+        conn.feed(&bhs, &param);
+        assert_eq!(
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
+        );
+        let (rbhs, _) = conn.take_pdu().unwrap();
+        assert_eq!(rbhs[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(rbhs[3], status::GOOD);
+
+        // The session drained the FORMAT `Fill` agenda through the plane.
+        let mut check = vec![0u8; 1 << 20];
+        planes[0]
+            .as_mut()
+            .unwrap()
+            .do_op(StoreOp::Read {
+                off: 0,
+                buf: &mut check,
+            })
+            .unwrap();
+        assert!(
+            check.iter().all(|&b| b == 0),
+            "FORMAT must zero-fill the plane through the iSCSI session agenda"
+        );
     }
 
     // ── ParamOut / DataOut LUN routing (O7 regression) ────────────────
@@ -1551,8 +1706,8 @@ mod tests {
         let bhs = mode_select6_bhs(1, 12, itt, 0, 12);
         conn.feed_padded(&bhs, &param);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
@@ -1595,8 +1750,8 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 6, 6);
         conn.feed_padded(&dout, &rest);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         // Expect R2T then SCSI Response.
         let (r2t, _) = conn.take_pdu().unwrap();
@@ -1638,8 +1793,8 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 0, 512);
         conn.feed_padded(&dout, &payload);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (r2t, _) = conn.take_pdu().unwrap();
         assert_eq!(r2t[0] & 0x3F, op::R2T);
@@ -1653,8 +1808,8 @@ mod tests {
         read1[9] = 1;
         conn.feed(&read1, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
         assert_eq!(data, payload, "LUN 1 data must match written payload");
@@ -1662,8 +1817,8 @@ mod tests {
         let read0 = read10_bhs(0, 1, 0xD2, 2);
         conn.feed(&read0, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let (_, data0) = conn.take_pdu().unwrap();
         assert_eq!(data0, vec![0u8; 512], "LUN 0 must remain untouched");
@@ -1692,8 +1847,8 @@ mod tests {
         let cmd = read10_bhs(0, 600, 0x7777, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs, &mut planes),
-            StepResult::Processed
+            session.run_once(&mut conn, &mut work, &mut devs, &mut planes),
+            Outcome::Processed
         );
         let mut collected = Vec::new();
         let mut saw_data_in = 0;

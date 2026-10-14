@@ -2,24 +2,28 @@
 //!
 //! [`TcpConn`] wraps `std::net::TcpStream` as an embedded-io byte stream
 //! (thus a
-//! [`Conn`](crate::iscsi::conn::Conn)). A read timeout is applied at
+//! [`Conn`]). A read timeout is applied at
 //! construction so a stalled peer cannot hang the server forever — this
 //! covers the login phase, the command loop, and Data-Out (DoS fix).
 //! Read/write loops are exact (`read_exact` / `write_all`
-//! in [`read_exact`](crate::iscsi::conn::read_exact) /
-//! [`write_all`](crate::iscsi::conn::write_all), RFC 3720 §3.1 byte stream).
+//! in [`read_exact`] /
+//! [`write_all`], RFC 3720 §3.1 byte stream).
 //!
 //! [`serve`] is the convenience entry: a serial accept
 //! loop (MaxConnections = 1) that serves one connection at a time with a
 //! fresh [`IscsiSession`], retrying accept failures with a backoff instead of C's
-//! infinite busy retry.
+//! infinite busy retry. Each connection is driven by [`serve_conn`], the
+//! protocol-agnostic shell loop over [`Action`]/[`Event`] (the session owns all
+//! framing; see `__ASYNC_SEP_PLAN.md` §1.4/§1.9).
 
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::iscsi::target::{serve_conn, IscsiSession, TargetError};
+use crate::iscsi::conn::{read_exact, write_all, Conn};
+use crate::iscsi::pdu::BHS_SIZE;
+use crate::iscsi::target::{Action, Event, IscsiSession, TargetError};
 use crate::scsi::Luns;
 
 /// Default read timeout guarding login / command loop / Data-Out.
@@ -69,6 +73,65 @@ impl embedded_io::Write for TcpConn {
 
     fn flush(&mut self) -> io::Result<()> {
         std::io::Write::flush(&mut self.stream)
+    }
+}
+
+/// Drive one iSCSI connection to completion over any byte stream
+/// (`__ASYNC_SEP_PLAN.md` §1.4/§1.9).
+///
+/// The shell is protocol-agnostic: it feeds the [`IscsiSession`]'s next
+/// [`Action`] to the connection (or to a [`Luns`] storage plane for
+/// [`Action::Store`]) and hands the completion back as an [`Event`]. The
+/// session owns all framing — the two-stage receive (48-byte BHS, then
+/// AHS + data segment + padding) is driven by `Action::HostRecv { len }`, so
+/// this loop carries no protocol knowledge.
+///
+/// Returns `Ok(())` when the session closes the connection or the peer hangs
+/// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
+pub fn serve_conn<C: Conn>(
+    conn: &mut C,
+    work: &mut [u8],
+    session: &mut IscsiSession,
+    luns: &mut Luns<'_>,
+) -> Result<(), TargetError> {
+    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+        return Err(TargetError::WorkBufTooSmall);
+    }
+    // Disjoint borrows: `devs` is handed to `poll`, `planes` executes the
+    // device-yielded `Store` ops without aliasing the device slice.
+    let Luns { devs, planes } = luns;
+    let mut ev = Event::Tick;
+    loop {
+        match session.poll(ev, work, devs) {
+            Action::HostRecv { len } => {
+                if len > work.len() {
+                    return Err(TargetError::Internal);
+                }
+                // Exact read of the framing length the session asked for (BHS
+                // first, then AHS + data + pad). EOF or an I/O failure ends
+                // the connection cleanly.
+                if read_exact(conn, &mut work[..len]).is_err() {
+                    return Ok(());
+                }
+                ev = Event::HostRecv { len };
+            }
+            Action::HostSend { bytes, .. } => {
+                if write_all(conn, bytes).is_err() {
+                    return Ok(());
+                }
+                ev = Event::HostSent;
+            }
+            Action::Store { lun, op } => {
+                let result = planes
+                    .get_mut(lun)
+                    .and_then(|plane| plane.as_mut())
+                    .ok_or(TargetError::Internal)?
+                    .do_op(op);
+                ev = Event::StoreDone { result };
+            }
+            Action::Closed => return Ok(()),
+            Action::Error(e) => return Err(e),
+        }
     }
 }
 

@@ -1,10 +1,22 @@
 //! iSCSI target protocol state machine (RFC 3720 §5 / §10).
 //!
 //! [`IscsiSession`] is a pure, non-blocking protocol state machine: it never
-//! blocks and never touches platform I/O.  A driver feeds one
-//! [`SessionEvent::PduReceived`] per [`IscsiSession::poll`] call and learns the
-//! next need from the returned [`SessionStep`].  The blocking
-//! [`IscsiSession::step`] wrapper drives the same state machine over a `Conn`.
+//! blocks and never touches platform I/O.  A shell feeds one [`Event`] (an I/O
+//! completion) per [`IscsiSession::poll`] call and learns the next [`Action`]
+//! (receive, send, a storage op, or close).  The library shell
+//! `crate::iscsi::transport::serve` (behind `std`) owns the platform loop; the
+//! shell carries no protocol knowledge.
+//!
+//! Incoming PDUs are framed in two stages: the core first asks for the
+//! 48-byte BHS (`RecvPdu`); on the BHS event it saves the header, parses
+//! `DataSegmentLength` / `TotalAHSLength` and asks for the remainder
+//! (`RecvData`); on the data event it reassembles the PDU in `work` (data at
+//! `work[BHS_SIZE..]`) and dispatches it to the handlers.
+//!
+//! A device data phase that yields [`Xfer::Store`] is handed to the shell as
+//! [`Action::Store`]; the shell executes it against the LUN's storage plane and
+//! feeds the result back as [`Event::StoreDone`], which the session maps
+//! through [`ScsiDevice::store_done`].  The wire bytes are unchanged.
 //!
 //! Key fixes over the legacy C implementation: CID read at
 //! byte 20-21 (from iscsi_pdu), Data-Out ITT/TTT/BufferOffset/DataSN
@@ -15,8 +27,7 @@
 
 use core::cell::Cell;
 
-use crate::common::store::StorePlane;
-use crate::iscsi::conn::{read_exact, write_all, Conn};
+use crate::common::store::StoreOp;
 use crate::iscsi::pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
     BHS_SIZE, MAX_DATA_SEGMENT,
@@ -25,47 +36,54 @@ use crate::scsi::backend::StorageError;
 use crate::scsi::device::{sense_for_storage_error, CommandOutcome, ScsiDevice, Xfer, XferOutcome};
 use crate::scsi::scsi::op as scsi_op;
 use crate::scsi::scsi::{asc, opcode_from_cdb, opcode_name, Sense, SenseKey};
-use crate::scsi::Luns;
 
 // ── Public types ─────────────────────────────────────────────────────
 
-/// One event fed from the driver to [`IscsiSession::poll`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEvent {
-    /// A complete iSCSI PDU has been received into the work buffer.
-    /// `dsl` is the data-segment length (from the BHS header).
-    PduReceived { dsl: u32 },
-}
-
-/// The core's next need, returned by [`IscsiSession::poll`].
+/// The core's next action, returned by [`IscsiSession::poll`].
 ///
-/// `NeedSend` borrows the work buffer; the driver must consume (send) the
-/// slice before calling `poll` again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStep<'a> {
-    /// Receive the next complete PDU from the wire into the work buffer.
-    NeedRecv,
-    /// Send `data` to the wire (a complete PDU: BHS + optional data +
-    /// padding).  `data` borrows the work buffer.
-    NeedSend(&'a [u8]),
-    /// The transaction completed and the connection should be closed
-    /// (Logout response sent, peer closed, or fatal I/O error).
+/// Normal flow never emits a "done" boundary: after a response is sent,
+/// `poll(Event::HostSent)` returns the next command-phase
+/// [`Action::HostRecv`] directly.  Only [`Action::Closed`] / [`Action::Error`]
+/// are distinct endings.
+#[derive(Debug)]
+pub enum Action<'a> {
+    /// Receive `len` bytes into `work[0..len]`.  PDUs are framed in two
+    /// stages: first [`BHS_SIZE`], then the remainder
+    /// (`TotalAHSLength*4 + DataSegmentLength + padding`).
+    HostRecv { len: usize },
+    /// Send `bytes` to the wire (a complete PDU: BHS + data + padding).
+    /// `prefetch` is the next read-ahead coordinate for read-phase overlap
+    /// (always `None` in v1).
+    HostSend {
+        bytes: &'a [u8],
+        prefetch: Option<(u64, usize)>,
+    },
+    /// Hand a storage op to the shell: the device's `xfer_in`/`xfer_out`
+    /// returned [`Xfer::Store`].  The shell executes it against the LUN's
+    /// storage plane and feeds the result back as [`Event::StoreDone`].
+    Store { lun: usize, op: StoreOp<'a> },
+    /// The connection is done (Logout response sent, peer closed, or a fatal
+    /// protocol error): the shell closes it.
     Closed,
-    /// An internal error (caller bug) — work buffer too small, etc.
+    /// Internal error (caller bug): work buffer too small, etc.
     Error(TargetError),
 }
 
-/// Result of one [`IscsiSession::step`] call.
+/// One completion fed from the shell to [`IscsiSession::poll`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepResult {
-    /// A PDU was consumed but nothing was sent (out-of-window CmdSN, §3.2.2.1).
-    Idle,
-    /// A transaction completed and response(s) were sent.
-    Processed,
-    /// The connection should be closed (Logout / peer closed / I/O failure).
-    Closed,
-    /// Internal error (caller bug), e.g. work buffer too small.
-    Error(TargetError),
+pub enum Event {
+    /// No-I/O driver tick (startup + timer): change no state and re-emit the
+    /// current pending [`Action`].
+    Tick,
+    /// The shell received `len` bytes into `work[0..len]` (a BHS or a data
+    /// segment, per the previous [`Action::HostRecv`]).
+    HostRecv { len: usize },
+    /// The pending [`Action::HostSend`] packet has been sent.
+    HostSent,
+    /// A storage op finished: the shell executed an [`Action::Store`] and
+    /// reports the plane's outcome.  The session maps it through
+    /// [`ScsiDevice::store_done`] and continues the data phase.
+    StoreDone { result: Result<(), StorageError> },
 }
 
 /// Target-level error (no_std).
@@ -282,31 +300,62 @@ pub struct IscsiSession {
     neg: NegotiatedParams,
     is_discovery: bool,
     state: IscsiState,
+    /// BHS of the PDU currently being framed: saved on the BHS event and
+    /// restored into `work[..BHS_SIZE]` before the PDU is dispatched.
+    bhs: [u8; BHS_SIZE],
+}
+
+/// Two-stage receive framing (`__M6_ISCSI.md` §2): the BHS is read first, then
+/// the AHS + data segment + padding remainder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    /// The R2T for the current burst is pending in `work[..BHS_SIZE]`.
+    Send,
+    /// Waiting for the 48-byte BHS.
+    Bhs,
+    /// Waiting for the remainder (`total` bytes).
+    Data { total: usize },
 }
 
 /// Internal state machine (private).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IscsiState {
-    /// Waiting for the next PDU from the initiator.
+    /// Waiting for the BHS of the next PDU.
     RecvPdu,
-    /// Data-In phase: sending data to the initiator.
+    /// Waiting for the remainder of the current PDU (`total` bytes:
+    /// `TotalAHSLength*4 + DataSegmentLength + padding`).
+    RecvData { total: usize },
+    /// Data-In phase: `sent` bytes already staged (not counting the pending
+    /// chunk), `pending` the length of the chunk staged in `work` (`data_sn`
+    /// its DataSN), `chunk` the maximum chunk size.
     DataIn {
         transfer_len: u64,
         sent: u64,
         itt: u32,
         chunk: usize,
-        lun: usize,
-    },
-    /// Data-Out phase: receiving data from the initiator via R2T.
-    R2tSend {
-        itt: u32,
-        transfer_len: u64,
-        received: u64,
-        r2t_sn: u32,
+        pending: usize,
         data_sn: u32,
         lun: usize,
     },
-    /// Collecting Data-Out PDUs for the current R2T burst.
+    /// Data-In phase awaiting a storage op (`Xfer::Store`): the chunk at
+    /// offset `sent` (length `chunk`, DataSN `data_sn`) is in flight.
+    DataInStore {
+        transfer_len: u64,
+        sent: u64,
+        itt: u32,
+        chunk: usize,
+        data_sn: u32,
+        lun: usize,
+    },
+    /// Data-Out immediate-data phase awaiting a storage op (`Xfer::Store`).
+    InXferStore {
+        itt: u32,
+        transfer_len: u64,
+        received: u64,
+        lun: usize,
+    },
+    /// Data-Out phase: collecting the Data-Out PDUs solicited by an R2T.
+    /// `frame` tracks the two-stage receive (and the pending R2T send).
     R2tCollect {
         itt: u32,
         transfer_len: u64,
@@ -316,8 +365,22 @@ enum IscsiState {
         expected_bo: u32,
         burst_remaining: u64,
         lun: usize,
+        frame: Frame,
     },
-    /// Collecting ParamOut data via R2T.
+    /// Data-Out phase awaiting a storage op (`Xfer::Store`): the chunk at
+    /// offset `expected_bo` (length `dsl`) is in flight.
+    R2tStore {
+        itt: u32,
+        transfer_len: u64,
+        received: u64,
+        r2t_sn: u32,
+        data_sn: u32,
+        expected_bo: u32,
+        burst_remaining: u64,
+        lun: usize,
+        dsl: usize,
+    },
+    /// Collecting ParamOut data via R2T. `frame` tracks the two-stage receive.
     ParamCollect {
         itt: u32,
         expected: u64,
@@ -331,16 +394,15 @@ enum IscsiState {
         /// Accumulation offset into work[BHS_SIZE..].
         acc_offset: usize,
         lun: usize,
+        frame: Frame,
     },
     /// Terminal-status agenda: the data phase is complete and the device
     /// agenda (`ScsiDevice::next_store_op`) must be drained before the
     /// terminating SCSI Response / final Data-In (`__ASYNC_SEP_PLAN.md` §1.5
-    /// rule 3/4). Carries the response parameters; `poll_agenda` executes the
-    /// agenda **inline** (iSCSI has no `StoreDone` round trip) and then emits
-    /// the response exactly as before.
+    /// rule 3/4).  Carries the response parameters; each `Some(op)` is yielded
+    /// as [`Action::Store`] and awaited via [`Event::StoreDone`].
     Agenda(Agenda),
-    /// Stalled after invalid CBW (iSCSI: fatal protocol error).
-    /// Only `reset()` or a new connection unfreezes.
+    /// Terminal (Logout / fatal protocol error / peer close).
     Closed,
 }
 
@@ -350,6 +412,9 @@ struct Agenda {
     itt: u32,
     lun: usize,
     kind: AgendaKind,
+    /// A drained agenda op failed: its sense, which turns the terminal status
+    /// into CHECK CONDITION.
+    failed_sense: Option<Sense>,
 }
 
 /// Which terminal PDU the agenda drain emits.
@@ -384,6 +449,7 @@ impl IscsiSession {
             neg: NegotiatedParams::default(),
             is_discovery: false,
             state: IscsiState::RecvPdu,
+            bhs: [0u8; BHS_SIZE],
         }
     }
 
@@ -393,394 +459,463 @@ impl IscsiSession {
 
     // ── Poll interface (non-blocking state machine) ───────────────
 
-    /// Non-blocking state-machine step: consume one event and return the
-    /// next need.
+    /// Non-blocking state-machine step: consume one [`Event`] and return the
+    /// next [`Action`].
     ///
-    /// `work` is the PDU scratch buffer (≥ [`crate::MIN_DATA_LEN`] +
-    /// `BHS_SIZE`); `devs` is the LUN slice and `planes` the 1:1 storage
-    /// planes (a [`StoreOp`](crate::common::store::StoreOp) yielded by a
-    /// device's `xfer_out`/`xfer_in` is executed **inline** here, on
-    /// `planes[lun]`, and fed back through [`ScsiDevice::store_done`]).
-    /// During the login phase the data area is used for parameter
-    /// negotiation; during Full Feature it is the CDB/Data-In/Data-Out
-    /// staging area.
+    /// `work` is the single time-multiplexed PDU scratch buffer
+    /// (`>= crate::MIN_DATA_LEN + BHS_SIZE`): incoming bytes land at
+    /// `work[0..len]`, the 48-byte BHS at `work[..BHS_SIZE]`, and the SCSI
+    /// data area at `work[BHS_SIZE..]`.  `devs` is the LUN slice; a device
+    /// data phase that yields [`Xfer::Store`] is returned as [`Action::Store`]
+    /// for the shell to execute.
     pub fn poll<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent,
+        ev: Event,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         // Single entry guard: every handler below may slice
         // `work[..BHS_SIZE]` and use `work[BHS_SIZE..]` as the data area.
         if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-            return SessionStep::Error(TargetError::WorkBufTooSmall);
+            return Action::Error(TargetError::WorkBufTooSmall);
         }
-        match self.state {
-            IscsiState::RecvPdu => self.poll_recv(ev, work, devs, planes),
-            IscsiState::DataIn { .. } => self.poll_data_in(work, devs, planes),
-            IscsiState::R2tSend { .. } => self.poll_r2t_send(work),
-            IscsiState::R2tCollect { .. } => self.poll_r2t_collect(ev, work, devs, planes),
-            IscsiState::ParamCollect { .. } => self.poll_param_collect(ev, work, devs, planes),
-            IscsiState::Agenda(_) => self.poll_agenda(work, devs, planes),
-            IscsiState::Closed => SessionStep::Closed,
-        }
-    }
-
-    /// BHS prefix of `work`.
-    ///
-    /// Infallible by contract: [`Self::poll`] enforces
-    /// `work.len() >= crate::MIN_DATA_LEN + BHS_SIZE` before any handler
-    /// runs, so the slice-and-convert below cannot fail.
-    fn bhs_of(work: &[u8]) -> Bhs {
-        Bhs::from_bytes(
-            work[..BHS_SIZE]
-                .try_into()
-                .expect("poll enforces a BHS_SIZE prefix"),
-        )
-    }
-
-    /// Blocking convenience wrapper: drive `poll` in a loop over a `Conn`,
-    /// processing one complete transaction (Login request/response or
-    /// Full Feature SCSI command including data phases and final status).
-    ///
-    /// `work` must be at least [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes.
-    /// Blocking convenience wrapper: process one complete iSCSI transaction
-    /// (Login or SCSI command including all data phases and final status).
-    ///
-    /// `work` must be at least [`crate::MIN_DATA_LEN`] + `BHS_SIZE` bytes.
-    /// `devs`/`planes` are the aligned LUN devices and storage planes; a
-    /// device-yielded [`Xfer::Store`] is executed inline on `planes[lun]`
-    /// (see [`Self::poll`]).
-    pub fn step<C: Conn, D: ScsiDevice>(
-        &mut self,
-        conn: &mut C,
-        work: &mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> StepResult {
-        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-            return StepResult::Error(TargetError::WorkBufTooSmall);
-        }
-        // Phase 1: receive and process the first PDU.
-        match recv_pdu(conn, work) {
-            Ok(dsl) => {
-                let r = self.poll(SessionEvent::PduReceived { dsl }, work, devs, planes);
-                match r {
-                    SessionStep::NeedSend(data) => {
-                        let len = data.len();
-
-                        let _ = r;
-                        if write_all(conn, &work[..len]).is_err() {
-                            return StepResult::Closed;
-                        }
-                        // StatSN is already advanced inside `poll` for final
-                        // `NeedSend` (state `RecvPdu`/`Closed`); intermediate
-                        // Data-In/R2T keep the current StatSN.
-                    }
-                    SessionStep::NeedRecv => return StepResult::Idle,
-                    SessionStep::Closed => return StepResult::Closed,
-                    SessionStep::Error(e) => return StepResult::Error(e),
-                }
-            }
-            Err(()) => return StepResult::Closed,
-        }
-        // Phase 2: drive remaining data phases to completion.
-        loop {
-            match self.state {
-                IscsiState::RecvPdu | IscsiState::Closed => break,
-                IscsiState::DataIn { .. } => {
-                    // Blocking Data-In: load chunks from backend, write
-                    // Data-In BHS per chunk, send over conn.
-                    let st = self.state;
-                    let IscsiState::DataIn {
-                        transfer_len,
-                        sent,
-                        itt,
-                        chunk,
-                        lun,
-                    } = st
-                    else {
-                        // Dispatch already selected the DataIn arm; a miss
-                        // is an internal invariant violation.
-                        return StepResult::Error(TargetError::Internal);
-                    };
-                    let mut data_sn: u32 = 1; // Phase 1 sent DataSN=0
-                    let mut offset = sent; // continue from where Phase 1 left off
-                    while offset < transfer_len {
-                        let remaining = transfer_len - offset;
-                        let len = (remaining as usize).min(chunk);
-                        if lun < devs.len() {
-                            let dev = &mut devs[lun];
-                            let produced = match dev
-                                .xfer_out(offset, &mut work[BHS_SIZE..BHS_SIZE + len])
-                            {
-                                Xfer::Inline { len } => len,
-                                Xfer::Store(op) => {
-                                    let Some(plane) = planes.get_mut(lun).and_then(Option::as_mut)
-                                    else {
-                                        return StepResult::Error(TargetError::Internal);
-                                    };
-                                    let r = plane.do_op(op);
-                                    if store_done_failed(dev, r) {
-                                        0
-                                    } else {
-                                        len
-                                    }
-                                }
-                            };
-                            if produced != len {
-                                let sense = dev.take_sense();
-                                let r = self.finish_response(
-                                    work,
-                                    devs,
-                                    planes,
-                                    lun,
-                                    itt,
-                                    status::CHECK_CONDITION,
-                                    sense,
-                                );
-                                if let SessionStep::NeedSend(data) = r {
-                                    let l = data.len();
-                                    let _ = r;
-                                    let _ = write_all(conn, &work[..l]);
-                                }
-                                return StepResult::Closed;
-                            }
-                        }
-                        let is_last = offset + len as u64 == transfer_len;
-                        if is_last {
-                            // Final Data-In (F+S): drain the agenda first.
-                            let r = self.finish_data_in_final(
-                                work,
-                                devs,
-                                planes,
-                                lun,
-                                itt,
-                                len,
-                                offset as u32,
-                                data_sn,
-                                status::GOOD,
-                            );
-                            if let SessionStep::NeedSend(data) = r {
-                                let l = data.len();
-                                let _ = r;
-                                if write_all(conn, &work[..l]).is_err() {
-                                    return StepResult::Closed;
-                                }
-                            }
-                            return StepResult::Processed;
-                        }
-                        let mut bhs = Bhs::new();
-                        bhs.set_opcode(op::SCSI_DATA_IN);
-                        bhs.set_itt(itt);
-                        bhs.set_data_sn(data_sn);
-                        bhs.set_buffer_offset(offset as u32);
-                        bhs.set_data_segment_len(len as u32);
-                        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
-                        let total = BHS_SIZE + len;
-                        let pad = pdu_pad_len(len as u32) as usize;
-                        work[total..total + pad].fill(0);
-                        if write_all(conn, &work[..total + pad]).is_err() {
-                            return StepResult::Closed;
-                        }
-                        offset += len as u64;
-                        data_sn = data_sn.wrapping_add(1);
-                    }
-                    self.state = IscsiState::RecvPdu;
-                    return StepResult::Processed;
-                }
-                // R2tSend: build R2T (no StatSN advance; only final response advances).
-                IscsiState::R2tSend { .. } => {
-                    let r = self.poll(SessionEvent::PduReceived { dsl: 0 }, work, devs, planes);
-                    if let SessionStep::NeedSend(data) = r {
-                        let len = data.len();
-                        let _ = r;
-                        if write_all(conn, &work[..len]).is_err() {
-                            return StepResult::Closed;
-                        }
-                    }
-                }
-                // Agenda: drain the device agenda and emit the terminal status.
-                // (The `finish_*` funnels resolve this inline, so this arm is a
-                // defensive completion of the dispatch.)
-                IscsiState::Agenda(_) => {
-                    let r = self.poll_agenda(work, devs, planes);
-                    match r {
-                        SessionStep::NeedSend(data) => {
-                            let len = data.len();
-                            let _ = r;
-                            if write_all(conn, &work[..len]).is_err() {
-                                return StepResult::Closed;
-                            }
-                        }
-                        SessionStep::NeedRecv => continue,
-                        SessionStep::Closed => return StepResult::Closed,
-                        SessionStep::Error(e) => return StepResult::Error(e),
-                    }
-                }
-                // R2tCollect / ParamCollect: need real Data-Out PDUs
-                // from the wire.
-                IscsiState::R2tCollect { .. } | IscsiState::ParamCollect { .. } => {
-                    match recv_pdu(conn, work) {
-                        Ok(dsl) => {
-                            let r =
-                                self.poll(SessionEvent::PduReceived { dsl }, work, devs, planes);
-                            match r {
-                                SessionStep::NeedSend(data) => {
-                                    let len = data.len();
-                                    let _ = r;
-                                    if write_all(conn, &work[..len]).is_err() {
-                                        return StepResult::Closed;
-                                    }
-                                    // StatSN already advanced inside `poll`.
-                                }
-                                SessionStep::NeedRecv => continue,
-                                SessionStep::Closed => return StepResult::Closed,
-                                SessionStep::Error(e) => return StepResult::Error(e),
-                            }
-                        }
-                        Err(()) => return StepResult::Closed,
-                    }
-                }
-            }
-        }
-        if self.state == IscsiState::Closed {
-            StepResult::Closed
-        } else {
-            StepResult::Processed
-        }
-    }
-
-    // ── Poll sub-handlers ─────────────────────────────────────────
-
-    fn poll_recv<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: SessionEvent,
-        work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
-        // (work-buffer length is enforced once in `poll`.)
         match ev {
-            SessionEvent::PduReceived { dsl } => {
-                let pdu = Pdu {
-                    bhs: Self::bhs_of(work),
-                    dsl: dsl as usize,
-                };
-
-                // AHS defense: Assumes TotalAHSLength = 0.
-                if pdu.bhs.total_ahs_length() != 0 {
-                    return self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs);
-                }
-
-                let iscsi_op = pdu.bhs.opcode();
-                crate::debug!(
-                    "recv {} (0x{:02X}) stage={:?} cmd_sn={} stat_sn={}",
-                    iscsi_opcode_name(iscsi_op),
-                    iscsi_op,
-                    self.stage,
-                    self.cmd_sn,
-                    self.stat_sn.get()
-                );
-                if self.stage != LoginStage::FullFeature {
-                    if iscsi_op != op::LOGIN_REQ {
-                        return self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs);
-                    }
-                    return self.handle_login(work, &pdu);
-                }
-
-                match iscsi_op {
-                    op::SCSI_CMD => self.handle_scsi_cmd(work, devs, planes, &pdu),
-                    op::SCSI_TASK_REQ => self.handle_tmf(work, &pdu, devs),
-                    op::NOP_OUT => self.handle_nop(work, &pdu),
-                    op::LOGOUT_REQ => self.handle_logout(work, &pdu),
-                    op::TEXT_REQ => self.handle_text(work, &pdu),
-                    op::LOGIN_REQ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
-                    _ => self.reject(work, reject::PROTOCOL_ERROR, &pdu.bhs),
-                }
-            }
+            Event::Tick => self.pending(work),
+            Event::HostRecv { len } => self.poll_host_recv(len, work, devs),
+            Event::HostSent => self.poll_host_sent(work, devs),
+            Event::StoreDone { result } => self.poll_store_done(result, work, devs),
         }
     }
 
+    /// The action for the current state (re-emitted on [`Event::Tick`]).
+    ///
+    /// A storage op in flight cannot be rebuilt from state (it borrows the
+    /// platform buffer / device), so those states report
+    /// [`TargetError::Internal`]: the shell executes the pending
+    /// [`Action::Store`] immediately and feeds [`Event::StoreDone`].
+    fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
+        match self.state {
+            IscsiState::RecvPdu => Action::HostRecv { len: BHS_SIZE },
+            IscsiState::RecvData { total } => Action::HostRecv { len: total },
+            IscsiState::DataIn { pending, .. } => Action::HostSend {
+                bytes: &work[..BHS_SIZE + pending + pdu_pad_len(pending as u32) as usize],
+                prefetch: None,
+            },
+            IscsiState::R2tCollect { frame, .. } | IscsiState::ParamCollect { frame, .. } => {
+                match frame {
+                    Frame::Send => Action::HostSend {
+                        bytes: &work[..BHS_SIZE],
+                        prefetch: None,
+                    },
+                    Frame::Bhs => Action::HostRecv { len: BHS_SIZE },
+                    Frame::Data { total } => Action::HostRecv { len: total },
+                }
+            }
+            IscsiState::DataInStore { .. }
+            | IscsiState::InXferStore { .. }
+            | IscsiState::R2tStore { .. }
+            | IscsiState::Agenda(_) => Action::Error(TargetError::Internal),
+            IscsiState::Closed => Action::Closed,
+        }
+    }
+
+    /// Incoming receive event: drive the two-stage framing, then dispatch the
+    /// assembled PDU to the handler for the current logical state.
+    fn poll_host_recv<'a, D: ScsiDevice>(
+        &'a mut self,
+        len: usize,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        match self.state {
+            IscsiState::RecvPdu => {
+                self.save_bhs(work);
+                match self.frame_remainder(work) {
+                    Ok(total) => {
+                        self.state = IscsiState::RecvData { total };
+                        Action::HostRecv { len: total }
+                    }
+                    Err(e) => Action::Error(e),
+                }
+            }
+            IscsiState::RecvData { .. } => {
+                self.assemble(work, len);
+                self.state = IscsiState::RecvPdu;
+                let pdu = self.current_pdu();
+                self.dispatch_new_pdu(&pdu, work, devs)
+            }
+            IscsiState::R2tCollect { frame, .. } => match frame {
+                Frame::Bhs => {
+                    self.save_bhs(work);
+                    match self.frame_remainder(work) {
+                        Ok(total) => {
+                            self.set_frame(Frame::Data { total });
+                            Action::HostRecv { len: total }
+                        }
+                        Err(e) => Action::Error(e),
+                    }
+                }
+                Frame::Data { .. } => {
+                    self.assemble(work, len);
+                    self.set_frame(Frame::Bhs);
+                    let pdu = self.current_pdu();
+                    self.poll_r2t_collect(&pdu, work, devs)
+                }
+                Frame::Send => self.pending(work),
+            },
+            IscsiState::ParamCollect { frame, .. } => match frame {
+                Frame::Bhs => {
+                    self.save_bhs(work);
+                    match self.frame_remainder(work) {
+                        Ok(total) => {
+                            self.set_frame(Frame::Data { total });
+                            Action::HostRecv { len: total }
+                        }
+                        Err(e) => Action::Error(e),
+                    }
+                }
+                Frame::Data { .. } => {
+                    self.assemble(work, len);
+                    self.set_frame(Frame::Bhs);
+                    let pdu = self.current_pdu();
+                    self.poll_param_collect(&pdu, work, devs)
+                }
+                Frame::Send => self.pending(work),
+            },
+            _ => self.pending(work),
+        }
+    }
+
+    /// Pending [`Action::HostSend`] completed: advance the state machine.
+    fn poll_host_sent<'a, D: ScsiDevice>(
+        &'a mut self,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        match self.state {
+            // A terminal response / R2T / Data-In has been sent.
+            IscsiState::RecvPdu => Action::HostRecv { len: BHS_SIZE },
+            IscsiState::DataIn { .. } => self.poll_data_in(work, devs),
+            IscsiState::R2tCollect {
+                frame: Frame::Send, ..
+            } => {
+                self.set_frame(Frame::Bhs);
+                Action::HostRecv { len: BHS_SIZE }
+            }
+            IscsiState::ParamCollect {
+                frame: Frame::Send, ..
+            } => {
+                self.set_frame(Frame::Bhs);
+                Action::HostRecv { len: BHS_SIZE }
+            }
+            IscsiState::Closed => Action::Closed,
+            _ => Action::Error(TargetError::Internal),
+        }
+    }
+
+    /// A storage op finished: map it through the device and continue.
+    fn poll_store_done<'a, D: ScsiDevice>(
+        &'a mut self,
+        result: Result<(), StorageError>,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        match self.state {
+            IscsiState::DataInStore { .. } => self.poll_data_in_store(result, work, devs),
+            IscsiState::InXferStore { .. } => self.poll_in_xfer_store(result, work, devs),
+            IscsiState::R2tStore { .. } => self.poll_r2t_store(result, work, devs),
+            IscsiState::Agenda(_) => self.poll_agenda(result, work, devs),
+            _ => Action::Error(TargetError::Internal),
+        }
+    }
+
+    /// Save the BHS from `work[..BHS_SIZE]`.
+    fn save_bhs(&mut self, work: &[u8]) {
+        self.bhs.copy_from_slice(&work[..BHS_SIZE]);
+    }
+
+    /// The length of the current PDU's remainder (AHS + data + padding),
+    /// computed from the saved BHS.
+    fn pdu_remainder(&self) -> usize {
+        let bhs = Bhs::from_bytes(self.bhs);
+        let dsl = bhs.data_segment_len() as usize;
+        usize::from(bhs.total_ahs_length()) * 4 + dsl + pdu_pad_len(dsl as u32) as usize
+    }
+
+    /// Validate that the current PDU's remainder fits in the data area.
+    fn frame_remainder(&self, work: &[u8]) -> Result<usize, TargetError> {
+        let total = self.pdu_remainder();
+        if total > work.len() - BHS_SIZE {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        Ok(total)
+    }
+
+    /// Reassemble a received PDU: move the freshly received bytes from
+    /// `work[0..len]` up to `work[BHS_SIZE..]`, then restore the saved BHS
+    /// into `work[..BHS_SIZE]`.
+    fn assemble(&self, work: &mut [u8], len: usize) {
+        let len = len.min(work.len() - BHS_SIZE);
+        work.copy_within(0..len, BHS_SIZE);
+        work[..BHS_SIZE].copy_from_slice(&self.bhs);
+    }
+
+    /// The [`Pdu`] described by the saved BHS.
+    fn current_pdu(&self) -> Pdu {
+        let bhs = Bhs::from_bytes(self.bhs);
+        Pdu {
+            dsl: bhs.data_segment_len() as usize,
+            bhs,
+        }
+    }
+
+    /// Update the framing stage of the active R2T / ParamOut collection.
+    fn set_frame(&mut self, f: Frame) {
+        match &mut self.state {
+            IscsiState::R2tCollect { frame, .. } => *frame = f,
+            IscsiState::ParamCollect { frame, .. } => *frame = f,
+            _ => {}
+        }
+    }
+
+    /// Dispatch an assembled PDU that is not part of an in-progress data
+    /// phase (login / SCSI command / TMF / NOP / Logout / Text).
+    fn dispatch_new_pdu<'a, D: ScsiDevice>(
+        &'a mut self,
+        pdu: &Pdu,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let bhs = &pdu.bhs;
+
+        // AHS defense: Assumes TotalAHSLength = 0.
+        if bhs.total_ahs_length() != 0 {
+            return self.reject(work, reject::PROTOCOL_ERROR, bhs);
+        }
+
+        let iscsi_op = bhs.opcode();
+        crate::debug!(
+            "recv {} (0x{:02X}) stage={:?} cmd_sn={} stat_sn={}",
+            iscsi_opcode_name(iscsi_op),
+            iscsi_op,
+            self.stage,
+            self.cmd_sn,
+            self.stat_sn.get()
+        );
+        if self.stage != LoginStage::FullFeature {
+            if iscsi_op != op::LOGIN_REQ {
+                return self.reject(work, reject::PROTOCOL_ERROR, bhs);
+            }
+            return self.handle_login(work, pdu);
+        }
+
+        match iscsi_op {
+            op::SCSI_CMD => self.handle_scsi_cmd(work, devs, pdu),
+            op::SCSI_TASK_REQ => self.handle_tmf(work, pdu, devs),
+            op::NOP_OUT => self.handle_nop(work, pdu),
+            op::LOGOUT_REQ => self.handle_logout(work, pdu),
+            op::TEXT_REQ => self.handle_text(work, pdu),
+            op::LOGIN_REQ => self.reject(work, reject::PROTOCOL_ERROR, bhs),
+            _ => self.reject(work, reject::PROTOCOL_ERROR, bhs),
+        }
+    }
+
+    // ── Data-In phase ─────────────────────────────────────────────
+
+    /// Advance a multi-chunk Data-In phase after the pending chunk was sent.
     fn poll_data_in<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let IscsiState::DataIn {
             transfer_len,
             sent,
             itt,
             chunk,
-            lun,
-        } = st
-        else {
-            return SessionStep::Error(TargetError::Internal);
-        };
-
-        if sent >= transfer_len {
-            // Whole transfer sent — drain the agenda then send the final
-            // Data-In with status.
-            return self.finish_data_in_final(work, devs, planes, lun, itt, 0, 0, 0, status::GOOD);
-        }
-
-        let next = ((transfer_len - sent) as usize).min(chunk);
-        if lun < devs.len() {
-            let dev = &mut devs[lun];
-            let produced = match dev.xfer_out(sent, &mut work[BHS_SIZE..BHS_SIZE + next]) {
-                Xfer::Inline { len } => len,
-                Xfer::Store(op) => {
-                    let Some(plane) = planes.get_mut(lun).and_then(Option::as_mut) else {
-                        return SessionStep::Error(TargetError::Internal);
-                    };
-                    let r = plane.do_op(op);
-                    if store_done_failed(dev, r) {
-                        0
-                    } else {
-                        next
-                    }
-                }
-            };
-            if produced != next {
-                let sense = dev.take_sense();
-                return self.finish_response(
-                    work,
-                    devs,
-                    planes,
-                    lun,
-                    itt,
-                    status::CHECK_CONDITION,
-                    sense,
-                );
-            }
-        }
-        self.state = IscsiState::DataIn {
-            transfer_len,
-            sent: sent + next as u64,
-            itt,
-            chunk: next,
-            lun,
-        };
-        SessionStep::NeedSend(&work[..BHS_SIZE + next])
-    }
-
-    fn poll_r2t_send<'a>(&'a mut self, work: &'a mut [u8]) -> SessionStep<'a> {
-        let st = self.state;
-        let IscsiState::R2tSend {
-            itt,
-            transfer_len,
-            received,
-            r2t_sn,
+            pending,
             data_sn,
             lun,
         } = st
         else {
-            return SessionStep::Error(TargetError::Internal);
+            return Action::Error(TargetError::Internal);
         };
+        // The next chunk starts just after the pending one.
+        let offset = sent + pending as u64;
+        let remaining = transfer_len - offset;
+        let next = (remaining as usize).min(chunk);
 
+        let probe = match devs[lun].xfer_out(offset, &mut work[BHS_SIZE..BHS_SIZE + next]) {
+            Xfer::Inline { len } => Ok(len),
+            Xfer::Store(op) => match StoreDesc::of(op) {
+                Some(desc) => Err(desc),
+                None => return Action::Error(TargetError::Internal),
+            },
+        };
+        let produced = match probe {
+            Ok(produced) => produced,
+            Err(desc) => {
+                self.state = IscsiState::DataInStore {
+                    transfer_len,
+                    sent: offset,
+                    itt,
+                    chunk: next,
+                    data_sn: data_sn.wrapping_add(1),
+                    lun,
+                };
+                return Action::Store {
+                    lun,
+                    op: desc.attach_mut(&mut work[BHS_SIZE..BHS_SIZE + next]),
+                };
+            }
+        };
+        if produced != next {
+            let sense = devs[lun].take_sense();
+            return self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense);
+        }
+        if offset + next as u64 == transfer_len {
+            // Final Data-In (F+S): drain the agenda first.
+            return self.finish_data_in_final(
+                work,
+                devs,
+                lun,
+                itt,
+                next,
+                offset as u32,
+                data_sn.wrapping_add(1),
+                status::GOOD,
+            );
+        }
+        let mut bhs = Bhs::new();
+        bhs.set_opcode(op::SCSI_DATA_IN);
+        bhs.set_itt(itt);
+        bhs.set_data_sn(data_sn.wrapping_add(1));
+        bhs.set_buffer_offset(offset as u32);
+        bhs.set_data_segment_len(next as u32);
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        let total = BHS_SIZE + next;
+        let pad = pdu_pad_len(next as u32) as usize;
+        work[total..total + pad].fill(0);
+        self.state = IscsiState::DataIn {
+            transfer_len,
+            sent: offset,
+            itt,
+            chunk,
+            pending: next,
+            data_sn: data_sn.wrapping_add(1),
+            lun,
+        };
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
+    }
+
+    /// Finalize a Data-In chunk whose storage op finished (`Xfer::Store`).
+    fn poll_data_in_store<'a, D: ScsiDevice>(
+        &'a mut self,
+        result: Result<(), StorageError>,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let st = self.state;
+        let IscsiState::DataInStore {
+            transfer_len,
+            sent,
+            itt,
+            chunk,
+            data_sn,
+            lun,
+        } = st
+        else {
+            return Action::Error(TargetError::Internal);
+        };
+        if store_done_failed(&mut devs[lun], result) {
+            let sense = devs[lun].take_sense();
+            return self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense);
+        }
+        if sent + chunk as u64 == transfer_len {
+            return self.finish_data_in_final(
+                work,
+                devs,
+                lun,
+                itt,
+                chunk,
+                sent as u32,
+                data_sn,
+                status::GOOD,
+            );
+        }
+        let mut bhs = Bhs::new();
+        bhs.set_opcode(op::SCSI_DATA_IN);
+        bhs.set_itt(itt);
+        bhs.set_data_sn(data_sn);
+        bhs.set_buffer_offset(sent as u32);
+        bhs.set_data_segment_len(chunk as u32);
+        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        let total = BHS_SIZE + chunk;
+        let pad = pdu_pad_len(chunk as u32) as usize;
+        work[total..total + pad].fill(0);
+        self.state = IscsiState::DataIn {
+            transfer_len,
+            sent,
+            itt,
+            chunk,
+            pending: chunk,
+            data_sn,
+            lun,
+        };
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
+    }
+
+    /// Data-Out immediate-data storage op finished (`Xfer::Store`).
+    fn poll_in_xfer_store<'a, D: ScsiDevice>(
+        &'a mut self,
+        result: Result<(), StorageError>,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let st = self.state;
+        let IscsiState::InXferStore {
+            itt,
+            transfer_len,
+            received,
+            lun,
+        } = st
+        else {
+            return Action::Error(TargetError::Internal);
+        };
+        if store_done_failed(&mut devs[lun], result) {
+            let sense = devs[lun].take_sense();
+            return self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense);
+        }
+        if received == transfer_len {
+            // The immediate data completed the whole write.
+            return self.finish_response(work, devs, lun, itt, status::GOOD, None);
+        }
+        // Enter R2T state: send the first R2T.
+        self.send_r2t(work, itt, transfer_len, received, 0, 0, lun)
+    }
+
+    // ── R2T / Data-Out phase ──────────────────────────────────────
+
+    /// Build and send an R2T PDU, entering [`IscsiState::R2tCollect`] with the
+    /// R2T pending in `work[..BHS_SIZE]` (`Frame::Send`).
+    #[allow(clippy::too_many_arguments)]
+    fn send_r2t<'a>(
+        &'a mut self,
+        work: &'a mut [u8],
+        itt: u32,
+        transfer_len: u64,
+        received: u64,
+        r2t_sn: u32,
+        data_sn: u32,
+        lun: usize,
+    ) -> Action<'a> {
         let burst = (u64::from(self.neg.max_burst_len)).min(transfer_len - received);
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::R2T);
@@ -801,7 +936,6 @@ impl IscsiSession {
             burst,
             lun
         );
-
         work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
@@ -814,17 +948,21 @@ impl IscsiSession {
             expected_bo: received as u32,
             burst_remaining: burst,
             lun,
+            frame: Frame::Send,
         };
-        SessionStep::NeedSend(&work[..BHS_SIZE])
+        Action::HostSend {
+            bytes: &work[..BHS_SIZE],
+            prefetch: None,
+        }
     }
 
+    /// Process one assembled Data-Out PDU for the active R2T.
     fn poll_r2t_collect<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent,
+        pdu: &Pdu,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let IscsiState::R2tCollect {
             itt,
@@ -835,62 +973,66 @@ impl IscsiSession {
             mut expected_bo,
             mut burst_remaining,
             lun,
+            ..
         } = st
         else {
-            return SessionStep::Error(TargetError::Internal);
+            return Action::Error(TargetError::Internal);
         };
 
-        let SessionEvent::PduReceived { dsl } = ev;
-        let pdu_bhs = Self::bhs_of(work);
-        let pdu_dsl = dsl as usize;
+        let pdu_bhs = &pdu.bhs;
+        let pdu_dsl = pdu.dsl;
 
         if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
-            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, pdu_bhs);
         }
         if pdu_bhs.itt() != itt || pdu_bhs.ttt() != TTT {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_bhs.buffer_offset() != expected_bo {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_bhs.data_sn() != data_sn {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_dsl > self.max_recv_data_segment as usize {
-            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, pdu_bhs);
         }
         if pdu_dsl as u64 > burst_remaining {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
 
-        if pdu_dsl > 0 && lun < devs.len() {
-            let dev = &mut devs[lun];
-            let produced =
-                match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
-                    Xfer::Inline { len } => len,
-                    Xfer::Store(op) => {
-                        let Some(plane) = planes.get_mut(lun).and_then(Option::as_mut) else {
-                            return SessionStep::Error(TargetError::Internal);
-                        };
-                        let r = plane.do_op(op);
-                        if store_done_failed(dev, r) {
-                            0
-                        } else {
-                            pdu_dsl
-                        }
-                    }
+        if pdu_dsl > 0 {
+            let probe =
+                match devs[lun].xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
+                    Xfer::Inline { len } => Ok(len),
+                    Xfer::Store(op) => match StoreDesc::of(op) {
+                        Some(desc) => Err(desc),
+                        None => return Action::Error(TargetError::Internal),
+                    },
                 };
+            let produced = match probe {
+                Ok(produced) => produced,
+                Err(desc) => {
+                    self.state = IscsiState::R2tStore {
+                        itt,
+                        transfer_len,
+                        received,
+                        r2t_sn,
+                        data_sn,
+                        expected_bo,
+                        burst_remaining,
+                        lun,
+                        dsl: pdu_dsl,
+                    };
+                    let Some(op) = desc.attach_ro(&work[BHS_SIZE..BHS_SIZE + pdu_dsl]) else {
+                        return Action::Error(TargetError::Internal);
+                    };
+                    return Action::Store { lun, op };
+                }
+            };
             if produced != pdu_dsl {
-                let sense = dev.take_sense();
-                return self.finish_response(
-                    work,
-                    devs,
-                    planes,
-                    lun,
-                    itt,
-                    status::CHECK_CONDITION,
-                    sense,
-                );
+                let sense = devs[lun].take_sense();
+                return self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense);
             }
         }
 
@@ -908,19 +1050,11 @@ impl IscsiSession {
         if burst_remaining == 0 {
             if received == transfer_len {
                 // Transfer complete — drain the agenda then send the SCSI Response.
-                return self.finish_response(work, devs, planes, lun, itt, status::GOOD, None);
+                return self.finish_response(work, devs, lun, itt, status::GOOD, None);
             }
             // Next R2T — DataSN resets per R2T (RFC 3720 §10.7, DataSN is
             // relative to the R2T's buffer offset, not the whole command).
-            self.state = IscsiState::R2tSend {
-                itt,
-                transfer_len,
-                received,
-                r2t_sn: r2t_sn + 1,
-                data_sn: 0,
-                lun,
-            };
-            return self.poll_r2t_send(work);
+            return self.send_r2t(work, itt, transfer_len, received, r2t_sn + 1, 0, lun);
         }
 
         // More Data-Out PDUs expected in this burst.
@@ -933,17 +1067,70 @@ impl IscsiSession {
             expected_bo,
             burst_remaining,
             lun,
+            frame: Frame::Bhs,
         };
-        SessionStep::NeedRecv
+        Action::HostRecv { len: BHS_SIZE }
     }
 
+    /// Data-Out storage op finished (`Xfer::Store`).
+    fn poll_r2t_store<'a, D: ScsiDevice>(
+        &'a mut self,
+        result: Result<(), StorageError>,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let st = self.state;
+        let IscsiState::R2tStore {
+            itt,
+            transfer_len,
+            received,
+            r2t_sn,
+            data_sn,
+            expected_bo,
+            burst_remaining,
+            lun,
+            dsl,
+        } = st
+        else {
+            return Action::Error(TargetError::Internal);
+        };
+        if store_done_failed(&mut devs[lun], result) {
+            let sense = devs[lun].take_sense();
+            return self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense);
+        }
+        let expected_bo = expected_bo + dsl as u32;
+        let received = received + dsl as u64;
+        let burst_remaining = burst_remaining - dsl as u64;
+        let data_sn = data_sn.wrapping_add(1);
+        if burst_remaining == 0 {
+            if received == transfer_len {
+                return self.finish_response(work, devs, lun, itt, status::GOOD, None);
+            }
+            return self.send_r2t(work, itt, transfer_len, received, r2t_sn + 1, 0, lun);
+        }
+        self.state = IscsiState::R2tCollect {
+            itt,
+            transfer_len,
+            received,
+            r2t_sn,
+            data_sn,
+            expected_bo,
+            burst_remaining,
+            lun,
+            frame: Frame::Bhs,
+        };
+        Action::HostRecv { len: BHS_SIZE }
+    }
+
+    // ── ParamOut collection ───────────────────────────────────────
+
+    /// Process one assembled Data-Out PDU accumulating ParamOut data.
     fn poll_param_collect<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent,
+        pdu: &Pdu,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let IscsiState::ParamCollect {
             itt,
@@ -957,32 +1144,32 @@ impl IscsiSession {
             cdb_len,
             mut acc_offset,
             lun,
+            ..
         } = st
         else {
-            return SessionStep::Error(TargetError::Internal);
+            return Action::Error(TargetError::Internal);
         };
 
-        let SessionEvent::PduReceived { dsl } = ev;
-        let pdu_bhs = Self::bhs_of(work);
-        let pdu_dsl = dsl as usize;
+        let pdu_bhs = &pdu.bhs;
+        let pdu_dsl = pdu.dsl;
 
         if pdu_bhs.opcode() != op::SCSI_DATA_OUT {
-            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, pdu_bhs);
         }
         if pdu_bhs.itt() != itt || pdu_bhs.ttt() != TTT {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_bhs.buffer_offset() != expected_bo {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_bhs.data_sn() != data_sn {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
         if pdu_dsl > self.max_recv_data_segment as usize {
-            return self.reject(work, reject::PROTOCOL_ERROR, &pdu_bhs);
+            return self.reject(work, reject::PROTOCOL_ERROR, pdu_bhs);
         }
         if pdu_dsl as u64 > burst_remaining {
-            return self.reject(work, reject::INVALID_PDU_FIELD, &pdu_bhs);
+            return self.reject(work, reject::INVALID_PDU_FIELD, pdu_bhs);
         }
 
         // Accumulate into work[BHS_SIZE + acc_offset ..].
@@ -1007,11 +1194,8 @@ impl IscsiSession {
                 CommandOutcome::CheckCondition
             };
             return match outcome {
-                CommandOutcome::Status => {
-                    self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
-                }
-                CommandOutcome::StatusWithSense => {
-                    self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
+                CommandOutcome::Status | CommandOutcome::StatusWithSense => {
+                    self.finish_response(work, devs, lun, itt, status::GOOD, None)
                 }
                 CommandOutcome::CheckCondition => {
                     let sense = if lun < devs.len() {
@@ -1019,27 +1203,11 @@ impl IscsiSession {
                     } else {
                         None
                     };
-                    self.finish_response(
-                        work,
-                        devs,
-                        planes,
-                        lun,
-                        itt,
-                        status::CHECK_CONDITION,
-                        sense,
-                    )
+                    self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense)
                 }
                 _ => {
                     let sense = Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
-                    self.finish_response(
-                        work,
-                        devs,
-                        planes,
-                        lun,
-                        itt,
-                        status::CHECK_CONDITION,
-                        Some(sense),
-                    )
+                    self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, Some(sense))
                 }
             };
         }
@@ -1050,7 +1218,7 @@ impl IscsiSession {
                 itt,
                 expected,
                 received,
-                r2t_sn: r2t_sn + 1,
+                r2t_sn,
                 data_sn,
                 expected_bo,
                 burst_remaining: (u64::from(self.neg.max_burst_len)).min(expected - received),
@@ -1058,6 +1226,7 @@ impl IscsiSession {
                 cdb_len,
                 acc_offset,
                 lun,
+                frame: Frame::Bhs,
             };
             return self.send_param_r2t(work, itt, received, r2t_sn + 1);
         }
@@ -1074,8 +1243,9 @@ impl IscsiSession {
             cdb_len,
             acc_offset,
             lun,
+            frame: Frame::Bhs,
         };
-        SessionStep::NeedRecv
+        Action::HostRecv { len: BHS_SIZE }
     }
 
     /// Build and send a ParamOut R2T PDU.
@@ -1085,7 +1255,7 @@ impl IscsiSession {
         itt: u32,
         buffer_offset: u64,
         r2t_sn: u32,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         let st = self.state;
         let IscsiState::ParamCollect {
             expected,
@@ -1094,7 +1264,7 @@ impl IscsiSession {
             ..
         } = st
         else {
-            return SessionStep::Error(TargetError::Internal);
+            return Action::Error(TargetError::Internal);
         };
         let burst = (u64::from(self.neg.max_burst_len)).min(expected - received);
         let mut bhs = Bhs::new();
@@ -1113,17 +1283,22 @@ impl IscsiSession {
         // Update burst_remaining in state.
         if let IscsiState::ParamCollect {
             ref mut burst_remaining,
+            ref mut frame,
             ..
         } = self.state
         {
             *burst_remaining = burst;
+            *frame = Frame::Send;
         }
-        SessionStep::NeedSend(&work[..BHS_SIZE])
+        Action::HostSend {
+            bytes: &work[..BHS_SIZE],
+            prefetch: None,
+        }
     }
 
     // ── Login Phase ───────────────────────────────────────────────
 
-    fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+    fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> Action<'a> {
         let req = &pdu.bhs;
         // Login C bit (byte1 bit6, RFC 3720 §10.12.1) — continuation not
         // supported; reject if set (M10).
@@ -1157,7 +1332,10 @@ impl IscsiSession {
             work[BHS_SIZE..BHS_SIZE + pad].fill(0);
             self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
             self.state = IscsiState::Closed;
-            return SessionStep::NeedSend(&work[..BHS_SIZE + pad]);
+            return Action::HostSend {
+                bytes: &work[..BHS_SIZE + pad],
+                prefetch: None,
+            };
         }
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
@@ -1173,13 +1351,13 @@ impl IscsiSession {
         let resp_len = if pdu.dsl <= LOGIN_MAX {
             let (head, tail) = work.split_at_mut(BHS_SIZE + pdu.dsl);
             let Some(n) = self.negotiate(&head[BHS_SIZE..], tail) else {
-                return SessionStep::Error(TargetError::WorkBufTooSmall);
+                return Action::Error(TargetError::WorkBufTooSmall);
             };
             work.copy_within(BHS_SIZE + pdu.dsl..BHS_SIZE + pdu.dsl + n, BHS_SIZE);
             n
         } else {
             let Some(n) = self.negotiate(&[], &mut work[BHS_SIZE..]) else {
-                return SessionStep::Error(TargetError::WorkBufTooSmall);
+                return Action::Error(TargetError::WorkBufTooSmall);
             };
             n
         };
@@ -1236,7 +1414,10 @@ impl IscsiSession {
         } else {
             self.stage = LoginStage::from_csg(req_csg).unwrap_or(LoginStage::Security);
         }
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
     }
 
     /// Parse initiator key=value text into a response, updating negotiated
@@ -1373,15 +1554,14 @@ impl IscsiSession {
     fn handle_scsi_cmd<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
+        devs: &'a mut [D],
         pdu: &Pdu,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return SessionStep::NeedRecv;
+            return Action::HostRecv { len: BHS_SIZE };
         }
         self.cmd_sn = recv_cmd_sn;
 
@@ -1399,7 +1579,6 @@ impl IscsiSession {
             return self.handle_report_luns(
                 work,
                 devs,
-                planes,
                 bhs.lun() as usize,
                 itt,
                 devs.len(),
@@ -1421,23 +1600,12 @@ impl IscsiSession {
                 if n > 0 {
                     work[BHS_SIZE..BHS_SIZE + n].copy_from_slice(&buf[..n]);
                 }
-                return self.finish_data_in_final(
-                    work,
-                    devs,
-                    planes,
-                    lun,
-                    itt,
-                    n,
-                    0,
-                    0,
-                    status::GOOD,
-                );
+                return self.finish_data_in_final(work, devs, lun, itt, n, 0, 0, status::GOOD);
             }
             let sense = Sense::new(SenseKey::IllegalRequest, asc::LOGICAL_UNIT_NOT_SUPPORTED, 0);
             return self.finish_response(
                 work,
                 devs,
-                planes,
                 lun,
                 itt,
                 status::CHECK_CONDITION,
@@ -1462,23 +1630,22 @@ impl IscsiSession {
             pdu.dsl
         );
 
-        let dev = &mut devs[lun];
-        let outcome = match dev.do_cmd(cdb, &mut work[BHS_SIZE..]) {
+        let outcome = match devs[lun].do_cmd(cdb, &mut work[BHS_SIZE..]) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
-                return SessionStep::Error(TargetError::WorkBufTooSmall)
+                return Action::Error(TargetError::WorkBufTooSmall)
             }
-            Err(_) => return SessionStep::Error(TargetError::Internal),
+            Err(_) => return Action::Error(TargetError::Internal),
         };
 
         match outcome {
             CommandOutcome::Status => {
                 crate::debug!("  -> Status (GOOD)");
-                self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
+                self.finish_response(work, devs, lun, itt, status::GOOD, None)
             }
             CommandOutcome::StatusWithSense => {
                 crate::debug!("  -> StatusWithSense (GOOD, sense pending)");
-                self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
+                self.finish_response(work, devs, lun, itt, status::GOOD, None)
             }
             CommandOutcome::CheckCondition => {
                 let sense = devs[lun].take_sense();
@@ -1492,61 +1659,58 @@ impl IscsiSession {
                 } else {
                     crate::debug!("  -> CheckCondition (no sense)");
                 }
-                self.finish_response(work, devs, planes, lun, itt, status::CHECK_CONDITION, sense)
+                self.finish_response(work, devs, lun, itt, status::CHECK_CONDITION, sense)
             }
             CommandOutcome::OutInline { len } => {
                 crate::debug!("  -> OutInline (synthesized, {} bytes)", len);
                 let n = len;
-                self.finish_data_in_final(work, devs, planes, lun, itt, n, 0, 0, status::GOOD)
+                self.finish_data_in_final(work, devs, lun, itt, n, 0, 0, status::GOOD)
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
                 crate::debug!("  -> OutXfer (backend, transfer_len={})", transfer_len);
                 let chunk = (transfer_len as usize)
                     .min(work.len() - BHS_SIZE)
                     .min(self.max_recv_data_segment as usize);
-                if lun < devs.len() {
-                    let dev = &mut devs[lun];
-                    let produced = match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
-                        Xfer::Inline { len } => len,
-                        Xfer::Store(op) => {
-                            let Some(plane) = planes.get_mut(lun).and_then(Option::as_mut) else {
-                                return SessionStep::Error(TargetError::Internal);
-                            };
-                            let r = plane.do_op(op);
-                            if store_done_failed(dev, r) {
-                                0
-                            } else {
-                                chunk
-                            }
-                        }
-                    };
-                    if produced != chunk {
-                        let sense = dev.take_sense();
-                        return self.finish_response(
-                            work,
-                            devs,
-                            planes,
-                            lun,
+                // First chunk (intermediate when the transfer spans chunks).
+                let probe = match devs[lun].xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
+                    Xfer::Inline { len } => Ok(len),
+                    Xfer::Store(op) => match StoreDesc::of(op) {
+                        Some(desc) => Err(desc),
+                        None => return Action::Error(TargetError::Internal),
+                    },
+                };
+                let produced = match probe {
+                    Ok(produced) => produced,
+                    Err(desc) => {
+                        self.state = IscsiState::DataInStore {
+                            transfer_len,
+                            sent: 0,
                             itt,
-                            status::CHECK_CONDITION,
-                            sense,
-                        );
+                            chunk,
+                            data_sn: 0,
+                            lun,
+                        };
+                        return Action::Store {
+                            lun,
+                            op: desc.attach_mut(&mut work[BHS_SIZE..BHS_SIZE + chunk]),
+                        };
                     }
+                };
+                if produced != chunk {
+                    let sense = devs[lun].take_sense();
+                    return self.finish_response(
+                        work,
+                        devs,
+                        lun,
+                        itt,
+                        status::CHECK_CONDITION,
+                        sense,
+                    );
                 }
                 if chunk as u64 == transfer_len {
                     // All data fits in one chunk — send as final Data-In (F+S),
                     // draining the agenda first.
-                    self.finish_data_in_final(
-                        work,
-                        devs,
-                        planes,
-                        lun,
-                        itt,
-                        chunk,
-                        0,
-                        0,
-                        status::GOOD,
-                    )
+                    self.finish_data_in_final(work, devs, lun, itt, chunk, 0, 0, status::GOOD)
                 } else {
                     // Multi-chunk: first chunk is intermediate (F=0, S=0).
                     let mut dib = Bhs::new();
@@ -1556,12 +1720,17 @@ impl IscsiSession {
                     work[..BHS_SIZE].copy_from_slice(dib.as_bytes());
                     self.state = IscsiState::DataIn {
                         transfer_len,
-                        sent: chunk as u64,
+                        sent: 0,
                         itt,
                         chunk,
+                        pending: chunk,
+                        data_sn: 0,
                         lun,
                     };
-                    SessionStep::NeedSend(&work[..BHS_SIZE + chunk])
+                    Action::HostSend {
+                        bytes: &work[..BHS_SIZE + chunk],
+                        prefetch: None,
+                    }
                 }
             }
             CommandOutcome::InXfer { len: transfer_len } => {
@@ -1572,29 +1741,37 @@ impl IscsiSession {
                     transfer_len,
                     received
                 );
-                if received > 0 && lun < devs.len() {
-                    let dev = &mut devs[lun];
+                if received > 0 {
                     let imm = &work[BHS_SIZE..BHS_SIZE + received as usize];
-                    let produced = match dev.xfer_in(0, imm) {
-                        Xfer::Inline { len } => len,
-                        Xfer::Store(op) => {
-                            let Some(plane) = planes.get_mut(lun).and_then(Option::as_mut) else {
-                                return SessionStep::Error(TargetError::Internal);
+                    let probe = match devs[lun].xfer_in(0, imm) {
+                        Xfer::Inline { len } => Ok(len),
+                        Xfer::Store(op) => match StoreDesc::of(op) {
+                            Some(desc) => Err(desc),
+                            None => return Action::Error(TargetError::Internal),
+                        },
+                    };
+                    let produced = match probe {
+                        Ok(produced) => produced,
+                        Err(desc) => {
+                            self.state = IscsiState::InXferStore {
+                                itt,
+                                transfer_len,
+                                received,
+                                lun,
                             };
-                            let r = plane.do_op(op);
-                            if store_done_failed(dev, r) {
-                                0
-                            } else {
-                                received as usize
-                            }
+                            let Some(op) =
+                                desc.attach_ro(&work[BHS_SIZE..BHS_SIZE + received as usize])
+                            else {
+                                return Action::Error(TargetError::Internal);
+                            };
+                            return Action::Store { lun, op };
                         }
                     };
                     if produced != received as usize {
-                        let sense = dev.take_sense();
+                        let sense = devs[lun].take_sense();
                         return self.finish_response(
                             work,
                             devs,
-                            planes,
                             lun,
                             itt,
                             status::CHECK_CONDITION,
@@ -1603,19 +1780,11 @@ impl IscsiSession {
                     }
                 }
                 if received == transfer_len {
-                    return self.finish_response(work, devs, planes, lun, itt, status::GOOD, None);
+                    return self.finish_response(work, devs, lun, itt, status::GOOD, None);
                 }
 
                 // Enter R2T state: send the first R2T.
-                self.state = IscsiState::R2tSend {
-                    itt,
-                    transfer_len,
-                    received,
-                    r2t_sn: 0,
-                    data_sn: 0,
-                    lun,
-                };
-                self.poll_r2t_send(work)
+                self.send_r2t(work, itt, transfer_len, received, 0, 0, lun)
             }
             CommandOutcome::InParam { expected_len } => {
                 let expected = expected_len as u64;
@@ -1628,7 +1797,7 @@ impl IscsiSession {
                     return self.reject(work, reject::PROTOCOL_ERROR, bhs);
                 }
                 if expected as usize > work.len() - BHS_SIZE {
-                    return SessionStep::Error(TargetError::WorkBufTooSmall);
+                    return Action::Error(TargetError::WorkBufTooSmall);
                 }
 
                 let mut cdb_buf = [0u8; 16];
@@ -1646,11 +1815,8 @@ impl IscsiSession {
                         CommandOutcome::CheckCondition
                     };
                     return match outcome2 {
-                        CommandOutcome::Status => {
-                            self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
-                        }
-                        CommandOutcome::StatusWithSense => {
-                            self.finish_response(work, devs, planes, lun, itt, status::GOOD, None)
+                        CommandOutcome::Status | CommandOutcome::StatusWithSense => {
+                            self.finish_response(work, devs, lun, itt, status::GOOD, None)
                         }
                         CommandOutcome::CheckCondition => {
                             let sense = if lun < devs.len() {
@@ -1661,7 +1827,6 @@ impl IscsiSession {
                             self.finish_response(
                                 work,
                                 devs,
-                                planes,
                                 lun,
                                 itt,
                                 status::CHECK_CONDITION,
@@ -1673,7 +1838,6 @@ impl IscsiSession {
                             self.finish_response(
                                 work,
                                 devs,
-                                planes,
                                 lun,
                                 itt,
                                 status::CHECK_CONDITION,
@@ -1698,6 +1862,7 @@ impl IscsiSession {
                     cdb_len,
                     acc_offset,
                     lun,
+                    frame: Frame::Bhs,
                 };
                 self.send_param_r2t(work, itt, received, 0)
             }
@@ -1709,13 +1874,12 @@ impl IscsiSession {
     fn handle_report_luns<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
+        devs: &'a mut [D],
         lun: usize,
         itt: u32,
         num_luns: usize,
         select_report: u8,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         // SPC-3 §6.21/Table 148: ONLY 00h (all non well-known), 01h
         // (well-known only) and 02h (all) are defined; the rest are reserved
         // → CHECK CONDITION / INVALID FIELD IN CDB (autosense-in-response).
@@ -1724,7 +1888,6 @@ impl IscsiSession {
             return self.finish_response(
                 work,
                 devs,
-                planes,
                 lun,
                 itt,
                 status::CHECK_CONDITION,
@@ -1739,7 +1902,7 @@ impl IscsiSession {
             .unwrap_or(u32::MAX);
         let total = 8usize + (list_len as usize);
         if total > work.len() - BHS_SIZE {
-            return SessionStep::Error(TargetError::WorkBufTooSmall);
+            return Action::Error(TargetError::WorkBufTooSmall);
         }
         work[BHS_SIZE..BHS_SIZE + 4].copy_from_slice(&list_len.to_be_bytes());
         for b in &mut work[BHS_SIZE + 4..BHS_SIZE + 8] {
@@ -1758,7 +1921,7 @@ impl IscsiSession {
             entries,
             select_report
         );
-        self.finish_data_in_final(work, devs, planes, lun, itt, total, 0, 0, status::GOOD)
+        self.finish_data_in_final(work, devs, lun, itt, total, 0, 0, status::GOOD)
     }
 
     // ── Full Feature: Task Management / NOP / Logout ─────────────
@@ -1767,14 +1930,14 @@ impl IscsiSession {
         &'a mut self,
         work: &'a mut [u8],
         pdu: &Pdu,
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
 
         if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return SessionStep::NeedRecv;
+            return Action::HostRecv { len: BHS_SIZE };
         }
         self.cmd_sn = recv_cmd_sn;
 
@@ -1808,10 +1971,13 @@ impl IscsiSession {
         let pad = pdu_pad_len(0) as usize;
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..BHS_SIZE + pad])
+        Action::HostSend {
+            bytes: &work[..BHS_SIZE + pad],
+            prefetch: None,
+        }
     }
 
-    fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+    fn handle_nop<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> Action<'a> {
         let bhs = &pdu.bhs;
         let itt = bhs.itt();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
@@ -1822,14 +1988,14 @@ impl IscsiSession {
             if !immediate_flag {
                 return self.reject(work, reject::PROTOCOL_ERROR, bhs);
             }
-            return SessionStep::NeedRecv;
+            return Action::HostRecv { len: BHS_SIZE };
         }
 
         // RFC 3720 §3.2.2.1: non-immediate commands advance CmdSN.
         if !immediate_flag {
             let recv_cmd_sn = bhs.cmd_sn();
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-                return SessionStep::NeedRecv;
+                return Action::HostRecv { len: BHS_SIZE };
             }
             self.cmd_sn = recv_cmd_sn;
         }
@@ -1858,10 +2024,13 @@ impl IscsiSession {
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
     }
 
-    fn handle_logout<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+    fn handle_logout<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> Action<'a> {
         let bhs = &pdu.bhs;
         let mut resp = Bhs::new();
         resp.set_opcode(op::LOGOUT_RESP);
@@ -1875,15 +2044,18 @@ impl IscsiSession {
         work[BHS_SIZE..BHS_SIZE + pad].fill(0);
         self.state = IscsiState::Closed;
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..BHS_SIZE + pad])
+        Action::HostSend {
+            bytes: &work[..BHS_SIZE + pad],
+            prefetch: None,
+        }
     }
 
-    fn handle_text<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> SessionStep<'a> {
+    fn handle_text<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> Action<'a> {
         let bhs = &pdu.bhs;
         // F=0 (continuation) and non-0xFFFFFFFF TTT are not supported (no fragmentation);
         // be lenient for the legacy text_request_rejected test that sends a minimal BHS.
         if pdu.dsl > work.len() - BHS_SIZE {
-            return SessionStep::Error(TargetError::WorkBufTooSmall);
+            return Action::Error(TargetError::WorkBufTooSmall);
         }
         let data = &work[BHS_SIZE..BHS_SIZE + pdu.dsl];
         let mut pos = 0usize;
@@ -1931,7 +2103,7 @@ impl IscsiSession {
             let prefix = b"TargetName=";
             let needed = prefix.len() + txt.len() + 1;
             if needed > work.len() - BHS_SIZE {
-                return SessionStep::Error(TargetError::WorkBufTooSmall);
+                return Action::Error(TargetError::WorkBufTooSmall);
             }
             work[BHS_SIZE..BHS_SIZE + prefix.len()].copy_from_slice(prefix);
             work[BHS_SIZE + prefix.len()..BHS_SIZE + prefix.len() + txt.len()].copy_from_slice(txt);
@@ -1947,7 +2119,10 @@ impl IscsiSession {
         work[total..total + pad].fill(0);
         self.state = IscsiState::RecvPdu;
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
     }
 
     // ── Response PDU builders ─────────────────────────────────────
@@ -1959,19 +2134,19 @@ impl IscsiSession {
     fn finish_response<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
+        devs: &'a mut [D],
         lun: usize,
         itt: u32,
         status: u8,
         sense: Option<Sense>,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         self.state = IscsiState::Agenda(Agenda {
             itt,
             lun,
             kind: AgendaKind::Response { status, sense },
+            failed_sense: None,
         });
-        self.poll_agenda(work, devs, planes)
+        self.drain_agenda(work, devs)
     }
 
     /// Terminal-status funnel for a final Data-In (F=1, S=1): drain the agenda
@@ -1980,15 +2155,14 @@ impl IscsiSession {
     fn finish_data_in_final<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
+        devs: &'a mut [D],
         lun: usize,
         itt: u32,
         data_len: usize,
         buffer_offset: u32,
         data_sn: u32,
         status: u8,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         self.state = IscsiState::Agenda(Agenda {
             itt,
             lun,
@@ -1998,41 +2172,38 @@ impl IscsiSession {
                 data_sn,
                 status,
             },
+            failed_sense: None,
         });
-        self.poll_agenda(work, devs, planes)
+        self.drain_agenda(work, devs)
     }
 
-    /// Drain the device agenda inline and emit the pending terminal status. A
-    /// `store_done` failure turns the status into CHECK CONDITION (sense taken
-    /// from the device); the response geometry is unchanged.
-    fn poll_agenda<'a, D: ScsiDevice>(
+    /// Yield the next device-agenda op, or emit the pending terminal status
+    /// once the agenda is drained. A `store_done` failure turns the status into
+    /// CHECK CONDITION (sense taken from the device).
+    fn drain_agenda<'a, D: ScsiDevice>(
         &'a mut self,
         work: &'a mut [u8],
-        devs: &mut [D],
-        planes: &mut [Option<StorePlane<'_>>],
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let IscsiState::Agenda(agenda) = self.state else {
-            return SessionStep::Error(TargetError::Internal);
+            return Action::Error(TargetError::Internal);
         };
-        let mut failed = false;
         if agenda.lun < devs.len() {
-            while let Some(op) = devs[agenda.lun].next_store_op() {
-                let Some(plane) = planes.get_mut(agenda.lun).and_then(Option::as_mut) else {
-                    return SessionStep::Error(TargetError::Internal);
+            if let Some(op) = devs[agenda.lun].next_store_op() {
+                // The op is in flight; the state stays `Agenda` so
+                // `Event::StoreDone` resumes the drain.
+                return Action::Store {
+                    lun: agenda.lun,
+                    op,
                 };
-                let r = plane.do_op(op);
-                if store_done_failed(&mut devs[agenda.lun], r) {
-                    failed = true;
-                }
             }
         }
-        if failed && agenda.lun < devs.len() {
-            let sense = devs[agenda.lun].take_sense();
+        if let Some(sense) = agenda.failed_sense {
             return self.send_scsi_response(
                 work,
                 agenda.itt,
                 status::CHECK_CONDITION,
-                sense.as_ref(),
+                Some(&sense),
             );
         }
         match agenda.kind {
@@ -2050,13 +2221,38 @@ impl IscsiSession {
         }
     }
 
+    /// Agenda op completion: map the result through `devs[lun].store_done` (a
+    /// failure captures the sense, which turns the terminal status into CHECK
+    /// CONDITION) and continue.
+    fn poll_agenda<'a, D: ScsiDevice>(
+        &'a mut self,
+        result: Result<(), StorageError>,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let IscsiState::Agenda(agenda) = self.state else {
+            return Action::Error(TargetError::Internal);
+        };
+        let mut failed_sense = agenda.failed_sense;
+        if agenda.lun < devs.len() && store_done_failed(&mut devs[agenda.lun], result) {
+            if let Some(sense) = devs[agenda.lun].take_sense() {
+                failed_sense = Some(sense);
+            }
+        }
+        self.state = IscsiState::Agenda(Agenda {
+            failed_sense,
+            ..agenda
+        });
+        self.drain_agenda(work, devs)
+    }
+
     fn send_scsi_response<'a>(
         &'a mut self,
         work: &'a mut [u8],
         itt: u32,
         scsi_status: u8,
         sense: Option<&Sense>,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_RESP);
@@ -2081,7 +2277,10 @@ impl IscsiSession {
         let pad = pdu_pad_len(dlen as u32) as usize;
         work[total..total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
     }
 
     /// Single final Data-In (F=1, S=1) with status — used for synthesized
@@ -2094,7 +2293,7 @@ impl IscsiSession {
         buffer_offset: u32,
         data_sn: u32,
         scsi_status: u8,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         self.state = IscsiState::RecvPdu;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
@@ -2112,12 +2311,15 @@ impl IscsiSession {
         let pad = pdu_pad_len(data_len as u32) as usize;
         work[total..total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
     }
 
     /// Send a Reject and close the connection.  The data segment carries
     /// the full header of the rejected PDU; ITT = 0xffffffff (fix #18).
-    fn reject<'a>(&'a mut self, work: &'a mut [u8], reason: u8, rejected: &Bhs) -> SessionStep<'a> {
+    fn reject<'a>(&'a mut self, work: &'a mut [u8], reason: u8, rejected: &Bhs) -> Action<'a> {
         crate::warn!(
             "rejecting {} (0x{:02X}) reason={} (0x{:02X})",
             iscsi_opcode_name(rejected.opcode()),
@@ -2141,7 +2343,66 @@ impl IscsiSession {
         work[total..total + pad].fill(0);
         self.state = IscsiState::Closed;
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-        SessionStep::NeedSend(&work[..total + pad])
+        Action::HostSend {
+            bytes: &work[..total + pad],
+            prefetch: None,
+        }
+    }
+}
+
+/// A byte-addressed [`StoreOp`] with its buffer detached, used to survive the
+/// borrow of `work` / `devs` that `xfer_out` / `xfer_in` take while the session
+/// still needs them on the `Inline` branch (the classic NLL conditional-borrow
+/// workaround). By contract the op returned by the device carries exactly the
+/// slice the session passed, so it can be split into its Copy fields and
+/// rebuilt identically once the call's borrow has ended. The reconstructed op
+/// is byte-identical, so the Store stays invisible on the wire.
+///
+/// Only the byte-addressed variants appear here: the data phase is
+/// byte-addressed, while path-addressed FS ops come from the device agenda
+/// (`next_store_op`) and never from the data phase.
+#[derive(Clone, Copy)]
+enum StoreDesc {
+    Read { off: u64 },
+    Write { off: u64 },
+    Fill { off: u64, len: u64, byte: u8 },
+    Sync,
+}
+
+impl StoreDesc {
+    /// Split a byte-addressed `op` into its Copy fields. `None` for a
+    /// path-addressed (FS) op, which cannot be detached here.
+    fn of(op: StoreOp<'_>) -> Option<Self> {
+        match op {
+            StoreOp::Read { off, .. } => Some(Self::Read { off }),
+            StoreOp::Write { off, .. } => Some(Self::Write { off }),
+            StoreOp::Fill { off, len, byte } => Some(Self::Fill { off, len, byte }),
+            StoreOp::Sync => Some(Self::Sync),
+            StoreOp::FileRead { .. } | StoreOp::FileWrite { .. } | StoreOp::FileRemove { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Re-attach a mutable `buf` (the Data-In read buffer).
+    fn attach_mut<'b>(self, buf: &'b mut [u8]) -> StoreOp<'b> {
+        match self {
+            Self::Read { off } => StoreOp::Read { off, buf },
+            Self::Write { off } => StoreOp::Write { off, buf },
+            Self::Fill { off, len, byte } => StoreOp::Fill { off, len, byte },
+            Self::Sync => StoreOp::Sync,
+        }
+    }
+
+    /// Re-attach an immutable `buf` (the Data-Out write buffer). `None` for a
+    /// read op (which needs a mutable buffer and never arrives here).
+    fn attach_ro<'b>(self, buf: &'b [u8]) -> Option<StoreOp<'b>> {
+        match self {
+            Self::Write { off } => Some(StoreOp::Write { off, buf }),
+            Self::Fill { off, len, byte } => Some(StoreOp::Fill { off, len, byte }),
+            Self::Sync => Some(StoreOp::Sync),
+            Self::Read { .. } => None,
+        }
     }
 }
 
@@ -2164,122 +2425,11 @@ fn store_done_failed<D: ScsiDevice>(dev: &mut D, r: Result<(), StorageError>) ->
     }
 }
 
-/// Blocking wrapper: run `session.step` until the connection closes.
-///
-/// Validates `work.len() >= MIN_DATA_LEN + BHS_SIZE` up front.  I/O errors
-/// inside `step` surface as `Closed`; only caller bugs propagate as `Err`.
-///
-/// `luns` bundles the LUN devices and their aligned storage planes; it is
-/// destructured for disjoint borrows so a device-yielded
-/// [`Xfer::Store`] can be executed against
-/// its plane while the device slice is borrowed.
-pub fn serve_conn<C: Conn>(
-    conn: &mut C,
-    work: &mut [u8],
-    session: &mut IscsiSession,
-    luns: &mut Luns<'_>,
-) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-        return Err(TargetError::WorkBufTooSmall);
-    }
-    let Luns { devs, planes } = luns;
-    loop {
-        match session.step(conn, work, devs, planes) {
-            StepResult::Idle | StepResult::Processed => {}
-            StepResult::Closed => return Ok(()),
-            StepResult::Error(e) => return Err(e),
-        }
-    }
-}
-
 // ── Private helpers ─────────────────────────────────────────────────
 
 struct Pdu {
     bhs: Bhs,
     dsl: usize,
-}
-
-/// Receive one PDU: 48-byte BHS, optional AHS (skipped), data segment
-/// (into `work[BHS_SIZE..]` when it fits, otherwise discarded), and padding.
-/// Returns the data-segment length.  Never leaves bytes behind — keeps
-/// TCP synchronized (fix #1).
-fn recv_pdu<C: Conn + ?Sized>(conn: &mut C, work: &mut [u8]) -> Result<u32, ()> {
-    let mut raw = [0u8; BHS_SIZE];
-    let mut got = 0usize;
-    while got < BHS_SIZE {
-        match conn.read(&mut raw[got..]) {
-            Ok(0) => {
-                crate::warn!(
-                    "recv: BHS EOF after {}/{} bytes (peer closed)",
-                    got,
-                    BHS_SIZE
-                );
-                return Err(());
-            }
-            Ok(n) => got += n,
-            Err(_) => {
-                crate::warn!("recv: BHS I/O error after {}/{} bytes", got, BHS_SIZE);
-                return Err(());
-            }
-        }
-    }
-    // Copy BHS into work[0..48] so the poll model can inspect it.
-    work[..BHS_SIZE].copy_from_slice(&raw);
-    let bhs = Bhs::from_bytes(raw);
-    let dsl = bhs.data_segment_len() as usize;
-    let ahs = usize::from(bhs.total_ahs_length());
-    let mut hexbuf = [0u8; BHS_SIZE * 2];
-    let hlen = fmt_hex(&raw, &mut hexbuf);
-    crate::trace!(
-        "recv BHS: hex={} op_raw=0x{:02X} op=0x{:02X} dsl={} ahs={}",
-        core::str::from_utf8(&hexbuf[..hlen]).unwrap_or("<invalid>"),
-        raw[0],
-        bhs.opcode(),
-        dsl,
-        ahs
-    );
-    if ahs > 0 && skip(conn, ahs * 4).is_err() {
-        crate::warn!(
-            "recv: connection closed while reading AHS ({}*4 bytes)",
-            ahs
-        );
-        return Err(());
-    }
-    if dsl <= work.len() - BHS_SIZE {
-        if read_exact(conn, &mut work[BHS_SIZE..BHS_SIZE + dsl]).is_err() {
-            crate::warn!(
-                "recv: connection closed while reading data segment (dsl={})",
-                dsl
-            );
-            return Err(());
-        }
-    } else if skip(conn, dsl).is_err() {
-        crate::warn!(
-            "recv: connection closed while discarding oversized data segment (dsl={})",
-            dsl
-        );
-        return Err(());
-    }
-    let pad = pdu_pad_len(dsl as u32) as usize;
-    if pad > 0 && skip(conn, pad).is_err() {
-        crate::warn!(
-            "recv: connection closed while reading padding (pad={})",
-            pad
-        );
-        return Err(());
-    }
-    Ok(dsl as u32)
-}
-
-/// Discard `n` bytes via a small stack scratch (no big stack arrays).
-fn skip<C: Conn + ?Sized>(conn: &mut C, mut n: usize) -> Result<(), ()> {
-    let mut scratch = [0u8; 256];
-    while n > 0 {
-        let chunk = n.min(scratch.len());
-        read_exact(conn, &mut scratch[..chunk])?;
-        n -= chunk;
-    }
-    Ok(())
 }
 
 // ── Login key helpers ──────────────────────────────────────────────
@@ -2328,20 +2478,6 @@ fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
     &buf[i..]
 }
 
-fn fmt_hex(bytes: &[u8], out: &mut [u8]) -> usize {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut i = 0;
-    for &b in bytes {
-        if i + 2 > out.len() {
-            break;
-        }
-        out[i] = HEX[(b >> 4) as usize];
-        out[i + 1] = HEX[(b & 0x0F) as usize];
-        i += 2;
-    }
-    i
-}
-
 fn parse_u32(v: &[u8]) -> Option<u32> {
     if v.is_empty() {
         return None;
@@ -2361,10 +2497,62 @@ fn parse_u32(v: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::store::StorePlane;
     use crate::iscsi::pdu::BHS_SIZE;
 
-    /// Verify poll model round-trips: Login → Full Feature → SCSI INQUIRY
-    /// → Logout produces the same logical flow as the old step() model.
+    /// Summary of a poll round (no borrows), for the test drivers.
+    #[derive(Debug)]
+    enum Reply {
+        Recv(usize),
+        Sent(Vec<u8>),
+        Closed,
+        Error,
+    }
+
+    /// Drive `poll` until it asks for I/O (a receive or a send), executing any
+    /// `Action::Store` on `planes` and feeding `Event::StoreDone` back.
+    fn step<D: ScsiDevice>(
+        session: &mut IscsiSession,
+        work: &mut [u8],
+        devs: &mut [D],
+        planes: &mut [Option<StorePlane<'_>>],
+        mut ev: Event,
+    ) -> Reply {
+        loop {
+            match session.poll(ev, work, devs) {
+                Action::HostRecv { len } => return Reply::Recv(len),
+                Action::HostSend { bytes, .. } => return Reply::Sent(bytes.to_vec()),
+                Action::Store { lun, op } => {
+                    let result = match planes.get_mut(lun).and_then(|p| p.as_mut()) {
+                        Some(plane) => plane.do_op(op),
+                        None => return Reply::Error,
+                    };
+                    ev = Event::StoreDone { result };
+                }
+                Action::Closed => return Reply::Closed,
+                Action::Error(_) => return Reply::Error,
+            }
+        }
+    }
+
+    /// Build a one-PDU Login Request BHS (I=1, T=1, CSG=1, NSG=3).
+    fn login_bhs(dsl: usize) -> [u8; 48] {
+        let mut bhs = [0u8; 48];
+        bhs[0] = op::LOGIN_REQ | 0x40;
+        bhs[1] = flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
+        bhs[5] = (dsl >> 16) as u8;
+        bhs[6] = (dsl >> 8) as u8;
+        bhs[7] = dsl as u8;
+        bhs
+    }
+
+    /// The framed remainder length the core requests for a data segment of
+    /// `dsl` bytes (AHS = 0): `dsl` rounded up to a 4-byte boundary.
+    fn remainder(dsl: usize) -> usize {
+        dsl + ((4 - (dsl & 3)) & 3)
+    }
+
+    /// Verify the two-stage poll model: Login → Full Feature → SCSI INQUIRY.
     #[test]
     fn poll_login_and_inquiry() {
         use crate::scsi::backend::RamBackend;
@@ -2376,66 +2564,83 @@ mod tests {
         let mut session = IscsiSession::new();
         let mut work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
 
-        // Build a Login Request BHS (I=1, T=1, CSG=1, NSG=3).
         let login_text = b"InitiatorName=iqn.test\0SessionType=Normal\0";
-        let mut login_bhs = [0u8; 48];
-        login_bhs[0] = op::LOGIN_REQ | 0x40;
-        login_bhs[1] =
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
-        login_bhs[5] = (login_text.len() >> 16) as u8;
-        login_bhs[6] = (login_text.len() >> 8) as u8;
-        login_bhs[7] = login_text.len() as u8;
 
-        // Place the PDU into work.
-        work[..48].copy_from_slice(&login_bhs);
-        work[48..48 + login_text.len()].copy_from_slice(login_text);
-
-        // Poll: should get NeedSend (Login Response).
-        match session.poll(
-            SessionEvent::PduReceived {
-                dsl: login_text.len() as u32,
-            },
+        // BHS stage → request the data segment.
+        work[..48].copy_from_slice(&login_bhs(login_text.len()));
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
         ) {
-            SessionStep::NeedSend(data) => {
-                assert!(data.len() >= BHS_SIZE);
-                let resp_op = data[0] & 0x3F;
-                assert_eq!(resp_op, op::LOGIN_RESP);
+            Reply::Recv(len) => assert_eq!(len, remainder(login_text.len())),
+            other => panic!("expected data recv, got {other:?}"),
+        }
+        // Data stage → Login Response.
+        work[..remainder(login_text.len())].fill(0);
+        work[..login_text.len()].copy_from_slice(login_text);
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv {
+                len: remainder(login_text.len()),
+            },
+        ) {
+            Reply::Sent(bytes) => {
+                assert!(bytes.len() >= BHS_SIZE);
+                assert_eq!(bytes[0] & 0x3F, op::LOGIN_RESP);
             }
-            other => panic!("expected NeedSend for login response, got {other:?}"),
+            other => panic!("expected login response, got {other:?}"),
+        }
+        assert_eq!(session.stage(), LoginStage::FullFeature);
+        // Response sent → the next command's BHS.
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostSent,
+        ) {
+            Reply::Recv(len) => assert_eq!(len, BHS_SIZE),
+            other => panic!("expected next BHS recv, got {other:?}"),
         }
 
-        // Simulate "send done" by advancing stat_sn (the blocking wrapper
-        // does this automatically).
-        // After login with T=1, stage should be FullFeature.
-        assert_eq!(session.stage(), LoginStage::FullFeature);
-
-        // Now issue an INQUIRY CDB via a SCSI Command PDU.
-        let inquiry_cdb = [0x12, 0, 0, 0, 96, 0]; // INQUIRY, alloc=96
+        // INQUIRY (dsl=0): BHS stage → zero-length data stage.
+        let inquiry_cdb = [0x12, 0, 0, 0, 96, 0];
         let mut scsi_bhs = [0u8; 48];
         scsi_bhs[0] = op::SCSI_CMD | 0x40; // I=1 (Immediate) + SCSI_CMD
         scsi_bhs[1] = 0x80; // R=1 (Data-In expected)
-        scsi_bhs[16..20].copy_from_slice(&0u32.to_be_bytes()); // ITT=0
         scsi_bhs[24..28].copy_from_slice(&0u32.to_be_bytes()); // CmdSN=0 (next after login)
         scsi_bhs[32..32 + inquiry_cdb.len()].copy_from_slice(&inquiry_cdb);
-
         work[..48].copy_from_slice(&scsi_bhs);
         work[48..].fill(0);
-
-        match session.poll(
-            SessionEvent::PduReceived { dsl: 0 },
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
         ) {
-            SessionStep::NeedSend(data) => {
-                assert!(data.len() > BHS_SIZE);
+            Reply::Recv(len) => assert_eq!(len, 0),
+            other => panic!("expected zero-length data recv, got {other:?}"),
+        }
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv { len: 0 },
+        ) {
+            Reply::Sent(bytes) => {
+                assert!(bytes.len() > BHS_SIZE);
                 // First byte of INQUIRY response: PDT = 0x00 (direct access).
-                assert_eq!(data[BHS_SIZE] & 0x1F, 0x00);
+                assert_eq!(bytes[BHS_SIZE] & 0x1F, 0x00);
             }
-            other => panic!("expected NeedSend for INQUIRY response, got {other:?}"),
+            other => panic!("expected INQUIRY response, got {other:?}"),
         }
     }
 
@@ -2452,42 +2657,61 @@ mod tests {
 
         // Login first.
         let login_text = b"InitiatorName=iqn.test\0SessionType=Normal\0";
-        let mut login_bhs = [0u8; 48];
-        login_bhs[0] = op::LOGIN_REQ | 0x40;
-        login_bhs[1] =
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
-        login_bhs[5] = (login_text.len() >> 16) as u8;
-        login_bhs[6] = (login_text.len() >> 8) as u8;
-        login_bhs[7] = login_text.len() as u8;
-        work[..48].copy_from_slice(&login_bhs);
-        work[48..48 + login_text.len()].copy_from_slice(login_text);
-        let _ = session.poll(
-            SessionEvent::PduReceived {
-                dsl: login_text.len() as u32,
-            },
+        work[..48].copy_from_slice(&login_bhs(login_text.len()));
+        let _ = step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
+        );
+        work[..login_text.len()].copy_from_slice(login_text);
+        let _ = step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv {
+                len: login_text.len(),
+            },
+        );
+        let _ = step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostSent,
         );
         assert_eq!(session.stage(), LoginStage::FullFeature);
 
-        // Send a SCSI Command with non-zero AHS → should Reject.
+        // SCSI Command with non-zero AHS → Reject.
         let mut scsi_bhs = [0u8; 48];
         scsi_bhs[0] = op::SCSI_CMD;
         scsi_bhs[4] = 1; // TotalAHSLength = 1 → invalid
         work[..48].copy_from_slice(&scsi_bhs);
-
-        match session.poll(
-            SessionEvent::PduReceived { dsl: 0 },
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
         ) {
-            SessionStep::NeedSend(data) => {
-                assert_eq!(data[0] & 0x3F, op::REJECT);
+            Reply::Recv(len) => assert_eq!(len, 4), // AHS length
+            other => panic!("expected AHS recv, got {other:?}"),
+        }
+        work[..4].fill(0);
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv { len: 4 },
+        ) {
+            Reply::Sent(bytes) => {
+                assert_eq!(bytes[0] & 0x3F, op::REJECT);
                 assert_eq!(session.stage(), LoginStage::FullFeature);
             }
-            other => panic!("expected NeedSend for Reject, got {other:?}"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -2506,29 +2730,41 @@ mod tests {
 
         // Login negotiating MaxRecvDataSegmentLength=1024 (small).
         let login_text = b"InitiatorName=iqn.test\0MaxRecvDataSegmentLength=1024\0";
-        let mut login_bhs = [0u8; 48];
-        login_bhs[0] = op::LOGIN_REQ | 0x40;
-        login_bhs[1] =
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
-        login_bhs[5] = (login_text.len() >> 16) as u8;
-        login_bhs[6] = (login_text.len() >> 8) as u8;
-        login_bhs[7] = login_text.len() as u8;
-        work[..48].copy_from_slice(&login_bhs);
-        work[48..48 + login_text.len()].copy_from_slice(login_text);
-        match session.poll(
-            SessionEvent::PduReceived {
-                dsl: login_text.len() as u32,
-            },
+        work[..48].copy_from_slice(&login_bhs(login_text.len()));
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
         ) {
-            SessionStep::NeedSend(_) => {}
+            Reply::Recv(len) => assert_eq!(len, remainder(login_text.len())),
+            other => panic!("expected login data recv, got {other:?}"),
+        }
+        work[..remainder(login_text.len())].fill(0);
+        work[..login_text.len()].copy_from_slice(login_text);
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv {
+                len: remainder(login_text.len()),
+            },
+        ) {
+            Reply::Sent(_) => {}
             other => panic!("expected login response, got {other:?}"),
         }
         assert_eq!(session.stage(), LoginStage::FullFeature);
         // Negotiated max should be clipped to 1024 (work 8192 → cap 8192, initiator 1024).
         assert_eq!(session.max_recv_data_segment, 1024);
+        let _ = step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostSent,
+        );
 
         // READ_10 for 8 blocks = 4096 bytes, which exceeds negotiated max.
         let mut cdb = [0u8; 10];
@@ -2543,36 +2779,47 @@ mod tests {
         work[..48].copy_from_slice(&scsi_bhs);
         work[48..].fill(0);
 
-        // First Data-In should be clipped to 1024, not 4096 or work capacity.
-        match session.poll(
-            SessionEvent::PduReceived { dsl: 0 },
+        // BHS stage → zero-length data stage → first Data-In clipped to 1024.
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostRecv { len: BHS_SIZE },
         ) {
-            SessionStep::NeedSend(data) => {
-                let bhs = crate::iscsi::pdu::Bhs::from_bytes(data[..48].try_into().unwrap());
+            Reply::Recv(len) => assert_eq!(len, 0),
+            other => panic!("expected zero-length data recv, got {other:?}"),
+        }
+        match step(
+            &mut session,
+            &mut work,
+            &mut devs,
+            &mut planes,
+            Event::HostRecv { len: 0 },
+        ) {
+            Reply::Sent(bytes) => {
+                let bhs = crate::iscsi::pdu::Bhs::from_bytes(bytes[..48].try_into().unwrap());
                 assert_eq!(bhs.opcode(), op::SCSI_DATA_IN);
                 assert_eq!(bhs.data_segment_len(), 1024);
-                assert_eq!(data.len(), BHS_SIZE + 1024);
-                // Also verify state is DataIn with same chunk.
+                assert_eq!(bytes.len(), BHS_SIZE + 1024);
                 match session.state {
-                    IscsiState::DataIn { chunk, .. } => assert_eq!(chunk, 1024),
+                    IscsiState::DataIn { pending, .. } => assert_eq!(pending, 1024),
                     other => panic!("expected DataIn state, got {other:?}"),
                 }
             }
-            other => panic!("expected NeedSend Data-In, got {other:?}"),
+            other => panic!("expected first Data-In, got {other:?}"),
         }
 
         // Second chunk should also be 1024.
-        match session.poll(
-            SessionEvent::PduReceived { dsl: 0 },
+        match step(
+            &mut session,
             &mut work,
             &mut devs,
             &mut planes,
+            Event::HostSent,
         ) {
-            SessionStep::NeedSend(data) => {
-                let bhs = crate::iscsi::pdu::Bhs::from_bytes(data[..48].try_into().unwrap());
+            Reply::Sent(bytes) => {
+                let bhs = crate::iscsi::pdu::Bhs::from_bytes(bytes[..48].try_into().unwrap());
                 assert_eq!(bhs.data_segment_len(), 1024);
             }
             other => panic!("expected second Data-In, got {other:?}"),
@@ -2586,7 +2833,7 @@ mod tests {
 
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap()];
-        let mut planes: [Option<StorePlane>; 0] = [];
+        let planes: [Option<StorePlane>; 0] = [];
         let mut session = IscsiSession::new();
 
         // Direct negotiate with tiny dst should return None (overflow).
@@ -2594,76 +2841,34 @@ mod tests {
         let src = b"InitiatorName=iqn.test\0TargetName=iqn.target\0";
         assert!(session.negotiate(src, &mut tiny).is_none());
 
-        // Via handle_login path: work buffer just enough for BHS + minimal
-        // data, but login response needs TargetAlias+TargetPortalGroupTag
-        // (~40 bytes) plus echo; tiny work forces overflow → Error.
-        let work = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
-        // Shrink work to force dst overflow: use work.len() - BHS_SIZE = MIN_DATA_LEN,
-        // but craft a huge initiator text that will require many Reject echoes.
-        let big_text = {
-            let mut v = Vec::new();
-            for i in 0..100 {
-                v.extend_from_slice(format!("UnknownKey{i}=value{i}\0").as_bytes());
-            }
-            v
-        };
-        // Need to bypass LOGIN_MAX guard to avoid early empty negotiate path:
-        // use a small dsl but many keys that will cause append overflow.
-        // Instead, test the tiny negotiate directly above is sufficient for
-        // coverage of the new error path; here verify handle_login propagates.
-        let mut session2 = IscsiSession::new();
-        // Use a work buffer where dst (tail) is tiny after head split.
-        let work2 = vec![0u8; BHS_SIZE + 64];
-        // Fake login PDU with dsl 0, but negotiate will still try to emit
-        // always keys (TargetAlias etc) into dst of 64 bytes → will overflow
-        // if we request many always? Actually always keys are ~50 bytes, so 64
-        // may be enough. Use even smaller: 32 bytes.
+        // Undersized work buffer is rejected up front.
         let mut work3 = vec![0u8; BHS_SIZE + 32];
-        let mut login_bhs = [0u8; 48];
-        login_bhs[0] = op::LOGIN_REQ | 0x40;
-        login_bhs[1] =
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
-        work3[..48].copy_from_slice(&login_bhs);
-        // dsl 0, stage OP_PARAM → FullFeature
-        match session2.poll(
-            SessionEvent::PduReceived { dsl: 0 },
-            &mut work3,
-            &mut devs,
-            &mut planes,
-        ) {
-            SessionStep::Error(TargetError::WorkBufTooSmall) => {}
-            SessionStep::NeedSend(_) => {
-                // If work3 still enough, try even smaller dst via direct negotiate
-                // already verified above; this branch is not failure.
-            }
-            other => panic!("expected WorkBufTooSmall or NeedSend, got {other:?}"),
+        work3[..48].copy_from_slice(&login_bhs(0));
+        match session.poll(Event::HostRecv { len: BHS_SIZE }, &mut work3, &mut devs) {
+            Action::Error(TargetError::WorkBufTooSmall) => {}
+            other => panic!("expected WorkBufTooSmall, got {other:?}"),
         }
 
         // Verify normal login still works with sufficient buffer.
         let mut work_ok = vec![0u8; crate::MIN_DATA_LEN + BHS_SIZE];
         let login_text = b"InitiatorName=iqn.test\0";
-        let mut login_bhs2 = [0u8; 48];
-        login_bhs2[0] = op::LOGIN_REQ | 0x40;
-        login_bhs2[1] =
-            flag::T_BIT | ((stage::OP_PARAM & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
-        login_bhs2[5] = (login_text.len() >> 16) as u8;
-        login_bhs2[6] = (login_text.len() >> 8) as u8;
-        login_bhs2[7] = login_text.len() as u8;
-        work_ok[..48].copy_from_slice(&login_bhs2);
-        work_ok[48..48 + login_text.len()].copy_from_slice(login_text);
+        work_ok[..48].copy_from_slice(&login_bhs(login_text.len()));
+        match session.poll(Event::HostRecv { len: BHS_SIZE }, &mut work_ok, &mut devs) {
+            Action::HostRecv { len } => assert_eq!(len, remainder(login_text.len())),
+            other => panic!("expected login data recv, got {other:?}"),
+        }
+        work_ok[..remainder(login_text.len())].fill(0);
+        work_ok[..login_text.len()].copy_from_slice(login_text);
         match session.poll(
-            SessionEvent::PduReceived {
-                dsl: login_text.len() as u32,
+            Event::HostRecv {
+                len: remainder(login_text.len()),
             },
             &mut work_ok,
             &mut devs,
-            &mut planes,
         ) {
-            SessionStep::NeedSend(_) => {}
-            other => panic!("expected login NeedSend, got {other:?}"),
+            Action::HostSend { .. } => {}
+            other => panic!("expected login response, got {other:?}"),
         }
-        let _ = big_text;
-        let _ = work;
-        let _ = work2;
+        let _ = planes;
     }
 }
