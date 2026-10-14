@@ -18,11 +18,11 @@ use snowscsi::usb::{
 use std::sync::atomic::Ordering;
 
 /// A 64 KiB block device over stack-owned RAM.
-fn block_device<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
+pub(crate) fn block_device<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
     BlockDevice::disk(RamBackend::new(ram), 512).unwrap()
 }
 
-fn device_read(dev: &mut BlockDevice<RamBackend<'_>>, offset: u64, buf: &mut [u8]) {
+pub(crate) fn device_read(dev: &mut BlockDevice<RamBackend<'_>>, offset: u64, buf: &mut [u8]) {
     use embedded_io::{Read, Seek};
     dev.backend()
         .seek(embedded_io::SeekFrom::Start(offset))
@@ -31,7 +31,7 @@ fn device_read(dev: &mut BlockDevice<RamBackend<'_>>, offset: u64, buf: &mut [u8
 }
 
 /// Build a raw 31-byte CBW from its logical fields (little endian).
-fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
+pub(crate) fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
     let mut raw = [0u8; CBW_LEN];
     raw[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
     raw[4..8].copy_from_slice(&tag.to_le_bytes());
@@ -44,7 +44,7 @@ fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_
 }
 
 /// Build a 10-byte READ/WRITE CDB (LBA at bytes 2-5, count at bytes 7-8).
-fn rw10(opcode: u8, lba: u32, blocks: u16) -> [u8; 10] {
+pub(crate) fn rw10(opcode: u8, lba: u32, blocks: u16) -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = opcode;
     cdb[2..6].copy_from_slice(&lba.to_be_bytes());
@@ -53,7 +53,7 @@ fn rw10(opcode: u8, lba: u32, blocks: u16) -> [u8; 10] {
 }
 
 /// Extract (tag, residue, status) from the trailing CSW of a sent stream.
-fn csw_fields(sent: &[u8]) -> (u32, u32, u8) {
+pub(crate) fn csw_fields(sent: &[u8]) -> (u32, u32, u8) {
     let csw = &sent[sent.len() - CSW_LEN..];
     assert_eq!(&csw[..4], b"USBS", "trailing bytes are not a CSW");
     (

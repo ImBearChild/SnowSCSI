@@ -8,7 +8,7 @@ description = "Integration tests for SnowSCSI (mock + libiscsi whitebox)"
 publish = false
 
 [dependencies]
-snowscsi = { workspace = true, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb", "bundle"] }
+snowscsi = { workspace = true, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb", "dvdram", "bundle"] }
 snowscsi-iso9660 = { workspace = true, features = ["std"] }
 snowscsi-common = { workspace = true, features = ["std"] }
 embedded-io.workspace = true

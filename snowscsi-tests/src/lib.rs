@@ -16,5 +16,17 @@ mod iso_cross;
 #[cfg(test)]
 mod bundle;
 
+#[cfg(test)]
+pub mod golden;
+
+#[cfg(test)]
+pub mod golden_drive;
+
+#[cfg(test)]
+pub mod golden_usb;
+
+#[cfg(test)]
+pub mod golden_iscsi;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;
