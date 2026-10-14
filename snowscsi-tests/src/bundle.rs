@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use snowscsi::common::flat_bundle::FlatBundle;
 use snowscsi::common::seekable_storage::{FlatData, RwRef, StorageError, WritableFlatData};
 use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
+use snowscsi::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
 use snowscsi::scsi::fs_backend::StdFsBackend;
 use snowscsi::MIN_DATA_LEN;
 
@@ -61,7 +61,7 @@ fn read_sectors(
         CommandOutcome::OutXfer { len } => {
             let n = len as usize;
             assert!(n <= out.len());
-            assert_eq!(dev.xfer_out(0, &mut out[..n]), XferOutcome::Ok);
+            assert!(matches!(dev.xfer_out(0, &mut out[..n]), Xfer::Inline { len } if len == n));
         }
         other => panic!("READ(10) expected OutXfer, got {other:?}"),
     }
@@ -74,7 +74,7 @@ fn write_sectors(dev: &mut BlockDevice<RwRef>, lba: u32, count: u16, work: &mut 
     match dev.do_cmd(&cdb, work).unwrap() {
         CommandOutcome::InXfer { len } => {
             assert_eq!(len as usize, bytes);
-            assert_eq!(dev.xfer_in(0, &src[..bytes]), XferOutcome::Ok);
+            assert!(matches!(dev.xfer_in(0, &src[..bytes]), Xfer::Inline { len } if len == bytes));
         }
         other => panic!("WRITE(10) expected InXfer, got {other:?}"),
     }

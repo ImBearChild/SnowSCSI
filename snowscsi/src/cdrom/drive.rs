@@ -14,9 +14,7 @@ use crate::cdrom::common::{
     CDROM_IDENTITY, SECTOR_SIZE,
 };
 use crate::cdrom::media::{CdMedia, MediaError, Tray};
-use crate::scsi::device::{
-    CommandOutcome, DeviceType, PendingXfer, XferDir, XferError, XferOutcome,
-};
+use crate::scsi::device::{CommandOutcome, DeviceType, PendingXfer, Xfer, XferDir};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, cdb_write_args, op, Sense,
     SenseKey,
@@ -284,28 +282,28 @@ impl<'a> CdromDrive<'a> {
 
     // ── xfer helpers ──────────────────────────────────────────────
 
-    pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+    pub fn xfer_out<'b>(&'b mut self, transfer_offset: u64, buf: &'b mut [u8]) -> Xfer<'b> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-                return XferOutcome::Error(XferError::NoCommand);
+                return Xfer::Inline { len: 0 };
             }
         };
         if dir != XferDir::Out {
             self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-            return XferOutcome::Error(XferError::Direction);
+            return Xfer::Inline { len: 0 };
         }
         let end = match transfer_offset.checked_add(buf.len() as u64) {
             Some(e) => e,
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-                return XferOutcome::Error(XferError::Overrun);
+                return Xfer::Inline { len: 0 };
             }
         };
         if end > transfer_len {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-            return XferOutcome::Error(XferError::Overrun);
+            return Xfer::Inline { len: 0 };
         }
         let actual = base_byte + transfer_offset;
         let res = if let Some(m) = self.loaded_mut() {
@@ -325,37 +323,37 @@ impl<'a> CdromDrive<'a> {
                     self.set_sense(SenseKey::MediumError, 0x11, 0);
                 }
             }
-            return XferOutcome::Error(XferError::Storage(e));
+            return Xfer::Inline { len: 0 };
         }
-        XferOutcome::Ok
+        Xfer::Inline { len: buf.len() }
     }
 
-    pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+    pub fn xfer_in<'b>(&'b mut self, transfer_offset: u64, buf: &'b [u8]) -> Xfer<'b> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-                return XferOutcome::Error(XferError::NoCommand);
+                return Xfer::Inline { len: 0 };
             }
         };
         if dir != XferDir::In {
             self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-            return XferOutcome::Error(XferError::Direction);
+            return Xfer::Inline { len: 0 };
         }
         let end = match transfer_offset.checked_add(buf.len() as u64) {
             Some(e) => e,
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-                return XferOutcome::Error(XferError::Overrun);
+                return Xfer::Inline { len: 0 };
             }
         };
         if end > transfer_len {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-            return XferOutcome::Error(XferError::Overrun);
+            return Xfer::Inline { len: 0 };
         }
         if !self.is_random_writable() {
             self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-            return XferOutcome::Error(XferError::WriteProtected);
+            return Xfer::Inline { len: 0 };
         }
         let actual = base_byte + transfer_offset;
         let res = if let Some(m) = self.loaded_mut() {
@@ -364,31 +362,25 @@ impl<'a> CdromDrive<'a> {
             Err(crate::cdrom::media::MediaError::WriteProtected)
         };
         match res {
-            Ok(()) => XferOutcome::Ok,
+            Ok(()) => Xfer::Inline { len: buf.len() },
             Err(e) => match e {
                 crate::cdrom::media::MediaError::WriteProtected => {
                     self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                    XferOutcome::Error(XferError::WriteProtected)
+                    Xfer::Inline { len: 0 }
                 }
                 crate::cdrom::media::MediaError::OutOfBounds => {
                     self.set_sense(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0);
-                    XferOutcome::Error(XferError::Storage(
-                        crate::scsi::backend::StorageError::OutOfBounds,
-                    ))
+                    Xfer::Inline { len: 0 }
                 }
                 crate::cdrom::media::MediaError::IllegalField => {
                     self.set_sense(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
                     // Payload is transport-diagnostic only; the sense above
                     // carries INVALID_FIELD (B9).
-                    XferOutcome::Error(XferError::Storage(crate::scsi::backend::StorageError::Io(
-                        embedded_io::ErrorKind::Other,
-                    )))
+                    Xfer::Inline { len: 0 }
                 }
-                crate::cdrom::media::MediaError::Io(kind) => {
+                crate::cdrom::media::MediaError::Io(_) => {
                     self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-                    XferOutcome::Error(XferError::Storage(crate::scsi::backend::StorageError::Io(
-                        kind,
-                    )))
+                    Xfer::Inline { len: 0 }
                 }
             },
         }
@@ -1511,11 +1503,11 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
         outcome
     }
 
-    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+    fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         self.xfer_out(transfer_offset, buf)
     }
 
-    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+    fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         self.xfer_in(transfer_offset, buf)
     }
 
@@ -1662,7 +1654,7 @@ mod tests {
     #[cfg(feature = "dvdram")]
     use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
     use crate::scsi::backend::{BlockBackend, RamBackend};
-    use crate::scsi::device::{ScsiDevice, XferOutcome};
+    use crate::scsi::device::{ScsiDevice, Xfer};
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
         [0u8; crate::MIN_DATA_LEN]
@@ -1689,7 +1681,10 @@ mod tests {
             CommandOutcome::OutXfer { len } => {
                 let n = len as usize;
                 assert!(n <= buf.len());
-                assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_out(0, &mut buf[..n]),
+                    Xfer::Inline { len } if len == n
+                ));
                 n
             }
             CommandOutcome::OutInline { len } => {
@@ -2392,7 +2387,10 @@ mod tests {
                     let _ = len;
                     // Use xfer_in directly with pattern
                     // Need to have pending set; we have it from WRITE_10
-                    assert_eq!(dev.xfer_in(0, &pat), XferOutcome::Ok);
+                    assert!(matches!(
+                        dev.xfer_in(0, &pat),
+                        Xfer::Inline { len } if len == pat.len()
+                    ));
                 }
                 _ => panic!("expected InXfer"),
             }
@@ -2451,7 +2449,10 @@ mod tests {
                 match outcome {
                     CommandOutcome::InXfer { .. } => {
                         let pat = [0x5A; 2048];
-                        assert_eq!(dev.xfer_in(0, &pat), XferOutcome::Ok);
+                        assert!(matches!(
+                            dev.xfer_in(0, &pat),
+                            Xfer::Inline { len } if len == pat.len()
+                        ));
                     }
                     _ => panic!("expected InXfer"),
                 }
@@ -2520,7 +2521,10 @@ mod tests {
                 cdb[8] = 1;
                 match dev.do_cmd(&cdb, &mut w).unwrap() {
                     CommandOutcome::InXfer { .. } => {
-                        assert_eq!(dev.xfer_in(0, &[0x5A; 2048]), XferOutcome::Ok);
+                        assert!(matches!(
+                            dev.xfer_in(0, &[0x5A; 2048]),
+                            Xfer::Inline { len: 2048 }
+                        ));
                     }
                     _ => panic!("expected InXfer"),
                 }

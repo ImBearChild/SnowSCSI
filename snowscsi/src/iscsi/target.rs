@@ -20,7 +20,7 @@ use crate::iscsi::pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
     BHS_SIZE, MAX_DATA_SEGMENT,
 };
-use crate::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
+use crate::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
 use crate::scsi::scsi::op as scsi_op;
 use crate::scsi::scsi::{asc, opcode_from_cdb, opcode_name, Sense, SenseKey};
 
@@ -470,23 +470,26 @@ impl IscsiSession {
                         let len = (remaining as usize).min(chunk);
                         if lun < devs.len() {
                             let dev = &mut devs[lun];
-                            match dev.xfer_out(offset, &mut work[BHS_SIZE..BHS_SIZE + len]) {
-                                XferOutcome::Ok => {}
-                                XferOutcome::Error(_) => {
-                                    let sense = dev.take_sense();
-                                    let r = self.send_scsi_response(
-                                        work,
-                                        itt,
-                                        status::CHECK_CONDITION,
-                                        sense.as_ref(),
-                                    );
-                                    if let SessionStep::NeedSend(data) = r {
-                                        let l = data.len();
-                                        let _ = r;
-                                        let _ = write_all(conn, &work[..l]);
-                                    }
-                                    return StepResult::Closed;
+                            let produced = match dev
+                                .xfer_out(offset, &mut work[BHS_SIZE..BHS_SIZE + len])
+                            {
+                                Xfer::Inline { len } => len,
+                                Xfer::Store(_) => return StepResult::Error(TargetError::Internal),
+                            };
+                            if produced != len {
+                                let sense = dev.take_sense();
+                                let r = self.send_scsi_response(
+                                    work,
+                                    itt,
+                                    status::CHECK_CONDITION,
+                                    sense.as_ref(),
+                                );
+                                if let SessionStep::NeedSend(data) = r {
+                                    let l = data.len();
+                                    let _ = r;
+                                    let _ = write_all(conn, &work[..l]);
                                 }
+                                return StepResult::Closed;
                             }
                         }
                         let is_last = offset + len as u64 == transfer_len;
@@ -638,17 +641,13 @@ impl IscsiSession {
         let next = ((transfer_len - sent) as usize).min(chunk);
         if lun < devs.len() {
             let dev = &mut devs[lun];
-            match dev.xfer_out(sent, &mut work[BHS_SIZE..BHS_SIZE + next]) {
-                XferOutcome::Ok => {}
-                XferOutcome::Error(_) => {
-                    let sense = dev.take_sense();
-                    return self.send_scsi_response(
-                        work,
-                        itt,
-                        status::CHECK_CONDITION,
-                        sense.as_ref(),
-                    );
-                }
+            let produced = match dev.xfer_out(sent, &mut work[BHS_SIZE..BHS_SIZE + next]) {
+                Xfer::Inline { len } => len,
+                Xfer::Store(_) => return SessionStep::Error(TargetError::Internal),
+            };
+            if produced != next {
+                let sense = dev.take_sense();
+                return self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref());
             }
         }
         self.state = IscsiState::DataIn {
@@ -758,17 +757,14 @@ impl IscsiSession {
 
         if pdu_dsl > 0 && lun < devs.len() {
             let dev = &mut devs[lun];
-            match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
-                XferOutcome::Ok => {}
-                XferOutcome::Error(_) => {
-                    let sense = dev.take_sense();
-                    return self.send_scsi_response(
-                        work,
-                        itt,
-                        status::CHECK_CONDITION,
-                        sense.as_ref(),
-                    );
-                }
+            let produced =
+                match dev.xfer_in(expected_bo as u64, &work[BHS_SIZE..BHS_SIZE + pdu_dsl]) {
+                    Xfer::Inline { len } => len,
+                    Xfer::Store(_) => return SessionStep::Error(TargetError::Internal),
+                };
+            if produced != pdu_dsl {
+                let sense = dev.take_sense();
+                return self.send_scsi_response(work, itt, status::CHECK_CONDITION, sense.as_ref());
             }
         }
 
@@ -1338,17 +1334,18 @@ impl IscsiSession {
                     .min(self.max_recv_data_segment as usize);
                 if lun < devs.len() {
                     let dev = &mut devs[lun];
-                    match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
-                        XferOutcome::Ok => {}
-                        XferOutcome::Error(_) => {
-                            let sense = dev.take_sense();
-                            return self.send_scsi_response(
-                                work,
-                                itt,
-                                status::CHECK_CONDITION,
-                                sense.as_ref(),
-                            );
-                        }
+                    let produced = match dev.xfer_out(0, &mut work[BHS_SIZE..BHS_SIZE + chunk]) {
+                        Xfer::Inline { len } => len,
+                        Xfer::Store(_) => return SessionStep::Error(TargetError::Internal),
+                    };
+                    if produced != chunk {
+                        let sense = dev.take_sense();
+                        return self.send_scsi_response(
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            sense.as_ref(),
+                        );
                     }
                 }
                 if chunk as u64 == transfer_len {
@@ -1393,17 +1390,18 @@ impl IscsiSession {
                 if received > 0 && lun < devs.len() {
                     let dev = &mut devs[lun];
                     let imm = &work[BHS_SIZE..BHS_SIZE + received as usize];
-                    match dev.xfer_in(0, imm) {
-                        XferOutcome::Ok => {}
-                        XferOutcome::Error(_) => {
-                            let sense = dev.take_sense();
-                            return self.send_scsi_response(
-                                work,
-                                itt,
-                                status::CHECK_CONDITION,
-                                sense.as_ref(),
-                            );
-                        }
+                    let produced = match dev.xfer_in(0, imm) {
+                        Xfer::Inline { len } => len,
+                        Xfer::Store(_) => return SessionStep::Error(TargetError::Internal),
+                    };
+                    if produced != received as usize {
+                        let sense = dev.take_sense();
+                        return self.send_scsi_response(
+                            work,
+                            itt,
+                            status::CHECK_CONDITION,
+                            sense.as_ref(),
+                        );
                     }
                 }
                 if received == transfer_len {

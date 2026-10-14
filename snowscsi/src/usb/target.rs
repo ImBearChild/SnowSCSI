@@ -73,7 +73,7 @@
 
 use core::time::Duration;
 
-use crate::scsi::device::{CommandOutcome, ScsiDevice, XferOutcome};
+use crate::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
 use crate::scsi::scsi::{asc, op as scsi_op, Sense, SenseKey};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
 use crate::usb::io::BotIo;
@@ -811,11 +811,14 @@ impl BotSession {
                     return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
                 }
                 let mut chunk = (actual as usize).min(data.len());
-                match devs[lun].xfer_out(0, &mut data[..chunk]) {
-                    XferOutcome::Ok => {}
-                    XferOutcome::Error(_) => {
-                        return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                let produced = match devs[lun].xfer_out(0, &mut data[..chunk]) {
+                    Xfer::Inline { len } => len,
+                    Xfer::Store(_) => {
+                        return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
                     }
+                };
+                if produced != chunk {
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
                 }
                 if chunk as u64 == actual {
                     chunk += self.merge_pad_boundary(data, chunk, declared, actual);
@@ -1242,7 +1245,13 @@ impl BotSession {
                 }
                 let remaining = transfer_len - sent;
                 let mut next = (remaining as usize).min(data.len());
-                if let XferOutcome::Error(_) = devs[lun].xfer_out(sent, &mut data[..next]) {
+                let produced = match devs[lun].xfer_out(sent, &mut data[..next]) {
+                    Xfer::Inline { len } => len,
+                    Xfer::Store(_) => {
+                        return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+                    }
+                };
+                if produced != next {
                     // Transfer failed midway.
                     if sent < expected && self.shortfall == ShortfallPolicy::Pad {
                         return self.end_shortfall_data_in(
@@ -1358,9 +1367,18 @@ impl BotSession {
                 if status == CswStatus::Passed && written < to_write {
                     let w = (recv.len() as u64).min(to_write - written) as usize;
                     if w > 0 {
-                        match devs[lun].xfer_in(written, &recv[..w]) {
-                            XferOutcome::Ok => written += w as u64,
-                            XferOutcome::Error(_) => status = CswStatus::Failed,
+                        let produced = match devs[lun].xfer_in(written, &recv[..w]) {
+                            Xfer::Inline { len } => len,
+                            Xfer::Store(_) => {
+                                return SessionStep::Done(BotStepResult::Error(
+                                    BotTargetError::Internal,
+                                ));
+                            }
+                        };
+                        if produced == w {
+                            written += produced as u64;
+                        } else {
+                            status = CswStatus::Failed;
                         }
                     }
                 }
@@ -1696,7 +1714,8 @@ mod tests {
         match outcome {
             CommandOutcome::OutXfer { len } => {
                 assert!(len >= buf.len() as u64);
-                assert_eq!(dev.xfer_out(0, buf), XferOutcome::Ok);
+                let n = buf.len();
+                assert!(matches!(dev.xfer_out(0, buf), Xfer::Inline { len } if len == n));
             }
             other => panic!("expected OutXfer, got {other:?}"),
         }

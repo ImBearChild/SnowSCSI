@@ -8,7 +8,7 @@
 use crate::common::seekable_storage::{FlatData, WritableFlatData};
 use crate::scsi::backend::StorageError;
 use crate::scsi::device::{
-    CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, XferDir, XferError, XferOutcome,
+    CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, Xfer, XferDir,
 };
 use crate::scsi::sbc::{execute_sbc, parse_sbc};
 use crate::scsi::scsi::{asc, Sense, SenseKey};
@@ -228,28 +228,28 @@ impl<D: FlatData> BlockDevice<D> {
 
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer.
-    pub fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+    pub fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-                return XferOutcome::Error(XferError::NoCommand);
+                return Xfer::Inline { len: 0 };
             }
         };
         if dir != XferDir::Out {
             self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-            return XferOutcome::Error(XferError::Direction);
+            return Xfer::Inline { len: 0 };
         }
         let end = match transfer_offset.checked_add(buf.len() as u64) {
             Some(e) => e,
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-                return XferOutcome::Error(XferError::Overrun);
+                return Xfer::Inline { len: 0 };
             }
         };
         if end > transfer_len {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-            return XferOutcome::Error(XferError::Overrun);
+            return Xfer::Inline { len: 0 };
         }
         let actual = base_byte + transfer_offset;
         if let Err(e) = self.check_bounds(actual, buf.len()) {
@@ -262,14 +262,14 @@ impl<D: FlatData> BlockDevice<D> {
                 e
             );
             self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return XferOutcome::Error(XferError::Storage(e));
+            return Xfer::Inline { len: 0 };
         }
         if let Err(e) = self.backend.read_at(actual, buf) {
             crate::warn!("READ backend: off={} len={} err={:?}", actual, buf.len(), e);
             self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return XferOutcome::Error(XferError::Storage(e));
+            return Xfer::Inline { len: 0 };
         }
-        XferOutcome::Ok
+        Xfer::Inline { len: buf.len() }
     }
 
     /// Write `buf` for the current WRITE transfer (host → device).
@@ -280,35 +280,35 @@ impl<D: FlatData> BlockDevice<D> {
     /// reports [`StorageError::NotWritable`] at write time (policy
     /// bit bypassed by a direct `disk()` over a read-only plane) is
     /// mapped to DATA PROTECT too.
-    pub fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+    pub fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-                return XferOutcome::Error(XferError::NoCommand);
+                return Xfer::Inline { len: 0 };
             }
         };
         if dir != XferDir::In {
             self.set_sense(SenseKey::IllegalRequest, 0x24, 0);
-            return XferOutcome::Error(XferError::Direction);
+            return Xfer::Inline { len: 0 };
         }
         let end = match transfer_offset.checked_add(buf.len() as u64) {
             Some(e) => e,
             None => {
                 self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-                return XferOutcome::Error(XferError::Overrun);
+                return Xfer::Inline { len: 0 };
             }
         };
         if end > transfer_len {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
-            return XferOutcome::Error(XferError::Overrun);
+            return Xfer::Inline { len: 0 };
         }
         let ops = match self.write_path {
             WritePath::Open(ops) => ops,
             // Capability missing or policy closed: same SCSI verdict.
             WritePath::Absent | WritePath::Locked(_) => {
                 self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                return XferOutcome::Error(XferError::WriteProtected);
+                return Xfer::Inline { len: 0 };
             }
         };
         let actual = base_byte + transfer_offset;
@@ -322,7 +322,7 @@ impl<D: FlatData> BlockDevice<D> {
                 e
             );
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return XferOutcome::Error(XferError::Storage(e));
+            return Xfer::Inline { len: 0 };
         }
         if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
             crate::warn!(
@@ -336,12 +336,12 @@ impl<D: FlatData> BlockDevice<D> {
             // surfaces as NotWritable, not a medium fault.
             if e == StorageError::NotWritable {
                 self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                return XferOutcome::Error(XferError::WriteProtected);
+                return Xfer::Inline { len: 0 };
             }
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return XferOutcome::Error(XferError::Storage(e));
+            return Xfer::Inline { len: 0 };
         }
-        XferOutcome::Ok
+        Xfer::Inline { len: buf.len() }
     }
 
     /// Process one SCSI command (`snowscsi_do_cmd`). `data` must be at
@@ -710,11 +710,11 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
         self.do_cmd(cdb, data)
     }
 
-    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+    fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         self.xfer_out(transfer_offset, buf)
     }
 
-    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+    fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         self.xfer_in(transfer_offset, buf)
     }
 
@@ -867,7 +867,10 @@ mod tests {
             CommandOutcome::OutXfer { len } => {
                 assert!(len as usize <= buf.len());
                 let n = len as usize;
-                assert_eq!(dev.xfer_out(0, &mut buf[..n]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_out(0, &mut buf[..n]),
+                    Xfer::Inline { len } if len == n
+                ));
                 n
             }
             CommandOutcome::OutInline { len } => {
@@ -919,7 +922,10 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..512]),
+                    Xfer::Inline { len: 512 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }
@@ -1028,7 +1034,10 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..512]),
+                    Xfer::Inline { len: 512 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }
@@ -1053,7 +1062,10 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
-                assert_eq!(dev.xfer_in(0, &w[0..1024]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..1024]),
+                    Xfer::Inline { len: 1024 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }
@@ -1078,7 +1090,10 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
-                assert_eq!(dev.xfer_in(0, &w[0..1024]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..1024]),
+                    Xfer::Inline { len: 1024 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }
@@ -1285,7 +1300,10 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..512]),
+                    Xfer::Inline { len: 512 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }
@@ -1320,7 +1338,7 @@ mod tests {
         match outcome {
             CommandOutcome::InXfer { len: _ } => {
                 let r = dev.xfer_in(0, &w[0..512]);
-                assert!(matches!(r, XferOutcome::Error(_)));
+                assert!(matches!(r, Xfer::Inline { len: 0 }));
                 assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
                 assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_PROTECTED);
             }
@@ -1348,10 +1366,16 @@ mod tests {
             CommandOutcome::OutXfer { len } => {
                 assert_eq!(len, 1024);
                 let mut chunk1 = vec![0u8; 600];
-                assert_eq!(dev.xfer_out(0, &mut chunk1), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_out(0, &mut chunk1),
+                    Xfer::Inline { len: 600 }
+                ));
                 assert_eq!(chunk1, expected[0..600]);
                 let mut chunk2 = vec![0u8; 424];
-                assert_eq!(dev.xfer_out(600, &mut chunk2), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_out(600, &mut chunk2),
+                    Xfer::Inline { len: 424 }
+                ));
                 assert_eq!(chunk2, expected[600..1024]);
             }
             _ => panic!("expected OutXfer"),
@@ -1369,8 +1393,14 @@ mod tests {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
                 let payload: Vec<u8> = (0..1024).map(|i| ((i * 7) % 251) as u8).collect();
-                assert_eq!(dev.xfer_in(0, &payload[0..600]), XferOutcome::Ok);
-                assert_eq!(dev.xfer_in(600, &payload[600..]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &payload[0..600]),
+                    Xfer::Inline { len: 600 }
+                ));
+                assert!(matches!(
+                    dev.xfer_in(600, &payload[600..]),
+                    Xfer::Inline { len: 424 }
+                ));
                 // Verify via read.
                 let cdb = make_cdb10(op::READ_10, 0, 2);
                 let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
@@ -1378,7 +1408,10 @@ mod tests {
                     CommandOutcome::OutXfer { len } => {
                         assert_eq!(len, 1024);
                         let mut buf = vec![0u8; 1024];
-                        assert_eq!(dev.xfer_out(0, &mut buf), XferOutcome::Ok);
+                        assert!(matches!(
+                            dev.xfer_out(0, &mut buf),
+                            Xfer::Inline { len: 1024 }
+                        ));
                         assert_eq!(buf, payload);
                     }
                     _ => panic!("expected OutXfer"),
@@ -1466,7 +1499,10 @@ mod tests {
         match dev.do_cmd(&cdb, &mut w).unwrap() {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert_eq!(dev.xfer_in(0, &w[0..512]), XferOutcome::Ok);
+                assert!(matches!(
+                    dev.xfer_in(0, &w[0..512]),
+                    Xfer::Inline { len: 512 }
+                ));
             }
             _ => panic!("expected InXfer"),
         }

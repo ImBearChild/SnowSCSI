@@ -1,8 +1,9 @@
 //! Device abstraction: result outcome types, the SCSI device seam, and
 //! the forwarding impls that let transports drive any LUN type.
 
+use crate::common::store::StoreOp;
 use crate::scsi::backend::StorageError;
-use crate::scsi::scsi::Sense;
+use crate::scsi::scsi::{asc, Sense, SenseKey};
 
 /// Device type reported via INQUIRY (device.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,42 +96,41 @@ pub struct PendingXfer {
     pub transfer_len: u64,
 }
 
-/// Data-phase error (does not carry sense; sense is held in the device).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XferError {
-    /// Backend storage failure.
-    Storage(StorageError),
-    /// No prior `do_cmd` (target misuse).
-    NoCommand,
-    /// Direction mismatch (READ called xfer_in, etc.).
-    Direction,
-    /// `transfer_offset + buf.len() > transfer_len`.
-    Overrun,
-    /// Write to read-only medium.
-    WriteProtected,
+/// Result of one `xfer_out` / `xfer_in` chunk.
+///
+/// The device either handled the chunk **in place** (`Inline`) or hands the
+/// platform a [`StoreOp`] to execute (`Store`). There is no error form: a
+/// data-phase failure is reported by setting sense and returning
+/// `Inline { len: 0 }` (see the module docs); genuine misuse is an internal
+/// error in the caller.
+#[derive(Debug)]
+pub enum Xfer<'a> {
+    /// The device handled `len` bytes in place (`len <= buf.len()`; pure
+    /// synthesis may produce short).
+    Inline { len: usize },
+    /// Hand the operation to the platform; the op carries its own buffer
+    /// (and, for FS, a path).
+    Store(StoreOp<'a>),
 }
 
-impl core::fmt::Display for XferError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Storage(e) => write!(f, "storage error: {e}"),
-            Self::NoCommand => write!(f, "no pending command"),
-            Self::Direction => write!(f, "direction mismatch"),
-            Self::Overrun => write!(f, "transfer overrun"),
-            Self::WriteProtected => write!(f, "write protected"),
-        }
+/// Map a storage error to its `(sense key, ASC, ASCQ)` triple (SPC-3).
+pub fn sense_for_storage_error(e: StorageError) -> (SenseKey, u8, u8) {
+    match e {
+        StorageError::OutOfBounds => (SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0),
+        StorageError::NotWritable => (SenseKey::DataProtect, asc::WRITE_PROTECTED, 0),
+        StorageError::Io(_) => (SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0),
+        StorageError::Unsupported => (SenseKey::IllegalRequest, asc::INVALID_FIELD, 0),
     }
 }
 
-impl core::error::Error for XferError {}
-
-/// Outcome of one `xfer_out` / `xfer_in` chunk.
+/// Outcome of the data-phase teardown ([`ScsiDevice::store_done`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XferOutcome {
-    /// Chunk transferred.
+    /// Storage finished; sense (if any) is held in the device.
     Ok,
-    /// Transfer failed; sense has been set in the device.
-    Error(XferError),
+    /// The device does not take over the mapping; the session maps the
+    /// [`StorageError`] to sense itself.
+    Error(StorageError),
 }
 
 /// Data-area capacity of a transport scratch buffer, rounded down to a
@@ -179,7 +179,7 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// use snowscsi::common::seekable_storage::{FlatData, RwRef};
 /// use snowscsi::scsi::backend::{BlockBackend, RamBackend};
 /// use snowscsi::scsi::block::BlockDevice;
-/// use snowscsi::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice, XferOutcome};
+/// use snowscsi::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice, Xfer};
 /// use snowscsi::scsi::scsi::{Sense, SenseKey};
 ///
 /// struct VendorLun<'a> {
@@ -200,10 +200,10 @@ pub fn data_capacity(work_len: usize) -> usize {
 ///         }
 ///         self.inner.do_cmd(cdb, data)
 ///     }
-///     fn xfer_out(&mut self, off: u64, buf: &mut [u8]) -> XferOutcome {
+///     fn xfer_out<'a>(&'a mut self, off: u64, buf: &'a mut [u8]) -> Xfer<'a> {
 ///         self.inner.xfer_out(off, buf)
 ///     }
-///     fn xfer_in(&mut self, off: u64, buf: &[u8]) -> XferOutcome {
+///     fn xfer_in<'a>(&'a mut self, off: u64, buf: &'a [u8]) -> Xfer<'a> {
 ///         self.inner.xfer_in(off, buf)
 ///     }
 ///     fn peek_sense(&self) -> Option<&Sense> {
@@ -243,8 +243,8 @@ pub fn data_capacity(work_len: usize) -> usize {
 ///     CommandOutcome::OutXfer { len } => {
 ///         for off in (0..len).step_by(CHUNK) {
 ///             match dev.xfer_out(off, &mut chunk[..]) {
-///                 XferOutcome::Ok => send(&chunk),
-///                 XferOutcome::Error(_) => break, // sense is in the device
+///                 Xfer::Inline { .. } => send(&chunk),
+///                 Xfer::Store(op) => { /* platform executes op, then store_done */ }
 ///             }
 ///         }
 ///     }
@@ -262,11 +262,41 @@ pub trait ScsiDevice {
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer (0 ≤ off < transfer_len).
     /// Actual backend byte = `base_byte + transfer_offset`.
-    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome;
+    ///
+    /// Returns [`Xfer::Inline`] when the device handled the chunk in place
+    /// (setting sense and producing `len: 0` on failure), or [`Xfer::Store`]
+    /// to hand the platform a [`StoreOp`].
+    fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a>;
 
     /// Write `buf` for the current WRITE transfer (host → device).
     /// Actual backend byte = `base_byte + transfer_offset`.
-    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome;
+    fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a>;
+
+    /// The device's next maintenance / background op (default `None`).
+    ///
+    /// The session drains this before any terminating status (the data phase
+    /// is followed by the device agenda). The returned op may borrow device
+    /// state.
+    fn next_store_op<'a>(&'a mut self) -> Option<StoreOp<'a>> {
+        None
+    }
+
+    /// Data-phase teardown: the **single** storage → sense entry point.
+    ///
+    /// Default: map a [`StorageError`] to sense via
+    /// [`sense_for_storage_error`] and return [`XferOutcome::Ok`]. A device
+    /// may override to recover / defer, or return [`XferOutcome::Error`] to
+    /// hand the mapping back to the session.
+    fn store_done(&mut self, r: Result<(), StorageError>) -> XferOutcome {
+        match r {
+            Ok(()) => XferOutcome::Ok,
+            Err(e) => {
+                let (key, asc, ascq) = sense_for_storage_error(e);
+                self.set_sense(Sense::new(key, asc, ascq));
+                XferOutcome::Ok
+            }
+        }
+    }
 
     /// Borrow the pending sense without consuming it (Status phase peek).
     fn peek_sense(&self) -> Option<&Sense>;
@@ -321,12 +351,20 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
         (**self).do_cmd(cdb, data)
     }
 
-    fn xfer_out(&mut self, transfer_offset: u64, buf: &mut [u8]) -> XferOutcome {
+    fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         (**self).xfer_out(transfer_offset, buf)
     }
 
-    fn xfer_in(&mut self, transfer_offset: u64, buf: &[u8]) -> XferOutcome {
+    fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         (**self).xfer_in(transfer_offset, buf)
+    }
+
+    fn next_store_op<'a>(&'a mut self) -> Option<StoreOp<'a>> {
+        (**self).next_store_op()
+    }
+
+    fn store_done(&mut self, r: Result<(), StorageError>) -> XferOutcome {
+        (**self).store_done(r)
     }
 
     fn peek_sense(&self) -> Option<&Sense> {
@@ -414,14 +452,20 @@ mod tests {
             luns[0].do_cmd(&cdb, &mut w).unwrap(),
             CommandOutcome::InXfer { len: 512 }
         ));
-        assert_eq!(luns[0].xfer_in(0, &w[..512]), XferOutcome::Ok);
+        assert!(matches!(
+            luns[0].xfer_in(0, &w[..512]),
+            Xfer::Inline { len: 512 }
+        ));
         cdb[0] = op::READ_10;
         assert!(matches!(
             luns[0].do_cmd(&cdb, &mut w).unwrap(),
             CommandOutcome::OutXfer { len: 512 }
         ));
         let mut buf = [0u8; 512];
-        assert_eq!(luns[0].xfer_out(0, &mut buf), XferOutcome::Ok);
+        assert!(matches!(
+            luns[0].xfer_out(0, &mut buf),
+            Xfer::Inline { len: 512 }
+        ));
         assert_eq!(&buf[..4], &w[..4]);
 
         // Optical profile refuses writes with DATA PROTECT.
@@ -431,8 +475,9 @@ mod tests {
             CommandOutcome::InXfer { .. } => {
                 assert!(matches!(
                     luns[1].xfer_in(0, &w[..512]),
-                    XferOutcome::Error(XferError::WriteProtected)
+                    Xfer::Inline { len: 0 }
                 ));
+                assert!(luns[1].peek_sense().is_some());
             }
             other => panic!("unexpected outcome {other:?}"),
         }
@@ -444,5 +489,44 @@ mod tests {
         let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
         // RAM backend sync is a no-op Ok; trait default covers compute LUNs.
         assert!(ScsiDevice::sync(&mut disk).is_ok());
+    }
+
+    #[test]
+    fn sense_for_storage_error_covers_all_variants() {
+        assert_eq!(
+            sense_for_storage_error(StorageError::OutOfBounds),
+            (SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0)
+        );
+        assert_eq!(
+            sense_for_storage_error(StorageError::NotWritable),
+            (SenseKey::DataProtect, asc::WRITE_PROTECTED, 0)
+        );
+        assert_eq!(
+            sense_for_storage_error(StorageError::Io(embedded_io::ErrorKind::Other)),
+            (SenseKey::MediumError, asc::UNRECOVERED_READ_ERROR, 0)
+        );
+        assert_eq!(
+            sense_for_storage_error(StorageError::Unsupported),
+            (SenseKey::IllegalRequest, asc::INVALID_FIELD, 0)
+        );
+    }
+
+    #[test]
+    fn store_done_maps_and_next_store_op_defaults_none() {
+        let mut ram = vec![0u8; 4096];
+        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+
+        // Default `next_store_op` is `None`.
+        assert!(disk.next_store_op().is_none());
+
+        // Default `store_done` maps a storage error to sense and returns Ok.
+        assert_eq!(disk.store_done(Ok(())), XferOutcome::Ok);
+        assert_eq!(
+            disk.store_done(Err(StorageError::NotWritable)),
+            XferOutcome::Ok
+        );
+        let s = disk.take_sense().unwrap();
+        assert_eq!(s.key, SenseKey::DataProtect);
+        assert_eq!(s.asc, asc::WRITE_PROTECTED);
     }
 }

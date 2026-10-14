@@ -9,7 +9,7 @@ mod tests {
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowscsi::iscsi::target::{IscsiSession, LoginStage, StepResult};
     use snowscsi::scsi::block::BlockDevice;
-    use snowscsi::scsi::device::ScsiDevice;
+    use snowscsi::scsi::device::{ScsiDevice, Xfer};
     use snowscsi::MIN_DATA_LEN;
 
     /// iSCSI target scratch buffer: BHS header + data area.
@@ -1400,20 +1400,12 @@ mod tests {
             Ok(snowscsi::scsi::device::CommandOutcome::Status)
         }
 
-        fn xfer_out(
-            &mut self,
-            _transfer_offset: u64,
-            _buf: &mut [u8],
-        ) -> snowscsi::scsi::device::XferOutcome {
-            snowscsi::scsi::device::XferOutcome::Ok
+        fn xfer_out<'a>(&'a mut self, _transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
+            Xfer::Inline { len: buf.len() }
         }
 
-        fn xfer_in(
-            &mut self,
-            _transfer_offset: u64,
-            _buf: &[u8],
-        ) -> snowscsi::scsi::device::XferOutcome {
-            snowscsi::scsi::device::XferOutcome::Ok
+        fn xfer_in<'a>(&'a mut self, _transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
+            Xfer::Inline { len: buf.len() }
         }
 
         fn peek_sense(&self) -> Option<&snowscsi::scsi::scsi::Sense> {
