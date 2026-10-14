@@ -27,7 +27,7 @@
 //! is an independent SCSI device with its own LBA semantics, so a dual-mount
 //! warning is printed to stderr. SIGINT / SIGTERM trigger a graceful
 //! shutdown: the blocking `accept()` is woken by a probe connection,
-//! `serve()` returns, and every backend is `sync()`ed before exit.
+//! `serve()` returns, and every store plane is `sync()`ed before exit.
 
 mod spec;
 
@@ -45,23 +45,24 @@ use clap::{Args, Parser};
 use snowscsi::cdrom::drive::CdromDrive;
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::dvdram::DvdRamMedia;
-use snowscsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
+use snowscsi::cdrom::media::{CdMedia, LiveData};
 use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
-use snowscsi::common::seekable_storage::RwRef;
+use snowscsi::common::store::StorePlane;
 use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
 use snowscsi::scsi::block::BlockDevice;
 use snowscsi::scsi::device::ScsiDevice;
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
+use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
 use spec::{Backing, DeviceRole, DeviceSpec};
 
 #[cfg(target_os = "linux")]
 use snowscsi::usb::{
-    BotIo, BotIoErr, BotSession, BotStepResult, CtrlAck, CtrlReply, CtrlReq, Gadget, SessionEvent,
-    SessionNeed, SessionStep, ShortfallPolicy,
+    serve as usb_serve, BotIo, BotIoErr, BotSession, CtrlAck, CtrlReply, CtrlReq, Gadget,
+    ShortfallPolicy,
 };
 #[cfg(target_os = "linux")]
 use usb_gadget::function::custom::{
@@ -77,21 +78,11 @@ const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
 const ISO_SECTOR_SIZE: u32 = 2048;
-/// Serve loop re-checks the control pipe / stop flag at this granularity
-/// (bounds Bulk-Only Reset / Get Max LUN response latency, §6.3).
-#[cfg(target_os = "linux")]
-const BOT_POLL_GRANULARITY: Duration = Duration::from_millis(50);
 
 /// USB bulk endpoint maximum packet size (high-speed). FunctionFS aio reads
 /// require an MPS-multiple buffer (§6.2 / §1.4).
 #[cfg(target_os = "linux")]
 const USB_MPS: usize = 512;
-
-/// Round `n` up to the next multiple of the USB bulk MPS (minimum one MPS).
-#[cfg(target_os = "linux")]
-fn round_up_mps(n: usize) -> usize {
-    (n + USB_MPS - 1) & !(USB_MPS - 1)
-}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -221,8 +212,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
     let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
-    let mut disks: Vec<BlockDevice<RwRef>> = Vec::new();
+    let mut disks: Vec<BlockDevice> = Vec::new();
     let mut drives: Vec<CdromDrive> = Vec::new();
+    // Store planes, one per LUN, 1:1 aligned with `devs` below.
+    let mut planes: Vec<Option<StorePlane>> = Vec::new();
     if build_devices(
         &specs,
         &mut ram_disks,
@@ -231,17 +224,21 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         &mut bundles,
         &mut disks,
         &mut drives,
+        &mut planes,
     )
     .is_err()
     {
         return ExitCode::FAILURE;
     }
     // LUN array in protocol order: all --block LUNs, then all --cdrom LUNs.
-    let mut luns: Vec<&mut dyn ScsiDevice> = disks
+    // `devs` and `planes` are built in the same spec order, so index `i` of
+    // each describes the same LUN (the 1:1 invariant `Luns` relies on).
+    let mut devs: Vec<&mut dyn ScsiDevice> = disks
         .iter_mut()
         .map(|d| d as &mut dyn ScsiDevice)
         .chain(drives.iter_mut().map(|d| d as &mut dyn ScsiDevice))
         .collect();
+    let mut luns = Luns::new(&mut devs, &mut planes);
 
     if let Some(selector) = args.usb.as_deref() {
         #[cfg(target_os = "linux")]
@@ -343,17 +340,22 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush backends.
-    sync_devices(&mut luns);
+    // Graceful exit: flush every store plane.
+    sync_planes(luns.planes);
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
 
-/// Flush every backend; errors are reported to stderr but not fatal.
-fn sync_devices(luns: &mut [&mut dyn ScsiDevice]) {
-    for (i, lun) in luns.iter_mut().enumerate() {
-        if let Err(e) = ScsiDevice::sync(lun) {
-            eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+/// Flush every store plane; errors are reported to stderr but not fatal.
+///
+/// A `None` plane is skipped (the CLI now always supplies a real plane, but
+/// `Luns` still admits self-backed LUNs).
+fn sync_planes(planes: &mut [Option<StorePlane<'_>>]) {
+    for (i, plane) in planes.iter_mut().enumerate() {
+        if let Some(plane) = plane {
+            if let Err(e) = plane.sync() {
+                eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+            }
         }
     }
 }
@@ -698,23 +700,37 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
     }
 }
 
-/// Shared device pipeline: build every parsed [`DeviceSpec`] into a backing
-/// plane and a typed LUN, in order (all `--block` devices first, then all
-/// `--cdrom` devices).
+/// Shared device pipeline: build every parsed [`DeviceSpec`] into a device and
+/// its store plane, in order (all `--block` devices first, then all `--cdrom`
+/// devices).
 ///
 /// Ownership model: the caller owns every resource — RAM slots
-/// (`ram_disks`), block/optical backends, live scanners and bundles — and
-/// the two typed LUN vectors borrow from them; the caller then lends the
-/// LUNs to a transport as `&mut dyn ScsiDevice`. On failure prints the
-/// error and returns `Err(())`.
+/// (`ram_disks`), block/optical backends, live scanners and bundles — and the
+/// store planes borrow from them. Each spec pushes exactly one device
+/// (`disks`/`drives`) and one plane (`planes`), so the two are 1:1 aligned and
+/// can be zipped into a [`Luns`] bundle. The caller then lends that bundle to a
+/// transport. On failure prints the error and returns `Err(())`.
+///
+/// Plane mapping:
+/// - writable `--block` → [`BlockDevice::disk`] + [`StorePlane::BlockRw`];
+/// - read-only `--block` → [`BlockDevice::disk_read_only`] +
+///   [`StorePlane::BlockRo`];
+/// - `--block …,profile=cd` → [`BlockDevice::cdrom`] +
+///   [`StorePlane::BlockRo`];
+/// - `--cdrom img=<iso>` / `live=<dir>` → `CdromDrive` +
+///   [`StorePlane::BlockRo`] (the drive keeps only cached geometry; reads go
+///   through the plane);
+/// - `--cdrom dvdram=<img>` → `CdromDrive` + [`StorePlane::BlockRw`].
+#[allow(clippy::too_many_arguments)]
 fn build_devices<'a>(
     specs: &[DeviceSpec],
     ram_disks: &'a mut Vec<Vec<u8>>,
     backends: &'a mut Vec<BlockBackend<'a>>,
     lives: &'a mut Vec<LiveData<StdFsBackend>>,
     bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
-    disks: &mut Vec<BlockDevice<RwRef<'a>>>,
-    drives: &mut Vec<CdromDrive<'a>>,
+    disks: &mut Vec<BlockDevice>,
+    drives: &mut Vec<CdromDrive>,
+    planes: &mut Vec<Option<StorePlane<'a>>>,
 ) -> Result<(), ()> {
     if specs.is_empty() {
         eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
@@ -834,7 +850,7 @@ fn build_devices<'a>(
                 }
                 // Read-only is enforced at BOTH layers: the plane is opened
                 // `rb` (so it works on read-only media; never `r+b`), and the
-                // LUN is locked below (`set_writable(false)`).
+                // LUN is built with `disk_read_only` (locked write policy).
                 let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
                 let b = FileBackend::open(path, writable)
                     .map_err(|e| eprintln!("snowscsi: failed to open {path}: {e}"))?;
@@ -896,9 +912,15 @@ fn build_devices<'a>(
         }
     }
 
-    // ── Phase B: lend each backend exactly once, build LUNs ────────
+    // ── Phase B: build one (device, plane) pair per spec ──────────
+    // Each backend is lent exactly once: both the block devices and the MMC
+    // `CdromDrive` read geometry once at construction and hand the plane to
+    // the LUN's `StorePlane` (reads/writes then flow through the plane).
+    // Every arm pushes exactly one device and one plane, in spec order, so
+    // the two stay 1:1 aligned.
     disks.clear();
     drives.clear();
+    planes.clear();
     let mut be_iter = backends.iter_mut();
     let mut live_iter = lives.iter_mut();
     #[cfg(feature = "bundle")]
@@ -912,18 +934,26 @@ fn build_devices<'a>(
                     .next()
                     .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
                 let cap = be.capacity();
-                let mut dev = BlockDevice::disk(RwRef::new(be), spec.plane.sector)
-                    .map_err(|e| eprintln!("snowscsi: bundle: invalid geometry for {dir}: {e}"))?;
                 if spec.plane.read_only {
-                    // Device layer RO (immediate DATA PROTECT); the plane is
-                    // already read-only, so both layers agree.
-                    dev.set_writable(false);
+                    // Read-only disk image: lock the device policy and expose
+                    // the plane read-only — both layers agree.
+                    let dev =
+                        BlockDevice::disk_read_only(&mut *be, spec.plane.sector).map_err(|e| {
+                            eprintln!("snowscsi: bundle: invalid geometry for {dir}: {e}")
+                        })?;
+                    disks.push(dev);
+                    planes.push(Some(StorePlane::BlockRo(be)));
+                } else {
+                    let dev = BlockDevice::disk(&mut *be, spec.plane.sector).map_err(|e| {
+                        eprintln!("snowscsi: bundle: invalid geometry for {dir}: {e}")
+                    })?;
+                    disks.push(dev);
+                    planes.push(Some(StorePlane::BlockRw(be)));
                 }
                 log::debug!(
                     "LUN {lun}: bundle block device ({cap} bytes, sector {})",
                     spec.plane.sector
                 );
-                disks.push(dev);
             }
             #[cfg(feature = "bundle")]
             (DeviceRole::BlockCd, Backing::ImgDir { dir }) => {
@@ -931,21 +961,28 @@ fn build_devices<'a>(
                     .next()
                     .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
                 let cap = be.capacity();
-                let dev = BlockDevice::cdrom(RwRef::new(be)).map_err(|e| {
+                let dev = BlockDevice::cdrom(&mut *be).map_err(|e| {
                     eprintln!("snowscsi: bundle: invalid CD geometry for {dir}: {e}")
                 })?;
-                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
                 disks.push(dev);
+                planes.push(Some(StorePlane::BlockRo(be)));
+                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
             }
             (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
                 let be = be_iter
                     .next()
                     .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
-                let mut dev =
-                    BlockDevice::disk(RwRef::new(be), SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
                 if spec.plane.read_only {
-                    dev.set_writable(false);
+                    let dev = BlockDevice::disk_read_only(&mut *be, SECTOR_SIZE)
+                        .expect("SECTOR_SIZE is nonzero");
+                    disks.push(dev);
+                    planes.push(Some(StorePlane::BlockRo(be)));
+                } else {
+                    let dev =
+                        BlockDevice::disk(&mut *be, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
+                    disks.push(dev);
+                    planes.push(Some(StorePlane::BlockRw(be)));
                 }
                 log::debug!(
                     "LUN {lun}: block device ({cap} bytes{})",
@@ -955,7 +992,6 @@ fn build_devices<'a>(
                         ""
                     }
                 );
-                disks.push(dev);
             }
             (DeviceRole::BlockCd, Backing::Img { .. } | Backing::Ram { .. }) => {
                 let be = be_iter
@@ -963,10 +999,11 @@ fn build_devices<'a>(
                     .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 // Optical image profile (PDT 0x05): writes rejected at the
-                // profile level; the erased plane type stays uniform.
-                let dev = BlockDevice::cdrom(RwRef::new(be)).expect("nonzero sectors");
-                log::debug!("LUN {lun}: CD profile ({cap} bytes)");
+                // profile level; the plane is read-only to match.
+                let dev = BlockDevice::cdrom(&mut *be).expect("nonzero sectors");
                 disks.push(dev);
+                planes.push(Some(StorePlane::BlockRo(be)));
+                log::debug!("LUN {lun}: CD profile ({cap} bytes)");
             }
             (DeviceRole::MmcCd, Backing::Img { path }) => {
                 let be = be_iter
@@ -974,9 +1011,10 @@ fn build_devices<'a>(
                     .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 let mut drive = CdromDrive::new();
-                drive.load(CdMedia::ro(be));
+                drive.load(CdMedia::ro(&mut *be));
                 log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
                 drives.push(drive);
+                planes.push(Some(StorePlane::BlockRo(be)));
             }
             (DeviceRole::MmcCd, Backing::Live { dir }) => {
                 let live = live_iter
@@ -984,9 +1022,10 @@ fn build_devices<'a>(
                     .ok_or_else(|| eprintln!("snowscsi: internal: live pool exhausted"))?;
                 let total = live.layout().total;
                 let mut drive = CdromDrive::new();
-                drive.load(CdMedia::ro(live));
+                drive.load(CdMedia::ro(&mut *live));
                 log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
                 drives.push(drive);
+                planes.push(Some(StorePlane::BlockRo(live)));
             }
             #[cfg(feature = "dvdram")]
             (DeviceRole::MmcCd, Backing::DvdRam { path: _ }) => {
@@ -996,13 +1035,14 @@ fn build_devices<'a>(
                 // A blank, random-writable DVD-RAM over the byte plane. The
                 // host formats it (FORMAT UNIT + its own UDF mkfs); the device
                 // never writes file-system structures.
-                let media = DvdRamMedia::open(RwRef::new(be));
+                let media = DvdRamMedia::open(&mut *be);
                 log::debug!("LUN {lun}: DvdRam DVD-RAM ({} bytes)", media.capacity());
                 let mut drive = CdromDrive::builder()
                     .capabilities(snowscsi::cdrom::HYPER_MULTI_CAPS)
                     .build();
                 drive.load(CdMedia::Rw(media));
                 drives.push(drive);
+                planes.push(Some(StorePlane::BlockRw(be)));
             }
             _ => {
                 eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
@@ -1010,6 +1050,9 @@ fn build_devices<'a>(
             }
         }
     }
+    // One plane per LUN: `disks` then `drives` reproduces spec order because
+    // `parse_all` emits every `--block` spec before every `--cdrom` spec.
+    debug_assert_eq!(disks.len() + drives.len(), planes.len());
     Ok(())
 }
 
@@ -1021,10 +1064,10 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 /// `snowscsi serve --usb`: assemble the MSC FunctionFS gadget, bind it to a
-/// UDC and run the BOT poll loop (§6).
+/// UDC and drive the library BOT loop ([`usb_serve`], §6).
 fn run_serve_usb(
     args: &ServeArgs,
-    luns: &mut [&mut dyn ScsiDevice],
+    luns: &mut Luns<'_>,
     work_size: usize,
     selector: &str,
 ) -> ExitCode {
@@ -1093,14 +1136,12 @@ fn run_serve_usb(
     };
     let mut session = BotSession::with_luns(luns.len()).with_shortfall(shortfall);
     let mut work = vec![0u8; work_size];
-    let mut recv = vec![0u8; round_up_mps(work_size)];
 
     log::info!("serving {} LUN(s) over USB", luns.len());
-    if let Err(e) = serve_bot(
+    if let Err(e) = usb_serve(
         &mut ffs_bot,
         &mut ffs_gadget,
         &mut session,
-        &mut recv,
         &mut work,
         luns,
         &stop,
@@ -1109,9 +1150,9 @@ fn run_serve_usb(
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush backends, unregister the gadget (RAII), then
-    // unmount configfs again if the `dummy` auto-config mounted it.
-    sync_devices(luns);
+    // Graceful exit: flush every store plane, unregister the gadget (RAII),
+    // then unmount configfs again if the `dummy` auto-config mounted it.
+    sync_planes(luns.planes);
     drop(reg);
     release_configfs(owns_configfs);
     log::info!("shutting down");
@@ -1306,13 +1347,21 @@ impl FfsBot {
         }
     }
 
+    /// Round `n` up to the next multiple of the USB bulk MPS (minimum one
+    /// MPS). FunctionFS aio reads require an MPS-multiple buffer (§6.2 /
+    /// §1.4), so this platform quirk lives here rather than in the
+    /// platform-agnostic library `usb::serve` loop.
+    fn round_up_mps(n: usize) -> usize {
+        (n + USB_MPS - 1) & !(USB_MPS - 1)
+    }
+
     /// Enqueue one read of `size` bytes (rounded up to the USB MPS) unless a
     /// read is already in flight.
     fn ensure_read(&mut self, size: usize) -> Result<(), BotIoErr> {
         if self.pending {
             return Ok(());
         }
-        let size = round_up_mps(size.max(1));
+        let size = Self::round_up_mps(size.max(1));
         self.out
             .try_recv(bytes::BytesMut::zeroed(size))
             .map_err(|e| {
@@ -1510,174 +1559,11 @@ impl<'a> Gadget<'a> for FfsGadget {
     }
 }
 
-#[cfg(target_os = "linux")]
-/// The PC poll driver (§6.3): control requests first, then one bulk step of
-/// the non-blocking `BotSession` core, bounded by the stop flag.
-fn serve_bot(
-    ffs_bot: &mut FfsBot,
-    ffs_gadget: &mut FfsGadget,
-    session: &mut BotSession,
-    recv: &mut [u8],
-    work: &mut [u8],
-    devs: &mut [&mut dyn ScsiDevice],
-    stop: &AtomicBool,
-) -> Result<(), String> {
-    if work.len() < MIN_DATA_LEN {
-        return Err(format!("work buffer smaller than {MIN_DATA_LEN}"));
-    }
-    let mut stalled = false;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        // 1) Control requests first (arrive at any time, even mid data phase).
-        if let Some(req) = ffs_gadget.try_next_ctrl() {
-            match req {
-                CtrlReq::BotReset { ack } => {
-                    session.reset();
-                    ack.ack();
-                    // BOT §3.1: BotReset preserves STALL. The core keeps the
-                    // STALLed state; clear_feature_halt() transitions out.
-                    // Only clear our local flag if the core did not stay STALLed.
-                    if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
-                        stalled = false;
-                    }
-                }
-                CtrlReq::GetMaxLun { mut reply } => {
-                    reply
-                        .send(&[session.max_lun()])
-                        .map_err(|_| "Get Max LUN reply failed".to_string())?;
-                }
-                CtrlReq::LinkReset => {
-                    session.reset();
-                    if !matches!(session.need(), SessionNeed::Done(BotStepResult::Stalled)) {
-                        stalled = false;
-                    }
-                }
-            }
-            continue;
-        }
-        // 2) STALLed: only control events until the host resets (§4.5).
-        if stalled {
-            continue;
-        }
-        match session.need() {
-            SessionNeed::NeedOut { len, probe } => {
-                // probe = non-blocking overrun drain (no wait); everything
-                // else bounds the ctrl/stop check latency.
-                let timeout = if probe {
-                    Duration::ZERO
-                } else {
-                    BOT_POLL_GRANULARITY
-                };
-                // FunctionFS aio reads need an MPS-multiple buffer: a smaller
-                // one (e.g. the 31-byte CBW request) overflows when the host
-                // sends a full MPS packet (-EOVERFLOW).
-                let aio_len = round_up_mps(len);
-                match ffs_bot.recv_out(&mut recv[..aio_len], Some(timeout)) {
-                    Ok(n) => {
-                        let step =
-                            session.poll(SessionEvent::OutRecv { data: &recv[..n] }, work, devs);
-                        if let SessionStep::Done(r) = step {
-                            handle_done(r, &mut stalled, ffs_bot)?;
-                        }
-                    }
-                    Err(BotIoErr::WouldBlock) => {
-                        if probe {
-                            let step = session.poll(SessionEvent::OutIdle, work, devs);
-                            if let SessionStep::Done(r) = step {
-                                handle_done(r, &mut stalled, ffs_bot)?;
-                            }
-                        }
-                    }
-                    Err(BotIoErr::Disconnected) => {
-                        // Host unplug / VM migration: reset and keep serving.
-                        // The next NeedOut re-arms the read (pending was
-                        // cleared by FfsBot); a re-attach is announced by
-                        // FunctionFS Bind/Enable events.
-                        log::info!("USB host disconnected; resetting session");
-                        session.reset();
-                        stalled = false;
-                    }
-                    Err(BotIoErr::Io) => return Err("bulk OUT I/O failure".to_string()),
-                }
-            }
-            SessionNeed::NeedIn { len } => {
-                let data = session.out_slice(&work[..]);
-                if data.len() != len {
-                    return Err("internal: out_slice length mismatch".to_string());
-                }
-                match ffs_bot.send_in(data) {
-                    Ok(()) => {}
-                    Err(BotIoErr::Disconnected) => {
-                        log::info!("USB host disconnected; resetting session");
-                        session.reset();
-                        stalled = false;
-                        continue;
-                    }
-                    Err(BotIoErr::Io) => return Err("bulk IN send failed".to_string()),
-                    Err(BotIoErr::WouldBlock) => {
-                        return Err("unexpected WouldBlock on bulk IN send".to_string());
-                    }
-                }
-                let step = session.poll(SessionEvent::InSent, work, devs);
-                if let SessionStep::Done(r) = step {
-                    handle_done(r, &mut stalled, ffs_bot)?;
-                }
-            }
-            SessionNeed::NeedStall => {
-                // `Short`: set the Bulk-In halt (the driver retries transient
-                // -EAGAIN inside `stall_in`), then release the withheld CSW.
-                // The core does not wait for the host's CLEAR_FEATURE — the USB
-                // core handles it and it is not observable here; the CSW is
-                // queued immediately and delivered once the halt clears.
-                match ffs_bot.stall_in() {
-                    Ok(()) => session.stall_applied(),
-                    Err(()) => {
-                        // A `Short`-without-`stall_in` mismatch aborts
-                        // deterministically (reset drops the withheld CSW).
-                        log::error!(
-                            "fatal: ShortfallPolicy::Short selected but bulk-IN STALL \
-                             unavailable; aborting transaction"
-                        );
-                        session.reset();
-                        stalled = false;
-                    }
-                }
-            }
-            SessionNeed::Done(r) => handle_done(r, &mut stalled, ffs_bot)?,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-/// React to a transaction-end result from the core.
-fn handle_done(
-    result: BotStepResult,
-    stalled: &mut bool,
-    ffs_bot: &mut FfsBot,
-) -> Result<(), String> {
-    match result {
-        BotStepResult::Stalled => {
-            if !*stalled {
-                let _ = ffs_bot.stall_both();
-                *stalled = true;
-            }
-            Ok(())
-        }
-        BotStepResult::Error(e) => Err(format!("BOT core error: {e}")),
-        // Emitted only by the blocking `step()` wrapper, which this poll loop
-        // does not use; unreachable here.
-        BotStepResult::Unsupported => Ok(()),
-        BotStepResult::Processed | BotStepResult::Closed => Ok(()),
-    }
-}
-
 /// `snowscsi mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
 /// standalone ISO9660/Joliet image to disk.
 ///
-/// Reuses the live-generation pipeline (`CdLiveFsDevice`: scan → layout →
-/// sector synthesis) and dumps every sector through `read_data`, so the
+/// Reuses the live-generation pipeline (`LiveData`: scan → layout → sector
+/// synthesis) and dumps every sector through its `FlatData::read_at`, so the
 /// on-disk image is byte-identical to what `serve --cdrom live=<dir>`
 /// would expose. The image is padded to whole 2048-byte sectors.
 fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
@@ -1707,7 +1593,7 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     };
 
     let fs = StdFsBackend::new(&args.dir);
-    let live = match LiveData::new(fs, &label) {
+    let mut live = match LiveData::new(fs, &label) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("snowscsi: failed to scan {}: {e}", args.dir);
@@ -1715,7 +1601,6 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
         }
     };
     let total_sectors = live.layout().total;
-    let mut flat = FlatMedia::new(live);
 
     let file = match File::create(&args.out) {
         Ok(f) => f,
@@ -1727,9 +1612,12 @@ fn run_mkisofs(args: MkisofsArgs) -> ExitCode {
     let mut writer = BufWriter::new(file);
     let mut sector = [0u8; ISO_SECTOR_SIZE as usize];
     for lba in 0..total_sectors {
-        if flat
-            .read_data(u64::from(lba) * u64::from(ISO_SECTOR_SIZE), &mut sector)
-            .is_err()
+        if snowscsi::common::seekable_storage::FlatData::read_at(
+            &mut live,
+            u64::from(lba) * u64::from(ISO_SECTOR_SIZE),
+            &mut sector,
+        )
+        .is_err()
         {
             eprintln!("snowscsi: failed to read sector {lba}");
             return ExitCode::FAILURE;

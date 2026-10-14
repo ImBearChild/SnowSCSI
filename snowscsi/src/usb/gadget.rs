@@ -8,8 +8,9 @@
 //!
 //! Reset / Get Max LUN arrive out-of-band at any time (even mid data
 //! phase); the driver loop drains this seam between bulk operations and
-//! reacts synchronously — [`crate::usb::target::BotSession::reset`] for a
-//! reset, [`crate::usb::target::BotSession::max_lun`] for Get Max LUN.
+//! reacts synchronously — feed
+//! [`Event::Reset`](crate::usb::target::Event::Reset) for a reset,
+//! [`crate::usb::target::BotSession::max_lun`] for Get Max LUN.
 
 /// Response handle for Get Max LUN: send the 1-byte answer.
 #[allow(clippy::result_unit_err)]
@@ -19,9 +20,9 @@ pub trait CtrlReply {
     fn send(&mut self, data: &[u8]) -> Result<(), ()>;
 }
 
-/// Acknowledgment handle for Bulk-Only Reset. Call after
-/// [`BotSession::reset`](crate::usb::target::BotSession::reset) — the
-/// control status stage must not complete until the reset is done
+/// Acknowledgment handle for Bulk-Only Reset. Feed
+/// [`Event::Reset`](crate::usb::target::Event::Reset) to the session first —
+/// the control status stage must not complete until the reset is done
 /// (BOT §6.4).
 pub trait CtrlAck {
     /// Consume the handle and complete the control status stage.
@@ -33,8 +34,8 @@ pub trait CtrlAck {
 /// `A` / `R` are the platform's ack / reply handles; the borrow of the
 /// platform control channel lives inside them (see [`Gadget`]).
 pub enum CtrlReq<A: CtrlAck, R: CtrlReply> {
-    /// Bulk-Only Mass Storage Reset (bRequest 0xFF). The driver must call
-    /// `BotSession::reset()` before `ack.ack()` (BOT §3.1).
+    /// Bulk-Only Mass Storage Reset (bRequest 0xFF). The driver must feed
+    /// `Event::Reset` to the session before `ack.ack()` (BOT §3.1).
     BotReset { ack: A },
     /// Get Max LUN (bRequest 0xFE). Reply immediately with
     /// `[session.max_lun()]`; never STALL this request (§4.3).

@@ -5,10 +5,9 @@
 //! optional STALL capabilities — `stall_both` for invalid CBWs (BOT §6.6.1)
 //! and `stall_in` for a `ShortfallPolicy::Short` Data-In shortfall (§6.7.2).
 //! The protocol core (`crate::usb::target::BotSession`) never touches this
-//! trait directly — it is driven by
-//! [`SessionEvent`](crate::usb::target::SessionEvent)s. Drivers (PC FunctionFS
-//! endpoints, embedded MCU USB peripherals) and the blocking `step` wrapper
-//! consume it.
+//! trait directly — it is driven by [`Event`](crate::usb::target::Event)s via
+//! [`crate::usb::serve()`]. Drivers (PC FunctionFS endpoints, embedded MCU USB
+//! peripherals) consume it.
 //!
 //! Like [`crate::iscsi::conn::Conn`], error kinds are deliberately coarse:
 //! any real I/O failure means the link is dead and the driver should stop.
@@ -80,18 +79,17 @@ pub trait BotIo {
     /// The driver must **retry the transient `-EAGAIN`** (the endpoint cannot
     /// be halted while a request is queued or the FIFO still holds bytes the
     /// host has not collected) until the halt is set or a bounded deadline
-    /// expires. On success the driver calls [`BotSession::stall_applied`]; the
+    /// expires. On success the driver feeds
+    /// [`Event::StallApplied`](crate::usb::target::Event::StallApplied); the
     /// core does **not** wait for the host's CLEAR_FEATURE (the USB core handles
     /// it and it is not observable here) — the withheld CSW is queued
     /// immediately and delivered once the halt clears. On `Err(())` the driver
-    /// **must** abort the transaction deterministically by calling
-    /// [`BotSession::reset`].
+    /// **must** abort the transaction deterministically by feeding
+    /// [`Event::Reset`](crate::usb::target::Event::Reset).
     ///
     /// Used only by `Short`; `Pad` and `ShortNoStall` never STALL.
     ///
     /// [`ShortfallPolicy::Short`]: crate::usb::target::ShortfallPolicy::Short
-    /// [`BotSession::reset`]: crate::usb::target::BotSession::reset
-    /// [`BotSession::stall_applied`]: crate::usb::target::BotSession::stall_applied
     fn stall_in(&mut self) -> Result<(), ()> {
         Err(())
     }

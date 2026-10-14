@@ -19,11 +19,14 @@ use std::net::TcpListener;
 use std::thread;
 
 use snowscsi::common::seekable_storage::RamBackend;
+use snowscsi::common::store::StorePlane;
 use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::target::{serve_conn, IscsiSession, TargetError};
 use snowscsi::iscsi::transport::TcpConn;
 use snowscsi::iscsi::transport::DEFAULT_READ_TIMEOUT;
 use snowscsi::scsi::block::BlockDevice;
+use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
 
 /// libiscsi constants (iscsi.h / scsi-lowlevel.h).
@@ -287,12 +290,24 @@ fn start_target_n_luns(
         for r in &rams_for_thread {
             guards.push(r.lock().unwrap());
         }
-        // Coerce each guard to a `&mut [u8]` slice view, build the device.
-        let mut devs: Vec<BlockDevice<RamBackend<'_>>> = Vec::with_capacity(n);
-        for g in &mut guards {
-            devs.push(BlockDevice::disk(RamBackend::new(&mut g[..]), BLOCK_SIZE).expect("device"));
-        }
-        serve_conn(&mut conn, &mut work, &mut session, &mut devs)
+        // Coerce each guard to a `&mut [u8]` slice view, build the device and
+        // its aligned store plane.
+        let mut backends: Vec<RamBackend<'_>> = guards
+            .iter_mut()
+            .map(|g| RamBackend::new(&mut g[..]))
+            .collect();
+        let mut devs: Vec<BlockDevice> = backends
+            .iter_mut()
+            .map(|b| BlockDevice::disk(b, BLOCK_SIZE).expect("device"))
+            .collect();
+        let mut dev_slices: Vec<&mut dyn ScsiDevice> =
+            devs.iter_mut().map(|d| d as &mut dyn ScsiDevice).collect();
+        let mut planes: Vec<Option<StorePlane<'_>>> = backends
+            .iter_mut()
+            .map(|b| Some(StorePlane::BlockRw(b)))
+            .collect();
+        let mut luns = Luns::new(&mut dev_slices, &mut planes);
+        serve_conn(&mut conn, &mut work, &mut session, &mut luns)
     });
     (port, handle, rams)
 }
@@ -463,7 +478,6 @@ fn out_of_range_sense_is_consumed() {
 #[test]
 fn bundle_scattered_writes_over_iscsi() {
     use snowscsi::common::flat_bundle::FlatBundle;
-    use snowscsi::common::seekable_storage::RwRef;
     use snowscsi::scsi::fs_backend::StdFsBackend;
 
     let size: u64 = 32 << 20;
@@ -490,9 +504,11 @@ fn bundle_scattered_writes_over_iscsi() {
             BLOCK_SIZE,
         )
         .expect("bundle");
-        let dev = BlockDevice::disk(RwRef::new(&mut bundle), BLOCK_SIZE).expect("device");
-        let mut devs = [dev];
-        serve_conn(&mut conn, &mut work, &mut session, &mut devs)
+        let mut dev = BlockDevice::disk(&mut bundle, BLOCK_SIZE).expect("device");
+        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut bundle))];
+        let mut luns = Luns::new(&mut devs, &mut planes);
+        serve_conn(&mut conn, &mut work, &mut session, &mut luns)
     });
 
     let iscsi = connect(port);

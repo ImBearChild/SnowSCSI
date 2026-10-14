@@ -13,7 +13,6 @@
 use crate::cdrom::drive::CdromDrive;
 #[cfg(feature = "dvdram")]
 use crate::cdrom::dvdram::DvdRamMedia;
-use crate::common::seekable_storage::RwRef;
 use crate::scsi::backend::{BlockBackend, RamBackend};
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::spc::SpcDevice as _;
@@ -37,7 +36,7 @@ fn rfc_formattable_descriptor_tdp_is_block_length() {
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "dvdram")]
     {
-        let media = DvdRamMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(&mut bb);
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "dvdram"))]
@@ -73,7 +72,7 @@ fn win_single_cmds_diag() {
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "dvdram")]
     {
-        let media = DvdRamMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(&mut bb);
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "dvdram"))]
@@ -160,7 +159,7 @@ fn win_rejected_probe_does_not_poison_next_command() {
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "dvdram")]
     {
-        let media = DvdRamMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(&mut bb);
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "dvdram"))]
@@ -224,7 +223,7 @@ fn win_ua_still_reports_once() {
     let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
     #[cfg(feature = "dvdram")]
     {
-        let media = DvdRamMedia::open(RwRef::new(&mut bb));
+        let media = DvdRamMedia::open(&mut bb);
         dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
     }
     #[cfg(not(feature = "dvdram"))]
@@ -281,14 +280,25 @@ fn win_ua_still_reports_once() {
 #[cfg(feature = "usb")]
 mod enumeration_sequence {
     use super::*;
-    use crate::scsi::scsi::{asc, SenseKey};
-    use crate::usb::target::{BotSession, SessionEvent, SessionNeed};
+    use crate::common::store::StorePlane;
+    use crate::scsi::device::ScsiDevice;
+    use crate::scsi::scsi::asc;
+    use crate::usb::target::{Action, BotSession, Event};
+    use crate::usb::CSW_LEN;
 
     /// One BOT transaction: build the CBW, run the state machine to
     /// completion, return (csw_status, response bytes).
+    ///
+    /// FORMAT/BLANK and SYNCHRONIZE CACHE no longer run inline in the command
+    /// phase: the drive arms an agenda and the session drains it as
+    /// [`Action::Store`] (`Fill`/`Sync`) ops before the terminal status. The
+    /// loop below executes each op on the LUN's store plane and feeds the
+    /// result back as [`Event::StoreDone`] — invisible on the wire, so the
+    /// CSW status and response bytes are unchanged.
     fn tx(
         session: &mut BotSession,
-        dev: &mut CdromDrive<'_>,
+        dev: &mut CdromDrive,
+        planes: &mut [Option<StorePlane<'_>>],
         work: &mut [u8],
         dir_in: bool,
         declared: usize,
@@ -310,40 +320,27 @@ mod enumeration_sequence {
         let mut csw_seen = false;
         let mut guard = 0usize;
 
-        session.poll(SessionEvent::OutRecv { data: &cbw }, work, &mut [&mut *dev]);
+        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut *dev];
+        work[..cbw.len()].copy_from_slice(&cbw);
+        // First turn feeds the CBW; every later turn carries the completion of
+        // the previous action. A whole-disc FORMAT agenda emits one `Fill` per
+        // 64 KiB chunk, so the guard is sized for the largest test disc.
+        let mut ev = Event::HostRecv { len: cbw.len() };
         loop {
             guard += 1;
-            assert!(
-                guard < 64,
-                "tx stuck: cdb={cdb:02x?} need={:?}",
-                session.need()
-            );
-            match session.need() {
-                SessionNeed::Done(_) => break,
-                SessionNeed::NeedStall => {
-                    panic!("unexpected NeedStall in a non-Short session");
-                }
+            assert!(guard < 1_000_000, "tx stuck: cdb={cdb:02x?}");
+            match session.poll(ev, work, &mut devs) {
                 // CSW sent: the core is back in Command phase waiting for
                 // the next CBW — transaction complete.
-                SessionNeed::NeedOut {
+                Action::HostRecv {
                     len: 31,
                     probe: false,
                 } if csw_seen => break,
-                SessionNeed::NeedIn { len } => {
-                    let owned = session.out_slice(work)[..len].to_vec();
-                    if len == 13 {
-                        csw_status = owned[12];
-                        csw_seen = true;
-                    } else {
-                        out.extend_from_slice(&owned);
-                    }
-                    session.poll(SessionEvent::InSent, work, &mut [&mut *dev]);
-                }
-                SessionNeed::NeedOut { len, probe } => {
+                Action::HostRecv { len, probe } => {
                     // Overrun probe: try once with no data — "nothing more
                     // from the host" ends the drain and moves to the CSW.
                     if probe {
-                        session.poll(SessionEvent::OutIdle, work, &mut [&mut *dev]);
+                        ev = Event::HostIdle;
                         continue;
                     }
                     // Data-Out payload (FORMAT UNIT parameter list etc.)
@@ -355,12 +352,28 @@ mod enumeration_sequence {
                         vec![0u8; len]
                     };
                     sent_payload += chunk.len();
-                    session.poll(
-                        SessionEvent::OutRecv { data: &chunk },
-                        work,
-                        &mut [&mut *dev],
-                    );
+                    work[..chunk.len()].copy_from_slice(&chunk);
+                    ev = Event::HostRecv { len: chunk.len() };
                 }
+                Action::HostSend { bytes, .. } => {
+                    if bytes.len() == CSW_LEN {
+                        csw_status = bytes[12];
+                        csw_seen = true;
+                    } else {
+                        out.extend_from_slice(bytes);
+                    }
+                    ev = Event::HostSent;
+                }
+                Action::Store { lun, op } => {
+                    let result = planes[lun]
+                        .as_mut()
+                        .expect("cdrom LUN must have a store plane")
+                        .do_op(op);
+                    ev = Event::StoreDone { result };
+                }
+                Action::StallBoth => panic!("unexpected StallBoth"),
+                Action::StallIn => panic!("unexpected StallIn in a non-Short session"),
+                Action::Error(e) => panic!("BOT core error: {e:?}"),
             }
         }
         (csw_status, out)
@@ -374,22 +387,33 @@ mod enumeration_sequence {
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
         #[cfg(feature = "dvdram")]
         {
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
         }
         #[cfg(not(feature = "dvdram"))]
         dev.load_quiet(CdMedia::ro(&mut bb));
 
+        // Real store plane for the cdrom LUN: the FORMAT `Fill` and SYNC CACHE
+        // `Sync` agenda ops are executed against it (previously inline).
+        #[cfg(feature = "dvdram")]
+        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut bb))];
+        #[cfg(not(feature = "dvdram"))]
+        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRo(&mut bb))];
+
         let mut session = BotSession::new();
-        // Production arms a reset-UA on link events before the first command.
-        session.reset();
         let mut work = vec![0u8; crate::MIN_DATA_LEN];
+        // Production arms a reset-UA on link events before the first command.
+        {
+            let mut no_devs: [&mut dyn ScsiDevice; 0] = [];
+            let _ = session.poll(Event::Reset, &mut work, &mut no_devs);
+        }
 
         macro_rules! run {
             ($dirin:expr, $decl:expr, $cdb:expr, $payload:expr) => {{
                 let r = tx(
                     &mut session,
                     &mut dev,
+                    &mut planes,
                     &mut work,
                     $dirin,
                     $decl,
@@ -411,10 +435,28 @@ mod enumeration_sequence {
         // fetched via REQUEST SENSE (ASC 29h).
         {
             let tur = [0x00u8; 6];
-            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            let (st, _) = tx(
+                &mut session,
+                &mut dev,
+                &mut planes,
+                &mut work,
+                false,
+                0,
+                &tur,
+                &[],
+            );
             assert_eq!(st, 1, "reset-UA delivered on first TUR");
             let rs = [0x03u8, 0, 0, 0, 0x12, 0];
-            let (st, sense) = tx(&mut session, &mut dev, &mut work, true, 18, &rs, &[]);
+            let (st, sense) = tx(
+                &mut session,
+                &mut dev,
+                &mut planes,
+                &mut work,
+                true,
+                18,
+                &rs,
+                &[],
+            );
             assert_eq!(st, 0);
             assert_eq!(sense[2], 0x06, "sense key UNIT ATTENTION");
             assert_eq!(sense[12], 0x29, "POWER ON, RESET OR BUS DEVICE RESET");
@@ -425,6 +467,7 @@ mod enumeration_sequence {
             let (st, _) = tx(
                 &mut session,
                 &mut dev,
+                &mut planes,
                 &mut work,
                 false,
                 0,
@@ -476,11 +519,29 @@ mod enumeration_sequence {
         pl.extend_from_slice(&nb);
         pl.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]);
         let fu = [0x04u8, 0x19, 0, 0, 0, 0];
-        let r = tx(&mut session, &mut dev, &mut work, false, 12, &fu, &pl);
+        let r = tx(
+            &mut session,
+            &mut dev,
+            &mut planes,
+            &mut work,
+            false,
+            12,
+            &fu,
+            &pl,
+        );
         assert_eq!(r.0, 0, "FORMAT UNIT must pass");
 
         let tur = [0x00u8; 6];
-        let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+        let (st, _) = tx(
+            &mut session,
+            &mut dev,
+            &mut planes,
+            &mut work,
+            false,
+            0,
+            &tur,
+            &[],
+        );
         assert_eq!(st, 1, "UA delivered on next TUR");
         assert!(dev.peek_sense().is_none(), "UA consumed once");
 
@@ -504,6 +565,7 @@ mod enumeration_sequence {
         let (st, _) = tx(
             &mut session,
             &mut dev,
+            &mut planes,
             &mut work,
             false,
             0,
@@ -515,11 +577,29 @@ mod enumeration_sequence {
         {
             // First TUR delivers the eject's MEDIUM-MAY-HAVE-CHANGED UA…
             let tur = [0x00u8; 6];
-            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            let (st, _) = tx(
+                &mut session,
+                &mut dev,
+                &mut planes,
+                &mut work,
+                false,
+                0,
+                &tur,
+                &[],
+            );
             assert_eq!(st, 1);
             assert!(dev.peek_sense().is_none(), "UA consumed once");
             // …the next one reports the open tray.
-            let (st, _) = tx(&mut session, &mut dev, &mut work, false, 0, &tur, &[]);
+            let (st, _) = tx(
+                &mut session,
+                &mut dev,
+                &mut planes,
+                &mut work,
+                false,
+                0,
+                &tur,
+                &[],
+            );
             assert_eq!(st, 1);
             let s = dev.peek_sense().unwrap();
             assert_eq!((s.asc, s.ascq), (asc::MEDIUM_NOT_PRESENT, 0x02));

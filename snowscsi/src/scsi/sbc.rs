@@ -5,7 +5,6 @@
 //! wraps the SPC fall-through as [`SbcCommand::Spc`] so a device's
 //! `do_cmd` is a single `parse_sbc` + two-arm dispatch.
 
-use crate::common::seekable_storage::FlatData;
 use crate::scsi::block::BlockDevice;
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::scsi::{
@@ -191,8 +190,8 @@ pub fn parse_sbc(cdb: &[u8]) -> Option<SbcCommand> {
 /// Execute one parsed SBC command against `dev`. SPC commands
 /// ([`SbcCommand::Spc`]) are delegated to [`execute_spc`] — every
 /// `SbcCommand` variant is executable here, total over the enum.
-pub(crate) fn execute_sbc<D: FlatData>(
-    dev: &mut BlockDevice<D>,
+pub(crate) fn execute_sbc(
+    dev: &mut BlockDevice,
     cmd: SbcCommand,
     data: &mut [u8],
 ) -> CommandOutcome {

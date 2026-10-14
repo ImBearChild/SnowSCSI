@@ -152,7 +152,7 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// Transports are generic over `D: ScsiDevice`, so the caller picks the
 /// element type of `devs: &mut [D]`:
 ///
-/// - homogeneous fast path — `&mut [BlockDevice<B>]` (zero dispatch);
+/// - homogeneous fast path — `&mut [BlockDevice]` (zero dispatch);
 /// - heterogeneous mixing — `&mut [&mut dyn ScsiDevice]` via the `&mut T`
 ///   forwarding impl below (protocol-mandated LUN spaces).
 ///
@@ -176,32 +176,32 @@ pub fn data_capacity(work_len: usize) -> usize {
 /// else:
 ///
 /// ```
-/// use snowscsi::common::seekable_storage::{FlatData, RwRef};
-/// use snowscsi::scsi::backend::{BlockBackend, RamBackend};
+/// use snowscsi::common::seekable_storage::StorageError;
+/// use snowscsi::common::store::StoreOp;
+/// use snowscsi::scsi::backend::RamBackend;
 /// use snowscsi::scsi::block::BlockDevice;
 /// use snowscsi::scsi::device::{CommandOutcome, DeviceType, Error, ScsiDevice, Xfer};
-/// use snowscsi::scsi::scsi::{Sense, SenseKey};
+/// use snowscsi::scsi::scsi::Sense;
 ///
-/// struct VendorLun<'a> {
-///     inner: BlockDevice<RwRef<'a>>,
+/// struct VendorLun {
+///     inner: BlockDevice,
 /// }
 ///
-/// impl ScsiDevice for VendorLun<'_> {
+/// impl ScsiDevice for VendorLun {
 ///     fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
 ///         // Claim vendor opcode 0xC0; everything else falls through to
-///         // built-in SBC/SPC.
+///         // built-in SBC/SPC. The vendor read is a 16-byte device→host
+///         // transfer: announce it and let `xfer_out` hand the shell the op.
 ///         if cdb.first() == Some(&0xC0) {
-///             let be = self.inner.backend();
-///             if be.read_at(0, &mut data[..16]).is_err() {
-///                 self.inner.set_sense(SenseKey::MediumError, 0x11, 0);
-///                 return Ok(CommandOutcome::CheckCondition);
-///             }
-///             return Ok(CommandOutcome::OutInline { len: 16 });
+///             return Ok(CommandOutcome::OutXfer { len: 16 });
 ///         }
 ///         self.inner.do_cmd(cdb, data)
 ///     }
-///     fn xfer_out<'a>(&'a mut self, off: u64, buf: &'a mut [u8]) -> Xfer<'a> {
-///         self.inner.xfer_out(off, buf)
+///     fn xfer_out<'a>(&'a mut self, _off: u64, buf: &'a mut [u8]) -> Xfer<'a> {
+///         // A real wrapper keeps its own pending-transfer state; this vendor
+///         // read always starts at plane offset 0. The shell executes the op
+///         // and the device never touches storage itself.
+///         Xfer::Store(StoreOp::Read { off: 0, buf })
 ///     }
 ///     fn xfer_in<'a>(&'a mut self, off: u64, buf: &'a [u8]) -> Xfer<'a> {
 ///         self.inner.xfer_in(off, buf)
@@ -215,15 +215,15 @@ pub fn data_capacity(work_len: usize) -> usize {
 ///     fn device_type(&self) -> DeviceType {
 ///         self.inner.device_type()
 ///     }
-///     fn sync(&mut self) -> Result<(), snowscsi::common::seekable_storage::StorageError> {
+///     fn sync(&mut self) -> Result<(), StorageError> {
 ///         self.inner.sync()
 ///     }
 /// }
 ///
-/// // Construction: any writable plane, erased or not.
+/// // Construction: any writable plane. The constructor borrows it once for
+/// // geometry and releases it — the device holds no backend.
 /// let mut img = vec![0u8; 64 * 1024];
-/// let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-/// let mut lun = VendorLun { inner: BlockDevice::disk(RwRef::new(&mut bb), 512).unwrap() };
+/// let mut lun = VendorLun { inner: BlockDevice::disk(&mut RamBackend::new(&mut img), 512).unwrap() };
 /// # let _ = lun.do_cmd(&[0x12, 0, 0, 0, 36, 0], &mut vec![0u8; 8192][..]);
 /// ```
 ///
@@ -399,6 +399,7 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::store::StorePlane;
     use crate::scsi::backend::RamBackend;
     use crate::scsi::block::BlockDevice;
     use crate::scsi::scsi::op;
@@ -434,8 +435,10 @@ mod tests {
         // driven generically through the `&mut T` forwarding impl.
         let mut ram = vec![0u8; 64 * 1024];
         let mut img = vec![0xAAu8; 2048 * 16];
-        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut optical = BlockDevice::cdrom(RamBackend::new(&mut img)).unwrap();
+        let mut ram_backend = RamBackend::new(&mut ram);
+        let mut disk = BlockDevice::disk(&mut ram_backend, 512).unwrap();
+        let mut img_backend = RamBackend::new(&mut img);
+        let mut optical = BlockDevice::cdrom(&mut img_backend).unwrap();
         let luns: [&mut dyn ScsiDevice; 2] = [&mut disk, &mut optical];
 
         assert_eq!(inquiry_pdt(luns[0], &mut work()), 0x00);
@@ -443,7 +446,8 @@ mod tests {
         assert_eq!(luns[0].device_type(), DeviceType::Block);
         assert_eq!(luns[1].device_type(), DeviceType::Cdrom);
 
-        // WRITE(10) LBA 0 len 1 on LUN 0, then READ it back.
+        // WRITE(10) LBA 0 len 1 on LUN 0, then READ it back. The device hands
+        // the shell a `Store` op; execute it against the RAM plane.
         let mut w = work();
         let mut cdb = [0u8; 10];
         cdb[0] = op::WRITE_10;
@@ -452,20 +456,24 @@ mod tests {
             luns[0].do_cmd(&cdb, &mut w).unwrap(),
             CommandOutcome::InXfer { len: 512 }
         ));
-        assert!(matches!(
-            luns[0].xfer_in(0, &w[..512]),
-            Xfer::Inline { len: 512 }
-        ));
+        match luns[0].xfer_in(0, &w[..512]) {
+            Xfer::Store(op) => {
+                StorePlane::BlockRw(&mut ram_backend).do_op(op).unwrap();
+            }
+            other => panic!("expected Store(Write), got {other:?}"),
+        }
         cdb[0] = op::READ_10;
         assert!(matches!(
             luns[0].do_cmd(&cdb, &mut w).unwrap(),
             CommandOutcome::OutXfer { len: 512 }
         ));
         let mut buf = [0u8; 512];
-        assert!(matches!(
-            luns[0].xfer_out(0, &mut buf),
-            Xfer::Inline { len: 512 }
-        ));
+        match luns[0].xfer_out(0, &mut buf) {
+            Xfer::Store(op) => {
+                StorePlane::BlockRw(&mut ram_backend).do_op(op).unwrap();
+            }
+            other => panic!("expected Store(Read), got {other:?}"),
+        }
         assert_eq!(&buf[..4], &w[..4]);
 
         // Optical profile refuses writes with DATA PROTECT.
@@ -486,7 +494,7 @@ mod tests {
     #[test]
     fn scsi_device_sync_defaults_and_forwards() {
         let mut ram = vec![0u8; 4096];
-        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut disk = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
         // RAM backend sync is a no-op Ok; trait default covers compute LUNs.
         assert!(ScsiDevice::sync(&mut disk).is_ok());
     }
@@ -514,7 +522,7 @@ mod tests {
     #[test]
     fn store_done_maps_and_next_store_op_defaults_none() {
         let mut ram = vec![0u8; 4096];
-        let mut disk = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut disk = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
 
         // Default `next_store_op` is `None`.
         assert!(disk.next_store_op().is_none());

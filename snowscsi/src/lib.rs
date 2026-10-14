@@ -47,7 +47,7 @@ pub mod usb;
 
 /// Minimum data-area size for `ScsiDevice::do_cmd`: 8192 bytes.
 ///
-/// Every command-processing entry point (`do_cmd`, `poll`, `step`) takes a
+/// Every command-processing entry point (`do_cmd`, `poll`) takes a
 /// caller-provided scratch buffer and rejects smaller ones at runtime with
 /// `WorkBufTooSmall`. Total RAM budget for one transport + LUN set:
 ///
@@ -55,7 +55,7 @@ pub mod usb;
 /// |-----------|------|
 /// | SCSI data area (`data` / work buffer data region) | ≥ [`MIN_DATA_LEN`] |
 /// | iSCSI: PDU header prefix in front of the data area | `BHS_SIZE` (48 B) |
-/// | USB BOT: separate driver receive scratch | ≥ `data.len()` |
+/// | USB BOT: single time-multiplexed `work` buffer | ≥ [`MIN_DATA_LEN`] |
 /// | Session state (`IscsiSession` / `BotSession`) | few hundred bytes each |
 ///
 /// See `ScsiDevice` for the full contract.

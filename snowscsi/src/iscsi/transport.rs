@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::iscsi::target::{serve_conn, IscsiSession, TargetError};
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::Luns;
 
 /// Default read timeout guarding login / command loop / Data-Out.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,14 +79,19 @@ impl embedded_io::Write for TcpConn {
 /// sequence numbers). Returns when `stop` is set, or on a caller bug
 /// (work buffer too small).
 ///
+/// `luns` bundles the LUN devices and their aligned storage planes (see
+/// [`crate::scsi::Luns`]); it is shared across every connection and handed to
+/// [`serve_conn`], which executes device-yielded `Store` ops against the
+/// planes.
+///
 /// Note: `std::net::TcpListener::bind` uses the OS default listen backlog
 /// (SOMAXCONN), not the C `listen(fd, 1)`; the serial loop still queues a
 /// second connection in the backlog until the current one ends.
-pub fn serve<D: ScsiDevice>(
+pub fn serve(
     listener: TcpListener,
     stop: &AtomicBool,
     work: &mut [u8],
-    devs: &mut [D],
+    luns: &mut Luns<'_>,
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE {
@@ -116,7 +121,7 @@ pub fn serve<D: ScsiDevice>(
             }
         };
         let mut session = IscsiSession::new();
-        match serve_conn(&mut conn, work, &mut session, devs) {
+        match serve_conn(&mut conn, work, &mut session, luns) {
             Ok(()) => crate::info!("connection from {} ended", peer),
             Err(e) => return Err(e),
         }
@@ -127,9 +132,11 @@ pub fn serve<D: ScsiDevice>(
 mod tests {
     use super::*;
     use crate::common::seekable_storage::RamBackend;
+    use crate::common::store::StorePlane;
     use crate::iscsi::conn::{read_exact, write_all};
     use crate::iscsi::pdu::{flag, op, stage};
     use crate::scsi::block::BlockDevice;
+    use crate::scsi::device::ScsiDevice;
     use crate::MIN_DATA_LEN;
     use std::io::{Read as _, Write as _};
 
@@ -218,63 +225,69 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut work = vec![0u8; MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut dev = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
+        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+        // Login/NOP/Logout never yield a `Store`; the aligned plane slot is
+        // the self-backed placeholder (`None`).
+        let mut planes: [Option<StorePlane>; 1] = [None];
+        let mut luns = Luns::new(&mut devs, &mut planes);
 
+        // `Luns` (hence `StorePlane`) is intentionally `!Send`, so `serve`
+        // runs on this thread and the initiator runs on the scoped thread.
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                serve(
-                    listener,
-                    &stop,
-                    &mut work,
-                    &mut devs,
-                    Some(Duration::from_secs(5)),
-                )
-                .unwrap();
+                let mut client = TcpStream::connect(addr).unwrap();
+
+                // Login → Login Response.
+                let text = REQ_TEXT.as_bytes();
+                send_pdu(&mut client, &login_bhs(text.len() as u32, 1), text);
+                let (bhs, _data) = read_pdu(&mut client);
+                assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+                assert_ne!(bhs[1] & 0x80, 0); // T=1
+                assert_eq!(&bhs[16..20], &be32(1)); // ITT echoed
+                assert_eq!(&bhs[24..28], &be32(0)); // StatSN = 0
+                assert_eq!(bhs[36], 0x00); // Status-Class = 0
+
+                // NOP-Out → NOP-In (keepalive, TTT echoed back).
+                let mut nop = [0u8; 48];
+                nop[0] = op::NOP_OUT;
+                nop[16..20].copy_from_slice(&be32(0xABCD));
+                nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
+                client.write_all(&nop).unwrap();
+                let (bhs, _) = read_pdu(&mut client);
+                assert_eq!(bhs[0] & 0x3F, op::NOP_IN);
+                assert_eq!(&bhs[16..20], &be32(0xABCD)); // ITT echoed
+                assert_eq!(&bhs[20..24], &be32(0xFFFF_FFFF)); // TTT echoed
+
+                // Logout → Logout Response → connection closes.
+                let mut lo = [0u8; 48];
+                lo[0] = op::LOGOUT_REQ;
+                lo[16..20].copy_from_slice(&be32(0xCAFE));
+                client.write_all(&lo).unwrap();
+                let (bhs, _) = read_pdu(&mut client);
+                assert_eq!(bhs[0] & 0x3F, op::LOGOUT_RESP);
+
+                drop(client);
+                // Wake the blocked accept() so serve() can observe `stop`.
+                // If teardown won the race — serve() finished serve_conn,
+                // saw `stop` at the top of its loop and exited without ever
+                // parking in accept() — the listener is already dropped and
+                // connecting fails with ConnectionRefused. That is fine: it
+                // proves serve() observed stop on its own.
+                stop.store(true, Ordering::SeqCst);
+                if let Ok(poke) = TcpStream::connect(addr) {
+                    drop(poke);
+                }
             });
 
-            let mut client = TcpStream::connect(addr).unwrap();
-
-            // Login → Login Response.
-            let text = REQ_TEXT.as_bytes();
-            send_pdu(&mut client, &login_bhs(text.len() as u32, 1), text);
-            let (bhs, _data) = read_pdu(&mut client);
-            assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
-            assert_ne!(bhs[1] & 0x80, 0); // T=1
-            assert_eq!(&bhs[16..20], &be32(1)); // ITT echoed
-            assert_eq!(&bhs[24..28], &be32(0)); // StatSN = 0
-            assert_eq!(bhs[36], 0x00); // Status-Class = 0
-
-            // NOP-Out → NOP-In (keepalive, TTT echoed back).
-            let mut nop = [0u8; 48];
-            nop[0] = op::NOP_OUT;
-            nop[16..20].copy_from_slice(&be32(0xABCD));
-            nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
-            client.write_all(&nop).unwrap();
-            let (bhs, _) = read_pdu(&mut client);
-            assert_eq!(bhs[0] & 0x3F, op::NOP_IN);
-            assert_eq!(&bhs[16..20], &be32(0xABCD)); // ITT echoed
-            assert_eq!(&bhs[20..24], &be32(0xFFFF_FFFF)); // TTT echoed
-
-            // Logout → Logout Response → connection closes.
-            let mut lo = [0u8; 48];
-            lo[0] = op::LOGOUT_REQ;
-            lo[16..20].copy_from_slice(&be32(0xCAFE));
-            client.write_all(&lo).unwrap();
-            let (bhs, _) = read_pdu(&mut client);
-            assert_eq!(bhs[0] & 0x3F, op::LOGOUT_RESP);
-
-            drop(client);
-            // Wake the blocked accept() so serve() can observe `stop`.
-            // If teardown won the race — serve() finished serve_conn,
-            // saw `stop` at the top of its loop and exited without ever
-            // parking in accept() — the listener is already dropped and
-            // connecting fails with ConnectionRefused. That is fine: it
-            // proves serve() observed stop on its own.
-            stop.store(true, Ordering::SeqCst);
-            if let Ok(poke) = TcpStream::connect(addr) {
-                drop(poke);
-            }
+            serve(
+                listener,
+                &stop,
+                &mut work,
+                &mut luns,
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
             handle.join().unwrap();
         });
     }

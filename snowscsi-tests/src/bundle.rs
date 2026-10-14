@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use snowscsi::common::flat_bundle::FlatBundle;
 use snowscsi::common::seekable_storage::{FlatData, RwRef, StorageError, WritableFlatData};
+use snowscsi::common::store::StorePlane;
 use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
+use snowscsi::scsi::device::{CommandOutcome, Xfer};
 use snowscsi::scsi::fs_backend::StdFsBackend;
 use snowscsi::MIN_DATA_LEN;
 
@@ -40,8 +41,12 @@ fn make_cdb10(opcode: u8, lba: u32, count: u16) -> [u8; 10] {
 }
 
 /// SBC block device over a real-directory FlatBundle (512-byte sectors).
-fn dev<'a>(bundle: &'a mut FlatBundle<StdFsBackend>) -> BlockDevice<RwRef<'a>> {
-    BlockDevice::disk(RwRef::new(bundle), SECTOR).unwrap()
+///
+/// The constructor borrows the bundle once for geometry and releases it; the
+/// data phase hands the caller a `Store` op, which the helpers below execute
+/// through a [`StorePlane`] over the same bundle.
+fn dev(bundle: &mut FlatBundle<StdFsBackend>) -> BlockDevice {
+    BlockDevice::disk(&mut RwRef::new(bundle), SECTOR).unwrap()
 }
 
 fn work() -> Vec<u8> {
@@ -50,7 +55,8 @@ fn work() -> Vec<u8> {
 
 /// READ(10) `count` sectors starting at `lba` into `out`.
 fn read_sectors(
-    dev: &mut BlockDevice<RwRef>,
+    dev: &mut BlockDevice,
+    bundle: &mut FlatBundle<StdFsBackend>,
     lba: u32,
     count: u16,
     work: &mut [u8],
@@ -61,20 +67,37 @@ fn read_sectors(
         CommandOutcome::OutXfer { len } => {
             let n = len as usize;
             assert!(n <= out.len());
-            assert!(matches!(dev.xfer_out(0, &mut out[..n]), Xfer::Inline { len } if len == n));
+            match dev.xfer_out(0, &mut out[..n]) {
+                Xfer::Store(op) => {
+                    StorePlane::BlockRw(bundle).do_op(op).unwrap();
+                }
+                other => panic!("READ(10) expected Store, got {other:?}"),
+            }
         }
         other => panic!("READ(10) expected OutXfer, got {other:?}"),
     }
 }
 
 /// WRITE(10) `count` sectors starting at `lba` from `src`.
-fn write_sectors(dev: &mut BlockDevice<RwRef>, lba: u32, count: u16, work: &mut [u8], src: &[u8]) {
+fn write_sectors(
+    dev: &mut BlockDevice,
+    bundle: &mut FlatBundle<StdFsBackend>,
+    lba: u32,
+    count: u16,
+    work: &mut [u8],
+    src: &[u8],
+) {
     let cdb = make_cdb10(WRITE_10, lba, count);
     let bytes = count as usize * SECTOR as usize;
     match dev.do_cmd(&cdb, work).unwrap() {
         CommandOutcome::InXfer { len } => {
             assert_eq!(len as usize, bytes);
-            assert!(matches!(dev.xfer_in(0, &src[..bytes]), Xfer::Inline { len } if len == bytes));
+            match dev.xfer_in(0, &src[..bytes]) {
+                Xfer::Store(op) => {
+                    StorePlane::BlockRw(bundle).do_op(op).unwrap();
+                }
+                other => panic!("WRITE(10) expected Store, got {other:?}"),
+            }
         }
         other => panic!("WRITE(10) expected InXfer, got {other:?}"),
     }
@@ -95,16 +118,16 @@ fn bundle_block_device_roundtrip() {
     let mut w = work();
 
     let pattern: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
-    write_sectors(&mut dev, 16, 8, &mut w, &pattern);
+    write_sectors(&mut dev, &mut bundle, 16, 8, &mut w, &pattern);
 
     // Read back through SCSI.
     let mut out = vec![0u8; 4096];
-    read_sectors(&mut dev, 16, 8, &mut w, &mut out);
+    read_sectors(&mut dev, &mut bundle, 16, 8, &mut w, &mut out);
     assert_eq!(out, pattern);
 
     // Unwritten sectors read as zeros (missing-chunk + intra-chunk holes).
     let mut hole = vec![0u8; 4096];
-    read_sectors(&mut dev, 0, 8, &mut w, &mut hole);
+    read_sectors(&mut dev, &mut bundle, 0, 8, &mut w, &mut hole);
     assert_eq!(hole, vec![0u8; 4096]);
 
     // READ CAPACITY reports virtual_size / sector_size.
@@ -306,9 +329,10 @@ fn bundle_reopen_persists() {
         let mut dev = dev(&mut bundle);
         let mut w = work();
         let pattern: Vec<u8> = (0..2048).map(|i| ((i * 3) & 0xFF) as u8).collect();
-        write_sectors(&mut dev, 64, 4, &mut w, &pattern);
+        write_sectors(&mut dev, &mut bundle, 64, 4, &mut w, &pattern);
         dev.do_cmd(&make_cdb10(0x35, 0, 0), &mut w).unwrap(); // SYNCHRONIZE CACHE(10)
-        dev.sync().unwrap();
+                                                              // The device holds no backend: the shell flushes the plane.
+        StorePlane::BlockRw(&mut bundle).sync().unwrap();
     } // drop closes chunk handles
 
     // The BUNDLE header was written to the real dir.
@@ -320,7 +344,7 @@ fn bundle_reopen_persists() {
     let mut dev = dev(&mut bundle);
     let mut w = work();
     let mut out = vec![0u8; 2048];
-    read_sectors(&mut dev, 64, 4, &mut w, &mut out);
+    read_sectors(&mut dev, &mut bundle, 64, 4, &mut w, &mut out);
     assert_eq!(
         out,
         (0..2048)

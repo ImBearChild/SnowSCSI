@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use iso9660_no_std::{DirectoryEntry, ISO9660Reader, ISODirectory, ISO9660};
 
-use snowscsi::cdrom::media::{FlatMedia, LiveData};
+use snowscsi::cdrom::media::LiveData;
+use snowscsi::common::seekable_storage::FlatData;
 use snowscsi::scsi::fs_backend::StdFsBackend;
 use snowscsi_iso9660::live::{MAX_JOLIET_NAME_CHARS, SECTOR_SIZE};
 
@@ -79,13 +80,15 @@ fn build_tree() -> (PathBuf, Vec<(String, Vec<u8>)>) {
 /// Dump the whole live image (all sectors) to a `Vec<u8>`.
 fn build_image(dir: &Path) -> Vec<u8> {
     let fs = StdFsBackend::new(&dir.to_string_lossy());
-    let live = LiveData::new(fs, "CROSS").expect("scan tree");
+    // `LiveData` is itself the read-only `FlatData` plane (media no longer
+    // wraps a backend), so read the generated ISO directly through it.
+    let mut live = LiveData::new(fs, "CROSS").expect("scan tree");
     let total = live.layout().total as usize;
-    let mut flat = FlatMedia::new(live);
     let mut img = vec![0u8; total * SECTOR_SIZE as usize];
     for lba in 0..total as u32 {
         let start = lba as usize * SECTOR_SIZE as usize;
-        flat.read_data(
+        FlatData::read_at(
+            &mut live,
             lba as u64 * SECTOR_SIZE as u64,
             &mut img[start..start + SECTOR_SIZE as usize],
         )

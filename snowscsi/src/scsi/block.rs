@@ -3,9 +3,10 @@
 //! Implements the direct-access block device commands (SPC-4 / SBC-3).
 //! SPC commands (INQUIRY, MODE SENSE, ...) are delegated to
 //! [`crate::scsi::spc`]; READ commands return an empty `immediate` and
-//! the target fetches the data via `xfer_out`.
+//! the target hands the platform a [`StoreOp`] via `xfer_out`.
 
 use crate::common::seekable_storage::{FlatData, WritableFlatData};
+use crate::common::store::StoreOp;
 use crate::scsi::backend::StorageError;
 use crate::scsi::device::{
     CommandOutcome, DeviceType, Error, PendingXfer, ScsiDevice, Xfer, XferDir,
@@ -30,84 +31,59 @@ pub const CDBLOCK_IDENTITY: DeviceIdentity = DeviceIdentity {
     version_descriptors: [0x00A0, 0x0960, 0x0460, 0x04C0], /* SAM-5, iSCSI, SPC-4, SBC-3 (no MMC) */
 };
 
-/// Write-path capability captured at construction time (`disk()` only).
-///
-/// Plain `fn` pointers parameterized by the backend type — no trait bound
-/// on the struct itself, so a read-only backend (`FlatData` only) can
-/// never reach the write path.
-#[derive(Debug)]
-pub(crate) struct WriteOps<D> {
-    write_at: fn(&mut D, u64, &[u8]) -> Result<(), StorageError>,
-    sync: fn(&mut D) -> Result<(), StorageError>,
-}
-
-// Hand-written (NOT derived): `derive(Copy)` would add a `D: Copy` bound,
-// and `D` is only used behind `fn(&mut D, …)` pointers — the ops value is
-// `Copy` regardless of `D`. Without the unbounded impl, `WritePath<D>`
-// below could not be `Copy` for non-`Copy` backends (e.g. `RwRef<'_>`).
-impl<D> Clone for WriteOps<D> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<D> Copy for WriteOps<D> {}
-
 /// Device-instance write-path state — all legal states, exhaustively.
 ///
 /// "Not writable" comes in two kinds that a single device type must
 /// express at runtime (the constructor-chosen difference necessarily
 /// degrades to runtime state):
 ///
-/// - [`WritePath::Absent`] — capability missing (`cdrom()` profile /
-///   read-only plane). Writes are DATA PROTECT, forever.
-/// - [`WritePath::Locked`] — backend *can* write but policy says no
+/// - [`WritePath::Absent`] — capability missing (`cdrom()` profile).
+///   Writes are DATA PROTECT, forever.
+/// - [`WritePath::Locked`] — the plane *can* write but policy says no
 ///   (read-only disk image). Re-openable via [`BlockDevice::set_writable`].
 /// - [`WritePath::Open`] — normal writable disk.
 ///
-/// The illegal combination `(writable == true, write_ops == None)` of the
-/// former two-field design is no longer representable.
-#[derive(Debug)]
-pub(crate) enum WritePath<D> {
-    /// No write path (`cdrom()` profile / read-only source). Always DATA
-    /// PROTECT; nothing to flush.
+/// This is **policy only**: the device no longer holds the backend, so
+/// there are no captured `fn` pointers here. The plane is executed by the
+/// shell (see [`crate::common::store::StorePlane`]); `xfer_out`/`xfer_in`
+/// hand it a [`StoreOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WritePath {
+    /// No write path (`cdrom()` profile). Always DATA PROTECT.
     Absent,
-    /// Backend has write capability, policy closed (read-only *disk*
-    /// image). Re-openable; still flushed on sync (dirty pages written
-    /// during an Open window must stay reachable).
-    Locked(WriteOps<D>),
+    /// Plane is write-capable, policy closed (read-only *disk* image).
+    /// Re-openable via [`BlockDevice::set_writable`].
+    Locked,
     /// Normal writable.
-    Open(WriteOps<D>),
+    Open,
 }
-
-// Same reasoning as [`WriteOps`]: variant payloads are `Copy` regardless
-// of `D`, so the impls must be unbounded.
-impl<D> Clone for WritePath<D> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<D> Copy for WritePath<D> {}
 
 /// SCSI LUN over an offset-addressed byte plane.
 ///
-/// Two profiles share this one type:
+/// Three profiles share this one type:
 ///
 /// - [`BlockDevice::disk`] — writable direct-access device (PDT 0x00,
-///   `BLOCK_IDENTITY`). Requires `D: WritableFlatData`.
+///   `BLOCK_IDENTITY`). The plane must be [`WritableFlatData`].
+/// - [`BlockDevice::disk_read_only`] — PDT 0x00 with the write policy
+///   locked (`WritePath::Locked`); accepts any [`FlatData`] and can be
+///   unlocked later via [`BlockDevice::set_writable`].
 /// - [`BlockDevice::cdrom`] — read-only optical profile (PDT 0x05,
 ///   `CDBLOCK_IDENTITY`, 2048-byte sectors, writes rejected with DATA
-///   PROTECT). Accepts any `D: FlatData`, including generated sources
+///   PROTECT). Accepts any [`FlatData`], including generated sources
 ///   such as live ISO9660. This is the former `CDBlockDevice`, now over
-///   any backend instead of only files.
+///   any plane.
+///
+/// The type is **non-generic**: every constructor borrows the plane once
+/// to read its capacity (geometry) and immediately releases it. In steady
+/// state the device holds no backend reference at all — data-phase I/O is
+/// handed to the platform as a [`StoreOp`].
 #[derive(Debug)]
-pub struct BlockDevice<D: FlatData> {
-    backend: D,
+pub struct BlockDevice {
     sector_size: u32,
-    /// Write-path state (capability × policy, exhaustively enumerated —
-    /// see [`WritePath`]). Replaces the former `writable: bool` +
-    /// `write_ops: Option<_>` pair whose `(true, None)` combination was
-    /// representable and panicked at first WRITE.
-    write_path: WritePath<D>,
+    /// Capacity in bytes, cached from `plane.capacity()` at construction.
+    capacity_bytes: u64,
+    /// Write-path state (policy only — see [`WritePath`]).
+    write_path: WritePath,
     identity: DeviceIdentity,
     pdt: DeviceType,
     sense: Option<Sense>,
@@ -115,7 +91,7 @@ pub struct BlockDevice<D: FlatData> {
     prevent_removal: bool,
 }
 
-impl<D: FlatData> BlockDevice<D> {
+impl BlockDevice {
     /// Read-only optical profile (the former `CDBlockDevice`): sector size
     /// fixed at 2048, every write rejected with DATA PROTECT, MODE SELECT
     /// accepted as a no-op, START STOP ignored.
@@ -124,7 +100,7 @@ impl<D: FlatData> BlockDevice<D> {
     ///
     /// Both serve read-only ISO images, but they are different layers:
     ///
-    /// - **`BlockDevice::cdrom(backend)`** — a *simple* read-only LUN
+    /// - **`BlockDevice::cdrom(plane)`** — a *simple* read-only LUN
     ///   (PDT 0x05) that answers SBC/SPC over any [`FlatData`] plane.
     ///   Use it when you just want to hand the host an image without
     ///   dragging in the full MMC machinery (embedded targets, quick
@@ -133,10 +109,10 @@ impl<D: FlatData> BlockDevice<D> {
     ///   MMC optical drive (READ TOC, GET CONFIGURATION, tray/medium
     ///   events, runtime media exchange via `load`/`eject`). Use it when
     ///   the guest expects a real optical drive or needs disc swapping.
-    pub fn cdrom(backend: D) -> Result<Self, Error> {
+    pub fn cdrom(plane: &mut dyn FlatData) -> Result<Self, Error> {
         Ok(Self {
-            backend,
             sector_size: CD_SECTOR_SIZE,
+            capacity_bytes: plane.capacity(),
             write_path: WritePath::Absent,
             identity: CDBLOCK_IDENTITY,
             pdt: DeviceType::Cdrom,
@@ -146,9 +122,43 @@ impl<D: FlatData> BlockDevice<D> {
         })
     }
 
-    /// Raw plane access for the target data path and wrapper authors.
-    pub fn backend(&mut self) -> &mut D {
-        &mut self.backend
+    /// Writable direct-access disk (PDT 0x00, `BLOCK_IDENTITY`). The plane
+    /// is borrowed only to read geometry; the write path is
+    /// `WritePath::Open`.
+    pub fn disk(plane: &mut dyn WritableFlatData, sector_size: u32) -> Result<Self, Error> {
+        if sector_size == 0 {
+            return Err(Error::InvalidSectorSize);
+        }
+        Ok(Self {
+            sector_size,
+            capacity_bytes: plane.capacity(),
+            write_path: WritePath::Open,
+            identity: BLOCK_IDENTITY,
+            pdt: DeviceType::Block,
+            sense: None,
+            pending: None,
+            prevent_removal: false,
+        })
+    }
+
+    /// Direct-access disk (PDT 0x00) with the write policy locked
+    /// (`WritePath::Locked`). Accepts any [`FlatData`] — including a
+    /// genuinely read-only source — because the lock is policy, not
+    /// capability; re-open with [`BlockDevice::set_writable`].
+    pub fn disk_read_only(plane: &mut dyn FlatData, sector_size: u32) -> Result<Self, Error> {
+        if sector_size == 0 {
+            return Err(Error::InvalidSectorSize);
+        }
+        Ok(Self {
+            sector_size,
+            capacity_bytes: plane.capacity(),
+            write_path: WritePath::Locked,
+            identity: BLOCK_IDENTITY,
+            pdt: DeviceType::Block,
+            sense: None,
+            pending: None,
+            prevent_removal: false,
+        })
     }
 
     pub fn sector_size(&self) -> u32 {
@@ -174,7 +184,7 @@ impl<D: FlatData> BlockDevice<D> {
     }
 
     pub(crate) fn max_lba(&self) -> u64 {
-        let nblocks = self.backend.capacity() / u64::from(self.sector_size);
+        let nblocks = self.capacity_bytes / u64::from(self.sector_size);
         nblocks.saturating_sub(1)
     }
 
@@ -208,26 +218,20 @@ impl<D: FlatData> BlockDevice<D> {
         let end = offset
             .checked_add(len as u64)
             .ok_or(StorageError::OutOfBounds)?;
-        if end > self.backend.capacity() {
+        if end > self.capacity_bytes {
             return Err(StorageError::OutOfBounds);
         }
         Ok(())
     }
 
-    /// Flush via the captured sync op (`SYNCHRONIZE CACHE`, shutdown).
-    ///
-    /// `Absent` ⇒ nothing was ever writable, always clean. `Locked` still
-    /// flushes: the lock is *policy*, not capability — dirty pages written
-    /// during an Open window must stay reachable after `set_writable(false)`.
-    pub(crate) fn sync_backend(&mut self) -> Result<(), StorageError> {
-        match self.write_path {
-            WritePath::Absent => Ok(()),
-            WritePath::Locked(ops) | WritePath::Open(ops) => (ops.sync)(&mut self.backend),
-        }
-    }
-
     /// Read `buf.len()` bytes for the current READ transfer (device → host).
     /// `transfer_offset` is the byte offset within the transfer.
+    ///
+    /// Returns [`Xfer::Store`] carrying a [`StoreOp::Read`] addressed at
+    /// the absolute plane byte (`base_byte + transfer_offset`); the shell
+    /// executes it. The pending/direction/range guards stay here so a
+    /// misuse (only reachable through a broken wrapper — `do_cmd` already
+    /// validated) sets sense and yields a zero-length [`Xfer::Inline`].
     pub fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
@@ -253,33 +257,26 @@ impl<D: FlatData> BlockDevice<D> {
         }
         let actual = base_byte + transfer_offset;
         if let Err(e) = self.check_bounds(actual, buf.len()) {
-            let cap = self.backend.capacity();
             crate::warn!(
                 "READ bounds: off={} len={} capacity={} err={:?}",
                 actual,
                 buf.len(),
-                cap,
+                self.capacity_bytes,
                 e
             );
             self.set_sense(SenseKey::MediumError, 0x11, 0);
             return Xfer::Inline { len: 0 };
         }
-        if let Err(e) = self.backend.read_at(actual, buf) {
-            crate::warn!("READ backend: off={} len={} err={:?}", actual, buf.len(), e);
-            self.set_sense(SenseKey::MediumError, 0x11, 0);
-            return Xfer::Inline { len: 0 };
-        }
-        Xfer::Inline { len: buf.len() }
+        Xfer::Store(StoreOp::Read { off: actual, buf })
     }
 
     /// Write `buf` for the current WRITE transfer (host → device).
     ///
-    /// Rejection order: transfer bookkeeping first, then the write path
-    /// gate (`WritePath::Open` only; `Absent | Locked` are both DATA
-    /// PROTECT), then bounds, then the actual plane write. A backend that
-    /// reports [`StorageError::NotWritable`] at write time (policy
-    /// bit bypassed by a direct `disk()` over a read-only plane) is
-    /// mapped to DATA PROTECT too.
+    /// Returns [`Xfer::Store`] carrying a [`StoreOp::Write`] addressed at
+    /// the absolute plane byte (`base_byte + transfer_offset`). The
+    /// write-path gate (`WritePath::Open` only) and bounds are checked
+    /// here; the command phase already rejected `Absent | Locked` with
+    /// DATA PROTECT, so this is a defensive re-check for broken wrappers.
     pub fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
@@ -303,45 +300,23 @@ impl<D: FlatData> BlockDevice<D> {
             self.set_sense(SenseKey::IllegalRequest, 0x21, 0);
             return Xfer::Inline { len: 0 };
         }
-        let ops = match self.write_path {
-            WritePath::Open(ops) => ops,
-            // Capability missing or policy closed: same SCSI verdict.
-            WritePath::Absent | WritePath::Locked(_) => {
-                self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                return Xfer::Inline { len: 0 };
-            }
-        };
+        if !matches!(self.write_path, WritePath::Open) {
+            self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+            return Xfer::Inline { len: 0 };
+        }
         let actual = base_byte + transfer_offset;
         if let Err(e) = self.check_bounds(actual, buf.len()) {
-            let cap = self.backend.capacity();
             crate::warn!(
                 "WRITE bounds: off={} len={} capacity={} err={:?}",
                 actual,
                 buf.len(),
-                cap,
+                self.capacity_bytes,
                 e
             );
             self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
             return Xfer::Inline { len: 0 };
         }
-        if let Err(e) = (ops.write_at)(&mut self.backend, actual, buf) {
-            crate::warn!(
-                "WRITE backend: off={} len={} err={:?}",
-                actual,
-                buf.len(),
-                e
-            );
-            // Read-only plane masquerading as writable through the
-            // blanket impl: the backend's policy rejection
-            // surfaces as NotWritable, not a medium fault.
-            if e == StorageError::NotWritable {
-                self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                return Xfer::Inline { len: 0 };
-            }
-            self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-            return Xfer::Inline { len: 0 };
-        }
-        Xfer::Inline { len: buf.len() }
+        Xfer::Store(StoreOp::Write { off: actual, buf })
     }
 
     /// Process one SCSI command (`snowscsi_do_cmd`). `data` must be at
@@ -350,6 +325,10 @@ impl<D: FlatData> BlockDevice<D> {
     /// The CDB is parsed by [`parse_sbc`]: SPC commands are dispatched to
     /// `execute_spc` (via the `SbcCommand::Spc` fall-through), SBC commands
     /// to `execute_sbc`; unknown opcodes yield INVALID COMMAND.
+    ///
+    /// The command phase performs **no storage I/O**: bounds and
+    /// write-protect are validated here, and the data phase only ships a
+    /// [`StoreOp`] to the shell.
     pub fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.pending = None;
         if data.len() < crate::MIN_DATA_LEN {
@@ -444,7 +423,7 @@ impl<D: FlatData> BlockDevice<D> {
         if count == 0 {
             return CommandOutcome::Status;
         }
-        if !matches!(self.write_path, WritePath::Open(_)) {
+        if !matches!(self.write_path, WritePath::Open) {
             // Read-only profile (Absent) or locked read-only *image*
             // (Locked): immediate DATA PROTECT — the former CDBlockDevice
             // behavior plus the policy bit.
@@ -551,10 +530,10 @@ impl<D: FlatData> BlockDevice<D> {
         } else if lba64 > max_lba || lba64 + u64::from(num_blocks) > max_lba + 1 {
             return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
         }
-        match self.sync_backend() {
-            Ok(()) => CommandOutcome::Status,
-            Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
-        }
+        // Flushing is a plane-level concern: the device holds no backend
+        // (the shell owns the planes and flushes them at shutdown). The
+        // command is a policy no-op here.
+        CommandOutcome::Status
     }
 
     pub(crate) fn synchronize_cache16_cmd(
@@ -578,10 +557,8 @@ impl<D: FlatData> BlockDevice<D> {
         } else if lba > max_lba || lba + u64::from(num_blocks) > max_lba + 1 {
             return self.cc(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE);
         }
-        match self.sync_backend() {
-            Ok(()) => CommandOutcome::Status,
-            Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
-        }
+        // See `synchronize_cache_cmd`: the shell flushes planes.
+        CommandOutcome::Status
     }
 
     pub(crate) fn format_unit_cmd(&mut self, cdb1: u8) -> CommandOutcome {
@@ -604,34 +581,10 @@ impl<D: FlatData> BlockDevice<D> {
         // implement defect lists / protection provisioning — report INVALID FIELD.
         self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD)
     }
-}
-
-impl<D: WritableFlatData> BlockDevice<D> {
-    /// Writable direct-access disk (PDT 0x00, `BLOCK_IDENTITY`). Only
-    /// backends that can actually write reach this constructor —
-    /// "writable if writable".
-    pub fn disk(backend: D, sector_size: u32) -> Result<Self, Error> {
-        if sector_size == 0 {
-            return Err(Error::InvalidSectorSize);
-        }
-        Ok(Self {
-            backend,
-            sector_size,
-            write_path: WritePath::Open(WriteOps {
-                write_at: D::write_at,
-                sync: D::sync,
-            }),
-            identity: BLOCK_IDENTITY,
-            pdt: DeviceType::Block,
-            sense: None,
-            pending: None,
-            prevent_removal: false,
-        })
-    }
 
     /// Policy switch for read-only *disk* images (PDT 0x00 but RO): the
-    /// backend stays writable-capable, the device refuses writes. serve 前
-    /// 设置。
+    /// plane stays write-capable, the device refuses writes. Set before
+    /// `serve`.
     ///
     /// Total function over the write path (`WritePath`): `Absent`
     /// (the `cdrom()` profile) stays absent regardless of `writable` — a
@@ -640,25 +593,18 @@ impl<D: WritableFlatData> BlockDevice<D> {
     pub fn set_writable(&mut self, writable: bool) {
         self.write_path = match self.write_path {
             WritePath::Absent => WritePath::Absent,
-            WritePath::Locked(ops) => {
+            WritePath::Locked | WritePath::Open => {
                 if writable {
-                    WritePath::Open(ops)
+                    WritePath::Open
                 } else {
-                    WritePath::Locked(ops)
-                }
-            }
-            WritePath::Open(ops) => {
-                if writable {
-                    WritePath::Open(ops)
-                } else {
-                    WritePath::Locked(ops)
+                    WritePath::Locked
                 }
             }
         };
     }
 }
 
-impl<D: FlatData> SpcDevice for BlockDevice<D> {
+impl SpcDevice for BlockDevice {
     fn device_type(&self) -> DeviceType {
         self.pdt
     }
@@ -668,7 +614,7 @@ impl<D: FlatData> SpcDevice for BlockDevice<D> {
     }
 
     fn id(&self) -> u64 {
-        self.backend.capacity()
+        self.capacity_bytes
     }
 
     fn mode_page(&self, page: u8) -> Option<&[u8]> {
@@ -701,11 +647,11 @@ impl<D: FlatData> SpcDevice for BlockDevice<D> {
     }
 
     fn is_write_protected(&self) -> bool {
-        !matches!(self.write_path, WritePath::Open(_))
+        !matches!(self.write_path, WritePath::Open)
     }
 }
 
-impl<D: FlatData> ScsiDevice for BlockDevice<D> {
+impl ScsiDevice for BlockDevice {
     fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
         self.do_cmd(cdb, data)
     }
@@ -770,7 +716,9 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {
-        self.sync_backend()
+        // Planes are flushed by the shell (CLI `sync_planes`); the device
+        // holds no backend, so there is nothing to flush here.
+        Ok(())
     }
 
     fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
@@ -785,8 +733,8 @@ impl<D: FlatData> ScsiDevice for BlockDevice<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::seekable_storage::FlatData;
     use crate::scsi::backend::RamBackend;
+    use crate::scsi::device::XferOutcome;
     use crate::scsi::scsi::op;
 
     /// Build a 6-byte CDB (test_block.c `make_cdb6`).
@@ -851,35 +799,85 @@ mod tests {
         [0u8; crate::MIN_DATA_LEN]
     }
 
-    fn ram_dev<'a>(ram: &'a mut [u8]) -> BlockDevice<RamBackend<'a>> {
-        BlockDevice::disk(RamBackend::new(ram), 512).unwrap()
+    fn ram_dev(ram: &mut [u8]) -> BlockDevice {
+        BlockDevice::disk(&mut RamBackend::new(ram), 512).unwrap()
     }
 
-    /// Extract the DataIn payload (backend read via xfer_out or work-resident).
-    /// Returns the number of bytes transferred. For OutInline, copies from work.
-    fn data_in<D: FlatData>(
-        dev: &mut BlockDevice<D>,
+    /// Execute a device-produced block op against the test's byte plane —
+    /// a stand-in for the platform's `StorePlane`.
+    fn run_op(op: StoreOp<'_>, plane: &mut [u8]) {
+        match op {
+            StoreOp::Read { off, buf } => {
+                let off = off as usize;
+                buf.copy_from_slice(&plane[off..off + buf.len()]);
+            }
+            StoreOp::Write { off, buf } => {
+                let off = off as usize;
+                plane[off..off + buf.len()].copy_from_slice(buf);
+            }
+            other => panic!("unexpected store op: {other:?}"),
+        }
+    }
+
+    /// Drive the Data-In phase of `outcome`: for `OutXfer` the device hands
+    /// a `Store(Read)` which we execute against `plane`; for `OutInline` we
+    /// copy from `work`. Returns the transferred byte count.
+    fn data_in(
+        dev: &mut BlockDevice,
         outcome: CommandOutcome,
         work: &[u8],
+        plane: &mut [u8],
         buf: &mut [u8],
     ) -> usize {
         match outcome {
             CommandOutcome::OutXfer { len } => {
-                assert!(len as usize <= buf.len());
                 let n = len as usize;
-                assert!(matches!(
-                    dev.xfer_out(0, &mut buf[..n]),
-                    Xfer::Inline { len } if len == n
-                ));
-                n
+                assert!(n <= buf.len());
+                match dev.xfer_out(0, &mut buf[..n]) {
+                    Xfer::Store(op) => {
+                        run_op(op, plane);
+                        n
+                    }
+                    Xfer::Inline { len } => {
+                        assert_eq!(len, n);
+                        n
+                    }
+                }
             }
             CommandOutcome::OutInline { len } => {
-                assert!(len as usize <= buf.len());
                 let n = len as usize;
+                assert!(n <= buf.len());
                 buf[..n].copy_from_slice(&work[..n]);
                 n
             }
             _ => panic!("expected OutXfer or OutInline"),
+        }
+    }
+
+    /// Drive the Data-Out phase of `outcome` (payload already in `work`):
+    /// execute the device's `Store(Write)` against `plane`. Returns the
+    /// transferred byte count.
+    fn data_out(
+        dev: &mut BlockDevice,
+        outcome: CommandOutcome,
+        work: &[u8],
+        plane: &mut [u8],
+    ) -> usize {
+        match outcome {
+            CommandOutcome::InXfer { len } => {
+                let n = len as usize;
+                match dev.xfer_in(0, &work[..n]) {
+                    Xfer::Store(op) => {
+                        run_op(op, plane);
+                        n
+                    }
+                    Xfer::Inline { len } => {
+                        assert_eq!(len, n);
+                        n
+                    }
+                }
+            }
+            _ => panic!("expected InXfer"),
         }
     }
 
@@ -894,7 +892,31 @@ mod tests {
     #[test]
     fn block_create_rejects_zero_sector() {
         let mut ram = [0u8; 512];
-        assert!(BlockDevice::disk(RamBackend::new(&mut ram), 0).is_err());
+        assert!(BlockDevice::disk(&mut RamBackend::new(&mut ram), 0).is_err());
+    }
+
+    #[test]
+    fn disk_read_only_rejects_writes_at_command_phase() {
+        let mut ram = [0u8; 4096];
+        let mut dev = BlockDevice::disk_read_only(&mut RamBackend::new(&mut ram), 512).unwrap();
+        assert_eq!(dev.device_type(), DeviceType::Block);
+        assert_eq!(dev.sector_size(), 512);
+
+        let mut w = work();
+        let cdb = make_cdb10(op::WRITE_10, 0, 1);
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::CheckCondition
+        );
+        assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
+        assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_PROTECTED);
+
+        // Policy is re-openable (unlike the `cdrom()` Absent state).
+        dev.set_writable(true);
+        assert!(matches!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::InXfer { len: 512 }
+        ));
     }
 
     #[test]
@@ -905,7 +927,7 @@ mod tests {
         let cdb = make_cdb10(op::READ_10, 0, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(buf, [0u8; 512]);
     }
 
@@ -919,21 +941,12 @@ mod tests {
 
         let cdb = make_cdb10(op::WRITE_10, 10, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 512);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..512]),
-                    Xfer::Inline { len: 512 }
-                ));
-            }
-            _ => panic!("expected InXfer"),
-        }
+        assert_eq!(data_out(&mut dev, outcome, &w, &mut ram), 512);
 
         let cdb = make_cdb10(op::READ_10, 10, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(buf, pattern.as_slice());
     }
 
@@ -971,7 +984,7 @@ mod tests {
         cdb[0] = op::READ_CAPACITY_10;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 8];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         let max_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let block_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         assert_eq!(max_lba, 2047);
@@ -989,7 +1002,7 @@ mod tests {
         cdb[13] = 0x20;
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 32];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(&buf[..8], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xFF]);
         assert_eq!(&buf[8..12], &[0x00, 0x00, 0x02, 0x00]);
         assert_eq!(&buf[12..], &[0u8; 20]);
@@ -1017,7 +1030,7 @@ mod tests {
         let cdb = make_cdb6(op::READ_6, 0, 0); /* 0 = 256 blocks */
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = vec![0u8; 256 * 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(buf, vec![0u8; 256 * 512]);
     }
 
@@ -1031,21 +1044,12 @@ mod tests {
 
         let cdb = make_cdb6(op::WRITE_6, 5, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 512);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..512]),
-                    Xfer::Inline { len: 512 }
-                ));
-            }
-            _ => panic!("expected InXfer"),
-        }
+        assert_eq!(data_out(&mut dev, outcome, &w, &mut ram), 512);
 
         let cdb = make_cdb6(op::READ_6, 5, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(buf, pattern.as_slice());
     }
 
@@ -1059,21 +1063,12 @@ mod tests {
 
         let cdb = make_cdb12(op::WRITE_12, 20, 2);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 1024);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..1024]),
-                    Xfer::Inline { len: 1024 }
-                ));
-            }
-            _ => panic!("expected InXfer"),
-        }
+        assert_eq!(data_out(&mut dev, outcome, &w, &mut ram), 1024);
 
         let cdb = make_cdb12(op::READ_12, 20, 2);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(&buf, &pattern[..]);
     }
 
@@ -1087,21 +1082,12 @@ mod tests {
 
         let cdb = make_cdb16(op::WRITE_16, 30, 2);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
-            CommandOutcome::InXfer { len } => {
-                assert_eq!(len, 1024);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..1024]),
-                    Xfer::Inline { len: 1024 }
-                ));
-            }
-            _ => panic!("expected InXfer"),
-        }
+        assert_eq!(data_out(&mut dev, outcome, &w, &mut ram), 1024);
 
         let cdb = make_cdb16(op::READ_16, 30, 2);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 1024];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(&buf, &pattern[..]);
     }
 
@@ -1288,22 +1274,25 @@ mod tests {
         f.set_len(1024 * 1024).unwrap();
         f.flush().unwrap();
 
-        let backend =
+        let mut backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), true).unwrap();
-        let mut dev = BlockDevice::disk(backend, 512).unwrap();
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
         let mut w = work();
         let pattern: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
         w[0..512].copy_from_slice(&pattern);
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
+        match dev.do_cmd(&cdb, &mut w).unwrap() {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..512]),
-                    Xfer::Inline { len: 512 }
-                ));
+                match dev.xfer_in(0, &w[0..512]) {
+                    Xfer::Store(op) => {
+                        crate::common::store::StorePlane::BlockRw(&mut backend)
+                            .do_op(op)
+                            .unwrap();
+                    }
+                    other => panic!("expected Store(Write), got {other:?}"),
+                }
             }
             _ => panic!("expected InXfer"),
         }
@@ -1311,6 +1300,11 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::SYNCHRONIZE_CACHE_10;
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
+
+        // The device no longer flushes; the shell flushes planes.
+        crate::common::store::StorePlane::BlockRw(&mut backend)
+            .sync()
+            .unwrap();
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[..512], pattern.as_slice());
@@ -1325,20 +1319,26 @@ mod tests {
         let path = dir.join(format!("snowscsi_block_ro_{}.img", std::process::id()));
         std::fs::write(&path, [0u8; 512]).unwrap();
 
-        // A read-only FileBackend handed *directly* to `disk()` bypasses
-        // the policy bit: the backend's PermissionDenied
-        // must surface as DATA PROTECT, not WRITE FAULT.
-        let backend =
+        // A read-only FileBackend handed *directly* to `disk()` is
+        // write-capable at the policy level: the backend's NotWritable
+        // must surface through `store_done` as DATA PROTECT, not WRITE
+        // FAULT.
+        let mut backend =
             crate::scsi::backend::FileBackend::open(&path.to_string_lossy(), false).unwrap();
-        let mut dev = BlockDevice::disk(backend, 512).unwrap();
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
         let mut w = work();
 
         let cdb = make_cdb10(op::WRITE_10, 0, 1);
-        let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
-        match outcome {
+        match dev.do_cmd(&cdb, &mut w).unwrap() {
             CommandOutcome::InXfer { len: _ } => {
-                let r = dev.xfer_in(0, &w[0..512]);
-                assert!(matches!(r, Xfer::Inline { len: 0 }));
+                match dev.xfer_in(0, &w[0..512]) {
+                    Xfer::Store(op) => {
+                        let r = crate::common::store::StorePlane::BlockRw(&mut backend).do_op(op);
+                        assert_eq!(r, Err(StorageError::NotWritable));
+                        assert_eq!(dev.store_done(r), XferOutcome::Ok);
+                    }
+                    other => panic!("expected Store(Write), got {other:?}"),
+                }
                 assert_eq!(dev.peek_sense().unwrap().key, SenseKey::DataProtect);
                 assert_eq!(dev.peek_sense().unwrap().asc, asc::WRITE_PROTECTED);
             }
@@ -1348,7 +1348,20 @@ mod tests {
         let cdb = make_cdb10(op::READ_10, 0, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        match outcome {
+            CommandOutcome::OutXfer { len } => {
+                assert_eq!(len, 512);
+                match dev.xfer_out(0, &mut buf) {
+                    Xfer::Store(op) => {
+                        crate::common::store::StorePlane::BlockRo(&mut backend)
+                            .do_op(op)
+                            .unwrap();
+                    }
+                    other => panic!("expected Store(Read), got {other:?}"),
+                }
+            }
+            _ => panic!("expected OutXfer"),
+        }
         assert_eq!(buf, [0u8; 512]);
 
         std::fs::remove_file(&path).unwrap();
@@ -1366,16 +1379,22 @@ mod tests {
             CommandOutcome::OutXfer { len } => {
                 assert_eq!(len, 1024);
                 let mut chunk1 = vec![0u8; 600];
-                assert!(matches!(
-                    dev.xfer_out(0, &mut chunk1),
-                    Xfer::Inline { len: 600 }
-                ));
+                match dev.xfer_out(0, &mut chunk1) {
+                    Xfer::Store(StoreOp::Read { off, buf }) => {
+                        assert_eq!(off, 0);
+                        buf.copy_from_slice(&ram[0..600]);
+                    }
+                    other => panic!("expected Store(Read), got {other:?}"),
+                }
                 assert_eq!(chunk1, expected[0..600]);
                 let mut chunk2 = vec![0u8; 424];
-                assert!(matches!(
-                    dev.xfer_out(600, &mut chunk2),
-                    Xfer::Inline { len: 424 }
-                ));
+                match dev.xfer_out(600, &mut chunk2) {
+                    Xfer::Store(StoreOp::Read { off, buf }) => {
+                        assert_eq!(off, 600);
+                        buf.copy_from_slice(&ram[600..1024]);
+                    }
+                    other => panic!("expected Store(Read), got {other:?}"),
+                }
                 assert_eq!(chunk2, expected[600..1024]);
             }
             _ => panic!("expected OutXfer"),
@@ -1393,14 +1412,20 @@ mod tests {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 1024);
                 let payload: Vec<u8> = (0..1024).map(|i| ((i * 7) % 251) as u8).collect();
-                assert!(matches!(
-                    dev.xfer_in(0, &payload[0..600]),
-                    Xfer::Inline { len: 600 }
-                ));
-                assert!(matches!(
-                    dev.xfer_in(600, &payload[600..]),
-                    Xfer::Inline { len: 424 }
-                ));
+                match dev.xfer_in(0, &payload[0..600]) {
+                    Xfer::Store(StoreOp::Write { off, buf }) => {
+                        assert_eq!(off, 0);
+                        ram[0..600].copy_from_slice(buf);
+                    }
+                    other => panic!("expected Store(Write), got {other:?}"),
+                }
+                match dev.xfer_in(600, &payload[600..]) {
+                    Xfer::Store(StoreOp::Write { off, buf }) => {
+                        assert_eq!(off, 600);
+                        ram[600..1024].copy_from_slice(buf);
+                    }
+                    other => panic!("expected Store(Write), got {other:?}"),
+                }
                 // Verify via read.
                 let cdb = make_cdb10(op::READ_10, 0, 2);
                 let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
@@ -1408,50 +1433,19 @@ mod tests {
                     CommandOutcome::OutXfer { len } => {
                         assert_eq!(len, 1024);
                         let mut buf = vec![0u8; 1024];
-                        assert!(matches!(
-                            dev.xfer_out(0, &mut buf),
-                            Xfer::Inline { len: 1024 }
-                        ));
+                        match dev.xfer_out(0, &mut buf) {
+                            Xfer::Store(StoreOp::Read { off, buf: out }) => {
+                                let off = off as usize;
+                                out.copy_from_slice(&ram[off..off + out.len()]);
+                            }
+                            other => panic!("expected Store(Read), got {other:?}"),
+                        }
                         assert_eq!(buf, payload);
                     }
                     _ => panic!("expected OutXfer"),
                 }
             }
             _ => panic!("expected InXfer"),
-        }
-    }
-
-    /// Backend whose `sync` counts invocations — makes flush behavior of
-    /// every [`WritePath`] state observable. Deliberately NOT `Copy`/
-    /// `Clone`: proves the hand-written `WritePath<D>: Copy` impl holds
-    /// for non-`Copy` `D` (a derived one would have demanded `D: Copy`).
-    struct CountingBackend {
-        data: Vec<u8>,
-        syncs: core::cell::Cell<u32>,
-    }
-
-    impl FlatData for CountingBackend {
-        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-            let off = off as usize;
-            buf.copy_from_slice(&self.data[off..off + buf.len()]);
-            Ok(())
-        }
-
-        fn capacity(&self) -> u64 {
-            self.data.len() as u64
-        }
-    }
-
-    impl WritableFlatData for CountingBackend {
-        fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
-            let off = off as usize;
-            self.data[off..off + buf.len()].copy_from_slice(buf);
-            Ok(())
-        }
-
-        fn sync(&mut self) -> Result<(), StorageError> {
-            self.syncs.set(self.syncs.get() + 1);
-            Ok(())
         }
     }
 
@@ -1463,7 +1457,7 @@ mod tests {
         // Absent state is sticky and the rejection happens at the command
         // phase.
         let mut ram = [0u8; 8192];
-        let mut dev = BlockDevice::cdrom(RamBackend::new(&mut ram)).unwrap();
+        let mut dev = BlockDevice::cdrom(&mut RamBackend::new(&mut ram)).unwrap();
         assert_eq!(dev.device_type(), DeviceType::Cdrom);
         dev.set_writable(true); // must be a no-op
         let mut w = work();
@@ -1479,7 +1473,7 @@ mod tests {
     #[test]
     fn disk_policy_lock_unlock_roundtrip() {
         let mut ram = vec![0u8; 4096];
-        let mut dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
+        let mut dev = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
         let mut w = work();
 
         // Lock: WRITE rejected at the command phase with DATA PROTECT.
@@ -1499,59 +1493,26 @@ mod tests {
         match dev.do_cmd(&cdb, &mut w).unwrap() {
             CommandOutcome::InXfer { len } => {
                 assert_eq!(len, 512);
-                assert!(matches!(
-                    dev.xfer_in(0, &w[0..512]),
-                    Xfer::Inline { len: 512 }
-                ));
+                match dev.xfer_in(0, &w[0..512]) {
+                    Xfer::Store(op) => run_op(op, &mut ram),
+                    other => panic!("expected Store(Write), got {other:?}"),
+                }
             }
             _ => panic!("expected InXfer"),
         }
         let cdb = make_cdb10(op::READ_10, 1, 1);
         let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
         let mut buf = [0u8; 512];
-        data_in(&mut dev, outcome, &w, &mut buf);
+        data_in(&mut dev, outcome, &w, &mut ram, &mut buf);
         assert_eq!(buf, pattern.as_slice());
     }
 
     #[test]
-    fn sync_flushes_open_and_locked_but_not_absent() {
-        // Locked is policy, not capability — dirty pages
-        // from an Open window must stay reachable, so sync flushes.
-        let mut dev = BlockDevice::disk(
-            CountingBackend {
-                data: vec![0u8; 1024],
-                syncs: core::cell::Cell::new(0),
-            },
-            512,
-        )
-        .unwrap();
-
-        // Open: flushes.
-        dev.sync().unwrap();
-        assert_eq!(dev.backend.syncs.get(), 1);
-
-        // Locked: still flushes.
-        dev.set_writable(false);
-        dev.sync().unwrap();
-        assert_eq!(dev.backend.syncs.get(), 2);
-        // …also via the SYNCHRONIZE CACHE command path.
-        let mut w = work();
-        let mut cdb = [0u8; 10];
-        cdb[0] = op::SYNCHRONIZE_CACHE_10;
-        assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
-        assert_eq!(dev.backend.syncs.get(), 3);
-
-        // Absent (`cdrom()` profile): nothing was ever writable, no op,
-        // and `set_writable` cannot conjure a write path.
-        let mut cd = BlockDevice::cdrom(CountingBackend {
-            data: vec![0u8; 2048],
-            syncs: core::cell::Cell::new(0),
-        })
-        .unwrap();
-        cd.sync().unwrap();
-        assert_eq!(cd.backend.syncs.get(), 0);
-        cd.set_writable(true);
-        cd.sync().unwrap();
-        assert_eq!(cd.backend.syncs.get(), 0);
+    fn sync_is_noop() {
+        // The device holds no backend: flushing is the shell's job
+        // (`sync_planes`), so `ScsiDevice::sync` is a no-op.
+        let mut ram = [0u8; 4096];
+        let mut dev = ram_dev(&mut ram);
+        assert_eq!(dev.sync(), Ok(()));
     }
 }

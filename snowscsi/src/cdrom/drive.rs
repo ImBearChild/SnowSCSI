@@ -13,7 +13,8 @@ use crate::cdrom::common::{
     cdrom_mode_page_for_caps, default_write_params_page, CdromCapabilities, DiscInfo, MediaState,
     CDROM_IDENTITY, SECTOR_SIZE,
 };
-use crate::cdrom::media::{CdMedia, MediaError, Tray};
+use crate::cdrom::media::{CdMedia, Tray};
+use crate::common::store::StoreOp;
 use crate::scsi::device::{CommandOutcome, DeviceType, PendingXfer, Xfer, XferDir};
 use crate::scsi::scsi::{
     asc, cdb_lba10, cdb_len_from_opcode, cdb_opcode, cdb_read_args, cdb_write_args, op, Sense,
@@ -29,8 +30,14 @@ const CLEAR_SENSE: Sense = Sense::clear();
 ///
 /// The drive identity (INQUIRY, caps, drive_id) is constant; the media
 /// slot is mutable.  `SpcDevice` is implemented directly here.
+///
+/// The drive is **non-generic and backend-free**: media geometry is cached
+/// at load time, data-phase I/O is handed to the shell as a
+/// [`StoreOp`], and FORMAT/BLANK/SYNCHRONIZE
+/// CACHE maintenance is produced by
+/// [`ScsiDevice::next_store_op`](crate::scsi::device::ScsiDevice::next_store_op).
 #[derive(Debug)]
-pub struct CdromDrive<'a> {
+pub struct CdromDrive {
     pub(crate) sense: Option<Sense>,
     pub(crate) pending: Option<PendingXfer>,
     pub(crate) prevent_removal: bool,
@@ -42,7 +49,7 @@ pub struct CdromDrive<'a> {
     /// INQUIRY identity.
     pub(crate) identity: DeviceIdentity,
     /// Tray: at most one disc, loaded or parked after a SCSI eject.
-    pub(crate) tray: Tray<'a>,
+    pub(crate) tray: Tray,
     /// Tray state: `true` = open.
     pub(crate) tray_open: bool,
     /// Page 0x05 write parameter cache.
@@ -53,28 +60,36 @@ pub struct CdromDrive<'a> {
     /// `true` when `load()` was requested by START STOP Load=1 on an
     /// empty tray.
     pub(crate) media_requested: bool,
-    _phantom: core::marker::PhantomData<&'a ()>,
+    // ── Maintenance agenda (drained by the session before any terminal
+    // status; see `ScsiDevice::next_store_op`) ────────────────────────
+    /// Next byte offset of a pending FORMAT/BLANK zero-fill.
+    format_off: u64,
+    /// Remaining bytes to zero-fill (`0` ⇒ no fill agenda armed).
+    format_remaining: u64,
+    /// Byte written by each pending `Fill` chunk (always zero here).
+    format_byte: u8,
+    /// One-shot `StoreOp::Sync` armed by SYNCHRONIZE CACHE.
+    sync_pending: bool,
 }
 
-impl Default for CdromDrive<'_> {
+impl Default for CdromDrive {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> CdromDrive<'a> {
+impl CdromDrive {
     /// Create a drive with default identity and capabilities.
     pub fn new() -> Self {
         Self::builder().build()
     }
 
     /// Start building a new drive.
-    pub fn builder() -> CdromDriveBuilder<'a> {
+    pub fn builder() -> CdromDriveBuilder {
         CdromDriveBuilder {
             identity: CDROM_IDENTITY,
             caps: CdromCapabilities::hyper_multi(),
             drive_id: 0,
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -83,34 +98,31 @@ impl<'a> CdromDrive<'a> {
     /// Disc-pool usage (runtime media swap across ANY backend kinds):
     ///
     /// ```text
-    /// use snowscsi::common::seekable_storage::{FlatRef, RwRef};
     /// use snowscsi::cdrom::media::{CdMedia, FlatMedia, LiveData};
     /// use snowscsi::cdrom::drive::CdromDrive;
     /// # fn demo(
-    /// #     img_file: &mut [u8],
+    /// #     img_file: &mut impl snowscsi_common::seekable_storage::FlatData,
     /// #     my_fs: impl snowscsi_common::fs_storage::FsStorage,
     /// #     sd_card: impl snowscsi_common::seekable_storage::WritableFlatData,
     /// # ) -> Result<(), Box<dyn core::error::Error>> {
     /// let mut drive = CdromDrive::new();
     ///
     /// let mut live_data = LiveData::new(my_fs, "LABEL")?;      // bind first:
-    /// let mut disc_a = CdMedia::ro(&mut live_data);            // no temporaries
-    /// let mut iso = FlatMedia::new(FlatRef::new(img_file));
-    /// let mut disc_b = CdMedia::Ro(iso);
+    /// let mut disc_a = CdMedia::ro(&mut live_data);            // geometry only
+    /// let mut disc_b = CdMedia::Ro(FlatMedia::new(img_file));  // plane read once
     /// // DVD-RAM over a writable plane (feature `dvdram`):
-    /// // let mut udf = DvdRamMedia::open(RwRef::new(&mut sd_card));
-    /// // let mut disc_c = CdMedia::Rw(udf);
+    /// // let mut disc_c = CdMedia::Rw(DvdRamMedia::open(&mut sd_card));
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// Borrow rule: every disc's backing data must outlive the drive;
-    /// `load`/`eject` round-trip ownership so a small "disc pool" can be
-    /// swapped at runtime (requirement: cross-backend media switching).
+    /// The media holds only cached geometry; the backing plane is owned by the
+    /// shell (the LUN's `StorePlane`). `load`/`eject` round-trip the media
+    /// value so a small "disc pool" can be swapped at runtime.
     ///
     /// Load media into the drive, returning whatever occupied the tray
     /// (a loaded disc or one parked by a SCSI eject). Sets UNIT ATTENTION.
-    pub fn load(&mut self, media: CdMedia<'a>) -> Option<CdMedia<'a>> {
+    pub fn load(&mut self, media: CdMedia) -> Option<CdMedia> {
         let old = core::mem::replace(&mut self.tray, Tray::Loaded(media)).disc();
         if old.is_some() {
             self.tray_open = false;
@@ -124,7 +136,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     /// Load media without setting UNIT ATTENTION (for test setup / initial load).
-    pub fn load_quiet(&mut self, media: CdMedia<'a>) -> Option<CdMedia<'a>> {
+    pub fn load_quiet(&mut self, media: CdMedia) -> Option<CdMedia> {
         let old = core::mem::replace(&mut self.tray, Tray::Loaded(media)).disc();
         if old.is_some() {
             self.tray_open = false;
@@ -136,7 +148,7 @@ impl<'a> CdromDrive<'a> {
     /// empty tray *and* on a parked disc (a disc parked by a SCSI eject
     /// belongs to the drive until [`Self::take_media`] reclaims it);
     /// queues UNIT ATTENTION whenever a disc comes out.
-    pub fn eject(&mut self) -> Option<CdMedia<'a>> {
+    pub fn eject(&mut self) -> Option<CdMedia> {
         if matches!(self.tray, Tray::Parked(_)) {
             return None;
         }
@@ -172,7 +184,7 @@ impl<'a> CdromDrive<'a> {
     }
 
     /// Reclaim a disc parked by a SCSI-initiated eject (`START STOP loej=1`).
-    pub fn take_media(&mut self) -> Option<CdMedia<'a>> {
+    pub fn take_media(&mut self) -> Option<CdMedia> {
         if matches!(self.tray, Tray::Parked(_)) {
             core::mem::replace(&mut self.tray, Tray::Empty).disc()
         } else {
@@ -182,14 +194,19 @@ impl<'a> CdromDrive<'a> {
 
     /// The loaded medium, if any. A parked disc is SCSI-ejected: logically
     /// NOT PRESENT until reclaimed or reloaded.
-    pub(crate) fn loaded_mut(&mut self) -> Option<&mut CdMedia<'a>> {
+    ///
+    /// Retained for callers that inspect/adjust the loaded media value; the
+    /// device itself no longer reads or writes through it (data I/O goes
+    /// through the LUN's store plane).
+    #[allow(dead_code)]
+    pub(crate) fn loaded_mut(&mut self) -> Option<&mut CdMedia> {
         match &mut self.tray {
             Tray::Loaded(m) => Some(m),
             _ => None,
         }
     }
 
-    fn loaded_ref(&self) -> Option<&CdMedia<'a>> {
+    fn loaded_ref(&self) -> Option<&CdMedia> {
         match &self.tray {
             Tray::Loaded(m) => Some(m),
             _ => None,
@@ -282,7 +299,34 @@ impl<'a> CdromDrive<'a> {
 
     // ── xfer helpers ──────────────────────────────────────────────
 
-    pub fn xfer_out<'b>(&'b mut self, transfer_offset: u64, buf: &'b mut [u8]) -> Xfer<'b> {
+    /// Capacity in bytes of the loaded medium (cached geometry), or `None`
+    /// when the tray is empty / parked.
+    fn media_capacity(&self) -> Option<u64> {
+        self.loaded_ref().map(CdMedia::capacity)
+    }
+
+    /// Arm the FORMAT UNIT / BLANK whole-disc zero-fill agenda: every
+    /// logical block of the loaded medium is cleared.
+    /// [`ScsiDevice::next_store_op`](crate::scsi::device::ScsiDevice::next_store_op)
+    /// yields the fill as `StoreOp::Fill` in 64 KiB chunks until exhausted;
+    /// the command phase performs no storage I/O.
+    #[cfg(feature = "dvdram")]
+    fn arm_format(&mut self) {
+        let cap = self.media_capacity().unwrap_or(0);
+        self.format_off = 0;
+        self.format_remaining = cap;
+        self.format_byte = 0;
+    }
+
+    /// Read `buf.len()` bytes for the current READ transfer (device → host).
+    ///
+    /// Returns [`Xfer::Store`] carrying a [`StoreOp::Read`] addressed at the
+    /// absolute plane byte (`base_byte + transfer_offset`); the shell executes
+    /// it against the LUN's store plane. The pending/direction/range guards
+    /// stay here so a misuse (only reachable through a broken wrapper —
+    /// `do_cmd` already validated) sets sense and yields a zero-length
+    /// [`Xfer::Inline`].
+    pub fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
@@ -306,29 +350,30 @@ impl<'a> CdromDrive<'a> {
             return Xfer::Inline { len: 0 };
         }
         let actual = base_byte + transfer_offset;
-        let res = if let Some(m) = self.loaded_mut() {
-            m.read_data(actual, buf)
-        } else {
-            Err(crate::scsi::backend::StorageError::OutOfBounds)
-        };
-        if let Err(e) = res {
-            match e {
-                crate::scsi::backend::StorageError::OutOfBounds => {
-                    self.set_sense(SenseKey::MediumError, 0x11, 0);
-                }
-                crate::scsi::backend::StorageError::Io(_) => {
-                    self.set_sense(SenseKey::MediumError, 0x11, 0);
-                }
-                _ => {
-                    self.set_sense(SenseKey::MediumError, 0x11, 0);
-                }
+        // Defensive geometry guard (the plane would also bound-check). An
+        // out-of-range read or an empty tray reports MEDIUM ERROR 11h/00h,
+        // matching the old direct `read_data` mapping.
+        match self.media_capacity() {
+            Some(cap)
+                if actual
+                    .checked_add(buf.len() as u64)
+                    .is_some_and(|e| e <= cap) => {}
+            _ => {
+                self.set_sense(SenseKey::MediumError, 0x11, 0);
+                return Xfer::Inline { len: 0 };
             }
-            return Xfer::Inline { len: 0 };
         }
-        Xfer::Inline { len: buf.len() }
+        Xfer::Store(StoreOp::Read { off: actual, buf })
     }
 
-    pub fn xfer_in<'b>(&'b mut self, transfer_offset: u64, buf: &'b [u8]) -> Xfer<'b> {
+    /// Write `buf` for the current WRITE transfer (host → device).
+    ///
+    /// Returns [`Xfer::Store`] carrying a [`StoreOp::Write`] addressed at the
+    /// absolute plane byte (`base_byte + transfer_offset`). The write-path
+    /// gate (random-writable media only) and geometry are checked here; the
+    /// command phase already rejected read-only media with DATA PROTECT, so
+    /// this is a defensive re-check for broken wrappers.
+    pub fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         let (dir, transfer_len, base_byte) = match self.pending {
             Some(p) => (p.dir, p.transfer_len, p.base_byte),
             None => {
@@ -356,34 +401,21 @@ impl<'a> CdromDrive<'a> {
             return Xfer::Inline { len: 0 };
         }
         let actual = base_byte + transfer_offset;
-        let res = if let Some(m) = self.loaded_mut() {
-            m.write_data(actual, buf)
-        } else {
-            Err(crate::cdrom::media::MediaError::WriteProtected)
-        };
-        match res {
-            Ok(()) => Xfer::Inline { len: buf.len() },
-            Err(e) => match e {
-                crate::cdrom::media::MediaError::WriteProtected => {
-                    self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
-                    Xfer::Inline { len: 0 }
-                }
-                crate::cdrom::media::MediaError::OutOfBounds => {
-                    self.set_sense(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0);
-                    Xfer::Inline { len: 0 }
-                }
-                crate::cdrom::media::MediaError::IllegalField => {
-                    self.set_sense(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0);
-                    // Payload is transport-diagnostic only; the sense above
-                    // carries INVALID_FIELD (B9).
-                    Xfer::Inline { len: 0 }
-                }
-                crate::cdrom::media::MediaError::Io(_) => {
-                    self.set_sense(SenseKey::MediumError, asc::WRITE_FAULT, 0);
-                    Xfer::Inline { len: 0 }
-                }
-            },
+        match self.media_capacity() {
+            Some(cap)
+                if actual
+                    .checked_add(buf.len() as u64)
+                    .is_some_and(|e| e <= cap) => {}
+            None => {
+                self.set_sense(SenseKey::DataProtect, asc::WRITE_PROTECTED, 0);
+                return Xfer::Inline { len: 0 };
+            }
+            Some(_) => {
+                self.set_sense(SenseKey::IllegalRequest, asc::LBA_OUT_OF_RANGE, 0);
+                return Xfer::Inline { len: 0 };
+            }
         }
+        Xfer::Store(StoreOp::Write { off: actual, buf })
     }
 
     // ── Unified command dispatch ───────────────────────
@@ -400,6 +432,10 @@ impl<'a> CdromDrive<'a> {
         }
         // PendingXfer is per-command: clear at entry.
         self.pending = None;
+        // The maintenance agenda is per-command too: a stale fill/sync from a
+        // command the session never drained must not leak into the next one.
+        self.format_remaining = 0;
+        self.sync_pending = false;
 
         let spc = parse_spc(cdb);
 
@@ -698,18 +734,19 @@ impl<'a> CdromDrive<'a> {
                     if self.is_random_writable() {
                         #[cfg(feature = "dvdram")]
                         {
-                            if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
-                                match media.format_unit() {
-                                    Ok(()) => {
-                                        self.sense = Some(Sense::new(
-                                            SenseKey::UnitAttention,
-                                            asc::MEDIUM_MAY_HAVE_CHANGED,
-                                            0,
-                                        ));
-                                        CommandOutcome::Status
-                                    }
-                                    Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
-                                }
+                            if matches!(self.loaded_ref(), Some(CdMedia::Rw(_))) {
+                                // Arm the whole-disc zero-fill on the agenda;
+                                // the session drains it before the terminal
+                                // status. Report GOOD + UNIT ATTENTION (media
+                                // may have changed), matching the old inline
+                                // format.
+                                self.arm_format();
+                                self.sense = Some(Sense::new(
+                                    SenseKey::UnitAttention,
+                                    asc::MEDIUM_MAY_HAVE_CHANGED,
+                                    0,
+                                ));
+                                CommandOutcome::Status
                             } else {
                                 self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
                             }
@@ -858,22 +895,21 @@ impl<'a> CdromDrive<'a> {
             return CommandOutcome::Status;
         }
         // The format runs synchronously in this emulation, so Immed and
-        // non-Immed are observably identical: clear now, report GOOD,
-        // queue UNIT ATTENTION so the host re-reads DiscInfo/TOC/Capacity.
+        // non-Immed are observably identical: arm the whole-disc zero-fill
+        // agenda, report GOOD, and queue UNIT ATTENTION so the host re-reads
+        // DiscInfo/TOC/Capacity. The session drains the agenda (invisible on
+        // the wire) before the terminal status; the command phase performs
+        // no storage I/O.
         #[cfg(feature = "dvdram")]
-        if let Some(CdMedia::Rw(ref mut media)) = self.loaded_mut() {
-            return match media.format_unit() {
-                Ok(()) => {
-                    // Signal media change so host re-reads DiscInfo/TOC/Capacity.
-                    self.sense = Some(Sense::new(
-                        SenseKey::UnitAttention,
-                        asc::MEDIUM_MAY_HAVE_CHANGED,
-                        0,
-                    ));
-                    CommandOutcome::Status
-                }
-                Err(_) => self.cc(SenseKey::MediumError, asc::WRITE_FAULT),
-            };
+        if matches!(self.loaded_ref(), Some(CdMedia::Rw(_))) {
+            self.arm_format();
+            // Signal media change so host re-reads DiscInfo/TOC/Capacity.
+            self.sense = Some(Sense::new(
+                SenseKey::UnitAttention,
+                asc::MEDIUM_MAY_HAVE_CHANGED,
+                0,
+            ));
+            return CommandOutcome::Status;
         }
         self.cc(SenseKey::DataProtect, asc::WRITE_PROTECTED)
     }
@@ -1373,32 +1409,21 @@ impl<'a> CdromDrive<'a> {
     /// Parked media is flushed too: the disc physically sits on the tray
     /// until `take_media()` reclaims it, and host-written data must not
     /// be lost in that window. Empty ⇒ nothing to flush.
-    pub fn sync_media(&mut self) -> Result<(), MediaError> {
-        match &mut self.tray {
-            Tray::Loaded(m) | Tray::Parked(m) => m.sync(),
-            Tray::Empty => Ok(()),
-        }
-    }
-
     pub fn sync_cache_cmd(&mut self) -> CommandOutcome {
-        // Same Loaded|Parked contract as `sync_media`: a Parked disc is
-        // still addressable storage; data safety wins over protocol
-        // purity (NOT READY after eject).
-        match &mut self.tray {
-            Tray::Loaded(m) | Tray::Parked(m) => {
-                if m.sync().is_err() {
-                    return self.cc(SenseKey::MediumError, asc::WRITE_FAULT);
-                }
-                CommandOutcome::Status
-            }
-            Tray::Empty => CommandOutcome::Status,
+        // A Parked disc is still addressable storage; data safety wins over
+        // protocol purity (NOT READY after eject). Empty ⇒ no op is armed.
+        // The session drains the one-shot `StoreOp::Sync` before the terminal
+        // status; the command phase performs no storage I/O.
+        if matches!(self.tray, Tray::Loaded(_) | Tray::Parked(_)) {
+            self.sync_pending = true;
         }
+        CommandOutcome::Status
     }
 }
 
 // ── SpcDevice impl ─────────────────────────────────────────────────
 
-impl SpcDevice for CdromDrive<'_> {
+impl SpcDevice for CdromDrive {
     fn device_type(&self) -> DeviceType {
         DeviceType::Cdrom
     }
@@ -1468,18 +1493,7 @@ impl SpcDevice for CdromDrive<'_> {
 
 // ── ScsiDevice impl ─────────────────────────────────────────────────
 
-impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
-    fn sync(&mut self) -> Result<(), crate::scsi::backend::StorageError> {
-        // MediaError → device-level storage error domain (`Io` keeps the
-        // plane's error kind — no `Other` fabrication).
-        use crate::scsi::backend::StorageError;
-        self.sync_media().map_err(|e| match e {
-            MediaError::OutOfBounds => StorageError::OutOfBounds,
-            MediaError::WriteProtected | MediaError::IllegalField => StorageError::NotWritable,
-            MediaError::Io(kind) => StorageError::Io(kind),
-        })
-    }
-
+impl crate::scsi::device::ScsiDevice for CdromDrive {
     fn do_cmd(
         &mut self,
         cdb: &[u8],
@@ -1509,6 +1523,37 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
 
     fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         self.xfer_in(transfer_offset, buf)
+    }
+
+    /// Device maintenance agenda (`__ASYNC_SEP_PLAN.md` §1.2/§1.5).
+    ///
+    /// FORMAT UNIT / BLANK arm a whole-disc zero-fill; this yields it as
+    /// [`StoreOp::Fill`] in **64 KiB chunks** (a single whole-disc op would
+    /// pin the shell for seconds) until exhausted. SYNCHRONIZE CACHE arms a
+    /// one-shot [`StoreOp::Sync`]. The session drains this before any
+    /// terminating status; the op is invisible on the wire, so the
+    /// command-phase outcome/status is byte-identical to the old inline
+    /// format/flush.
+    fn next_store_op<'a>(&'a mut self) -> Option<StoreOp<'a>> {
+        /// Fill chunk size: small enough that a whole-disc format stays
+        /// responsive to resets/probes, large enough to amortize per-op cost.
+        const FILL_CHUNK: u64 = 64 * 1024;
+        if self.format_remaining > 0 {
+            let len = self.format_remaining.min(FILL_CHUNK);
+            let off = self.format_off;
+            self.format_off = off + len;
+            self.format_remaining -= len;
+            return Some(StoreOp::Fill {
+                off,
+                len,
+                byte: self.format_byte,
+            });
+        }
+        if self.sync_pending {
+            self.sync_pending = false;
+            return Some(StoreOp::Sync);
+        }
+        None
     }
 
     fn peek_sense(&self) -> Option<&Sense> {
@@ -1566,15 +1611,13 @@ impl crate::scsi::device::ScsiDevice for CdromDrive<'_> {
 /// Constructs the drive identity; media is injected at runtime via
 /// `load()`.
 #[derive(Debug)]
-pub struct CdromDriveBuilder<'a> {
+pub struct CdromDriveBuilder {
     identity: DeviceIdentity,
     caps: CdromCapabilities,
     drive_id: u64,
-    /// Media borrow anchor: the built drive borrows disc data for `'a`.
-    _phantom: core::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> CdromDriveBuilder<'a> {
+impl CdromDriveBuilder {
     /// Set INQUIRY identity (vendor, product, revision).
     pub fn identity(mut self, vendor: &[u8; 8], product: &[u8; 16], rev: &[u8; 4]) -> Self {
         self.identity = DeviceIdentity {
@@ -1606,9 +1649,9 @@ impl<'a> CdromDriveBuilder<'a> {
         self
     }
 
-    /// Build the drive (empty tray). The drive borrows disc data for `'a`;
-    /// discs must outlive it.
-    pub fn build(self) -> CdromDrive<'a> {
+    /// Build the drive (empty tray). Media is injected at runtime; the
+    /// media holds only cached geometry, so the drive is backend-free.
+    pub fn build(self) -> CdromDrive {
         CdromDrive {
             sense: None,
             pending: None,
@@ -1621,7 +1664,10 @@ impl<'a> CdromDriveBuilder<'a> {
             mode_page_05: [0u8; 52],
             mode_page_05_valid: false,
             media_requested: false,
-            _phantom: core::marker::PhantomData,
+            format_off: 0,
+            format_remaining: 0,
+            format_byte: 0,
+            sync_pending: false,
         }
     }
 }
@@ -1650,10 +1696,12 @@ pub(crate) fn hex_of<'o>(out: &'o mut [u8], data: &[u8]) -> &'o [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::seekable_storage::RwRef;
     #[cfg(feature = "dvdram")]
     use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
+    #[cfg(feature = "dvdram")]
+    use crate::common::store::{StoreOp, StorePlane};
     use crate::scsi::backend::{BlockBackend, RamBackend};
+    #[cfg(feature = "dvdram")]
     use crate::scsi::device::{ScsiDevice, Xfer};
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
@@ -1671,8 +1719,13 @@ mod tests {
         }
     }
 
+    /// Execute a READ data phase. The media no longer holds the backend, so
+    /// `xfer_out` yields `Xfer::Store(StoreOp::Read)`; run it against `plane`.
+    /// `Inline` (synthesized) responses are copied from `work` as before.
+    #[cfg(feature = "dvdram")]
     fn data_in_xfer(
-        dev: &mut CdromDrive<'_>,
+        dev: &mut CdromDrive,
+        plane: &mut dyn FlatData,
         outcome: CommandOutcome,
         work: &[u8],
         buf: &mut [u8],
@@ -1681,10 +1734,12 @@ mod tests {
             CommandOutcome::OutXfer { len } => {
                 let n = len as usize;
                 assert!(n <= buf.len());
-                assert!(matches!(
-                    dev.xfer_out(0, &mut buf[..n]),
-                    Xfer::Inline { len } if len == n
-                ));
+                match dev.xfer_out(0, &mut buf[..n]) {
+                    Xfer::Store(StoreOp::Read { off, buf }) => {
+                        plane.read_at(off, buf).expect("read from plane");
+                    }
+                    other => panic!("expected Store(Read), got {other:?}"),
+                }
                 n
             }
             CommandOutcome::OutInline { len } => {
@@ -1694,6 +1749,33 @@ mod tests {
                 n
             }
             _ => panic!("expected OutXfer or OutInline"),
+        }
+    }
+
+    /// Execute a WRITE data phase: run the `Xfer::Store(StoreOp::Write)`
+    /// against `plane`; return the number of bytes written.
+    #[cfg(feature = "dvdram")]
+    fn data_out_xfer(dev: &mut CdromDrive, plane: &mut dyn WritableFlatData, buf: &[u8]) -> usize {
+        match dev.xfer_in(0, buf) {
+            Xfer::Store(StoreOp::Write { off, buf }) => {
+                plane.write_at(off, buf).expect("write to plane");
+                buf.len()
+            }
+            Xfer::Inline { len } => len,
+            other => panic!("expected Store(Write), got {other:?}"),
+        }
+    }
+
+    /// Drain the device maintenance agenda (FORMAT `Fill`, SYNCHRONIZE CACHE
+    /// `Sync`) by executing every op against `plane` — the shell's job in
+    /// production (`usb::serve` / `iscsi`). The session does this before any
+    /// terminal status; these unit tests drive the device directly.
+    #[cfg(feature = "dvdram")]
+    fn drain_agenda(dev: &mut CdromDrive, plane: &mut dyn WritableFlatData) {
+        while let Some(op) = dev.next_store_op() {
+            StorePlane::BlockRw(plane)
+                .do_op(op)
+                .expect("agenda op must succeed");
         }
     }
 
@@ -1867,7 +1949,7 @@ mod tests {
         let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
         #[cfg(feature = "dvdram")]
         {
-            let media = crate::cdrom::dvdram::DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = crate::cdrom::dvdram::DvdRamMedia::open(&mut bb);
             dev.load_quiet(crate::cdrom::media::CdMedia::Rw(media));
         }
         #[cfg(not(feature = "dvdram"))]
@@ -2216,10 +2298,12 @@ mod tests {
     #[cfg(feature = "dvdram")]
     #[test]
     fn sync_reaches_parked_media() {
-        // After a SCSI eject the disc sits Parked on the
-        // tray until take_media(); shutdown (`ScsiDevice::sync`) and
-        // SYNCHRONIZE CACHE must both reach it — the former behavior
-        // returned Ok/Status without flushing ⇒ data-loss window.
+        // After a SCSI eject the disc sits Parked on the tray until
+        // take_media(); SYNCHRONIZE CACHE must still reach it (a Parked disc
+        // is addressable storage — data safety over protocol purity). The
+        // command now arms a one-shot `StoreOp::Sync`; draining the agenda
+        // (the shell's job, like the shutdown `sync_planes`) flushes it. The
+        // former inline flush could be skipped ⇒ data-loss window.
         use crate::cdrom::dvdram::DvdRamMedia;
 
         let syncs = std::rc::Rc::new(core::cell::Cell::new(0));
@@ -2227,7 +2311,7 @@ mod tests {
             data: vec![0u8; 4096 * 2048],
             syncs: std::rc::Rc::clone(&syncs),
         };
-        let media = DvdRamMedia::open(RwRef::new(&mut be));
+        let media = DvdRamMedia::open(&mut be);
 
         let mut dev = CdromDrive::new();
         let swapped_out = dev.load(CdMedia::Rw(media));
@@ -2237,13 +2321,8 @@ mod tests {
         use crate::scsi::spc::SpcDevice;
         assert_eq!(dev.start_stop(true, false), SpcEffect::Good);
 
-        // Shutdown-path flush reaches the parked disc.
-        ScsiDevice::sync(&mut dev).unwrap();
-        assert_eq!(syncs.get(), 1);
-
-        // …and so does the SYNCHRONIZE CACHE command path. Consume the
-        // eject's UNIT ATTENTION first (correct SCSI behavior: the first
-        // command after a medium change reports CC/UA).
+        // Consume the eject's UNIT ATTENTION first (correct SCSI behavior:
+        // the first command after a medium change reports CC/UA).
         assert_eq!(
             dev.take_sense().map(|s| s.key),
             Some(SenseKey::UnitAttention)
@@ -2252,7 +2331,8 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = op::SYNCHRONIZE_CACHE_10;
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
-        assert_eq!(syncs.get(), 2);
+        drain_agenda(&mut dev, &mut be);
+        assert_eq!(syncs.get(), 1);
 
         // Reclaim: the disc leaves with its data flushed.
         assert!(dev.take_media().is_some());
@@ -2294,7 +2374,7 @@ mod tests {
         {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2331,7 +2411,7 @@ mod tests {
         {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             let mut cdb = [0u8; 6];
             cdb[0] = op::FORMAT_UNIT;
@@ -2370,7 +2450,7 @@ mod tests {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             // Write pattern via xfer_in path
             let mut w = work();
@@ -2381,16 +2461,11 @@ mod tests {
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             match outcome {
                 CommandOutcome::InXfer { len } => {
-                    let mut pat = [0xA5u8; 2048];
-                    // immediate is borrowed from work; copy pattern into work prefix for xfer
-                    // For this test we directly use media write via xfer_in
+                    let pat = [0xA5u8; 2048];
+                    // The media holds no backend: run the WRITE data phase on
+                    // the test's own plane (`data_out_xfer`).
                     let _ = len;
-                    // Use xfer_in directly with pattern
-                    // Need to have pending set; we have it from WRITE_10
-                    assert!(matches!(
-                        dev.xfer_in(0, &pat),
-                        Xfer::Inline { len } if len == pat.len()
-                    ));
+                    assert_eq!(data_out_xfer(&mut dev, &mut bb, &pat), pat.len());
                 }
                 _ => panic!("expected InXfer"),
             }
@@ -2421,7 +2496,7 @@ mod tests {
             cdb[8] = 1;
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut out = [0u8; 2048];
-            let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
+            let n = data_in_xfer(&mut dev, &mut bb, outcome, &w, &mut out);
             assert_eq!(n, 2048);
             assert_eq!(out, [0xA5; 2048]);
         }
@@ -2436,7 +2511,7 @@ mod tests {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             // Write some data via xfer_in
             {
@@ -2449,10 +2524,7 @@ mod tests {
                 match outcome {
                     CommandOutcome::InXfer { .. } => {
                         let pat = [0x5A; 2048];
-                        assert!(matches!(
-                            dev.xfer_in(0, &pat),
-                            Xfer::Inline { len } if len == pat.len()
-                        ));
+                        assert_eq!(data_out_xfer(&mut dev, &mut bb, &pat), pat.len());
                     }
                     _ => panic!("expected InXfer"),
                 }
@@ -2469,6 +2541,9 @@ mod tests {
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             assert_eq!(outcome, CommandOutcome::InParam { expected_len: 12 });
             assert_eq!(dev.complete_param(&cdb, &w[..12]), CommandOutcome::Status);
+            // FORMAT arms the zero-fill agenda; drain it (the session does this
+            // before the terminal status) so the medium is actually cleared.
+            drain_agenda(&mut dev, &mut bb);
             // Consume UA from format (autosense)
             let _ = dev.take_sense();
             // Verify cleared via READ + xfer_out
@@ -2479,7 +2554,7 @@ mod tests {
             cdb[8] = 1;
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut out = [0u8; 2048];
-            let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
+            let n = data_in_xfer(&mut dev, &mut bb, outcome, &w, &mut out);
             assert_eq!(n, 2048);
             assert_eq!(out, [0u8; 2048]);
             // UDF structures should be zeroed — check BEA sector via READ
@@ -2489,7 +2564,7 @@ mod tests {
             cdb[8] = 1;
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut sec = [0u8; 2048];
-            let n = data_in_xfer(&mut dev, outcome, &w, &mut sec);
+            let n = data_in_xfer(&mut dev, &mut bb, outcome, &w, &mut sec);
             assert_eq!(n, 2048);
             assert_eq!(sec, [0u8; 2048]);
         }
@@ -2510,7 +2585,7 @@ mod tests {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             // Leave a pattern at LBA 1 so we can observe the clear.
             {
@@ -2521,10 +2596,7 @@ mod tests {
                 cdb[8] = 1;
                 match dev.do_cmd(&cdb, &mut w).unwrap() {
                     CommandOutcome::InXfer { .. } => {
-                        assert!(matches!(
-                            dev.xfer_in(0, &[0x5A; 2048]),
-                            Xfer::Inline { len: 2048 }
-                        ));
+                        assert_eq!(data_out_xfer(&mut dev, &mut bb, &[0x5A; 2048]), 2048);
                     }
                     _ => panic!("expected InXfer"),
                 }
@@ -2544,7 +2616,9 @@ mod tests {
                 CommandOutcome::InParam { expected_len: 12 }
             );
             assert_eq!(dev.complete_param(&cdb, &w[..12]), CommandOutcome::Status);
-            // The format ran even though Immed was set.
+            // The format ran even though Immed was set: drain the zero-fill
+            // agenda (the session does this before the terminal status).
+            drain_agenda(&mut dev, &mut bb);
             let s = dev.take_sense().expect("UNIT ATTENTION after format");
             assert_eq!(s.key, SenseKey::UnitAttention);
             assert_eq!(s.asc, asc::MEDIUM_MAY_HAVE_CHANGED);
@@ -2556,7 +2630,7 @@ mod tests {
             cdb[8] = 1;
             let outcome = dev.do_cmd(&cdb, &mut w).unwrap();
             let mut out = [0u8; 2048];
-            let n = data_in_xfer(&mut dev, outcome, &w, &mut out);
+            let n = data_in_xfer(&mut dev, &mut bb, outcome, &w, &mut out);
             assert_eq!(n, 2048);
             assert_eq!(out, [0u8; 2048]);
         }
@@ -2571,7 +2645,7 @@ mod tests {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             let mut w = work();
             for &fmt in &[0x08u8, 0x09, 0x0A, 0x0B] {
@@ -2619,7 +2693,7 @@ mod tests {
             use crate::cdrom::dvdram::DvdRamMedia;
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
             // Immediately after load, TUR is GOOD (no format needed)
             let mut w = work();
@@ -2683,7 +2757,7 @@ mod tests {
         {
             use crate::cdrom::dvdram::DvdRamMedia;
 
-            fn disc_status(dev: &mut CdromDrive<'_>) -> u8 {
+            fn disc_status(dev: &mut CdromDrive) -> u8 {
                 let mut w = [0u8; crate::MIN_DATA_LEN];
                 let mut cdb = [0u8; 10];
                 cdb[0] = op::READ_DISC_INFORMATION;
@@ -2697,7 +2771,7 @@ mod tests {
 
             let mut dev = CdromDrive::new();
             let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
-            let media = DvdRamMedia::open(RwRef::new(&mut bb));
+            let media = DvdRamMedia::open(&mut bb);
             dev.load_quiet(CdMedia::Rw(media));
 
             // Always formatted — 10b "Finalized" (MMC-6 Table 372).
@@ -2717,7 +2791,9 @@ mod tests {
                 CommandOutcome::InParam { expected_len: 12 }
             );
             assert_eq!(dev.complete_param(&cdbf, &w[..12]), CommandOutcome::Status);
-            // Consume UA from format
+            // Drain the zero-fill agenda (the session does this before the
+            // terminal status), then consume the format's UA.
+            drain_agenda(&mut dev, &mut bb);
             let mut cdb_rs = [0u8; 6];
             cdb_rs[0] = op::REQUEST_SENSE;
             cdb_rs[4] = 18;

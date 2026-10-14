@@ -1,26 +1,35 @@
 //! USB MSC Bulk-Only Transport session state machine (target.rs).
 //!
 //! [`BotSession`] is a pure, non-blocking protocol state machine: it never
-//! blocks and never touches platform I/O. A driver feeds one [`SessionEvent`]
-//! (an I/O completion) per [`BotSession::poll`] call and learns the next
-//! need from the returned [`SessionStep`] (or the copyable [`BotSession::need`]).
-//! The same core is driven by the PC FunctionFS poll loop, the blocking
-//! [`BotSession::step`] convenience wrapper, and embedded `select!` drivers.
+//! blocks and never touches platform I/O. A shell feeds one [`Event`] (an I/O
+//! completion or a control-plane notification) per [`BotSession::poll`] call
+//! and learns the next [`Action`] (receive, send, stall, or — from Step 2 on —
+//! a storage op). The library shell [`crate::usb::serve()`] owns the platform
+//! loop; the PC FunctionFS driver and embedded `select!` drivers implement the
+//! same `Event`/`Action` contract.
 //!
-//! Out-of-band control never enters the core: Bulk-Only Reset and Get Max
-//! LUN arrive on the control pipe at any time (even mid data phase), so the
-//! driver calls [`BotSession::reset`] / [`BotSession::max_lun`] directly
-//! between bulk events.
+//! Out-of-band control enters the core as events: Bulk-Only Reset and
+//! LinkReset arrive as [`Event::Reset`], Get Max LUN is a pure getter
+//! ([`BotSession::max_lun`]). There is no out-of-band state mutation.
 //!
 //! Design invariants (§4 / §3.7 / §3.8):
 //! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled
-//!   in an internal buffer; the caller's `data` area holds only SCSI data.
-//! - STALL is used for invalid CBWs (both pipes) and, under
-//!   [`ShortfallPolicy::Short`], for a Data-In shortfall (Bulk-In only).
+//!   in an internal buffer; the caller's `work` area holds only SCSI data.
+//! - STALL is used for invalid CBWs (both pipes, [`Action::StallBoth`]) and,
+//!   under [`ShortfallPolicy::Short`], for a Data-In shortfall (Bulk-In only,
+//!   [`Action::StallIn`]).
 //! - Data-Out host overrun is drained to a short packet so leftover bytes
 //!   never corrupt the next CBW.
 //! - After a reset the session injects a UNIT ATTENTION: delivered on the
 //!   next TEST UNIT READY (Failed CSW), cleared by REQUEST SENSE.
+//!
+//! ## Single-buffer model
+//!
+//! `poll` takes one time-multiplexed `work` buffer. A receive always lands at
+//! `work[0..len]`; Data-In and synthesized responses are written into `work`.
+//! A parameter-list Data-Out accumulates at the **tail** of `work` (the
+//! `received` bytes sit at `work[work.len() - received..]`) so a front-landing
+//! receive never clobbers earlier chunks.
 //!
 //! ## Data-In shortfall policy ([`ShortfallPolicy`])
 //!
@@ -42,12 +51,13 @@
 //!   to pad the data if we don't halt the endpoint. Presumably nobody will
 //!   mind." — `drivers/usb/gadget/function/f_mass_storage.c`, `finish_reply()`.
 //! - [`ShortfallPolicy::Short`] (conformant): the short packet is followed by a
-//!   Bulk-In STALL; the CSW is queued straight away and reaches the host once
-//!   it clears the halt (handled by the USB core). It needs a driver that
-//!   implements `BotIo::stall_in` — retrying transient `-EAGAIN` (the endpoint
-//!   cannot be halted while a request is queued or the FIFO still holds
-//!   uncollected bytes) — and then calls [`BotSession::stall_applied`]. A real
-//!   `stall_in` failure aborts the transaction via [`BotSession::reset`].
+//!   Bulk-In STALL ([`Action::StallIn`]); the CSW is queued straight away and
+//!   reaches the host once it clears the halt (handled by the USB core). It
+//!   needs a driver that implements `BotIo::stall_in` — retrying transient
+//!   `-EAGAIN` (the endpoint cannot be halted while a request is queued or the
+//!   FIFO still holds uncollected bytes) — and then feeds
+//!   [`Event::StallApplied`]. A real `stall_in` failure aborts the transaction
+//!   via [`Event::Reset`].
 //! - [`ShortfallPolicy::Pad`] (conformant up to the cap): fill zeros up to
 //!   `dCBWDataTransferLength`, capped at [`MAX_PAD`]. The fill is not "relevant"
 //!   data, so the residue stays `declared − produced`. A cap-exhausted pad ends
@@ -62,26 +72,13 @@
 //! Residue is always `declared − produced` (the *relevant* data actually sent);
 //! `Pad` fill bytes are not relevant, so a fully padded phase still reports a
 //! non-zero residue.
-//!
-//! ## `step()` constraint
-//!
-//! [`BotSession::step`] does not service the control plane, so it pre-rejects
-//! [`ShortfallPolicy::Short`] with [`BotStepResult::Unsupported`] at entry,
-//! before any wire effect. Drive `Short` with a `need()`/`poll()` loop that
-//! handles [`SessionNeed::NeedStall`]. `ShortNoStall` and `Pad` are fully
-//! drivable by `step()`.
 
-use core::time::Duration;
-
-use crate::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
+use crate::common::seekable_storage::StorageError;
+use crate::common::store::StoreOp;
+use crate::scsi::device::{sense_for_storage_error, CommandOutcome, ScsiDevice, Xfer, XferOutcome};
 use crate::scsi::scsi::{asc, op as scsi_op, Sense, SenseKey};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
-use crate::usb::io::BotIo;
 use crate::usb::{CBW_LEN, CSW_LEN};
-
-/// Blocking `step` receive granularity: drives the poll loop and bounds the
-/// Data-Out overrun drain wait (mirrors the PC driver's 50ms ctrl poll).
-const STEP_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Default USB bulk endpoint max packet size (high-speed, 512 B; full-speed is
 /// 64 B). FunctionFS high-speed enumeration is the only tested path, so this
@@ -101,7 +98,7 @@ const BOT_BULK_MPS: u64 = 512;
 pub const MAX_PAD: u64 = 64 * 1024;
 
 /// Zero source for `ShortfallPolicy::Pad` fill, emitted through
-/// [`BotSession::out_slice`]. `4096` is a multiple of every realistic bulk MPS
+/// [`Action::HostSend`]. `4096` is a multiple of every realistic bulk MPS
 /// (64 Full-Speed, 512 High-Speed), so intermediate fill chunks are full-MPS
 /// packets; only a chunk reaching the (possibly non-aligned) pad target is a
 /// short packet, which is correct because it is the final transfer.
@@ -112,7 +109,7 @@ const ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
 /// max-compat deviation; `Short` and `Pad` are the conformant modes. The
 /// caller knows its transport, so the selected variant is the capability
 /// declaration; a `Short`-without-`stall_in` mismatch exits through the
-/// reset route (the driver calls [`BotSession::reset`]), never silently.
+/// reset route (the shell feeds [`Event::Reset`]), never silently.
 ///
 /// ## Choice logic (why exactly three values)
 ///
@@ -155,11 +152,11 @@ pub enum ShortfallPolicy {
     /// leaking a short packet that would terminate the host's bulk-IN before
     /// the fill.
     Pad,
-    /// Conformant: short packet then STALL Bulk-In; the withheld CSW is queued
-    /// immediately and delivered once the host clears the halt. Requires a
-    /// driver that implements `stall_in` (retrying transient `-EAGAIN`) and
-    /// then calls [`BotSession::stall_applied`]; a real `stall_in` failure
-    /// aborts via [`BotSession::reset`].
+    /// Conformant: short packet then STALL Bulk-In ([`Action::StallIn`]); the
+    /// withheld CSW is queued immediately and delivered once the host clears
+    /// the halt. Requires a driver that implements `BotIo::stall_in` (retrying
+    /// transient `-EAGAIN`) and then feeds [`Event::StallApplied`]; a real
+    /// `stall_in` failure aborts via [`Event::Reset`].
     Short,
     /// Non-conformant, default: plain short packet, no STALL. Runs unaided on
     /// any transport (no stall capability, no clear observability required);
@@ -168,87 +165,81 @@ pub enum ShortfallPolicy {
     ShortNoStall,
 }
 
-/// One bulk I/O completion fed from the driver to the core.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEvent<'a> {
-    /// bulk OUT (host → device): `data` is a CBW fragment or a Data-Out
-    /// chunk (borrowed from the driver's receive buffer).
-    OutRecv { data: &'a [u8] },
-    /// bulk IN (device → host): the pending packet has been sent.
-    InSent,
-    /// The driver's bulk-OUT receive found no data (timed out). Ignored by
-    /// every state except the Data-Out overrun drain, where it ends the
-    /// drain and moves on to the CSW.
-    OutIdle,
-}
-
-/// The core's next need, returned by [`BotSession::poll`].
+/// The core's next action, returned by [`BotSession::poll`].
 ///
-/// `NeedIn` borrows the caller's `data` region (Data-In chunks / synthesized
-/// responses) or the internal CSW buffer; `NeedOut` needs `len` more bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStep<'a> {
-    /// Receive `len` more bytes. `probe` marks a non-blocking drain receive
-    /// (Data-Out overrun): the driver should try once; a WouldBlock result
-    /// ends the data phase and should be fed back as [`SessionEvent::OutIdle`].
-    NeedOut { len: usize, probe: bool },
-    /// Send these bytes (chunk from `data`, or the internal CSW).
-    NeedIn(&'a [u8]),
-    /// STALL the Bulk-In endpoint (`ShortfallPolicy::Short`; see the
-    /// module-level "Data-In shortfall policy"). The driver calls
-    /// `BotIo::stall_in` (retrying transient `-EAGAIN`), then
-    /// [`BotSession::stall_applied`] to release the withheld CSW.
-    NeedStall,
-    /// The transaction ended; the driver stops feeding bulk events.
-    Done(BotStepResult),
-}
-
-/// Copyable variant of [`SessionStep`] (no borrows), for [`BotSession::need`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionNeed {
-    /// See [`SessionStep::NeedOut`].
-    NeedOut { len: usize, probe: bool },
-    /// Send `len` bytes (fetch via [`BotSession::out_slice`]).
-    NeedIn { len: usize },
-    /// STALL the Bulk-In endpoint (see [`SessionStep::NeedStall`]).
-    NeedStall,
-    /// Transaction ended; the driver stops feeding bulk events.
-    Done(BotStepResult),
-}
-
-/// How a transaction ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BotStepResult {
-    /// CSW sent; back in Command phase.
-    Processed,
-    /// Invalid CBW — STALL both bulk endpoints and wait for a reset.
-    Stalled,
-    /// I/O link failed (used by the blocking `step` wrapper).
-    Closed,
-    /// Caller bug (buffer too small / impossible event).
+/// Normal flow never emits a "done" action: after a CSW is sent,
+/// `poll(Event::HostSent)` returns the next command-phase
+/// [`Action::HostRecv`] directly. Only the abnormal outcomes are distinct
+/// (`StallBoth`/`StallIn`/`Error`).
+#[derive(Debug)]
+pub enum Action<'a> {
+    /// Receive `len` bytes into `work[0..len]`. `probe` marks a non-blocking
+    /// drain receive (Data-Out overrun): the shell should try once; a
+    /// WouldBlock result ends the data phase and should be fed back as
+    /// [`Event::HostIdle`].
+    HostRecv { len: usize, probe: bool },
+    /// Send `bytes` on the bulk-IN pipe. `prefetch` is the next read-ahead
+    /// coordinate `(off, len)` for read-phase overlap (`None` in Step 1).
+    HostSend {
+        bytes: &'a [u8],
+        prefetch: Option<(u64, usize)>,
+    },
+    /// Hand a storage op to the platform: the device's `xfer_out`/`xfer_in`
+    /// returned [`Xfer::Store`] for the current data-phase chunk. The shell
+    /// executes the op and feeds the result back as [`Event::StoreDone`];
+    /// the Store is invisible on the wire.
+    Store { lun: usize, op: StoreOp<'a> },
+    /// Invalid CBW (BOT §6.6.1): STALL both bulk endpoints. The core has
+    /// already returned to the Command phase; a new CBW arriving clears the
+    /// halt (the host's CLEAR_FEATURE is handled by the USB core).
+    StallBoth,
+    /// `ShortfallPolicy::Short` Data-In shortfall: STALL Bulk-In, then feed
+    /// [`Event::StallApplied`] to release the withheld CSW.
+    StallIn,
+    /// Core-level error (work buffer too small / impossible transition).
     Error(BotTargetError),
-    /// The selected [`ShortfallPolicy`] cannot be driven by the blocking
-    /// [`BotSession::step`] wrapper. Emitted only by `step()` and only for
-    /// `Short` (which needs a `need()`/`poll()` loop that services the
-    /// control plane); returned at entry, before any wire effect.
-    Unsupported,
+}
+
+/// One completion fed from the shell to the core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// No-I/O driver tick (startup + timer): change no state and re-emit the
+    /// current pending [`Action`].
+    Tick,
+    /// The shell received `len` bytes into `work[0..len]`.
+    HostRecv { len: usize },
+    /// The shell's receive found no data (timed out). Has end-of-phase
+    /// meaning for the Data-Out overrun drain.
+    HostIdle,
+    /// The pending bulk-IN packet has been sent.
+    HostSent,
+    /// A storage op finished: `result` is the plane's outcome. Fed by the
+    /// shell after it executed an [`Action::Store`]; the session maps it
+    /// through [`ScsiDevice::store_done`] and continues the data phase.
+    StoreDone { result: Result<(), StorageError> },
+    /// The `Short` shortfall's Bulk-In STALL has been applied; release the
+    /// withheld CSW.
+    StallApplied,
+    /// Bulk-Only Reset / LinkReset: abort any in-flight transaction, return to
+    /// the Command phase, and inject a UNIT ATTENTION (BOT §4.2, §5.2).
+    Reset,
 }
 
 /// Core-level error (no_std).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotTargetError {
-    /// The caller's `data` buffer is smaller than [`crate::MIN_DATA_LEN`].
+    /// The caller's `work` buffer is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
-    /// I/O failure (reported through the blocking `step` wrapper).
+    /// I/O failure (reported through the shell).
     Io,
-    /// An impossible state transition (driver fed a wrong event).
+    /// An impossible state transition (shell fed a wrong event).
     Internal,
 }
 
 impl core::fmt::Display for BotTargetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::WorkBufTooSmall => write!(f, "data buffer smaller than MIN_DATA_LEN"),
+            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN"),
             Self::Io => write!(f, "bulk I/O failure"),
             Self::Internal => write!(f, "internal BOT state error"),
         }
@@ -282,8 +273,36 @@ enum BotState {
         status: CswStatus,
         chunk: usize,
     },
-    /// Parameter-list Data-Out: receive `expected` bytes contiguously
-    /// into `data[0..expected]` then call `complete_param`.
+    /// Data-In phase awaiting a storage op (`Xfer::Store`): the chunk is in
+    /// flight in the platform. `sent` is the relevant data already sent
+    /// (excluding this chunk); on [`Event::StoreDone`] the chunk is finalized
+    /// — including the `ShortfallPolicy::Pad` boundary merge — and the phase
+    /// continues exactly like the `Inline` path.
+    DataInStore {
+        expected: u64,
+        transfer_len: u64,
+        sent: u64,
+        tag: u32,
+        lun: usize,
+        chunk: usize,
+    },
+    /// Data-Out phase awaiting a storage op (`Xfer::Store`): the received
+    /// chunk `got` (of which `w` bytes were handed to `xfer_in`) is in flight.
+    /// On [`Event::StoreDone`] `written` advances by `w` (or `status` becomes
+    /// `Failed`) and the phase continues exactly like the `Inline` path.
+    DataOutStore {
+        declared: u64,
+        to_write: u64,
+        received: u64,
+        written: u64,
+        tag: u32,
+        lun: usize,
+        status: CswStatus,
+        got: usize,
+        w: usize,
+    },
+    /// Parameter-list Data-Out: receive `expected` bytes into the **tail** of
+    /// `work` then call `complete_param`.
     ParamOut {
         expected: u64,
         received: u64,
@@ -298,7 +317,21 @@ enum BotState {
         tag: u32,
         residue: u64,
         status: CswStatus,
+        lun: usize,
         chunk: usize,
+    },
+    /// Terminal-status pending: the data phase (including any ZLP / STALL) is
+    /// done, but the device agenda (`ScsiDevice::next_store_op`) must be drained
+    /// before the CSW (`__ASYNC_SEP_PLAN.md` §1.5 rule 3/4). Carries the CSW
+    /// payload; each `Some(op)` is yielded as [`Action::Store`] and awaited via
+    /// [`Event::StoreDone`], then `devs[lun].store_done(result)` maps a failure
+    /// to sense (the terminal status becomes `Failed`). `None` emits the CSW
+    /// exactly as before.
+    Agenda {
+        tag: u32,
+        residue: u64,
+        status: CswStatus,
+        lun: usize,
     },
     /// CSW pending in the internal buffer.
     Csw,
@@ -315,34 +348,34 @@ enum BotState {
         produced: u64,
         wire: u64,
         status: CswStatus,
+        lun: usize,
         chunk: usize,
     },
     /// CSW pending, but a zero-length packet must terminate the data phase
     /// first (a shortfall whose length is a multiple of the bulk MPS,
     /// including zero bytes — see [`finish_data_in`]). Carries the shortfall
-    /// payload so the terminating `InSent` can enter [`BotState::DataInStall`]
+    /// payload so the terminating `HostSent` can enter [`BotState::DataInStall`]
     /// under `ShortfallPolicy::Short`.
     CswZlp {
         tag: u32,
         declared: u64,
         actual: u64,
         status: CswStatus,
+        lun: usize,
     },
-    /// The CSW is pending, but the driver must first STALL Bulk-In
-    /// (`ShortfallPolicy::Short`): `need()` returns `NeedStall`. Holds the CSW
-    /// payload that [`BotSession::stall_applied`] turns into the CSW once the
-    /// driver has set the halt. The host's CLEAR_FEATURE is handled by the USB
-    /// core and is not observable here, so this state is released by the driver
-    /// (see [`stall_applied`](BotSession::stall_applied)), not by an event.
-    /// Distinct from the invalid-CBW terminal [`BotState::Stalled`].
+    /// The CSW is pending, but the shell must first STALL Bulk-In
+    /// (`ShortfallPolicy::Short`): `pending()` returns [`Action::StallIn`].
+    /// Holds the CSW payload that [`Event::StallApplied`] turns into the CSW
+    /// once the shell has set the halt. The host's CLEAR_FEATURE is handled by
+    /// the USB core and is not observable here, so this state is released by
+    /// [`Event::StallApplied`], not by a bulk event.
     DataInStall {
         tag: u32,
         declared: u64,
         actual: u64,
         status: CswStatus,
+        lun: usize,
     },
-    /// Frozen after an invalid CBW; only `reset()` unfreezes.
-    Stalled,
 }
 
 /// BOT session: a non-blocking protocol state machine over one bulk pipe
@@ -437,232 +470,272 @@ impl BotSession {
         self.shortfall
     }
 
-    /// The session's current need (Copy; the driver polls the matching
-    /// endpoint / checks ep0 in between).
-    pub fn need(&self) -> SessionNeed {
-        match self.state {
-            BotState::Command { got } => SessionNeed::NeedOut {
-                len: CBW_LEN - got,
-                probe: false,
-            },
-            BotState::DataIn { chunk, .. } => SessionNeed::NeedIn { len: chunk },
-            BotState::DataOut { chunk, .. } => SessionNeed::NeedOut {
-                len: chunk,
-                probe: false,
-            },
-            BotState::ParamOut { chunk, .. } => SessionNeed::NeedOut {
-                len: chunk,
-                probe: false,
-            },
-            BotState::DataOutOverrun { chunk, .. } => SessionNeed::NeedOut {
-                len: chunk,
-                probe: true,
-            },
-            BotState::Csw => SessionNeed::NeedIn { len: CSW_LEN },
-            BotState::CswZlp { .. } => SessionNeed::NeedIn { len: 0 },
-            BotState::DataInPad { chunk, .. } => SessionNeed::NeedIn { len: chunk },
-            BotState::DataInStall { .. } => SessionNeed::NeedStall,
-            BotState::Stalled => SessionNeed::Done(BotStepResult::Stalled),
-        }
-    }
-
-    /// The bytes to send when `need() == NeedIn`: a Data-In chunk from the
-    /// caller's `data` region, or the internal CSW buffer.
-    pub fn out_slice<'a>(&'a mut self, data: &'a [u8]) -> &'a [u8] {
-        match self.state {
-            BotState::Csw => &self.csw[..],
-            BotState::DataIn { chunk, .. } => &data[..chunk],
-            BotState::DataInPad { chunk, .. } => &ZERO_CHUNK[..chunk],
-            _ => &[],
-        }
-    }
-
     /// Get Max LUN answer value (`num_luns - 1`, ≤ 15). The LUN count is
-    /// refreshed from the device slice on every command.
+    /// refreshed from the device slice on every command. Pure getter (no state
+    /// change).
     pub fn max_lun(&self) -> u8 {
         self.num_luns.saturating_sub(1)
     }
 
-    /// Bulk-Only Reset / LinkReset: abort any in-flight transaction, return
-    /// to the Command phase, and inject a UNIT ATTENTION for the next
+    /// The action for the current state (the old `need()` + `out_slice()`
+    /// merged). Used to re-emit the pending [`Action`] on [`Event::Tick`] and
+    /// after an out-of-band control event.
+    fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
+        match self.state {
+            BotState::Command { got } => Action::HostRecv {
+                len: CBW_LEN - got,
+                probe: false,
+            },
+            BotState::DataIn { chunk, .. } => Action::HostSend {
+                bytes: &work[..chunk],
+                prefetch: None,
+            },
+            BotState::DataOut { chunk, .. } => Action::HostRecv {
+                len: chunk,
+                probe: false,
+            },
+            // A storage op is in flight. The op itself borrows the platform
+            // buffer / device and cannot be rebuilt here; the shell executes
+            // the pending `Action::Store` immediately and feeds
+            // `Event::StoreDone`, so this is only reachable on a mis-fed
+            // `Tick` / out-of-band event.
+            BotState::DataInStore { .. } | BotState::DataOutStore { .. } => {
+                Action::Error(BotTargetError::Internal)
+            }
+            // An agenda op is in flight: same reasoning as the data-phase
+            // store states (the op cannot be rebuilt from state).
+            BotState::Agenda { .. } => Action::Error(BotTargetError::Internal),
+            BotState::ParamOut { chunk, .. } => Action::HostRecv {
+                len: chunk,
+                probe: false,
+            },
+            BotState::DataOutOverrun { chunk, .. } => Action::HostRecv {
+                len: chunk,
+                probe: true,
+            },
+            BotState::Csw => Action::HostSend {
+                bytes: &self.csw[..],
+                prefetch: None,
+            },
+            BotState::CswZlp { .. } => Action::HostSend {
+                bytes: &[],
+                prefetch: None,
+            },
+            BotState::DataInPad { chunk, .. } => Action::HostSend {
+                bytes: &ZERO_CHUNK[..chunk],
+                prefetch: None,
+            },
+            BotState::DataInStall { .. } => Action::StallIn,
+        }
+    }
+
+    /// Bulk-Only Reset / LinkReset body: abort any in-flight transaction,
+    /// return to the Command phase, and inject a UNIT ATTENTION for the next
     /// TEST UNIT READY (BOT §4.2, §5.2).
     ///
-    /// Per BOT §3.1, a Bulk-Only Reset **preserves** the endpoint STALL
-    /// condition. If the session is currently STALLed (invalid CBW), the
-    /// reset keeps it STALLed until the host sends CLEAR FEATURE(ENDPOINT_HALT);
-    /// see [`clear_feature_halt`](Self::clear_feature_halt).
-    pub fn reset(&mut self) {
+    /// Unlike the pre-Step-1 core there is no persistent `Stalled` state: an
+    /// invalid CBW returns to the Command phase immediately (the host's
+    /// CLEAR_FEATURE is handled by the USB core), so a reset always lands in
+    /// `Command { got: 0 }`.
+    fn reset_state(&mut self) {
         self.cbw = [0u8; CBW_LEN];
         self.invalid_lun_sense = None;
         self.pending_ua = Some(Sense::new(SenseKey::UnitAttention, asc::POWER_ON_RESET, 0));
-        // BOT §3.1: preserve STALL across BotReset. Only leave the STALLed
-        // state via CLEAR FEATURE(ENDPOINT_HALT).
-        if !matches!(self.state, BotState::Stalled) {
-            self.state = BotState::Command { got: 0 };
-        }
+        self.state = BotState::Command { got: 0 };
     }
 
-    /// CLEAR FEATURE(ENDPOINT_HALT): clear a bulk-endpoint STALL condition
-    /// (USB 2.0 §9.4.1) and return to the Command phase.
+    /// Enter the terminal-status agenda: remember the pending CSW payload and
+    /// start draining the device agenda. Every terminal-status transition (CSW,
+    /// GOOD or CHECK CONDITION) funnels through here so the device's
+    /// maintenance/background ops (`next_store_op`) run **after** the data phase
+    /// (including any ZLP / STALL) and **before** the CSW
+    /// (`__ASYNC_SEP_PLAN.md` §1.5 rule 3/4).
     ///
-    /// Per BOT §3.1, the host must send this request after a BotReset that
-    /// preserved a STALL condition to resume normal operation. This is only
-    /// meaningful for transports that can observe the host's CLEAR_FEATURE (a
-    /// platform-level capability); a data-phase STALL left by a
-    /// `ShortfallPolicy::Short` shortfall is released with
-    /// [`stall_applied`](Self::stall_applied) instead.
-    pub fn clear_feature_halt(&mut self) {
-        if matches!(self.state, BotState::Stalled) {
-            self.state = BotState::Command { got: 0 };
-        }
-    }
-
-    /// Release the data-phase STALL entered by a `ShortfallPolicy::Short`
-    /// shortfall. The driver calls this immediately after [`BotIo::stall_in`]
-    /// succeeds: the host's CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB
-    /// core and is **not** observable by the function, so the core does not
-    /// wait for an event — the withheld CSW is queued straight away and reaches
-    /// the host once it clears the halt. No-op outside the `DataInStall` state.
-    pub fn stall_applied(&mut self) {
-        if matches!(self.state, BotState::DataInStall { .. }) {
-            self.state = BotState::Csw;
-        }
-    }
-
-    /// Non-blocking state-machine step: consume one event and return the
-    /// next need. `data` is the pure SCSI data area (≥
-    /// [`crate::MIN_DATA_LEN`] for commands routed to the device); `devs`
-    /// is the LUN slice.
-    pub fn poll<'a, 'e, D: ScsiDevice>(
+    /// `lun` may be out of range (invalid-LUN / REPORT LUNS terminal statuses);
+    /// the drain then skips the device entirely and emits the CSW unchanged.
+    fn enter_agenda<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent<'e>,
-        data: &'a mut [u8],
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
-        match self.state {
-            BotState::Stalled => SessionStep::Done(BotStepResult::Stalled),
-            BotState::Command { got } => self.poll_command(ev, data, devs, got),
-            BotState::DataIn { .. } => self.poll_data_in(ev, data, devs),
-            BotState::DataOut { .. } => self.poll_data_out(ev, data, devs),
-            BotState::ParamOut { .. } => self.poll_param_out(ev, data, devs),
-            BotState::DataOutOverrun { .. } => self.poll_overrun(ev),
-            BotState::Csw => self.poll_csw(ev),
-            BotState::CswZlp { .. } => self.poll_csw_zlp(ev),
-            BotState::DataInPad { .. } => self.poll_data_in_pad(ev),
-            BotState::DataInStall { .. } => self.poll_data_in_stall(ev),
+        tag: u32,
+        residue: u64,
+        status: CswStatus,
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        self.state = BotState::Agenda {
+            tag,
+            residue,
+            status,
+            lun,
+        };
+        self.drain_agenda(devs)
+    }
+
+    /// Yield the next agenda op, or emit the terminal status once the agenda is
+    /// drained. The CSW is written into the internal buffer on emission (the
+    /// same bytes the pre-agenda code produced).
+    fn drain_agenda<'a, D: ScsiDevice>(&'a mut self, devs: &'a mut [D]) -> Action<'a> {
+        let BotState::Agenda {
+            tag,
+            residue,
+            status,
+            lun,
+        } = self.state
+        else {
+            return Action::Error(BotTargetError::Internal);
+        };
+        if lun < devs.len() {
+            if let Some(op) = devs[lun].next_store_op() {
+                // Re-state the pending payload (the op is in flight).
+                self.state = BotState::Agenda {
+                    tag,
+                    residue,
+                    status,
+                    lun,
+                };
+                return Action::Store { lun, op };
+            }
+        }
+        self.store_csw(tag, residue, status);
+        self.state = BotState::Csw;
+        Action::HostSend {
+            bytes: &self.csw[..],
+            prefetch: None,
         }
     }
 
-    /// Blocking convenience wrapper over `need()` + `poll()`: drives one
-    /// transaction to completion using `io`. `recv` is the driver's receive
-    /// scratch (≥ `data.len()`). Out-of-band control is NOT handled here.
-    pub fn step<B: BotIo, D: ScsiDevice>(
-        &mut self,
-        io: &mut B,
-        data: &mut [u8],
-        recv: &mut [u8],
-        devs: &mut [D],
-    ) -> BotStepResult {
-        // `Short` needs the `stall_in` capability that `step()` does not
-        // service. Pre-reject at entry, before any wire effect, so a mid-phase
-        // exit can never leave the wire in a half-phase.
-        if self.shortfall == ShortfallPolicy::Short {
-            return BotStepResult::Unsupported;
-        }
-        if data.len() < crate::MIN_DATA_LEN {
-            return BotStepResult::Error(BotTargetError::WorkBufTooSmall);
-        }
-        loop {
-            match self.need() {
-                SessionNeed::NeedOut { len, .. } => {
-                    if len > recv.len() {
-                        return BotStepResult::Error(BotTargetError::WorkBufTooSmall);
-                    }
-                    match io.recv_out(&mut recv[..len], Some(STEP_RECV_TIMEOUT)) {
-                        Ok(n) => {
-                            if n == 0 {
-                                return BotStepResult::Closed;
-                            }
-                            let step =
-                                self.poll(SessionEvent::OutRecv { data: &recv[..n] }, data, devs);
-                            if let SessionStep::Done(r) = step {
-                                return r;
-                            }
-                        }
-                        Err(crate::usb::BotIoErr::WouldBlock) => {
-                            let step = self.poll(SessionEvent::OutIdle, data, devs);
-                            if let SessionStep::Done(r) = step {
-                                return r;
-                            }
-                        }
-                        Err(_) => return BotStepResult::Closed,
-                    }
-                }
-                SessionNeed::NeedIn { len } => {
-                    let bytes = self.out_slice(&data[..]);
-                    if bytes.len() != len {
-                        return BotStepResult::Error(BotTargetError::Internal);
-                    }
-                    if io.send_in(bytes).is_err() {
-                        return BotStepResult::Closed;
-                    }
-                    let step = self.poll(SessionEvent::InSent, data, devs);
-                    if let SessionStep::Done(r) = step {
-                        return r;
-                    }
-                }
-                SessionNeed::NeedStall => {
-                    // Unreachable: `Short` (the only policy that stalls) was
-                    // pre-rejected above; `Pad`/`ShortNoStall` never stall.
-                    return BotStepResult::Unsupported;
-                }
-                SessionNeed::Done(r) => return r,
+    /// Agenda op completion: map the result through `devs[lun].store_done` (a
+    /// failure sets sense and turns the terminal status `Failed`) and continue
+    /// the drain. `residue`/`tag` semantics are unchanged.
+    fn poll_agenda<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
+        let BotState::Agenda {
+            tag,
+            residue,
+            status,
+            lun,
+        } = self.state
+        else {
+            return Action::Error(BotTargetError::Internal);
+        };
+        match ev {
+            Event::StoreDone { result } => {
+                let status = if lun < devs.len() && store_done_failed(devs, lun, result) {
+                    CswStatus::Failed
+                } else {
+                    status
+                };
+                self.state = BotState::Agenda {
+                    tag,
+                    residue,
+                    status,
+                    lun,
+                };
+                self.drain_agenda(devs)
             }
+            _ => Action::Error(BotTargetError::Internal),
+        }
+    }
+
+    /// Non-blocking state-machine step: consume one event and return the next
+    /// action. `work` is the single time-multiplexed buffer; `devs` is the LUN
+    /// slice.
+    pub fn poll<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        // Out-of-band / no-I/O events first (they do not depend on the phase).
+        match ev {
+            Event::Reset => {
+                self.reset_state();
+                return self.pending(work);
+            }
+            Event::StallApplied => {
+                // The `Short` shortfall's STALL is on the wire; the data phase
+                // is now complete, so drain the device agenda before the CSW.
+                if let BotState::DataInStall {
+                    tag,
+                    declared,
+                    actual,
+                    status,
+                    lun,
+                } = self.state
+                {
+                    return self.enter_agenda(tag, declared - actual, status, lun, devs);
+                }
+                return self.pending(work);
+            }
+            Event::Tick => return self.pending(work),
+            // `StoreDone` is consumed by the Data-In/Data-Out store states
+            // below; any other state treats it as a mis-fed event.
+            Event::StoreDone { .. }
+            | Event::HostRecv { .. }
+            | Event::HostIdle
+            | Event::HostSent => {}
+        }
+        match self.state {
+            BotState::Command { got } => self.poll_command(ev, work, devs, got),
+            BotState::DataIn { .. } => self.poll_data_in(ev, work, devs),
+            BotState::DataInStore { .. } => self.poll_data_in_store(ev, work, devs),
+            BotState::DataOut { .. } => self.poll_data_out(ev, work, devs),
+            BotState::DataOutStore { .. } => self.poll_data_out_store(ev, work, devs),
+            BotState::ParamOut { .. } => self.poll_param_out(ev, work, devs),
+            BotState::DataOutOverrun { .. } => self.poll_overrun(ev, devs),
+            BotState::Agenda { .. } => self.poll_agenda(ev, devs),
+            BotState::Csw => self.poll_csw(ev),
+            BotState::CswZlp { .. } => self.poll_csw_zlp(ev, devs),
+            BotState::DataInPad { .. } => self.poll_data_in_pad(ev, devs),
+            BotState::DataInStall { .. } => self.poll_data_in_stall(ev),
         }
     }
 
     // ── Command phase ──────────────────────────────────────────────
 
-    fn poll_command<'a, 'e, D: ScsiDevice>(
+    fn poll_command<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent<'e>,
-        data: &'a mut [u8],
-        devs: &mut [D],
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
         got: usize,
-    ) -> SessionStep<'a> {
+    ) -> Action<'a> {
         match ev {
-            SessionEvent::InSent => {
-                SessionStep::Done(BotStepResult::Error(BotTargetError::Internal))
-            }
-            SessionEvent::OutIdle => SessionStep::NeedOut {
+            Event::HostSent => Action::Error(BotTargetError::Internal),
+            Event::HostIdle => Action::HostRecv {
                 len: CBW_LEN - got,
                 probe: false,
             },
-            SessionEvent::OutRecv { data: chunk } => {
-                if chunk.len() > CBW_LEN - got {
+            Event::HostRecv { len } => {
+                // The shell guarantees `len <= work.len()`; clamp defensively.
+                let recv = &work[..len.min(work.len())];
+                if recv.len() > CBW_LEN - got {
                     crate::warn!(
                         "bot: CBW packet tail {} bytes discarded (single-packet CBW is 31B)",
-                        chunk.len() - (CBW_LEN - got)
+                        recv.len() - (CBW_LEN - got)
                     );
                 }
-                let add = chunk.len().min(CBW_LEN - got);
-                self.cbw[got..got + add].copy_from_slice(&chunk[..add]);
+                let add = recv.len().min(CBW_LEN - got);
+                self.cbw[got..got + add].copy_from_slice(&recv[..add]);
                 let got = got + add;
                 if got < CBW_LEN {
                     self.state = BotState::Command { got };
-                    return SessionStep::NeedOut {
+                    return Action::HostRecv {
                         len: CBW_LEN - got,
                         probe: false,
                     };
                 }
                 match Cbw::parse(&self.cbw) {
                     None => {
-                        self.state = BotState::Stalled;
-                        SessionStep::Done(BotStepResult::Stalled)
+                        // Invalid CBW (BOT §6.6.1): STALL both endpoints and
+                        // return to the Command phase. The host's
+                        // CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB
+                        // core; the next CBW arriving means the halt is clear.
+                        self.state = BotState::Command { got: 0 };
+                        Action::StallBoth
                     }
-                    Some(cbw) => self.dispatch_cbw(&cbw, data, devs),
+                    Some(cbw) => self.dispatch_cbw(&cbw, work, devs),
                 }
             }
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
@@ -671,9 +744,9 @@ impl BotSession {
     fn dispatch_cbw<'a, D: ScsiDevice>(
         &'a mut self,
         cbw: &Cbw,
-        data: &'a mut [u8],
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         self.num_luns = devs.len().clamp(1, 16) as u8;
         let cdb = cbw.cdb_slice();
         let declared = u64::from(cbw.data_len);
@@ -698,10 +771,17 @@ impl BotSession {
                 if let Some(dev) = devs.get_mut(cbw.lun as usize) {
                     dev.set_sense(Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0));
                 }
-                return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                return self.finish_cmd(
+                    cbw,
+                    0,
+                    CswStatus::Failed,
+                    work.len(),
+                    cbw.lun as usize,
+                    devs,
+                );
             }
-            let n = write_report_luns(data, if select == 0x01 { 0 } else { devs.len() });
-            return self.synthesize_data_in(cbw, data, n as u64);
+            let n = write_report_luns(work, if select == 0x01 { 0 } else { devs.len() });
+            return self.synthesize_data_in(cbw, work, n as u64, devs);
         }
 
         if cbw.lun as usize >= devs.len() {
@@ -716,15 +796,22 @@ impl BotSession {
                     0,
                 ));
                 self.invalid_lun_sense = Some(sense);
-                let n = sense.write_fixed(data);
-                return self.synthesize_data_in(cbw, data, n as u64);
+                let n = sense.write_fixed(work);
+                return self.synthesize_data_in(cbw, work, n as u64, devs);
             }
             self.invalid_lun_sense = Some(Sense::new(
                 SenseKey::IllegalRequest,
                 asc::LOGICAL_UNIT_NOT_SUPPORTED,
                 0,
             ));
-            return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+            return self.finish_cmd(
+                cbw,
+                0,
+                CswStatus::Failed,
+                work.len(),
+                cbw.lun as usize,
+                devs,
+            );
         }
 
         // Valid LUN: unit-attention injection (§5.2). The UA is delivered
@@ -732,58 +819,74 @@ impl BotSession {
         if self.pending_ua.is_some() {
             match cdb.first() {
                 Some(&scsi_op::TEST_UNIT_READY) => {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                    return self.finish_cmd(
+                        cbw,
+                        0,
+                        CswStatus::Failed,
+                        work.len(),
+                        cbw.lun as usize,
+                        devs,
+                    );
                 }
                 Some(&scsi_op::REQUEST_SENSE) => {
                     // Defensive: no UA (driver raced a reset) — report an
                     // empty fixed-sense (NO SENSE) instead of panicking.
                     let sense = self.pending_ua.take().unwrap_or_else(Sense::clear);
-                    let n = sense.write_fixed(data);
-                    return self.synthesize_data_in(cbw, data, n as u64);
+                    let n = sense.write_fixed(work);
+                    return self.synthesize_data_in(cbw, work, n as u64, devs);
                 }
                 _ => {}
             }
         }
 
         let lun = cbw.lun as usize;
-        let outcome = match devs[lun].do_cmd(cdb, data) {
+        let outcome = match devs[lun].do_cmd(cdb, work) {
             Ok(o) => o,
             Err(crate::scsi::device::Error::WorkBufTooSmall) => {
-                return SessionStep::Done(BotStepResult::Error(BotTargetError::WorkBufTooSmall));
+                return Action::Error(BotTargetError::WorkBufTooSmall);
             }
             Err(_) => {
-                return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+                return Action::Error(BotTargetError::Internal);
             }
         };
         match outcome {
-            CommandOutcome::Status => self.finish_cmd(cbw, 0, CswStatus::Passed, data.len()),
+            CommandOutcome::Status => {
+                self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs)
+            }
             CommandOutcome::StatusWithSense => {
-                self.finish_cmd(cbw, 0, CswStatus::Passed, data.len())
+                self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs)
             }
             CommandOutcome::CheckCondition => {
-                self.finish_cmd(cbw, 0, CswStatus::Failed, data.len())
+                self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs)
             }
             CommandOutcome::OutInline { len } => {
                 if declared == 0 {
                     // BOT §6.7.1 Case (2) Hn<Di: Di with Hn => PhaseError.
                     if len > 0 {
-                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                        return self.finish_cmd(
+                            cbw,
+                            0,
+                            CswStatus::PhaseError,
+                            work.len(),
+                            lun,
+                            devs,
+                        );
                     }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
                 if cbw.dir != BotDir::DataIn {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
                 }
                 // `len` is work-buffer-relative (`usize`); widen once at the
                 // BOT boundary (declared ≤ u32::MAX per the CBW spec, so the
                 // min below is exact on every target).
                 let actual = (len as u64).min(declared);
                 if actual == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
-                let mut chunk = (actual as usize).min(data.len());
+                let mut chunk = (actual as usize).min(work.len());
                 if chunk as u64 == actual {
-                    chunk += self.merge_pad_boundary(data, chunk, declared, actual);
+                    chunk += self.merge_pad_boundary(work, chunk, declared, actual);
                 }
                 self.state = BotState::DataIn {
                     expected: declared,
@@ -793,35 +896,68 @@ impl BotSession {
                     lun,
                     chunk,
                 };
-                SessionStep::NeedIn(&data[..chunk])
+                Action::HostSend {
+                    bytes: &work[..chunk],
+                    prefetch: None,
+                }
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
                 if declared == 0 {
                     // BOT §6.7.1 Case (2) Hn<Di.
                     if transfer_len > 0 {
-                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                        return self.finish_cmd(
+                            cbw,
+                            0,
+                            CswStatus::PhaseError,
+                            work.len(),
+                            lun,
+                            devs,
+                        );
                     }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
                 if cbw.dir != BotDir::DataIn {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
                 }
                 let actual = transfer_len.min(declared);
                 if actual == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
-                let mut chunk = (actual as usize).min(data.len());
-                let produced = match devs[lun].xfer_out(0, &mut data[..chunk]) {
-                    Xfer::Inline { len } => len,
-                    Xfer::Store(_) => {
-                        return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+                let mut chunk = (actual as usize).min(work.len());
+                // The device may hand back a `Store` op whose buffer borrows
+                // `work`; because the `Inline` branch below still needs `work`,
+                // split the op into its Copy fields first (see [`StoreDesc`])
+                // and re-attach a fresh borrow only once the call's borrow of
+                // `work` has ended.
+                let probe = match devs[lun].xfer_out(0, &mut work[..chunk]) {
+                    Xfer::Inline { len } => Ok(len),
+                    Xfer::Store(op) => match StoreDesc::of(op) {
+                        Some(desc) => Err(desc),
+                        None => return Action::Error(BotTargetError::Internal),
+                    },
+                };
+                let produced = match probe {
+                    Ok(len) => len,
+                    Err(desc) => {
+                        self.state = BotState::DataInStore {
+                            expected: declared,
+                            transfer_len: actual,
+                            sent: 0,
+                            tag: cbw.tag,
+                            lun,
+                            chunk,
+                        };
+                        return Action::Store {
+                            lun,
+                            op: desc.attach(&mut work[..chunk]),
+                        };
                     }
                 };
                 if produced != chunk {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs);
                 }
                 if chunk as u64 == actual {
-                    chunk += self.merge_pad_boundary(data, chunk, declared, actual);
+                    chunk += self.merge_pad_boundary(work, chunk, declared, actual);
                 }
                 self.state = BotState::DataIn {
                     expected: declared,
@@ -831,22 +967,32 @@ impl BotSession {
                     lun,
                     chunk,
                 };
-                SessionStep::NeedIn(&data[..chunk])
+                Action::HostSend {
+                    bytes: &work[..chunk],
+                    prefetch: None,
+                }
             }
             CommandOutcome::InXfer { len: transfer_len } => {
                 if declared == 0 {
                     // BOT §6.7.1 Case (3) Hn<Do.
                     if transfer_len > 0 {
-                        return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                        return self.finish_cmd(
+                            cbw,
+                            0,
+                            CswStatus::PhaseError,
+                            work.len(),
+                            lun,
+                            devs,
+                        );
                     }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
                 if cbw.dir != BotDir::DataOut {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
                 }
                 let to_write = transfer_len.min(declared);
                 let status = CswStatus::Passed;
-                let chunk = (declared as usize).min(data.len());
+                let chunk = (declared as usize).min(work.len());
                 self.state = BotState::DataOut {
                     declared,
                     to_write,
@@ -857,7 +1003,7 @@ impl BotSession {
                     status,
                     chunk,
                 };
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: chunk,
                     probe: false,
                 }
@@ -865,19 +1011,19 @@ impl BotSession {
             CommandOutcome::InParam { expected_len } => {
                 let expected = expected_len as u64;
                 if expected == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
                 }
                 if cbw.dir != BotDir::DataOut {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
                 }
                 // BOT §6.7.3 Case (13) Ho<Do: Ho < Do => PhaseError.
                 if declared < expected {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
                 }
                 if declared != expected {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, data.len());
+                    return self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs);
                 }
-                let first_chunk = (expected as usize).min(data.len());
+                let first_chunk = (expected as usize).min(work.len());
                 self.state = BotState::ParamOut {
                     expected,
                     received: 0,
@@ -892,7 +1038,7 @@ impl BotSession {
                     cdb_len: cdb.len().min(16),
                     chunk: first_chunk,
                 };
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: first_chunk,
                     probe: false,
                 }
@@ -901,25 +1047,27 @@ impl BotSession {
     }
 
     /// Enter a Data-In phase for a response already synthesized into
-    /// `data[0..available]` (REPORT LUNS, core-injected sense).
-    fn synthesize_data_in<'a>(
+    /// `work[0..available]` (REPORT LUNS, core-injected sense).
+    fn synthesize_data_in<'a, D: ScsiDevice>(
         &'a mut self,
         cbw: &Cbw,
-        data: &'a mut [u8],
+        work: &'a mut [u8],
         available: u64,
-    ) -> SessionStep<'a> {
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let declared = u64::from(cbw.data_len);
+        let lun = cbw.lun as usize;
         if declared == 0 && available > 0 {
             // BOT §6.7.1 Case (2) Hn<Di (synthesized REPORT LUNS/sense).
-            return self.finish_cmd(cbw, 0, CswStatus::PhaseError, data.len());
+            return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
         }
         let actual = available.min(declared);
         if actual == 0 {
-            return self.finish_cmd(cbw, 0, CswStatus::Passed, data.len());
+            return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
         }
-        let mut chunk = (actual as usize).min(data.len());
+        let mut chunk = (actual as usize).min(work.len());
         if chunk as u64 == actual {
-            chunk += self.merge_pad_boundary(data, chunk, declared, actual);
+            chunk += self.merge_pad_boundary(work, chunk, declared, actual);
         }
         self.state = BotState::DataIn {
             expected: declared,
@@ -929,7 +1077,10 @@ impl BotSession {
             lun: usize::from(cbw.lun),
             chunk,
         };
-        SessionStep::NeedIn(&data[..chunk])
+        Action::HostSend {
+            bytes: &work[..chunk],
+            prefetch: None,
+        }
     }
 
     /// Write the CSW for `(tag, residue, status)` into the internal buffer.
@@ -949,61 +1100,69 @@ impl BotSession {
         csw.write(&mut self.csw);
     }
 
-    /// Assemble the CSW into the internal buffer and move to the CSW state.
-    fn finish_csw_bot<'a>(
+    /// Assemble the CSW into the internal buffer and enter the terminal-status
+    /// agenda (which drains `next_store_op` before emitting the CSW).
+    fn finish_csw_bot<'a, D: ScsiDevice>(
         &'a mut self,
         tag: u32,
         residue: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
-        self.store_csw(tag, residue, status);
-        self.state = BotState::Csw;
-        SessionStep::NeedIn(&self.csw[..])
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        self.enter_agenda(tag, residue, status, lun, devs)
     }
 
     /// Plain shortfall ending: the short packet is already on the wire; report
     /// the shortfall via `dCSWDataResidue` and send the CSW (with a ZLP first
     /// when the produced length is an MPS multiple, so a full-MPS last packet
     /// is terminated). No padding, no STALL.
-    fn finish_short_fall<'a>(
+    fn finish_short_fall<'a, D: ScsiDevice>(
         &'a mut self,
         tag: u32,
         declared: u64,
         actual: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         crate::debug!(
             "bot csw tag={} residue={} status={:?}",
             tag,
             declared - actual,
             status
         );
-        self.store_csw(tag, declared - actual, status);
         if actual < declared && actual.is_multiple_of(self.bulk_mps) {
+            self.store_csw(tag, declared - actual, status);
             self.state = BotState::CswZlp {
                 tag,
                 declared,
                 actual,
                 status,
+                lun,
             };
-            SessionStep::NeedIn(&[])
+            Action::HostSend {
+                bytes: &[],
+                prefetch: None,
+            }
         } else {
-            self.state = BotState::Csw;
-            SessionStep::NeedIn(&self.csw[..])
+            self.enter_agenda(tag, declared - actual, status, lun, devs)
         }
     }
 
     /// `ShortfallPolicy::Short` ending: the short packet is on the wire; when it
     /// was a full-MPS last packet, terminate it with a ZLP first. Then the phase
-    /// STALLs Bulk-In (`DataInStall`); the driver sets the halt and calls
-    /// [`BotSession::stall_applied`], which releases the withheld CSW.
+    /// STALLs Bulk-In (`DataInStall`); the shell sets the halt and feeds
+    /// [`Event::StallApplied`], which drains the agenda and releases the
+    /// withheld CSW.
     fn finish_short_stall<'a>(
         &'a mut self,
         tag: u32,
         declared: u64,
         actual: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
+        lun: usize,
+    ) -> Action<'a> {
         crate::debug!(
             "bot csw (stall) tag={} residue={} status={:?}",
             tag,
@@ -1017,20 +1176,25 @@ impl BotSession {
                 declared,
                 actual,
                 status,
+                lun,
             };
-            SessionStep::NeedIn(&[])
+            Action::HostSend {
+                bytes: &[],
+                prefetch: None,
+            }
         } else {
             self.state = BotState::DataInStall {
                 tag,
                 declared,
                 actual,
                 status,
+                lun,
             };
-            SessionStep::NeedStall
+            Action::StallIn
         }
     }
 
-    /// Zero-extend the final relevant Data-In chunk in `data` to the next
+    /// Zero-extend the final relevant Data-In chunk in `work` to the next
     /// bulk-MPS boundary under `ShortfallPolicy::Pad`, so the host never sees a
     /// premature short packet before the fill. Bounded by the fill budget
     /// (`declared − produced`, capped at [`MAX_PAD`]) and the remaining buffer;
@@ -1040,7 +1204,7 @@ impl BotSession {
     /// [`end_shortfall_data_in`]).
     fn merge_pad_boundary(
         &self,
-        data: &mut [u8],
+        work: &mut [u8],
         chunk: usize,
         declared: u64,
         produced: u64,
@@ -1052,10 +1216,10 @@ impl BotSession {
         let mps = self.bulk_mps.max(1);
         let rem = chunk as u64 % mps;
         let boundary = if rem == 0 { 0 } else { mps - rem };
-        let room = data.len().saturating_sub(chunk) as u64;
+        let room = work.len().saturating_sub(chunk) as u64;
         let merge = boundary.min(budget).min(room) as usize;
         if merge > 0 {
-            data[chunk..chunk + merge].fill(0);
+            work[chunk..chunk + merge].fill(0);
         }
         merge
     }
@@ -1065,25 +1229,28 @@ impl BotSession {
     /// the relevant data sent; `wire` is the total already on the wire
     /// (relevant + any boundary-merged fill). Residue is `declared − produced`
     /// (the fill is *not* relevant data).
-    fn end_shortfall_data_in<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn end_shortfall_data_in<'a, D: ScsiDevice>(
         &'a mut self,
         tag: u32,
         declared: u64,
         produced: u64,
         wire: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let mps = self.bulk_mps.max(1);
         // A non-MPS-multiple wire length below `declared` means a short packet
         // already terminated the host's bulk-IN (e.g. a non-MPS-aligned work
         // buffer blocked the boundary merge); appending fill now would corrupt
         // the CSW. End ShortNoStall-style.
         if wire < declared && !wire.is_multiple_of(mps) {
-            return self.finish_short_fall(tag, declared, produced, status);
+            return self.finish_short_fall(tag, declared, produced, status, lun, devs);
         }
         let target = declared.min(produced + MAX_PAD);
         if wire >= target {
-            return self.write_pad_csw(tag, declared, produced, wire, status);
+            return self.write_pad_csw(tag, declared, produced, wire, status, lun, devs);
         }
         let chunk = ((target - wire) as usize).min(ZERO_CHUNK.len());
         self.state = BotState::DataInPad {
@@ -1092,23 +1259,30 @@ impl BotSession {
             produced,
             wire,
             status,
+            lun,
             chunk,
         };
-        SessionStep::NeedIn(&ZERO_CHUNK[..chunk])
+        Action::HostSend {
+            bytes: &ZERO_CHUNK[..chunk],
+            prefetch: None,
+        }
     }
 
     /// Send the CSW after a completed `Pad` fill. A fully-filled phase
     /// (`wire == declared`) sends the CSW directly; a cap-exhausted phase
     /// (`wire < declared`) ends like `ShortNoStall` — with a ZLP first when the
     /// wire length is an MPS multiple, no STALL.
-    fn write_pad_csw<'a>(
+    #[allow(clippy::too_many_arguments)]
+    fn write_pad_csw<'a, D: ScsiDevice>(
         &'a mut self,
         tag: u32,
         declared: u64,
         produced: u64,
         wire: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         crate::debug!(
             "bot csw (pad) tag={} residue={} wire={} status={:?}",
             tag,
@@ -1116,18 +1290,21 @@ impl BotSession {
             wire,
             status
         );
-        self.store_csw(tag, declared - produced, status);
         if wire < declared && wire.is_multiple_of(self.bulk_mps) {
+            self.store_csw(tag, declared - produced, status);
             self.state = BotState::CswZlp {
                 tag,
                 declared,
                 actual: produced,
                 status,
+                lun,
             };
-            SessionStep::NeedIn(&[])
+            Action::HostSend {
+                bytes: &[],
+                prefetch: None,
+            }
         } else {
-            self.state = BotState::Csw;
-            SessionStep::NeedIn(&self.csw[..])
+            self.enter_agenda(tag, declared - produced, status, lun, devs)
         }
     }
 
@@ -1140,44 +1317,50 @@ impl BotSession {
     /// `dCSWDataResidue` and sends a short packet. A produced length that is a
     /// multiple of the bulk MPS is terminated with a ZLP first. Residue is
     /// 32-bit (BOT §5.2); truncation is guarded (declared is 32-bit).
-    fn finish_data_in<'a>(
+    fn finish_data_in<'a, D: ScsiDevice>(
         &'a mut self,
         tag: u32,
         declared: u64,
         actual: u64,
         status: CswStatus,
-    ) -> SessionStep<'a> {
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let actual = actual.min(declared);
         if actual < declared {
             return match self.shortfall {
                 ShortfallPolicy::Pad => {
-                    self.end_shortfall_data_in(tag, declared, actual, actual, status)
+                    self.end_shortfall_data_in(tag, declared, actual, actual, status, lun, devs)
                 }
-                ShortfallPolicy::Short => self.finish_short_stall(tag, declared, actual, status),
+                ShortfallPolicy::Short => {
+                    self.finish_short_stall(tag, declared, actual, status, lun)
+                }
                 ShortfallPolicy::ShortNoStall => {
-                    self.finish_short_fall(tag, declared, actual, status)
+                    self.finish_short_fall(tag, declared, actual, status, lun, devs)
                 }
             };
         }
-        self.finish_short_fall(tag, declared, actual, status)
+        self.finish_short_fall(tag, declared, actual, status, lun, devs)
     }
 
     /// End a transaction, first resolving the data phase the CBW declared
     /// (§6.7). `actual` is the number of Data-In bytes produced. A declared
     /// Data-Out phase is drained instead of left in the bulk-OUT fifo (the
     /// host will send `declared` bytes regardless of the outcome).
-    fn finish_cmd<'a>(
+    fn finish_cmd<'a, D: ScsiDevice>(
         &'a mut self,
         cbw: &Cbw,
         actual: u64,
         status: CswStatus,
-        data_len: usize,
-    ) -> SessionStep<'a> {
+        work_len: usize,
+        lun: usize,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let declared = u64::from(cbw.data_len);
         if declared > 0 && cbw.dir == BotDir::DataOut {
-            return self.start_data_out_drain(cbw, status, data_len);
+            return self.start_data_out_drain(cbw, status, work_len, lun);
         }
-        self.finish_data_in(cbw.tag, declared, actual, status)
+        self.finish_data_in(cbw.tag, declared, actual, status, lun, devs)
     }
 
     /// Enter a Data-Out phase that writes nothing: receive and discard the
@@ -1187,21 +1370,22 @@ impl BotSession {
         &'a mut self,
         cbw: &Cbw,
         status: CswStatus,
-        data_len: usize,
-    ) -> SessionStep<'a> {
+        work_len: usize,
+        lun: usize,
+    ) -> Action<'a> {
         let declared = u64::from(cbw.data_len);
-        let chunk = (declared as usize).min(data_len);
+        let chunk = (declared as usize).min(work_len);
         self.state = BotState::DataOut {
             declared,
             to_write: 0,
             received: 0,
             written: 0,
             tag: cbw.tag,
-            lun: cbw.lun as usize,
+            lun,
             status,
             chunk,
         };
-        SessionStep::NeedOut {
+        Action::HostRecv {
             len: chunk,
             probe: false,
         }
@@ -1209,12 +1393,12 @@ impl BotSession {
 
     // ── Data-In phase ───────────────────────────────────────────────
 
-    fn poll_data_in<'a, 'e, D: ScsiDevice>(
+    fn poll_data_in<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent<'e>,
-        data: &'a mut [u8],
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let BotState::DataIn {
             expected,
@@ -1225,10 +1409,10 @@ impl BotSession {
             chunk,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::InSent => {
+            Event::HostSent => {
                 if sent >= transfer_len {
                     // Relevant data complete. `sent` may exceed `transfer_len`
                     // when `Pad` boundary-merged fill zeros into the final chunk.
@@ -1239,16 +1423,45 @@ impl BotSession {
                             transfer_len,
                             sent,
                             CswStatus::Passed,
+                            lun,
+                            devs,
                         );
                     }
-                    return self.finish_data_in(tag, expected, transfer_len, CswStatus::Passed);
+                    return self.finish_data_in(
+                        tag,
+                        expected,
+                        transfer_len,
+                        CswStatus::Passed,
+                        lun,
+                        devs,
+                    );
                 }
                 let remaining = transfer_len - sent;
-                let mut next = (remaining as usize).min(data.len());
-                let produced = match devs[lun].xfer_out(sent, &mut data[..next]) {
-                    Xfer::Inline { len } => len,
-                    Xfer::Store(_) => {
-                        return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+                let mut next = (remaining as usize).min(work.len());
+                // See the `OutXfer` arm of `dispatch_cbw`: extract the op's
+                // Copy fields before re-borrowing `work` for the `Inline` send.
+                let probe = match devs[lun].xfer_out(sent, &mut work[..next]) {
+                    Xfer::Inline { len } => Ok(len),
+                    Xfer::Store(op) => match StoreDesc::of(op) {
+                        Some(desc) => Err(desc),
+                        None => return Action::Error(BotTargetError::Internal),
+                    },
+                };
+                let produced = match probe {
+                    Ok(len) => len,
+                    Err(desc) => {
+                        self.state = BotState::DataInStore {
+                            expected,
+                            transfer_len,
+                            sent,
+                            tag,
+                            lun,
+                            chunk: next,
+                        };
+                        return Action::Store {
+                            lun,
+                            op: desc.attach(&mut work[..next]),
+                        };
                     }
                 };
                 if produced != next {
@@ -1260,14 +1473,16 @@ impl BotSession {
                             sent,
                             sent,
                             CswStatus::Failed,
+                            lun,
+                            devs,
                         );
                     }
-                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed);
+                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed, lun, devs);
                 }
                 if next as u64 == remaining {
                     // Final relevant chunk: boundary-merge Pad fill in-buffer so
                     // the host never sees a premature short packet.
-                    next += self.merge_pad_boundary(data, next, expected, transfer_len);
+                    next += self.merge_pad_boundary(work, next, expected, transfer_len);
                 }
                 self.state = BotState::DataIn {
                     expected,
@@ -1277,18 +1492,82 @@ impl BotSession {
                     lun,
                     chunk: next,
                 };
-                SessionStep::NeedIn(&data[..next])
+                Action::HostSend {
+                    bytes: &work[..next],
+                    prefetch: None,
+                }
             }
-            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
+            Event::HostRecv { .. } | Event::HostIdle => {
                 // No-op: still need to send the pending chunk.
-                SessionStep::NeedIn(&data[..chunk])
+                Action::HostSend {
+                    bytes: &work[..chunk],
+                    prefetch: None,
+                }
             }
+            _ => Action::Error(BotTargetError::Internal),
+        }
+    }
+
+    /// Finalize a Data-In chunk whose storage op finished (`Xfer::Store`).
+    ///
+    /// On success the chunk is sent exactly like the `Inline` path (including
+    /// the `Pad` boundary merge on the final relevant chunk); on failure the
+    /// data phase is terminated with the same residue/CSW path as the old
+    /// `produced != chunk` shortfall.
+    fn poll_data_in_store<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let st = self.state;
+        let BotState::DataInStore {
+            expected,
+            transfer_len,
+            sent,
+            tag,
+            lun,
+            chunk,
+        } = st
+        else {
+            return Action::Error(BotTargetError::Internal);
+        };
+        match ev {
+            Event::StoreDone { result } => {
+                if store_done_failed(devs, lun, result) {
+                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed, lun, devs);
+                }
+                let remaining = transfer_len - sent;
+                let mut next = chunk;
+                if next as u64 == remaining {
+                    // Final relevant chunk: boundary-merge Pad fill in-buffer
+                    // so the host never sees a premature short packet.
+                    next += self.merge_pad_boundary(work, next, expected, transfer_len);
+                }
+                self.state = BotState::DataIn {
+                    expected,
+                    transfer_len,
+                    sent: sent + next as u64,
+                    tag,
+                    lun,
+                    chunk: next,
+                };
+                Action::HostSend {
+                    bytes: &work[..next],
+                    prefetch: None,
+                }
+            }
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     // ── Data-In pad (ShortfallPolicy::Pad) ──────────────────────────
 
-    fn poll_data_in_pad<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+    fn poll_data_in_pad<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: Event,
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let BotState::DataInPad {
             tag,
@@ -1296,17 +1575,18 @@ impl BotSession {
             produced,
             wire,
             status,
+            lun,
             chunk,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::InSent => {
+            Event::HostSent => {
                 let wire = wire + chunk as u64;
                 let target = declared.min(produced + MAX_PAD);
                 if wire >= target {
-                    return self.write_pad_csw(tag, declared, produced, wire, status);
+                    return self.write_pad_csw(tag, declared, produced, wire, status, lun, devs);
                 }
                 let next = ((target - wire) as usize).min(ZERO_CHUNK.len());
                 self.state = BotState::DataInPad {
@@ -1315,37 +1595,45 @@ impl BotSession {
                     produced,
                     wire,
                     status,
+                    lun,
                     chunk: next,
                 };
-                SessionStep::NeedIn(&ZERO_CHUNK[..next])
+                Action::HostSend {
+                    bytes: &ZERO_CHUNK[..next],
+                    prefetch: None,
+                }
             }
-            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
+            Event::HostRecv { .. } | Event::HostIdle => {
                 // No-op: still need to send the pending fill chunk.
-                SessionStep::NeedIn(&ZERO_CHUNK[..chunk])
+                Action::HostSend {
+                    bytes: &ZERO_CHUNK[..chunk],
+                    prefetch: None,
+                }
             }
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     // ── Data-In stall (ShortfallPolicy::Short) ──────────────────────
 
     /// Transient stall state: the shortfall's short packet (and any ZLP) is on
-    /// the wire and the driver is about to STALL Bulk-In. Bulk events are
-    /// ignored (the endpoint is halted, so none should arrive); `need()` keeps
-    /// asking for the STALL until the driver calls
-    /// [`BotSession::stall_applied`], which releases the CSW. A driver whose
-    /// `BotIo::stall_in` fails calls [`BotSession::reset`].
-    fn poll_data_in_stall<'a>(&'a mut self, _ev: SessionEvent<'_>) -> SessionStep<'a> {
-        SessionStep::NeedStall
+    /// the wire and the shell is about to STALL Bulk-In. Bulk events are
+    /// ignored (the endpoint is halted, so none should arrive); `pending()`
+    /// keeps returning [`Action::StallIn`] until the shell feeds
+    /// [`Event::StallApplied`], which releases the CSW. A shell whose
+    /// `BotIo::stall_in` fails feeds [`Event::Reset`].
+    fn poll_data_in_stall<'a>(&'a mut self, _ev: Event) -> Action<'a> {
+        Action::StallIn
     }
 
     // ── Data-Out phase ──────────────────────────────────────────────
 
-    fn poll_data_out<'a, 'e, D: ScsiDevice>(
+    fn poll_data_out<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent<'e>,
-        data: &'a mut [u8],
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let BotState::DataOut {
             declared,
@@ -1358,21 +1646,42 @@ impl BotSession {
             chunk,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::OutRecv { data: recv } => {
+            Event::HostRecv { len } => {
                 let mut written = written;
                 let mut status = status;
                 if status == CswStatus::Passed && written < to_write {
-                    let w = (recv.len() as u64).min(to_write - written) as usize;
+                    let w = (len as u64).min(to_write - written) as usize;
                     if w > 0 {
-                        let produced = match devs[lun].xfer_in(written, &recv[..w]) {
-                            Xfer::Inline { len } => len,
-                            Xfer::Store(_) => {
-                                return SessionStep::Done(BotStepResult::Error(
-                                    BotTargetError::Internal,
-                                ));
+                        // Detach the op's Copy fields before re-borrowing `devs`
+                        // for the terminal-status agenda (see [`StoreDesc`]).
+                        let probe = match devs[lun].xfer_in(written, &work[..w]) {
+                            Xfer::Inline { len } => Ok(len),
+                            Xfer::Store(op) => match StoreDesc::of(op) {
+                                Some(desc) => Err(desc),
+                                None => return Action::Error(BotTargetError::Internal),
+                            },
+                        };
+                        let produced = match probe {
+                            Ok(len) => len,
+                            Err(desc) => {
+                                self.state = BotState::DataOutStore {
+                                    declared,
+                                    to_write,
+                                    received,
+                                    written,
+                                    tag,
+                                    lun,
+                                    status,
+                                    got: len,
+                                    w,
+                                };
+                                return Action::Store {
+                                    lun,
+                                    op: desc.attach(&mut work[..w]),
+                                };
                             }
                         };
                         if produced == w {
@@ -1382,12 +1691,12 @@ impl BotSession {
                         }
                     }
                 }
-                let received = received + recv.len() as u64;
+                let received = received + len as u64;
                 if received >= declared {
                     let residue = declared - written;
                     if received > declared {
                         // Overshoot already consumed the excess: straight to CSW.
-                        return self.finish_csw_bot(tag, residue, status);
+                        return self.finish_csw_bot(tag, residue, status, lun, devs);
                     }
                     // Exact end of the declared phase: probe for a host
                     // overrun (leftover bytes would corrupt the next CBW).
@@ -1395,14 +1704,15 @@ impl BotSession {
                         tag,
                         residue,
                         status,
-                        chunk: data.len(),
+                        lun,
+                        chunk: work.len(),
                     };
-                    return SessionStep::NeedOut {
-                        len: data.len(),
+                    return Action::HostRecv {
+                        len: work.len(),
                         probe: true,
                     };
                 }
-                let next = ((declared - received) as usize).min(data.len());
+                let next = ((declared - received) as usize).min(work.len());
                 self.state = BotState::DataOut {
                     declared,
                     to_write,
@@ -1413,32 +1723,106 @@ impl BotSession {
                     status,
                     chunk: next,
                 };
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: next,
                     probe: false,
                 }
             }
-            SessionEvent::OutIdle => {
+            Event::HostIdle => {
                 // Host paused mid phase: keep waiting for the chunk.
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: chunk,
                     probe: false,
                 }
             }
-            SessionEvent::InSent => {
-                SessionStep::Done(BotStepResult::Error(BotTargetError::Internal))
+            _ => Action::Error(BotTargetError::Internal),
+        }
+    }
+
+    /// Continue a Data-Out phase after its storage op finished
+    /// (`Xfer::Store`). On success `written` advances by the handed-to-
+    /// `xfer_in` count `w`; on failure `status` becomes `Failed`. The received
+    /// bookkeeping then proceeds exactly like the `Inline` path (overrun probe
+    /// or the next receive).
+    fn poll_data_out_store<'a, D: ScsiDevice>(
+        &'a mut self,
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        let st = self.state;
+        let BotState::DataOutStore {
+            declared,
+            to_write,
+            received,
+            written,
+            tag,
+            lun,
+            status,
+            got,
+            w,
+        } = st
+        else {
+            return Action::Error(BotTargetError::Internal);
+        };
+        match ev {
+            Event::StoreDone { result } => {
+                let mut written = written;
+                let mut status = status;
+                if store_done_failed(devs, lun, result) {
+                    status = CswStatus::Failed;
+                } else {
+                    written += w as u64;
+                }
+                let received = received + got as u64;
+                if received >= declared {
+                    let residue = declared - written;
+                    if received > declared {
+                        // Overshoot already consumed the excess: straight to CSW.
+                        return self.finish_csw_bot(tag, residue, status, lun, devs);
+                    }
+                    // Exact end of the declared phase: probe for a host
+                    // overrun (leftover bytes would corrupt the next CBW).
+                    self.state = BotState::DataOutOverrun {
+                        tag,
+                        residue,
+                        status,
+                        lun,
+                        chunk: work.len(),
+                    };
+                    return Action::HostRecv {
+                        len: work.len(),
+                        probe: true,
+                    };
+                }
+                let next = ((declared - received) as usize).min(work.len());
+                self.state = BotState::DataOut {
+                    declared,
+                    to_write,
+                    received,
+                    written,
+                    tag,
+                    lun,
+                    status,
+                    chunk: next,
+                };
+                Action::HostRecv {
+                    len: next,
+                    probe: false,
+                }
             }
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     // ── Parameter-list Data-Out ─────────────────────────────────────
 
-    fn poll_param_out<'a, 'e, D: ScsiDevice>(
+    fn poll_param_out<'a, D: ScsiDevice>(
         &'a mut self,
-        ev: SessionEvent<'e>,
-        data: &'a mut [u8],
-        devs: &mut [D],
-    ) -> SessionStep<'a> {
+        ev: Event,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
         let st = self.state;
         let BotState::ParamOut {
             expected,
@@ -1450,69 +1834,68 @@ impl BotSession {
             chunk,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::OutRecv { data: recv } => {
+            Event::HostRecv { len: n } => {
                 let remaining = expected - received;
-                if recv.len() as u64 > remaining {
-                    // Host overran declared length: copy what fits, drain rest.
+                let base = work.len() - expected as usize;
+                if n as u64 > remaining {
+                    // Host overran declared length: keep the first `remaining`
+                    // bytes, complete the parameter list, then drain the rest.
                     let fit = remaining as usize;
                     if fit > 0 {
-                        data[received as usize..received as usize + fit]
-                            .copy_from_slice(&recv[..fit]);
+                        let dst = work.len() - received as usize - fit;
+                        work.copy_within(0..fit, dst);
                     }
                     let status = match devs[lun]
-                        .complete_param(&cdb[..cdb_len], &data[..expected as usize])
+                        .complete_param(&cdb[..cdb_len], &work[base..base + expected as usize])
                     {
-                        CommandOutcome::Status => CswStatus::Passed,
-                        CommandOutcome::StatusWithSense => CswStatus::Passed,
-                        CommandOutcome::CheckCondition => CswStatus::Failed,
+                        CommandOutcome::Status | CommandOutcome::StatusWithSense => {
+                            CswStatus::Passed
+                        }
                         _ => CswStatus::Failed,
                     };
-                    // Extra bytes beyond declared are already in recv[fit..]; treat as overrun.
-                    // If extra exactly fills a packet, we still need to probe.
                     self.state = BotState::DataOutOverrun {
                         tag,
                         residue: 0,
                         status,
-                        chunk: data.len(),
+                        lun,
+                        chunk: work.len(),
                     };
-                    // If recv had extra and was short packet (< chunk), we can go straight to CSW.
-                    // For now, enter overrun probe to drain any further excess.
-                    return SessionStep::NeedOut {
-                        len: data.len(),
+                    return Action::HostRecv {
+                        len: work.len(),
                         probe: true,
                     };
                 }
-                // Normal case: copy recv into param buffer.
-                data[received as usize..received as usize + recv.len()].copy_from_slice(recv);
-                let received = received + recv.len() as u64;
+                // Normal case: move the received bytes to the tail so they sit
+                // contiguously after the already-accumulated bytes.
+                let dst = work.len() - received as usize - n;
+                work.copy_within(0..n, dst);
+                let received = received + n as u64;
                 if received >= expected {
-                    let cdb_slice = &cdb[..cdb_len];
-                    let outcome = devs[lun].complete_param(cdb_slice, &data[..expected as usize]);
-                    let status = match outcome {
-                        CommandOutcome::Status => CswStatus::Passed,
-                        CommandOutcome::StatusWithSense => CswStatus::Passed,
-                        CommandOutcome::CheckCondition => CswStatus::Failed,
+                    let status = match devs[lun]
+                        .complete_param(&cdb[..cdb_len], &work[base..base + expected as usize])
+                    {
+                        CommandOutcome::Status | CommandOutcome::StatusWithSense => {
+                            CswStatus::Passed
+                        }
                         _ => CswStatus::Failed,
                     };
-                    if received > expected {
-                        return self.finish_csw_bot(tag, 0, status);
-                    }
-                    // Exact: probe for host overrun before CSW (like DataOut).
+                    // Exact end: probe for host overrun before CSW.
                     self.state = BotState::DataOutOverrun {
                         tag,
                         residue: 0,
                         status,
-                        chunk: data.len(),
+                        lun,
+                        chunk: work.len(),
                     };
-                    return SessionStep::NeedOut {
-                        len: data.len(),
+                    return Action::HostRecv {
+                        len: work.len(),
                         probe: true,
                     };
                 }
-                let next = ((expected - received) as usize).min(data.len() - received as usize);
+                let next = ((expected - received) as usize).min(work.len() - received as usize);
                 self.state = BotState::ParamOut {
                     expected,
                     received,
@@ -1522,103 +1905,190 @@ impl BotSession {
                     cdb_len,
                     chunk: next,
                 };
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: next,
                     probe: false,
                 }
             }
-            SessionEvent::OutIdle => SessionStep::NeedOut {
+            Event::HostIdle => Action::HostRecv {
                 len: chunk,
                 probe: false,
             },
-            SessionEvent::InSent => {
-                SessionStep::Done(BotStepResult::Error(BotTargetError::Internal))
-            }
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     // ── Data-Out overrun drain ──────────────────────────────────────
 
-    fn poll_overrun<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+    fn poll_overrun<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
         let st = self.state;
         let BotState::DataOutOverrun {
             tag,
             residue,
             status,
+            lun,
             chunk,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::OutRecv { data } => {
-                if data.len() < chunk {
+            Event::HostRecv { len } => {
+                if len < chunk {
                     // Short packet: leftover drained → CSW.
-                    return self.finish_csw_bot(tag, residue, status);
+                    return self.finish_csw_bot(tag, residue, status, lun, devs);
                 }
                 // Full chunk: more leftover pending.
                 self.state = BotState::DataOutOverrun {
                     tag,
                     residue,
                     status,
+                    lun,
                     chunk,
                 };
-                SessionStep::NeedOut {
+                Action::HostRecv {
                     len: chunk,
                     probe: true,
                 }
             }
-            SessionEvent::OutIdle => self.finish_csw_bot(tag, residue, status),
-            SessionEvent::InSent => {
-                SessionStep::Done(BotStepResult::Error(BotTargetError::Internal))
-            }
+            Event::HostIdle => self.finish_csw_bot(tag, residue, status, lun, devs),
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     // ── CSW phase ───────────────────────────────────────────────────
 
-    fn poll_csw<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+    fn poll_csw<'a>(&'a mut self, ev: Event) -> Action<'a> {
         match ev {
-            SessionEvent::InSent => {
+            Event::HostSent => {
+                // Normal ending: no "done" boundary — hand back the next
+                // command-phase receive directly.
                 self.state = BotState::Command { got: 0 };
-                SessionStep::Done(BotStepResult::Processed)
+                Action::HostRecv {
+                    len: CBW_LEN,
+                    probe: false,
+                }
             }
-            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => {
-                SessionStep::NeedIn(&self.csw[..])
-            }
+            Event::HostRecv { .. } | Event::HostIdle => Action::HostSend {
+                bytes: &self.csw[..],
+                prefetch: None,
+            },
+            _ => Action::Error(BotTargetError::Internal),
         }
     }
 
     /// The zero-length packet that terminates a short Data-In phase has been
     /// sent; under `ShortfallPolicy::Short` the phase then STALLs (`DataInStall`)
-    /// instead of sending the CSW immediately.
-    fn poll_csw_zlp<'a>(&'a mut self, ev: SessionEvent<'_>) -> SessionStep<'a> {
+    /// instead of sending the CSW immediately. Otherwise the data phase is
+    /// complete and the device agenda is drained before the CSW.
+    fn poll_csw_zlp<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
         let st = self.state;
         let BotState::CswZlp {
             tag,
             declared,
             actual,
             status,
+            lun,
         } = st
         else {
-            return SessionStep::Done(BotStepResult::Error(BotTargetError::Internal));
+            return Action::Error(BotTargetError::Internal);
         };
         match ev {
-            SessionEvent::InSent => {
+            Event::HostSent => {
                 if self.shortfall == ShortfallPolicy::Short && actual < declared {
                     self.state = BotState::DataInStall {
                         tag,
                         declared,
                         actual,
                         status,
+                        lun,
                     };
-                    SessionStep::NeedStall
+                    Action::StallIn
                 } else {
-                    self.state = BotState::Csw;
-                    SessionStep::NeedIn(&self.csw[..])
+                    self.enter_agenda(tag, declared - actual, status, lun, devs)
                 }
             }
-            SessionEvent::OutRecv { .. } | SessionEvent::OutIdle => SessionStep::NeedIn(&[]),
+            Event::HostRecv { .. } | Event::HostIdle => Action::HostSend {
+                bytes: &[],
+                prefetch: None,
+            },
+            _ => Action::Error(BotTargetError::Internal),
+        }
+    }
+}
+
+/// A byte-addressed [`StoreOp`] with its buffer detached, used to survive the
+/// borrow of `work` that `xfer_out` takes while the session still needs `work`
+/// on the `Inline` branch.
+///
+/// By contract the op returned by the device carries exactly the slice the
+/// session passed (`&mut work[..chunk]`), so it can be split into its Copy
+/// fields and the buffer and then rebuilt identically once the call's borrow
+/// has ended. This is the classic NLL "conditional borrow" workaround:
+/// returning the op directly would force the call's mutable borrow of `work`
+/// to live for the whole function, so the `Inline` branch could not re-borrow
+/// `work`. The reconstructed op is byte-identical, so the Store stays
+/// invisible on the wire.
+///
+/// Only the byte-addressed variants appear here: the data phase is
+/// byte-addressed (`BlockDevice::xfer_out`/`xfer_in`), while path-addressed FS
+/// ops are produced by the device agenda (`next_store_op`), never by the data
+/// phase. A path-addressed op in the data phase is a contract violation and is
+/// reported as [`BotTargetError::Internal`] (it also cannot be detached here —
+/// its `path` borrows the device for the same lifetime as the buffer).
+#[derive(Clone, Copy)]
+enum StoreDesc {
+    Read { off: u64 },
+    Write { off: u64 },
+    Fill { off: u64, len: u64, byte: u8 },
+    Sync,
+}
+
+impl StoreDesc {
+    /// Split a byte-addressed `op` into its Copy fields, dropping the buffer
+    /// borrow. `None` for a path-addressed (FS) op (see the type docs).
+    fn of(op: StoreOp<'_>) -> Option<Self> {
+        match op {
+            StoreOp::Read { off, .. } => Some(Self::Read { off }),
+            StoreOp::Write { off, .. } => Some(Self::Write { off }),
+            StoreOp::Fill { off, len, byte } => Some(Self::Fill { off, len, byte }),
+            StoreOp::Sync => Some(Self::Sync),
+            StoreOp::FileRead { .. } | StoreOp::FileWrite { .. } | StoreOp::FileRemove { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Re-attach `buf` — the same slice the device received — to rebuild the op.
+    fn attach<'b>(self, buf: &'b mut [u8]) -> StoreOp<'b> {
+        match self {
+            Self::Read { off } => StoreOp::Read { off, buf },
+            Self::Write { off } => StoreOp::Write { off, buf },
+            Self::Fill { off, len, byte } => StoreOp::Fill { off, len, byte },
+            Self::Sync => StoreOp::Sync,
+        }
+    }
+}
+
+/// Feed a finished storage op to `devs[lun].store_done` and report whether the
+/// data phase must fail.
+///
+/// [`ScsiDevice::store_done`]'s default maps a [`StorageError`] to sense (so a
+/// left sense means failure); a recovering override leaves no sense and the
+/// phase continues. [`XferOutcome::Error`] means the device declined to take
+/// over the mapping, so the session applies it via
+/// [`sense_for_storage_error`].
+fn store_done_failed<D: ScsiDevice>(
+    devs: &mut [D],
+    lun: usize,
+    result: Result<(), StorageError>,
+) -> bool {
+    match devs[lun].store_done(result) {
+        XferOutcome::Ok => result.is_err() && devs[lun].peek_sense().is_some(),
+        XferOutcome::Error(e) => {
+            let (key, asc, ascq) = sense_for_storage_error(e);
+            devs[lun].set_sense(Sense::new(key, asc, ascq));
+            true
         }
     }
 }
@@ -1651,15 +2121,89 @@ fn write_report_luns(data: &mut [u8], num_luns: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scsi::backend::{BlockBackend, RamBackend};
+    use crate::scsi::backend::RamBackend;
     use crate::scsi::block::BlockDevice;
-    use crate::usb::{BotIoErr, CBW_SIGNATURE};
+    use crate::scsi::device::{DeviceType, Error};
+    use crate::usb::{BotIo, BotIoErr, CBW_SIGNATURE};
     use core::cell::RefCell;
+    use core::time::Duration;
     use std::collections::VecDeque;
 
+    /// A 64 KiB block device over test-owned RAM.
+    ///
+    /// The built-in [`BlockDevice`] hands the platform a [`StoreOp`] and holds
+    /// no plane, so a plane-less device cannot read/write its own RAM. These
+    /// session tests exercise the **wire** (chunk lengths, CSW residue, ZLP,
+    /// shortfall policy), which is independent of whether the device yields
+    /// `Inline` or `Store`; the `Store` path itself is covered end-to-end by
+    /// the `snowscsi-tests` golden fixtures through `usb::serve`. So the test
+    /// LUN executes the built-in block op **inline** against its RAM and
+    /// reports `Inline`, keeping every session-level assertion unchanged.
+    struct TestLun<'r> {
+        inner: BlockDevice,
+        ram: &'r mut [u8],
+    }
+
+    impl ScsiDevice for TestLun<'_> {
+        fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
+            self.inner.do_cmd(cdb, data)
+        }
+
+        fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
+            match self.inner.xfer_out(transfer_offset, buf) {
+                Xfer::Store(StoreOp::Read { off, buf: b }) => {
+                    let off = off as usize;
+                    b.copy_from_slice(&self.ram[off..off + b.len()]);
+                    Xfer::Inline { len: b.len() }
+                }
+                other => other,
+            }
+        }
+
+        fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
+            match self.inner.xfer_in(transfer_offset, buf) {
+                Xfer::Store(StoreOp::Write { off, buf: b }) => {
+                    let off = off as usize;
+                    self.ram[off..off + b.len()].copy_from_slice(b);
+                    Xfer::Inline { len: b.len() }
+                }
+                other => other,
+            }
+        }
+
+        fn peek_sense(&self) -> Option<&Sense> {
+            self.inner.peek_sense()
+        }
+
+        fn take_sense(&mut self) -> Option<Sense> {
+            self.inner.take_sense()
+        }
+
+        fn device_type(&self) -> DeviceType {
+            self.inner.device_type()
+        }
+
+        fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
+            self.inner.complete_param(cdb, data)
+        }
+
+        fn sync(&mut self) -> Result<(), StorageError> {
+            self.inner.sync()
+        }
+
+        fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
+            self.inner.inject_unit_attention(asc, ascq);
+        }
+
+        fn set_sense(&mut self, sense: Sense) {
+            ScsiDevice::set_sense(&mut self.inner, sense);
+        }
+    }
+
     /// A 64 KiB block device over stack-owned RAM.
-    fn test_dev(ram: &mut [u8]) -> BlockDevice<BlockBackend<'_>> {
-        BlockDevice::disk(BlockBackend::Ram(RamBackend::new(ram)), 512).unwrap()
+    fn test_dev(ram: &mut [u8]) -> TestLun<'_> {
+        let inner = BlockDevice::disk(&mut RamBackend::new(ram), 512).unwrap();
+        TestLun { inner, ram }
     }
 
     fn work() -> [u8; crate::MIN_DATA_LEN] {
@@ -1679,9 +2223,62 @@ mod tests {
         raw
     }
 
-    /// Read the pending CSW from the session's internal buffer.
-    fn read_csw(s: &mut BotSession, data: &mut [u8]) -> (u32, u32, u8) {
-        let csw = s.out_slice(&data[..]);
+    /// Feed host bytes into `work` and poll a `HostRecv` of that length.
+    fn recv<'a, D: ScsiDevice>(
+        s: &'a mut BotSession,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+        bytes: &[u8],
+    ) -> Action<'a> {
+        work[..bytes.len()].copy_from_slice(bytes);
+        s.poll(Event::HostRecv { len: bytes.len() }, work, devs)
+    }
+
+    /// Poll a `HostSent` (the pending bulk-IN packet has been sent).
+    fn sent<'a, D: ScsiDevice>(
+        s: &'a mut BotSession,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        s.poll(Event::HostSent, work, devs)
+    }
+
+    /// Poll a `HostIdle` (the shell's receive found nothing).
+    fn idle<'a, D: ScsiDevice>(
+        s: &'a mut BotSession,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        s.poll(Event::HostIdle, work, devs)
+    }
+
+    /// Poll an `Event::Reset` (BotReset / LinkReset).
+    fn reset<'a, D: ScsiDevice>(
+        s: &'a mut BotSession,
+        work: &'a mut [u8],
+        devs: &'a mut [D],
+    ) -> Action<'a> {
+        s.poll(Event::Reset, work, devs)
+    }
+
+    /// Assert the action is a receive of `len` bytes with the given `probe`.
+    fn expect_recv(action: Action<'_>, len: usize, probe: bool) {
+        match action {
+            Action::HostRecv { len: l, probe: p } => {
+                assert_eq!(l, len, "HostRecv len");
+                assert_eq!(p, probe, "HostRecv probe");
+            }
+            other => panic!("expected HostRecv {{ len: {len}, probe: {probe} }}, got {other:?}"),
+        }
+    }
+
+    /// Read the pending CSW from the session's internal buffer (via the
+    /// private `pending()` re-emit).
+    fn read_csw(s: &mut BotSession, work: &mut [u8]) -> (u32, u32, u8) {
+        let csw = match s.pending(work) {
+            Action::HostSend { bytes, .. } => bytes,
+            other => panic!("expected a pending HostSend, got {other:?}"),
+        };
         assert_eq!(csw.len(), CSW_LEN);
         assert_eq!(&csw[0..4], b"USBS");
         (
@@ -1698,7 +2295,7 @@ mod tests {
         cdb
     }
 
-    fn read_via_xfer(dev: &mut BlockDevice<BlockBackend<'_>>, lba: u64, buf: &mut [u8]) {
+    fn read_via_xfer(dev: &mut TestLun<'_>, lba: u64, buf: &mut [u8]) {
         let mut work = [0u8; crate::MIN_DATA_LEN];
         let blocks = (buf.len() as u64).div_ceil(512) as u32;
         let nblocks = blocks.max(1) as u16; // at least 1 for small reads like 64B tail
@@ -1723,14 +2320,15 @@ mod tests {
 
     #[test]
     fn need_starts_in_command_phase() {
-        let s = BotSession::new();
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 31,
-                probe: false
+        let mut s = BotSession::new();
+        let mut work = work();
+        match s.pending(&mut work) {
+            Action::HostRecv { len, probe } => {
+                assert_eq!(len, 31);
+                assert!(!probe);
             }
-        );
+            other => panic!("expected HostRecv, got {other:?}"),
+        }
         assert_eq!(s.max_lun(), 0);
     }
 
@@ -1768,37 +2366,18 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         let raw = raw_cbw(1, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &raw[..20] },
-            &mut data,
-            &mut devs,
-        );
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 11,
-                probe: false
-            }
-        );
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 11,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw[..20]);
+        expect_recv(step, 11, false);
+        // The pending action re-emitted on Tick matches.
+        expect_recv(s.poll(Event::Tick, &mut work, &mut devs), 11, false);
 
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &raw[20..] },
-            &mut data,
-            &mut devs,
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw[20..]);
         match step {
-            SessionStep::NeedIn(_) => {}
-            other => panic!("expected NeedIn, got {other:?}"),
+            Action::HostSend { .. } => {}
+            other => panic!("expected HostSend, got {other:?}"),
         }
     }
 
@@ -1807,41 +2386,35 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         let raw = raw_cbw(0xAAAA_AAAA, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
         match step {
-            SessionStep::NeedIn(bytes) => {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 96);
                 assert_eq!(bytes[0] & 0x1F, 0x00); // PDT = direct-access block
             }
-            other => panic!("expected NeedIn with INQUIRY data, got {other:?}"),
+            other => panic!("expected HostSend with INQUIRY data, got {other:?}"),
         }
-        assert_eq!(s.need(), SessionNeed::NeedIn { len: 96 });
+        match s.poll(Event::Tick, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
+            other => panic!("expected re-emitted INQUIRY data, got {other:?}"),
+        }
 
         // Data sent → CSW pending (tag echo, Passed; residue 0: host
         // declared 96 and the INQUIRY response is 96 bytes).
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 0xAAAA_AAAA);
         assert_eq!(residue, 0);
         assert_eq!(status, 0x00);
 
-        // CSW sent → back to Command.
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        assert_eq!(step, SessionStep::Done(BotStepResult::Processed));
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 31,
-                probe: false
-            }
-        );
+        // CSW sent → back to Command (next CBW receive).
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -1852,14 +2425,13 @@ mod tests {
         }
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) LBA 0, 20 blocks → 10240 bytes (> one 8K chunk).
         let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 20, 0];
         let raw = raw_cbw(0x1111, 10240, 0x80, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 8192);
                 assert_eq!(bytes[0], 0);
                 assert_eq!(bytes[8191], (8191 % 251) as u8);
@@ -1867,27 +2439,22 @@ mod tests {
             other => panic!("expected first chunk, got {other:?}"),
         }
 
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 2048);
                 assert_eq!(bytes[0], (8192 % 251) as u8);
             }
             other => panic!("expected second chunk, got {other:?}"),
         }
 
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 0);
         assert_eq!(status, 0x00);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -1895,60 +2462,34 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // WRITE(10) LBA 0, 1 block → 512 bytes.
         let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x2222, 512, 0x00, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
+        expect_recv(step, 512, false);
+        expect_recv(s.poll(Event::Tick, &mut work, &mut devs), 512, false);
 
         // Feed the data chunk → declared phase complete → overrun probe.
         let payload: Vec<u8> = (0..512u16).map(|i| (i % 7) as u8).collect();
-        let wlen = data.len();
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &payload },
-            &mut data,
-            &mut devs,
-        );
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: wlen,
-                probe: true
-            }
-        );
+        let wlen = work.len();
+        let step = recv(&mut s, &mut work, &mut devs, &payload);
+        expect_recv(step, wlen, true);
         let mut check = [0u8; 512];
         read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
 
         // No more data → OutIdle ends the drain → CSW.
-        let step = s.poll(SessionEvent::OutIdle, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match idle(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 0x2222);
         assert_eq!(residue, 0);
         assert_eq!(status, 0x00);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -1956,39 +2497,22 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x3333, 512, 0x00, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
+        expect_recv(step, 512, false);
 
         let payload: Vec<u8> = vec![0x5A; 512];
-        let wlen = data.len();
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &payload },
-            &mut data,
-            &mut devs,
-        );
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: wlen,
-                probe: true
-            }
-        );
+        let wlen = work.len();
+        let step = recv(&mut s, &mut work, &mut devs, &payload);
+        expect_recv(step, wlen, true);
 
         // Host over-sent 100 extra bytes: drain (short packet) → CSW.
         let extra = vec![0x6B; 100];
-        let step = s.poll(SessionEvent::OutRecv { data: &extra }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match recv(&mut s, &mut work, &mut devs, &extra) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW after drain, got {other:?}"),
         }
         // The excess was discarded, not written to the backend.
@@ -1999,7 +2523,7 @@ mod tests {
         read_via_xfer(&mut devs[0], 1, &mut tail);
         assert!(tail.iter().all(|&b| b == 0));
 
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 0);
         assert_eq!(status, 0x00);
     }
@@ -2009,36 +2533,24 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) declared with Data-Out direction → the host will send
         // the declared bytes, so they are drained, then a Phase Error CSW.
         let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x4444, 512, 0x00, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
+        expect_recv(step, 512, false);
         let payload = vec![0u8; 512];
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &payload },
-            &mut data,
-            &mut devs,
-        );
-        match step {
-            SessionStep::NeedOut { probe: true, .. } => {}
+        match recv(&mut s, &mut work, &mut devs, &payload) {
+            Action::HostRecv { probe: true, .. } => {}
             other => panic!("expected overrun probe, got {other:?}"),
         }
-        let step = s.poll(SessionEvent::OutIdle, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match idle(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 512);
         assert_eq!(status, 0x02); // Phase Error
     }
@@ -2048,35 +2560,31 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
         // declared a 512-byte Data-In phase. The zero-byte phase must be
         // closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)).
         let cdb = [0x28, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x20, 512, 0x80, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
-                assert!(bytes.is_empty());
-                assert_eq!(s.need(), SessionNeed::NeedIn { len: 0 });
-            }
-            other => panic!("expected empty ZLP need, got {other:?}"),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected empty ZLP, got {other:?}"),
+        }
+        match s.poll(Event::Tick, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected pending ZLP, got {other:?}"),
         }
         // ZLP sent → CSW pending (Failed, residue = declared = 512).
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 0x20);
         assert_eq!(residue, 512);
         assert_eq!(status, 0x01); // Failed
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -2084,7 +2592,7 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) count 1 → 512 data bytes, while CBW declared 1024. The
         // shortfall is not padded: the phase ends with a short packet. 512 is
@@ -2092,31 +2600,25 @@ mod tests {
         // before the CSW (BOT §6.7 Case (4)/(5)).
         let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x21, 1024, 0x80, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
             other => panic!("expected 512-byte chunk, got {other:?}"),
         }
         // 512 bytes sent: 512 % MPS == 0 → an empty ZLP first.
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => assert!(bytes.is_empty(), "expected ZLP"),
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert!(bytes.is_empty(), "expected ZLP"),
             other => panic!("expected ZLP, got {other:?}"),
         }
         // Then the CSW.
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 0x21);
         assert_eq!(residue, 1024 - 512);
         assert_eq!(status, 0x00); // Passed
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -2124,39 +2626,27 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // WRITE(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
         // declared a 512-byte Data-Out phase the host will still send. The
         // bytes must be drained so they cannot corrupt the next CBW.
         let cdb = [0x2A, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0x22, 512, 0x00, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
+        expect_recv(step, 512, false);
 
         // The host's data-out arrives and is discarded (nothing written).
         let payload = vec![0xAA; 512];
-        let step = s.poll(
-            SessionEvent::OutRecv { data: &payload },
-            &mut data,
-            &mut devs,
-        );
-        match step {
-            SessionStep::NeedOut { probe: true, .. } => {}
+        match recv(&mut s, &mut work, &mut devs, &payload) {
+            Action::HostRecv { probe: true, .. } => {}
             other => panic!("expected overrun probe, got {other:?}"),
         }
-        let step = s.poll(SessionEvent::OutIdle, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match idle(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 0x22);
         assert_eq!(residue, 512); // nothing written
         assert_eq!(status, 0x01); // Failed
@@ -2167,44 +2657,29 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cbw_frozen_until_reset() {
+    fn invalid_cbw_stalls_and_recovers() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
+        // An invalid CBW STALLs both endpoints and returns to the Command
+        // phase (no persistent Stalled state; a new CBW clears the halt).
         let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
         bad[0] = b'X'; // bad signature
-        let step = s.poll(SessionEvent::OutRecv { data: &bad }, &mut data, &mut devs);
-        assert_eq!(step, SessionStep::Done(BotStepResult::Stalled));
-        assert_eq!(s.need(), SessionNeed::Done(BotStepResult::Stalled));
-
-        // Frozen: any further bulk event is ignored.
-        let step = s.poll(SessionEvent::OutRecv { data: &bad }, &mut data, &mut devs);
-        assert_eq!(step, SessionStep::Done(BotStepResult::Stalled));
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        assert_eq!(step, SessionStep::Done(BotStepResult::Stalled));
-
-        // BOT §3.1: BotReset preserves the STALL condition. The session stays
-        // STALLed until CLEAR FEATURE(ENDPOINT_HALT) is received.
-        s.reset();
-        assert_eq!(s.need(), SessionNeed::Done(BotStepResult::Stalled));
-
-        // CLEAR FEATURE(ENDPOINT_HALT) unfreezes; a valid CBW is then processed.
-        s.clear_feature_halt();
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 31,
-                probe: false
-            }
-        );
+        match recv(&mut s, &mut work, &mut devs, &bad) {
+            Action::StallBoth => {}
+            other => panic!("expected StallBoth, got {other:?}"),
+        }
+        // Back in Command: the next valid CBW is processed.
         let raw = raw_cbw(2, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
             other => panic!("expected INQUIRY data, got {other:?}"),
         }
+
+        // A reset also returns to the Command phase.
+        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -2212,45 +2687,25 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(5, 512, 0x00, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 512,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &raw);
+        expect_recv(step, 512, false);
 
         // Partial data received.
         let part = vec![0xAA; 128];
-        let step = s.poll(SessionEvent::OutRecv { data: &part }, &mut data, &mut devs);
-        assert_eq!(
-            step,
-            SessionStep::NeedOut {
-                len: 384,
-                probe: false
-            }
-        );
+        let step = recv(&mut s, &mut work, &mut devs, &part);
+        expect_recv(step, 384, false);
 
         // Reset aborts the transaction and returns to Command.
-        s.reset();
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: 31,
-                probe: false
-            }
-        );
+        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // A new valid CBW is processed.
         let raw = raw_cbw(6, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
             other => panic!("expected INQUIRY data, got {other:?}"),
         }
     }
@@ -2260,32 +2715,27 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // TEST UNIT READY to LUN 3 (only LUN 0 exists) → Failed CSW.
         let raw = raw_cbw(7, 0, 0, 3, &[0x00, 0, 0, 0, 0, 0]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 7);
         assert_eq!(residue, 0);
         assert_eq!(status, 0x01); // Failed
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // REQUEST SENSE to the invalid LUN → LOGICAL UNIT NOT SUPPORTED.
         let mut rs = [0u8; 6];
         rs[0] = scsi_op::REQUEST_SENSE;
         rs[4] = 18;
         let raw = raw_cbw(8, 18, 0x80, 3, &rs);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 18);
                 assert_eq!(bytes[0], 0x70); // fixed format
                 assert_eq!(bytes[2], 0x05); // ILLEGAL REQUEST
@@ -2293,12 +2743,11 @@ mod tests {
             }
             other => panic!("expected sense data, got {other:?}"),
         }
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, status) = read_csw(&mut s, &mut data);
+        let (_, _, status) = read_csw(&mut s, &mut work);
         assert_eq!(status, 0x00); // Passed
     }
 
@@ -2307,56 +2756,46 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
-        s.reset();
+        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // First TEST UNIT READY → CHECK CONDITION (UA), Failed CSW.
         let raw = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, status) = read_csw(&mut s, &mut data);
+        let (_, _, status) = read_csw(&mut s, &mut work);
         assert_eq!(status, 0x01); // Failed
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // REQUEST SENSE → the UA (0x29/00) is reported and cleared.
         let mut rs = [0u8; 6];
         rs[0] = scsi_op::REQUEST_SENSE;
         rs[4] = 18;
         let raw = raw_cbw(2, 18, 0x80, 0, &rs);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes[2], 0x06); // UNIT ATTENTION
                 assert_eq!(bytes[12], 0x29);
                 assert_eq!(bytes[13], 0x00);
             }
             other => panic!("expected UA sense, got {other:?}"),
         }
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {} // CSW pending
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // Subsequent TEST UNIT READY → GOOD (Passed CSW).
         let raw = raw_cbw(3, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, status) = read_csw(&mut s, &mut data);
+        let (_, _, status) = read_csw(&mut s, &mut work);
         assert_eq!(status, 0x00); // Passed
     }
 
@@ -2365,77 +2804,62 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // 01h → empty inventory (no well-known logical units implemented).
         let raw = raw_cbw(21, 16, 0x80, 0, &[0xA0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        let p1 = match step {
-            SessionStep::NeedIn(bytes) => bytes.to_vec(),
+        let p1 = match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => bytes.to_vec(),
             other => panic!("expected REPORT LUNS data, got {other:?}"),
         };
         assert_eq!(u32::from_be_bytes([p1[0], p1[1], p1[2], p1[3]]), 0);
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, st1) = read_csw(&mut s, &mut data);
+        let (_, _, st1) = read_csw(&mut s, &mut work);
         assert_eq!(st1, 0x00);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // 02h → full inventory (same as 00h for peripheral-only arrays).
         let raw = raw_cbw(22, 16, 0x80, 0, &[0xA0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        let p2 = match step {
-            SessionStep::NeedIn(bytes) => bytes.to_vec(),
+        let p2 = match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => bytes.to_vec(),
             other => panic!("expected REPORT LUNS data, got {other:?}"),
         };
         assert_eq!(u32::from_be_bytes([p2[0], p2[1], p2[2], p2[3]]), 8);
         assert_eq!(p2[8], 0x00); // address method 00b
         assert_eq!(p2[9], 0x00); // LUN 0
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, st2) = read_csw(&mut s, &mut data);
+        let (_, _, st2) = read_csw(&mut s, &mut work);
         assert_eq!(st2, 0x00);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // 03h (reserved) → Failed CSW; 05/24 sense stored on the device.
         // actual=0 < declared=16 → ZLP, then CSW (BOT §6.7.2 short packet).
         let raw = raw_cbw(23, 16, 0x80, 0, &[0xA0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 0), // ZLP
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 0), // ZLP
             other => panic!("expected ZLP, got {other:?}"),
         }
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, _, st3) = read_csw(&mut s, &mut data);
+        let (_, _, st3) = read_csw(&mut s, &mut work);
         assert_eq!(st3, 0x01); // Failed
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
 
         // REQUEST SENSE → INVALID FIELD IN CDB (0x24).
         let mut rs = [0u8; 6];
         rs[0] = scsi_op::REQUEST_SENSE;
         rs[4] = 18;
         let raw = raw_cbw(24, 18, 0x80, 0, &rs);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
-                assert_eq!(bytes[12], 0x24);
-            }
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes[12], 0x24),
             other => panic!("expected sense data, got {other:?}"),
         }
     }
@@ -2445,14 +2869,13 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
+        let mut work = work();
 
         // REPORT LUNS, allocation 16, addressed to LUN 0.
         let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16];
         let raw = raw_cbw(9, 16, 0x80, 0, &cdb);
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => {
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 16);
                 assert_eq!(
                     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -2470,26 +2893,24 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut data = work();
+        let mut work = work();
 
         // INQUIRY data is 96 bytes, but the host declared 192.
         let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
-        let step = s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
             other => panic!("expected short INQUIRY packet, got {other:?}"),
         }
-        let step = s.poll(SessionEvent::InSent, &mut data, &mut devs);
-        match step {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 192 - 96); // short packet + residue, no STALL
         assert_eq!(status, 0x00);
     }
 
-    /// Scripted bulk driver for the blocking `step` wrapper.
+    /// Scripted bulk driver for the local `drive_once` helper.
     struct ScriptIo {
         out: VecDeque<u8>,
         sent: RefCell<Vec<u8>>,
@@ -2537,18 +2958,76 @@ mod tests {
         }
     }
 
+    /// Drive one transaction to completion over a scripted `BotIo` (the
+    /// removed blocking `step` wrapper's replacement). Returns once the CSW
+    /// has been sent and the core is back in the Command phase.
+    fn drive_once<D: ScsiDevice>(
+        s: &mut BotSession,
+        io: &mut ScriptIo,
+        work: &mut [u8],
+        devs: &mut [D],
+    ) {
+        let mut csw_sent = false;
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            assert!(guard < 4096, "drive_once stuck");
+            match s.poll(Event::Tick, work, devs) {
+                Action::HostRecv { len, probe } => {
+                    if csw_sent && len == CBW_LEN {
+                        return;
+                    }
+                    match io.try_recv_out(&mut work[..len]) {
+                        Ok(n) => {
+                            if n == 0 {
+                                return;
+                            }
+                            let _ = s.poll(Event::HostRecv { len: n }, work, devs);
+                        }
+                        Err(BotIoErr::WouldBlock) => {
+                            if probe {
+                                let _ = s.poll(Event::HostIdle, work, devs);
+                            } else {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Action::HostSend { bytes, .. } => {
+                    let is_csw = bytes.len() == CSW_LEN && bytes.starts_with(b"USBS");
+                    io.send_in(bytes).expect("bulk send");
+                    let _ = s.poll(Event::HostSent, work, devs);
+                    if is_csw {
+                        csw_sent = true;
+                    }
+                }
+                Action::StallBoth => {
+                    let _ = io.stall_both();
+                }
+                Action::StallIn => {
+                    io.stall_in().expect("stall_in");
+                    let _ = s.poll(Event::StallApplied, work, devs);
+                }
+                Action::Error(e) => panic!("drive_once core error: {e:?}"),
+                // `TestLun` executes the built-in block op inline, so the
+                // session never yields a `Store` here (the `Store` path is
+                // covered end-to-end by the `snowscsi-tests` golden fixtures).
+                Action::Store { .. } => panic!("Store unreachable with the inline test LUN"),
+            }
+        }
+    }
+
     #[test]
-    fn step_drives_inquiry_to_completion() {
+    fn drive_inquiry_to_completion() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
-        let mut recv = work();
+        let mut work = work();
 
         let raw = raw_cbw(0xCAFE, 96, 0x80, 0, &inquiry_cdb(96));
         let mut io = ScriptIo::new(&raw);
-        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
-        assert_eq!(r, BotStepResult::Processed);
+        drive_once(&mut s, &mut io, &mut work, &mut devs);
 
         // Sent: 96-byte INQUIRY response then the 13-byte CSW.
         let sent = io.sent.borrow();
@@ -2571,12 +3050,11 @@ mod tests {
     }
 
     #[test]
-    fn step_drives_write_with_data_phase() {
+    fn drive_write_with_data_phase() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new();
-        let mut data = work();
-        let mut recv = work();
+        let mut work = work();
 
         let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         let raw = raw_cbw(0xBEEF, 512, 0x00, 0, &cdb);
@@ -2587,8 +3065,7 @@ mod tests {
         stream.extend_from_slice(&payload);
 
         let mut io = ScriptIo::new(&stream);
-        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
-        assert_eq!(r, BotStepResult::Processed);
+        drive_once(&mut s, &mut io, &mut work, &mut devs);
         let mut check = [0u8; 512];
         read_via_xfer(&mut devs[0], 0, &mut check);
         assert_eq!(&check[..], payload.as_slice());
@@ -2626,35 +3103,32 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) 1 block = 512 bytes; host declared 1024.
         let raw = raw_cbw(1, 1024, 0x80, 0, &read10(1));
-        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
             other => panic!("expected 512 relevant bytes, got {other:?}"),
         }
         // Fill zeros up to `declared`.
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => {
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 512);
                 assert!(bytes.iter().all(|&b| b == 0), "fill must be zeros");
             }
             other => panic!("expected 512 fill bytes, got {other:?}"),
         }
         // Then the CSW; residue is the *relevant* shortfall, not 0.
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 1);
         assert_eq!(residue, 1024 - 512);
         assert_eq!(status, 0x00);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::Done(BotStepResult::Processed)
-        );
+        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
     }
 
     #[test]
@@ -2662,24 +3136,24 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut data = work();
+        let mut work = work();
 
         // READ(10) 2 blocks = 1024 bytes (2 MPS); host declared 2048.
         let raw = raw_cbw(2, 2048, 0x80, 0, &read10(2));
-        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 1024),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 1024),
             other => panic!("expected 1024 relevant bytes, got {other:?}"),
         }
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 1024),
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 1024),
             other => panic!("expected 1024 fill bytes, got {other:?}"),
         }
         // Fully filled to declared → CSW directly (no ZLP/stray trailer).
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, residue, status) = read_csw(&mut s, &mut data); // asserts CSW length
+        let (_, residue, status) = read_csw(&mut s, &mut work); // asserts CSW length
         assert_eq!(residue, 2048 - 1024);
         assert_eq!(status, 0x00);
     }
@@ -2692,22 +3166,22 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut data = work();
+        let mut work = work();
 
         let raw = raw_cbw(3, 192, 0x80, 0, &inquiry_cdb(95));
-        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => {
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => {
                 assert_eq!(bytes.len(), 192, "one transfer reaching declared");
                 assert_eq!(bytes[0] & 0x1F, 0x00); // INQUIRY payload
                 assert!(bytes[95..].iter().all(|&b| b == 0), "tail is fill");
             }
             other => panic!("expected a single 192-byte transfer, got {other:?}"),
         }
-        match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-            SessionStep::NeedIn(_) => {}
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
             other => panic!("expected CSW, got {other:?}"),
         }
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 192 - 95);
         assert_eq!(status, 0x00);
     }
@@ -2717,15 +3191,13 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut data = vec![0u8; 64 * 1024];
-        let mut recv = work();
+        let mut work = vec![0u8; 64 * 1024];
 
         // READ(10) 1 block (512 produced); declared far past produced + MAX_PAD.
         let declared = 512 + MAX_PAD as u32 + 512;
         let raw = raw_cbw(4, declared, 0x80, 0, &read10(1));
         let mut io = ScriptIo::new(&raw);
-        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
-        assert_eq!(r, BotStepResult::Processed);
+        drive_once(&mut s, &mut io, &mut work, &mut devs);
 
         // 512 relevant + exactly MAX_PAD fill + ZLP (wire is MPS-multiple) + CSW.
         let wire = 512 + MAX_PAD as usize;
@@ -2741,17 +3213,15 @@ mod tests {
     }
 
     #[test]
-    fn step_drives_pad_to_declared() {
+    fn drive_pad_to_declared() {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut data = work();
-        let mut recv = work();
+        let mut work = work();
 
         let raw = raw_cbw(5, 1024, 0x80, 0, &read10(1));
         let mut io = ScriptIo::new(&raw);
-        let r = s.step(&mut io, &mut data, &mut recv, &mut devs);
-        assert_eq!(r, BotStepResult::Processed);
+        drive_once(&mut s, &mut io, &mut work, &mut devs);
         // 512 relevant + 512 fill + CSW.
         assert_eq!(io.sent.borrow().len(), 512 + 512 + CSW_LEN);
     }
@@ -2761,39 +3231,47 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut data = work();
+        let mut work = work();
 
         // READ 1 block (512, an MPS multiple) vs declared 1024.
         let raw = raw_cbw(6, 1024, 0x80, 0, &read10(1));
-        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 512),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
             other => panic!("expected 512 relevant bytes, got {other:?}"),
         }
         // 512 % MPS == 0 → a ZLP first.
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::NeedIn(&[])
-        );
-        assert_eq!(s.need(), SessionNeed::NeedIn { len: 0 });
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected ZLP, got {other:?}"),
+        }
+        match s.poll(Event::Tick, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected pending ZLP, got {other:?}"),
+        }
         // Then the STALL.
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::NeedStall
-        );
-        assert_eq!(s.need(), SessionNeed::NeedStall);
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::StallIn => {}
+            other => panic!("expected StallIn, got {other:?}"),
+        }
+        match s.poll(Event::Tick, &mut work, &mut devs) {
+            Action::StallIn => {}
+            other => panic!("expected pending StallIn, got {other:?}"),
+        }
         // Bulk events are ignored while stalled.
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::NeedStall
-        );
-        assert_eq!(
-            s.poll(SessionEvent::OutRecv { data: &[] }, &mut data, &mut devs),
-            SessionStep::NeedStall
-        );
-        // The driver releases the stall (no CLEAR_FEATURE event to wait for).
-        s.stall_applied();
-        assert_eq!(s.need(), SessionNeed::NeedIn { len: CSW_LEN });
-        let (tag, residue, status) = read_csw(&mut s, &mut data);
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::StallIn => {}
+            other => panic!("expected StallIn, got {other:?}"),
+        }
+        match recv(&mut s, &mut work, &mut devs, &[]) {
+            Action::StallIn => {}
+            other => panic!("expected StallIn, got {other:?}"),
+        }
+        // The shell releases the stall (no CLEAR_FEATURE event to wait for).
+        match s.poll(Event::StallApplied, &mut work, &mut devs) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
+            other => panic!("expected CSW, got {other:?}"),
+        }
+        let (tag, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(tag, 6);
         assert_eq!(residue, 1024 - 512);
         assert_eq!(status, 0x00);
@@ -2804,21 +3282,21 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut data = work();
+        let mut work = work();
 
         let raw = raw_cbw(7, 192, 0x80, 0, &inquiry_cdb(95));
-        match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-            SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 95),
+        match recv(&mut s, &mut work, &mut devs, &raw) {
+            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 95),
             other => panic!("expected 95 relevant bytes, got {other:?}"),
         }
         // 95 % MPS != 0: the short packet already terminated the read → STALL
         // directly, no ZLP.
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::NeedStall
-        );
-        s.stall_applied();
-        let (_, residue, status) = read_csw(&mut s, &mut data);
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::StallIn => {}
+            other => panic!("expected StallIn, got {other:?}"),
+        }
+        let _ = s.poll(Event::StallApplied, &mut work, &mut devs);
+        let (_, residue, status) = read_csw(&mut s, &mut work);
         assert_eq!(residue, 192 - 95);
         assert_eq!(status, 0x00);
     }
@@ -2828,57 +3306,22 @@ mod tests {
         let mut ram = vec![0u8; 64 * 1024];
         let mut devs = [test_dev(&mut ram)];
         let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut data = work();
+        let mut work = work();
 
         let raw = raw_cbw(8, 192, 0x80, 0, &inquiry_cdb(95));
-        s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs);
-        assert_eq!(
-            s.poll(SessionEvent::InSent, &mut data, &mut devs),
-            SessionStep::NeedStall
-        );
+        let _ = recv(&mut s, &mut work, &mut devs, &raw);
+        match sent(&mut s, &mut work, &mut devs) {
+            Action::StallIn => {}
+            other => panic!("expected StallIn, got {other:?}"),
+        }
 
         // Bot Reset aborts the transaction; the CSW is dropped.
-        s.reset();
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: CBW_LEN,
-                probe: false
-            }
-        );
+        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
         // A later (stale) release is a no-op: no CSW is emitted.
-        s.stall_applied();
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: CBW_LEN,
-                probe: false
-            }
-        );
-    }
-
-    #[test]
-    fn step_rejects_short_before_any_wire_effect() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut data = work();
-        let mut recv = work();
-
-        // Even an exact-length command (no shortfall) is rejected at entry.
-        let raw = raw_cbw(9, 96, 0x80, 0, &inquiry_cdb(96));
-        let mut io = ScriptIo::new(&raw);
-        assert_eq!(
-            s.step(&mut io, &mut data, &mut recv, &mut devs),
-            BotStepResult::Unsupported
-        );
-        assert!(io.sent.borrow().is_empty(), "no wire effect");
-        assert_eq!(
-            s.need(),
-            SessionNeed::NeedOut {
-                len: CBW_LEN,
-                probe: false
-            }
+        expect_recv(
+            s.poll(Event::StallApplied, &mut work, &mut devs),
+            CBW_LEN,
+            false,
         );
     }
 
@@ -2892,25 +3335,22 @@ mod tests {
             let mut ram = vec![0u8; 64 * 1024];
             let mut devs = [test_dev(&mut ram)];
             let mut s = BotSession::new().with_shortfall(policy);
-            let mut data = work();
+            let mut work = work();
 
             // INQUIRY alloc 96, declared 96: no shortfall.
             let raw = raw_cbw(10, 96, 0x80, 0, &inquiry_cdb(96));
-            match s.poll(SessionEvent::OutRecv { data: &raw }, &mut data, &mut devs) {
-                SessionStep::NeedIn(bytes) => assert_eq!(bytes.len(), 96),
+            match recv(&mut s, &mut work, &mut devs, &raw) {
+                Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
                 other => panic!("[{policy:?}] expected 96 bytes, got {other:?}"),
             }
-            match s.poll(SessionEvent::InSent, &mut data, &mut devs) {
-                SessionStep::NeedIn(_) => {}
+            match sent(&mut s, &mut work, &mut devs) {
+                Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
                 other => panic!("[{policy:?}] expected CSW, got {other:?}"),
             }
-            let (_, residue, status) = read_csw(&mut s, &mut data);
+            let (_, residue, status) = read_csw(&mut s, &mut work);
             assert_eq!(residue, 0, "[{policy:?}] exact transfer has no residue");
             assert_eq!(status, 0x00);
-            assert_eq!(
-                s.poll(SessionEvent::InSent, &mut data, &mut devs),
-                SessionStep::Done(BotStepResult::Processed)
-            );
+            expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
         }
     }
 }

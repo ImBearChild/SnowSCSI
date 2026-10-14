@@ -15,7 +15,7 @@
 use crate::cdrom::common::{CurrentProfile, MediaState};
 #[cfg(feature = "dvdram")]
 use crate::cdrom::dvdram::DvdRamMedia;
-use crate::common::seekable_storage::{FlatData, FlatRef, RwRef};
+use crate::common::seekable_storage::FlatData;
 use crate::scsi::backend::StorageError;
 
 // ── Geometry constants ─────────────────────────────────
@@ -230,44 +230,44 @@ pub enum MediaEventStatus {
 
 /// The media slot inside a [`CdromDrive`](super::drive::CdromDrive).
 ///
-/// `None` means the tray is empty.  Each variant wraps a
-/// concrete media type that provides geometry and a data plane.
+/// `None` means the tray is empty.  Each variant wraps a concrete media
+/// type that provides **cached geometry**; data-phase I/O is handed to the
+/// shell as a [`StoreOp`](crate::common::store::StoreOp).
 ///
-/// Variants are added incrementally:
-/// - * `DvdRam(…)` (migrated from standalone `DvdRamDevice`)
-/// - * `Flat(…)` and `Live(…)`
-/// - * `Bundle(…)`
+/// - `Ro(…)` — read-only disc over any [`FlatData`] source.
+/// - `Rw(…)` (feature `dvdram`) — random-writable DVD-RAM over any writable
+///   plane.
 #[derive(Debug)]
-pub enum CdMedia<'a> {
+pub enum CdMedia {
     /// Read-only disc: flat ISO/RAM image or live-generated ISO9660 —
     /// anything that speaks [`FlatData`]. Geometry derives from the
     /// plane capacity at construction time.
-    Ro(FlatMedia<FlatRef<'a>>),
+    Ro(FlatMedia),
 
     /// Random-writable DVD-RAM/RW: a UDF 2.01 volume over an erased
     /// writable plane (`dvdram` feature).
     #[cfg(feature = "dvdram")]
-    Rw(DvdRamMedia<RwRef<'a>>),
+    Rw(DvdRamMedia),
 }
 
 /// Physical tray state: at most one disc, either loaded or parked by a
 /// SCSI-initiated eject (`START STOP loej=1`). A parked disc is logically
-/// NOT PRESENT but its borrow is held until
+/// NOT PRESENT but its slot is held until
 /// [`CdromDrive::take_media`](crate::cdrom::drive::CdromDrive::take_media)
 /// returns it to the application.
 #[derive(Debug)]
-pub enum Tray<'a> {
+pub enum Tray {
     /// No disc.
     Empty,
     /// Disc loaded and addressable.
-    Loaded(CdMedia<'a>),
+    Loaded(CdMedia),
     /// Disc ejected by the host; awaiting reclaim via `take_media()`.
-    Parked(CdMedia<'a>),
+    Parked(CdMedia),
 }
 
-impl<'a> Tray<'a> {
+impl Tray {
     /// Take the disc out of any occupied state.
-    pub(crate) fn disc(self) -> Option<CdMedia<'a>> {
+    pub(crate) fn disc(self) -> Option<CdMedia> {
         match self {
             Tray::Empty => None,
             Tray::Loaded(m) | Tray::Parked(m) => Some(m),
@@ -275,15 +275,25 @@ impl<'a> Tray<'a> {
     }
 }
 
-impl<'a> CdMedia<'a> {
+impl CdMedia {
     /// Build a read-only disc over any [`FlatData`] source (ISO image,
-    /// RAM bytes, live-generated ISO9660, user planes).
-    pub fn ro<D: FlatData>(data: &'a mut D) -> Self {
-        Self::Ro(FlatMedia::new(FlatRef::new(data)))
+    /// RAM bytes, live-generated ISO9660, user planes). The plane is
+    /// borrowed once to read its capacity and immediately released.
+    pub fn ro(plane: &mut dyn FlatData) -> Self {
+        Self::Ro(FlatMedia::new(plane))
     }
 }
 
-impl<'a> CdMedia<'a> {
+impl CdMedia {
+    /// Whether the loaded medium accepts SBC random writes (`Rw` = true).
+    pub fn is_writable(&self) -> bool {
+        match self {
+            Self::Ro(_) => false,
+            #[cfg(feature = "dvdram")]
+            Self::Rw(_) => true,
+        }
+    }
+
     /// Describe the currently inserted medium without exposing drive
     /// capabilities.
     pub fn state(&self) -> MediaState {
@@ -351,50 +361,12 @@ impl<'a> CdMedia<'a> {
         }
     }
 
-    /// Media capacity in bytes.
+    /// Media capacity in bytes (cached at construction).
     pub fn capacity(&self) -> u64 {
         match self {
-            Self::Ro(m) => FlatData::capacity(&m.data),
+            Self::Ro(m) => m.capacity(),
             #[cfg(feature = "dvdram")]
             Self::Rw(m) => m.capacity(),
-        }
-    }
-
-    // ── Data plane ─────────────────────────────────────
-
-    /// Read data from the medium (target data path).
-    pub fn read_data(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-        match self {
-            Self::Ro(m) => m.read_data(offset, buf),
-            #[cfg(feature = "dvdram")]
-            Self::Rw(m) => m.read_data(offset, buf),
-        }
-    }
-
-    /// Write data to the medium (target data path).
-    pub fn write_data(&mut self, offset: u64, buf: &[u8]) -> Result<(), MediaError> {
-        match self {
-            Self::Ro(_) => Err(MediaError::WriteProtected),
-            #[cfg(feature = "dvdram")]
-            Self::Rw(m) => m.write_data(offset, buf).map_err(MediaError::from),
-        }
-    }
-
-    /// Flush the medium (SYNCHRONIZE CACHE).
-    pub fn sync(&mut self) -> Result<(), MediaError> {
-        match self {
-            Self::Ro(_) => Ok(()),
-            #[cfg(feature = "dvdram")]
-            Self::Rw(m) => m.sync().map_err(MediaError::from),
-        }
-    }
-
-    /// Reinitialize a writable medium using its native format.
-    pub fn format_unit(&mut self) -> Result<(), MediaError> {
-        match self {
-            Self::Ro(_) => Err(MediaError::WriteProtected),
-            #[cfg(feature = "dvdram")]
-            Self::Rw(m) => m.format_unit().map_err(MediaError::from),
         }
     }
 
@@ -457,20 +429,27 @@ pub struct DvdPhysicalFormat {
 
 /// Flat (read-only) media: single track, single session, finalized.
 ///
-/// Generic over any [`FlatData`] backend.  The geometry is derived
-/// from the backend capacity at construction time.
+/// **Non-generic and backend-free**: the plane is borrowed once at
+/// construction to read its capacity, then released. Only the derived
+/// geometry (`capacity_sectors`/`tracks`/`sessions`) is retained; the drive
+/// addresses the LUN's store plane for data-phase I/O.
 #[derive(Debug)]
-pub struct FlatMedia<D: FlatData> {
-    data: D,
+pub struct FlatMedia {
     capacity_sectors: u32,
     tracks: [Track; 1],
     sessions: [SessionInfo; 1],
 }
 
-impl<D: FlatData> FlatMedia<D> {
-    /// Create a flat media over `data`; geometry derives from its capacity.
-    pub fn new(data: D) -> Self {
-        let cap = data.capacity();
+impl FlatMedia {
+    /// Create a flat media over `plane`; geometry derives from its capacity.
+    /// The plane is borrowed only for the capacity read and released.
+    pub fn new(plane: &mut dyn FlatData) -> Self {
+        Self::from_capacity(plane.capacity())
+    }
+
+    /// Build the fixed single-track / single-session geometry from a byte
+    /// capacity.
+    fn from_capacity(cap: u64) -> Self {
         let capacity_sectors = (cap / u64::from(SECTOR_SIZE)).min(u32::MAX as u64) as u32;
         let tracks = [Track {
             num: 1,
@@ -494,7 +473,6 @@ impl<D: FlatData> FlatMedia<D> {
             closed: true,
         }];
         Self {
-            data,
             capacity_sectors,
             tracks,
             sessions,
@@ -502,7 +480,12 @@ impl<D: FlatData> FlatMedia<D> {
     }
 
     pub fn profile(&self) -> CurrentProfile {
-        CurrentProfile::from_capacity(self.data.capacity())
+        CurrentProfile::from_capacity(self.capacity())
+    }
+
+    /// Capacity in bytes (sector-aligned, from the cached geometry).
+    pub fn capacity(&self) -> u64 {
+        u64::from(self.capacity_sectors) * u64::from(SECTOR_SIZE)
     }
 
     pub fn max_lba(&self) -> u64 {
@@ -519,19 +502,6 @@ impl<D: FlatData> FlatMedia<D> {
 
     pub fn sessions(&self) -> &[SessionInfo] {
         &self.sessions
-    }
-
-    /// Access the inner data plane.
-    pub fn data(&mut self) -> &mut D {
-        &mut self.data
-    }
-
-    pub fn read_data(&mut self, byte_offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-        self.data.read_at(byte_offset, buf)
-    }
-
-    pub fn write_data(&mut self, _offset: u64, _buf: &[u8]) -> Result<(), MediaError> {
-        Err(MediaError::WriteProtected)
     }
 }
 

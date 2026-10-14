@@ -6,10 +6,12 @@
 mod tests {
     use crate::mock_conn::MockConn;
     use snowscsi::common::seekable_storage::RamBackend;
+    use snowscsi::common::store::{StoreOp, StorePlane};
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowscsi::iscsi::target::{IscsiSession, LoginStage, StepResult};
     use snowscsi::scsi::block::BlockDevice;
     use snowscsi::scsi::device::{ScsiDevice, Xfer};
+    use snowscsi::scsi::Luns;
     use snowscsi::MIN_DATA_LEN;
 
     /// iSCSI target scratch buffer: BHS header + data area.
@@ -111,11 +113,15 @@ mod tests {
         session: &mut IscsiSession,
         work: &mut [u8],
         devs: &mut [D],
+        planes: &mut [Option<StorePlane<'_>>],
     ) -> (Vec<u8>, Vec<u8>) {
         let text = REQ_TEXT.as_bytes();
         let bhs = login_bhs(text.len() as u32);
         conn.feed_padded(&bhs, text);
-        assert_eq!(session.step(conn, work, devs), StepResult::Processed);
+        assert_eq!(
+            session.step(conn, work, devs, planes),
+            StepResult::Processed
+        );
         conn.take_pdu().expect("login response")
     }
 
@@ -127,9 +133,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        let (bhs, _data) = login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
         assert_eq!(bhs[1] & 0x80, 0x80); // T=1
@@ -164,9 +172,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
         for k in [
             "TargetName",
             "InitiatorName",
@@ -185,9 +195,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
         assert_eq!(
             resp_value(&data, "TargetAlias"),
             Some(b"SnowSCSI".as_slice())
@@ -204,9 +216,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        let (_bhs, data) = login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
         assert_eq!(resp_value(&data, "InitialR2T"), Some(b"Yes".as_slice()));
         assert_eq!(
             resp_value(&data, "MaxBurstLength"),
@@ -254,8 +268,10 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
 
         // Stage 1: CSG=0 (Security), T=1, NSG=3 → target forces NSG=1.
         let mut bhs = [0u8; 48];
@@ -263,7 +279,7 @@ mod tests {
         bhs[1] = flag::T_BIT | ((stage::SECURITY & 0x03) << flag::CSG_SHIFT) | stage::FULL_FEATURE;
         conn.feed(&bhs, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp1, _) = conn.take_pdu().unwrap();
@@ -279,7 +295,7 @@ mod tests {
         bhs[15] = 0x01; // TSIH from stage 1 response
         conn.feed(&bhs, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp2, _) = conn.take_pdu().unwrap();
@@ -291,7 +307,7 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x9999, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
@@ -307,24 +323,28 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
-        // Pre-fill the device with a known pattern (LBA 0..18).
+        // Pre-fill the device with a known pattern (LBA 0..18) via the plane.
         let pattern: Vec<u8> = (0..9216u32).map(|i| (i & 0xFF) as u8).collect();
-        {
-            use embedded_io::{Seek, Write};
-            let b = devs[0].backend();
-            b.seek(embedded_io::SeekFrom::Start(0)).unwrap();
-            b.write_all(&pattern).unwrap();
-        }
+        planes[0]
+            .as_mut()
+            .unwrap()
+            .do_op(StoreOp::Write {
+                off: 0,
+                buf: &pattern,
+            })
+            .unwrap();
 
         // READ 18 blocks (9216 bytes) — crosses 2+ Data-In PDUs.
         let cmd = read10_bhs(0, 18, 0x12345678, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let mut count = 0;
@@ -359,9 +379,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // WRITE 3 blocks at LBA 10 with only 512 bytes of immediate data.
         let itt = 0x7777_0001;
@@ -375,7 +397,7 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 512, 1024);
         conn.feed_padded(&dout, &out);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
 
@@ -397,14 +419,16 @@ mod tests {
         assert_eq!(&resp[28..32], &be32(1)); // ExpCmdSN = cmd_sn+1
         assert_eq!(&resp[32..36], &be32(1)); // MaxCmdSN
 
-        // Verify backend content.
+        // Verify backend content through the plane.
         let mut buf = [0u8; 1536];
-        {
-            use embedded_io::{Read, Seek};
-            let b = devs[0].backend();
-            b.seek(embedded_io::SeekFrom::Start(10 * 512)).unwrap();
-            b.read_exact(&mut buf).unwrap();
-        }
+        planes[0]
+            .as_mut()
+            .unwrap()
+            .do_op(StoreOp::Read {
+                off: 10 * 512,
+                buf: &mut buf,
+            })
+            .unwrap();
         let mut expect = imm.clone();
         expect.extend_from_slice(&out);
         assert_eq!(&buf, expect.as_slice());
@@ -418,9 +442,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // 600 blocks = 307200 bytes > MaxBurstLength (262144).
         let itt = 0xAAAA_0001;
@@ -447,7 +473,7 @@ mod tests {
         conn.feed_padded(&dout, &vec![0x7Cu8; 4096]);
 
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
 
@@ -476,9 +502,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut nop = [0u8; 48];
         nop[0] = op::NOP_OUT;
@@ -486,7 +514,7 @@ mod tests {
         nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
         conn.feed(&nop, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
 
@@ -505,9 +533,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut cmd = read10_bhs(0, 1, 0x1111, 0);
         cmd[9] = 5; // LUN out of range (only LUN 0 exists)
@@ -516,7 +546,7 @@ mod tests {
         // error, not a session-level protocol failure → the connection
         // stays open (Processed), and the response carries the sense.
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
 
@@ -538,9 +568,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // SAM-2 multi-level (logical unit) addressing: byte 8 address
         // method bits 6-3 = 0100b. Byte 9 alone is meaningless for this
@@ -550,7 +582,7 @@ mod tests {
         cmd[9] = 0; // would decode to LUN 0 (in range) if mis-read
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Closed
         );
 
@@ -569,15 +601,17 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // CmdSN=5 while the next expected is 0 → silent ignore, no PDU.
         let cmd = read10_bhs(0, 1, 0x2222, 5);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Idle
         );
         assert!(conn.take_pdu().is_none());
@@ -586,7 +620,7 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x3333, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -601,8 +635,10 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
 
         // Login carrying a non-zero CmdSN, as a real initiator would.
         let text = REQ_TEXT.as_bytes();
@@ -610,7 +646,7 @@ mod tests {
         bhs[24..28].copy_from_slice(&be32(0x73dd_e21f));
         conn.feed_padded(&bhs, text);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
@@ -621,7 +657,7 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x9999, 0x73dd_e21f);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -631,7 +667,7 @@ mod tests {
         let cmd = read10_bhs(0, 1, 0x999A, 0x73dd_e220);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
     }
@@ -644,9 +680,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut tmfr = [0u8; 48];
         tmfr[0] = op::SCSI_TASK_REQ | 0x40; // I bit
@@ -656,7 +694,7 @@ mod tests {
         tmfr[24..28].copy_from_slice(&be32(9)); // out of window, but I=1
         conn.feed(&tmfr, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
 
@@ -674,9 +712,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut tmfr = [0u8; 48];
         tmfr[0] = op::SCSI_TASK_REQ; // I=0
@@ -685,7 +725,7 @@ mod tests {
         tmfr[24..28].copy_from_slice(&be32(7)); // out of window, I=0 → ignore
         conn.feed(&tmfr, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Idle
         );
         assert!(conn.take_pdu().is_none());
@@ -699,16 +739,18 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut lo = [0u8; 48];
         lo[0] = op::LOGOUT_REQ;
         lo[16..20].copy_from_slice(&be32(0xCAFE));
         conn.feed(&lo, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Closed
         );
 
@@ -725,9 +767,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut txt = [0u8; 48];
         txt[0] = op::TEXT_REQ;
@@ -735,7 +779,7 @@ mod tests {
         txt[24..28].copy_from_slice(&be32(1)); // CmdSN (Text uses the window)
         conn.feed(&txt, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Closed
         );
 
@@ -750,8 +794,10 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
         // Login with Discovery
         let text = b"InitiatorName=iqn.test\0SessionType=Discovery\0TargetName=iqn.1970-01.local.snowscsi:target\0";
         let bhs = {
@@ -767,7 +813,7 @@ mod tests {
         };
         conn.feed_padded(&bhs, text);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         conn.take_pdu().unwrap();
@@ -785,7 +831,7 @@ mod tests {
         txt[24..28].copy_from_slice(&be32(1));
         conn.feed_padded(&txt, payload);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -805,16 +851,18 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut pdu = read10_bhs(0, 1, 0x7777, 0);
         pdu[4] = 1; // TotalAHSLength = 1 (4 bytes of AHS)
         conn.feed(&pdu, &[]);
         conn.feed_bytes(&[0u8; 4]); // the AHS bytes
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Closed
         );
 
@@ -835,9 +883,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // F(0x80) | W(0x20) | ATTR_SIMPLE(0x01) = 0xA1 — write10_bhs default.
         let itt = 0xA100_0001;
@@ -845,7 +895,7 @@ mod tests {
         let cmd = write10_bhs(0, 1, itt, 0, 512);
         conn.feed_padded(&cmd, &imm);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
@@ -858,7 +908,7 @@ mod tests {
         cmd[1] = 0xA0;
         conn.feed_padded(&cmd, &imm);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (resp, _) = conn.take_pdu().unwrap();
@@ -876,8 +926,11 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        let mut luns = Luns::new(&mut devs, &mut planes);
 
         let text = REQ_TEXT.as_bytes();
         conn.feed_padded(&login_bhs(text.len() as u32), text);
@@ -886,7 +939,7 @@ mod tests {
         lo[16..20].copy_from_slice(&be32(1));
         conn.feed(&lo, &[]);
 
-        assert!(serve_conn(&mut conn, &mut work, &mut session, &mut devs).is_ok());
+        assert!(serve_conn(&mut conn, &mut work, &mut session, &mut luns).is_ok());
 
         let (bhs, _) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
@@ -925,13 +978,15 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs(0, 0xA1, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -966,13 +1021,15 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs_select(0, 0xA2, 0, 0x01), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -987,13 +1044,15 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs_select(0, 0xA3, 0, 0x02), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1008,13 +1067,15 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs_select(0, 0xA4, 0, 0x03), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1052,18 +1113,26 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::disk(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = BlockDevice::disk(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = BlockDevice::disk(RamBackend::new(&mut r2), 512).unwrap();
-        let mut devs = [d0, d1, d2];
+        let mut b0 = RamBackend::new(&mut r0);
+        let mut b1 = RamBackend::new(&mut r1);
+        let mut b2 = RamBackend::new(&mut r2);
+        let mut d0 = BlockDevice::disk(&mut b0, 512).unwrap();
+        let mut d1 = BlockDevice::disk(&mut b1, 512).unwrap();
+        let mut d2 = BlockDevice::disk(&mut b2, 512).unwrap();
+        let mut devs: [&mut dyn ScsiDevice; 3] = [&mut d0, &mut d1, &mut d2];
+        let mut planes = [
+            Some(StorePlane::BlockRw(&mut b0)),
+            Some(StorePlane::BlockRw(&mut b1)),
+            Some(StorePlane::BlockRw(&mut b2)),
+        ];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs(0, 0xBEEF, 0), &[]);
-        session.step(&mut conn, &mut work, &mut devs);
+        session.step(&mut conn, &mut work, &mut devs, &mut planes);
         let (_, data) = conn.take_pdu().unwrap();
 
         // Replay the kernel's parse loop (drivers/scsi/scsi_scan.c):
@@ -1094,19 +1163,27 @@ mod tests {
         let mut r0 = vec![0u8; 16 * 1024];
         let mut r1 = vec![0u8; 16 * 1024];
         let mut r2 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::disk(RamBackend::new(&mut r0), 512).unwrap();
-        let d1 = BlockDevice::disk(RamBackend::new(&mut r1), 512).unwrap();
-        let d2 = BlockDevice::disk(RamBackend::new(&mut r2), 512).unwrap();
-        let mut devs = [d0, d1, d2];
+        let mut b0 = RamBackend::new(&mut r0);
+        let mut b1 = RamBackend::new(&mut r1);
+        let mut b2 = RamBackend::new(&mut r2);
+        let mut d0 = BlockDevice::disk(&mut b0, 512).unwrap();
+        let mut d1 = BlockDevice::disk(&mut b1, 512).unwrap();
+        let mut d2 = BlockDevice::disk(&mut b2, 512).unwrap();
+        let mut devs: [&mut dyn ScsiDevice; 3] = [&mut d0, &mut d1, &mut d2];
+        let mut planes = [
+            Some(StorePlane::BlockRw(&mut b0)),
+            Some(StorePlane::BlockRw(&mut b1)),
+            Some(StorePlane::BlockRw(&mut b2)),
+        ];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         conn.feed(&report_luns_bhs(1, 0xCAFE, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
@@ -1121,19 +1198,21 @@ mod tests {
         // REPORT LUNS is a well-known command (SPC-3 §6.21) and must be
         // served from any LUN, even an unsupported one (M7).
         let mut ram = vec![0u8; 16 * 1024];
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let mut cmd = report_luns_bhs(5, 0xDEAD, 0); // LUN 5 doesn't exist
         cmd[9] = 5;
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1169,22 +1248,29 @@ mod tests {
         std::fs::write(&iso, vec![0xCDu8; 2048 * 32]).unwrap();
 
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let mut d0 = BlockDevice::disk(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap();
+        let mut b0 = RamBackend::new(&mut ram);
+        let mut d0 = BlockDevice::disk(&mut b0, 512).unwrap();
         // Former `CDBlockDevice`: read-only optical profile over the ISO file.
         let mut bb_iso =
             BlockBackend::File(FileBackend::open(iso.to_str().unwrap(), false).unwrap());
-        let mut d1 = BlockDevice::cdrom(FlatRef::new(&mut bb_iso)).unwrap();
+        let mut d1 = BlockDevice::cdrom(&mut FlatRef::new(&mut bb_iso)).unwrap();
         let mut devs: [&mut dyn ScsiDevice; 2] = [&mut d0, &mut d1];
+        // LUN 0 is writable RAM; LUN 1 is the read-only optical profile over
+        // the ISO file (a `BlockDevice`, so it still yields `Store` ops).
+        let mut planes: [Option<StorePlane<'_>>; 2] = [
+            Some(StorePlane::BlockRw(&mut b0)),
+            Some(StorePlane::BlockRo(&mut bb_iso)),
+        ];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // INQUIRY LUN 0 → PDT 0x00 (disk).
         conn.feed(&inquiry_bhs(0, 96, 0x0101, 0), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1195,7 +1281,7 @@ mod tests {
         // INQUIRY LUN 1 → PDT 0x05 (CD-ROM).
         conn.feed(&inquiry_bhs(1, 96, 0x0102, 1), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1207,7 +1293,7 @@ mod tests {
         read[9] = 1;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1221,7 +1307,7 @@ mod tests {
         write[9] = 1;
         conn.feed(&write, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -1231,7 +1317,7 @@ mod tests {
         // REPORT LUNS lists both LUNs (target-wide, from LUN 0).
         conn.feed(&report_luns_bhs(0, 0x0401, 4), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
@@ -1267,7 +1353,8 @@ mod tests {
         let live_lba = live.layout().extents[0].lba;
 
         let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let mut d0 = BlockDevice::disk(BlockBackend::Ram(RamBackend::new(&mut ram)), 512).unwrap();
+        let mut b0 = RamBackend::new(&mut ram);
+        let mut d0 = BlockDevice::disk(&mut b0, 512).unwrap();
 
         // LUN 1: flat CD-ROM via CdromDrive over the ISO file plane
         let mut bb_flat =
@@ -1280,17 +1367,25 @@ mod tests {
         drive2.load_quiet(CdMedia::ro(&mut live));
 
         let mut devs: [&mut dyn ScsiDevice; 3] = [&mut d0, &mut drive1, &mut drive2];
+        // The cdrom LUNs now carry real read-only store planes: the drives'
+        // READ data phase is handed to the session as `StoreOp::Read` (the
+        // media holds only geometry, never the backend).
+        let mut planes: [Option<StorePlane<'_>>; 3] = [
+            Some(StorePlane::BlockRw(&mut b0)),
+            Some(StorePlane::BlockRo(&mut bb_flat)),
+            Some(StorePlane::BlockRo(&mut live)),
+        ];
 
         let mut conn = MockConn::new();
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // INQUIRY: LUN 0 → PDT 0x00, LUN 1/2 → PDT 0x05.
         for (lun, pdt) in [(0u8, 0x00u8), (1, 0x05), (2, 0x05)] {
             conn.feed(&inquiry_bhs(lun, 96, 0x0100 + lun as u32, lun as u32), &[]);
             assert_eq!(
-                session.step(&mut conn, &mut work, &mut devs),
+                session.step(&mut conn, &mut work, &mut devs, &mut planes),
                 StepResult::Processed
             );
             let (bhs, data) = conn.take_pdu().unwrap();
@@ -1304,7 +1399,7 @@ mod tests {
         read[9] = 1;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1318,7 +1413,7 @@ mod tests {
         read[9] = 2;
         conn.feed(&read, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, data) = conn.take_pdu().unwrap();
@@ -1332,7 +1427,7 @@ mod tests {
         write[9] = 2;
         conn.feed(&write, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -1342,7 +1437,7 @@ mod tests {
         // REPORT LUNS lists all three LUNs.
         conn.feed(&report_luns_bhs(0, 0x0401, 6), &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
@@ -1436,18 +1531,19 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let d0 = TrackingParamDevice {
+        let mut d0 = TrackingParamDevice {
             lun: 0,
             calls: calls.clone(),
             sense: None,
         };
-        let d1 = TrackingParamDevice {
+        let mut d1 = TrackingParamDevice {
             lun: 1,
             calls: calls.clone(),
             sense: None,
         };
-        let mut devs = [d0, d1];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut devs: [&mut dyn ScsiDevice; 2] = [&mut d0, &mut d1];
+        let mut planes: [Option<StorePlane<'_>>; 2] = [None, None];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // MODE SELECT(6) to LUN 1 with all 12 bytes immediate — handle_scsi_cmd immediate path.
         let itt = 0xA1A1;
@@ -1455,7 +1551,7 @@ mod tests {
         let bhs = mode_select6_bhs(1, 12, itt, 0, 12);
         conn.feed_padded(&bhs, &param);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (bhs, _) = conn.take_pdu().unwrap();
@@ -1475,18 +1571,19 @@ mod tests {
         let mut session = IscsiSession::default();
         let mut work = vec![0u8; WORK_LEN];
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let d0 = TrackingParamDevice {
+        let mut d0 = TrackingParamDevice {
             lun: 0,
             calls: calls.clone(),
             sense: None,
         };
-        let d1 = TrackingParamDevice {
+        let mut d1 = TrackingParamDevice {
             lun: 1,
             calls: calls.clone(),
             sense: None,
         };
-        let mut devs = [d0, d1];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut devs: [&mut dyn ScsiDevice; 2] = [&mut d0, &mut d1];
+        let mut planes: [Option<StorePlane<'_>>; 2] = [None, None];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // MODE SELECT(6) to LUN 1 with 6 of 12 bytes immediate — needs R2T.
         let itt = 0xB2B2;
@@ -1498,7 +1595,7 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 6, 6);
         conn.feed_padded(&dout, &rest);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         // Expect R2T then SCSI Response.
@@ -1520,10 +1617,16 @@ mod tests {
         let mut work = vec![0u8; WORK_LEN];
         let mut ram0 = vec![0u8; 16 * 1024];
         let mut ram1 = vec![0u8; 16 * 1024];
-        let d0 = BlockDevice::disk(RamBackend::new(&mut ram0), 512).unwrap();
-        let d1 = BlockDevice::disk(RamBackend::new(&mut ram1), 512).unwrap();
-        let mut devs = [d0, d1];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut b0 = RamBackend::new(&mut ram0);
+        let mut b1 = RamBackend::new(&mut ram1);
+        let mut d0 = BlockDevice::disk(&mut b0, 512).unwrap();
+        let mut d1 = BlockDevice::disk(&mut b1, 512).unwrap();
+        let mut devs: [&mut dyn ScsiDevice; 2] = [&mut d0, &mut d1];
+        let mut planes = [
+            Some(StorePlane::BlockRw(&mut b0)),
+            Some(StorePlane::BlockRw(&mut b1)),
+        ];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         // WRITE(10) LUN 1, LBA 0, 1 block, no immediate — R2T path.
         let itt = 0xC3C3;
@@ -1535,7 +1638,7 @@ mod tests {
         let dout = dataout_bhs(itt, 1, 0, 0, 512);
         conn.feed_padded(&dout, &payload);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (r2t, _) = conn.take_pdu().unwrap();
@@ -1550,7 +1653,7 @@ mod tests {
         read1[9] = 1;
         conn.feed(&read1, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (_, data) = conn.take_pdu().unwrap();
@@ -1559,7 +1662,7 @@ mod tests {
         let read0 = read10_bhs(0, 1, 0xD2, 2);
         conn.feed(&read0, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let (_, data0) = conn.take_pdu().unwrap();
@@ -1580,14 +1683,16 @@ mod tests {
             *b = (i % 251) as u8;
         }
         let expected = ram[0..600 * 512].to_vec();
-        let dev = BlockDevice::disk(RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs = [dev];
-        login(&mut conn, &mut session, &mut work, &mut devs);
+        let mut backend = RamBackend::new(&mut ram);
+        let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
+        let mut devs = [&mut dev as &mut dyn ScsiDevice];
+        let mut planes = [Some(StorePlane::BlockRw(&mut backend))];
+        login(&mut conn, &mut session, &mut work, &mut devs, &mut planes);
 
         let cmd = read10_bhs(0, 600, 0x7777, 0);
         conn.feed(&cmd, &[]);
         assert_eq!(
-            session.step(&mut conn, &mut work, &mut devs),
+            session.step(&mut conn, &mut work, &mut devs, &mut planes),
             StepResult::Processed
         );
         let mut collected = Vec::new();
