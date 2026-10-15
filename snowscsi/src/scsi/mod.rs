@@ -30,5 +30,6 @@ pub mod sbc;
 #[allow(clippy::module_inception)]
 pub mod scsi;
 pub mod spc;
+pub(crate) mod util;
 
 pub use luns::Luns;

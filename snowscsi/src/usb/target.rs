@@ -757,7 +757,7 @@ impl BotSession {
             cbw.dir,
             declared,
             cbw.tag,
-            core::str::from_utf8(crate::cdrom::drive::hex_of(&mut hx, cdb)).unwrap_or("?")
+            core::str::from_utf8(crate::scsi::util::hex_of(&mut hx, cdb)).unwrap_or("?")
         );
 
         // REPORT LUNS is served for any addressed LUN (§5.3).
