@@ -78,23 +78,11 @@ impl StorePlane<'_> {
             StorePlane::BlockRw(p) => match op {
                 StoreOp::Read { off, buf } => p.read_at(off, buf),
                 StoreOp::Write { off, buf } => p.write_at(off, buf),
-                StoreOp::Fill { off, len, byte } => {
-                    // Reject `off + len` wrapping before touching the backend;
-                    // a raw `WritableFlatData` impl need not bounds-check.
-                    let _end = off.checked_add(len).ok_or(StorageError::OutOfBounds)?;
-                    // Stack chunk buffer: a whole-disc Fill must not require
-                    // `alloc`. `write_at` re-checks against capacity per chunk.
-                    let chunk = [byte; 4096];
-                    let mut pos = off;
-                    let mut remaining = len;
-                    while remaining > 0 {
-                        let n = core::cmp::min(remaining, chunk.len() as u64) as usize;
-                        p.write_at(pos, &chunk[..n])?;
-                        pos += n as u64;
-                        remaining -= n as u64;
-                    }
-                    Ok(())
-                }
+                // The plane's `fill_at` bounds-checks (`off + len` overflow and
+                // past-capacity) and lets the backend pick the chunk size
+                // (`memset` for RAM, a loop otherwise) — no `alloc`, no
+                // caller-side magic number.
+                StoreOp::Fill { off, len, byte } => p.fill_at(off, len, byte),
                 StoreOp::FileRead { .. }
                 | StoreOp::FileWrite { .. }
                 | StoreOp::FileRemove { .. } => Err(StorageError::Unsupported),

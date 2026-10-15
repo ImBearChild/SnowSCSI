@@ -54,6 +54,15 @@ impl From<super::fs_storage::FsError> for StorageError {
     }
 }
 
+/// Stack chunk size for the default `fill_at` loops ([`SeekableStorage`] and
+/// [`WritableFlatData`]). One sector (512 B): safe for every backend's
+/// alignment (SD blocks, 512e sectors) and small enough for an MCU stack —
+/// pushing `Fill` down to the seam is precisely so a whole-disc FORMAT never
+/// needs a large buffer. Backends with a cheaper primitive override `fill_at`
+/// (`RamBackend` uses `memset`; the std file backend uses a larger chunk to
+/// amortize syscalls).
+const FILL_CHUNK: usize = 512;
+
 /// Random-access seekable storage backend.
 ///
 /// Supertraits: [`embedded_io::Read`] + [`embedded_io::Write`] +
@@ -76,6 +85,29 @@ pub trait SeekableStorage: embedded_io::Read + embedded_io::Write + embedded_io:
     /// `Write::flush` only reaches the OS page cache; `sync()` calls
     /// through to the platform fsync. RAM backends are no-op.
     fn sync(&mut self) -> Result<(), Self::Error>;
+
+    /// Fill `len` bytes at `off` with `byte` (random access).
+    ///
+    /// Default: loop `write_all` over a 512-byte stack chunk — no
+    /// `alloc`. Backends with a cheaper primitive override: `RamBackend` uses
+    /// `memset`; the std file backend uses a larger chunk to amortize syscalls.
+    ///
+    /// This is the raw cursor-level primitive: it does **not** bounds-check
+    /// against [`Self::capacity`]. The [`WritableFlatData`] blanket checks
+    /// (returning [`StorageError::OutOfBounds`]) before delegating, so
+    /// implementations that touch fixed memory should still re-check
+    /// defensively for direct callers.
+    fn fill_at(&mut self, mut off: u64, mut len: u64, byte: u8) -> Result<(), Self::Error> {
+        let chunk = [byte; FILL_CHUNK];
+        while len > 0 {
+            let n = core::cmp::min(len, FILL_CHUNK as u64) as usize;
+            self.seek(embedded_io::SeekFrom::Start(off))?;
+            self.write_all(&chunk[..n])?;
+            off += n as u64;
+            len -= n as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Read-only disc data plane: offset-addressed byte source (① in the
@@ -120,6 +152,29 @@ pub trait WritableFlatData: FlatData {
 
     /// Persist pending writes beyond page cache (`fsync` semantics).
     fn sync(&mut self) -> Result<(), StorageError>;
+
+    /// Fill `len` bytes at `off` with `byte`.
+    ///
+    /// Default: bounds-check against [`FlatData::capacity`] (rejecting an
+    /// `off + len` overflow and a past-capacity range with
+    /// [`StorageError::OutOfBounds`]) then loop [`Self::write_at`] over a
+    /// 512-byte stack chunk — no `alloc`. Backends reached through
+    /// the [`SeekableStorage`] blanket override via [`SeekableStorage::fill_at`]
+    /// (e.g. RAM `memset`); direct implementations may override too.
+    fn fill_at(&mut self, mut off: u64, mut len: u64, byte: u8) -> Result<(), StorageError> {
+        let end = off.checked_add(len).ok_or(StorageError::OutOfBounds)?;
+        if end > self.capacity() {
+            return Err(StorageError::OutOfBounds);
+        }
+        let chunk = [byte; FILL_CHUNK];
+        while len > 0 {
+            let n = core::cmp::min(len, FILL_CHUNK as u64) as usize;
+            self.write_at(off, &chunk[..n])?;
+            off += n as u64;
+            len -= n as u64;
+        }
+        Ok(())
+    }
 }
 
 // Blanket lift: every block backend speaks both disc planes for free.
@@ -164,6 +219,16 @@ impl<B: SeekableStorage + ?Sized> WritableFlatData for B {
 
     fn sync(&mut self) -> Result<(), StorageError> {
         SeekableStorage::sync(self).map_err(map_policy_err)
+    }
+
+    fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), StorageError> {
+        // Bounds first, so a past-capacity fill is `OutOfBounds` and never an
+        // implicit file growth; then delegate to the backend's fill.
+        let end = off.checked_add(len).ok_or(StorageError::OutOfBounds)?;
+        if end > SeekableStorage::capacity(self) {
+            return Err(StorageError::OutOfBounds);
+        }
+        SeekableStorage::fill_at(self, off, len, byte).map_err(map_policy_err)
     }
 }
 
@@ -253,6 +318,10 @@ impl WritableFlatData for RwRef<'_> {
     fn sync(&mut self) -> Result<(), StorageError> {
         self.0.sync()
     }
+
+    fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), StorageError> {
+        self.0.fill_at(off, len, byte)
+    }
 }
 
 /// RAM backend. Wraps a caller-provided `&mut [u8]` and implements
@@ -335,6 +404,20 @@ impl SeekableStorage for RamBackend<'_> {
     fn sync(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// `memset` — no chunk buffer, no loop. The [`WritableFlatData`] blanket
+    /// bounds-checks before delegating; re-check defensively for direct
+    /// callers (embedded-io has no `OutOfBounds` kind, so `Other`).
+    fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), Self::Error> {
+        let start = usize::try_from(off).map_err(|_| embedded_io::ErrorKind::Other)?;
+        let len = usize::try_from(len).map_err(|_| embedded_io::ErrorKind::Other)?;
+        let end = start
+            .checked_add(len)
+            .filter(|&e| e <= self.data.len())
+            .ok_or(embedded_io::ErrorKind::Other)?;
+        self.data[start..end].fill(byte);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +469,71 @@ mod tests {
         let mut ram: [u8; 0] = [];
         let b = RamBackend::new(&mut ram);
         assert_eq!(SeekableStorage::capacity(&b), 0);
+    }
+
+    #[test]
+    fn ram_fill_at_is_memset() {
+        let mut ram = [0xFFu8; 64];
+        let mut b = RamBackend::new(&mut ram);
+        // Raw `SeekableStorage` primitive (no bounds check).
+        SeekableStorage::fill_at(&mut b, 8, 16, 0).unwrap();
+        assert!(ram[..8].iter().all(|&x| x == 0xFF));
+        assert!(ram[8..24].iter().all(|&x| x == 0));
+        assert!(ram[24..].iter().all(|&x| x == 0xFF));
+    }
+
+    #[test]
+    fn fill_at_via_writable_flat_data_bounds_checked() {
+        let mut ram = [0u8; 64];
+        {
+            let mut b = RamBackend::new(&mut ram);
+            // In-bounds: blanket → `SeekableStorage::fill_at` → RAM `memset`.
+            assert_eq!(WritableFlatData::fill_at(&mut b, 0, 64, 0x5A), Ok(()));
+            // Past capacity → OutOfBounds (never an implicit grow).
+            assert_eq!(
+                WritableFlatData::fill_at(&mut b, 60, 8, 0),
+                Err(StorageError::OutOfBounds)
+            );
+            // `off + len` overflow → OutOfBounds.
+            assert_eq!(
+                WritableFlatData::fill_at(&mut b, u64::MAX, 2, 0),
+                Err(StorageError::OutOfBounds)
+            );
+        }
+        assert!(ram.iter().all(|&x| x == 0x5A));
+    }
+
+    #[test]
+    fn writable_flat_data_default_fill_loops() {
+        // A *direct* impl (not reached through `SeekableStorage`) exercises the
+        // default `fill_at` loop, which chunks over `write_at` — here spanning
+        // more than one 512-byte `FILL_CHUNK`.
+        struct Mem([u8; 1500]);
+        impl FlatData for Mem {
+            fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+                let s = off as usize;
+                buf.copy_from_slice(&self.0[s..s + buf.len()]);
+                Ok(())
+            }
+            fn capacity(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+        impl WritableFlatData for Mem {
+            fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+                let s = off as usize;
+                self.0[s..s + buf.len()].copy_from_slice(buf);
+                Ok(())
+            }
+            fn sync(&mut self) -> Result<(), StorageError> {
+                Ok(())
+            }
+        }
+
+        let mut m = Mem([0u8; 1500]);
+        assert_eq!(m.fill_at(0, 1500, 0x7E), Ok(())); // 512 + 512 + 476
+        assert!(m.0.iter().all(|&x| x == 0x7E));
+        assert_eq!(m.fill_at(1499, 2, 0), Err(StorageError::OutOfBounds));
+        assert_eq!(m.fill_at(u64::MAX, 2, 0), Err(StorageError::OutOfBounds));
     }
 }

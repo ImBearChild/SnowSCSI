@@ -100,6 +100,14 @@ impl SeekableStorage for BlockBackend<'_> {
             Self::File(b) => SeekableStorage::sync(b),
         }
     }
+
+    fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), Self::Error> {
+        match self {
+            Self::Ram(b) => SeekableStorage::fill_at(b, off, len, byte),
+            #[cfg(feature = "std")]
+            Self::File(b) => SeekableStorage::fill_at(b, off, len, byte),
+        }
+    }
 }
 
 /// File backend (std feature, `std::fs`).
@@ -247,6 +255,22 @@ impl SeekableStorage for FileBackend {
         use std::io::Write;
         self.file.flush().map_err(|e| map_io_err(e.kind()))?;
         self.file.sync_all().map_err(|e| map_io_err(e.kind()))
+    }
+
+    /// Override the 512-byte default with a 4 KiB stack chunk: a whole-disc
+    /// FORMAT through the std backend is syscall-bound, so amortize
+    /// `seek`+`write` (4 KiB = one page; a hosted stack can spare it).
+    fn fill_at(&mut self, mut off: u64, mut len: u64, byte: u8) -> Result<(), Self::Error> {
+        const CHUNK: usize = 4096;
+        let chunk = [byte; CHUNK];
+        while len > 0 {
+            let n = core::cmp::min(len, CHUNK as u64) as usize;
+            embedded_io::Seek::seek(self, embedded_io::SeekFrom::Start(off))?;
+            embedded_io::Write::write_all(self, &chunk[..n])?;
+            off += n as u64;
+            len -= n as u64;
+        }
+        Ok(())
     }
 }
 
