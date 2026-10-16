@@ -1,4 +1,4 @@
-//! Synchronous shell loop for the USB BOT core (`__ASYNC_SEP_PLAN.md` §1.9).
+//! Synchronous shell loop for the USB BOT core.
 //!
 //! [`serve`] owns the platform loop that used to live in the CLI: it polls the
 //! control plane, executes the [`BotSession`]'s next [`Action`] exactly once

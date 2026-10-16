@@ -1,4 +1,4 @@
-//! Two-store operation vocabulary (`__ASYNC_SEP_PLAN.md` §1.1).
+//! Two-store operation vocabulary.
 //!
 //! A [`StoreOp`] is a single unit of storage work addressed either **by byte
 //! offset** on a block plane (`Read`/`Write`/`Fill`) or **by path** on a

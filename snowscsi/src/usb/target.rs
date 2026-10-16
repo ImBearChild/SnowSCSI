@@ -322,7 +322,7 @@ enum BotState {
     },
     /// Terminal-status pending: the data phase (including any ZLP / STALL) is
     /// done, but the device agenda (`ScsiDevice::next_store_op`) must be drained
-    /// before the CSW (`__ASYNC_SEP_PLAN.md` §1.5 rule 3/4). Carries the CSW
+    /// before the CSW. Carries the CSW
     /// payload; each `Some(op)` is yielded as [`Action::Store`] and awaited via
     /// [`Event::StoreDone`], then `devs[lun].store_done(result)` maps a failure
     /// to sense (the terminal status becomes `Failed`). `None` emits the CSW
@@ -548,8 +548,7 @@ impl BotSession {
     /// start draining the device agenda. Every terminal-status transition (CSW,
     /// GOOD or CHECK CONDITION) funnels through here so the device's
     /// maintenance/background ops (`next_store_op`) run **after** the data phase
-    /// (including any ZLP / STALL) and **before** the CSW
-    /// (`__ASYNC_SEP_PLAN.md` §1.5 rule 3/4).
+    /// (including any ZLP / STALL) and **before** the CSW.
     ///
     /// `lun` may be out of range (invalid-LUN / REPORT LUNS terminal statuses);
     /// the drain then skips the device entirely and emits the CSW unchanged.

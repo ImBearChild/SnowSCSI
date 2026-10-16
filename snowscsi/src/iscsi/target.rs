@@ -398,9 +398,9 @@ enum IscsiState {
     },
     /// Terminal-status agenda: the data phase is complete and the device
     /// agenda (`ScsiDevice::next_store_op`) must be drained before the
-    /// terminating SCSI Response / final Data-In (`__ASYNC_SEP_PLAN.md` §1.5
-    /// rule 3/4).  Carries the response parameters; each `Some(op)` is yielded
-    /// as [`Action::Store`] and awaited via [`Event::StoreDone`].
+    /// terminating SCSI Response / final Data-In.  Carries the response
+    /// parameters; each `Some(op)` is yielded as [`Action::Store`] and awaited
+    /// via [`Event::StoreDone`].
     Agenda(Agenda),
     /// Terminal (Logout / fatal protocol error / peer close).
     Closed,
@@ -1301,7 +1301,7 @@ impl IscsiSession {
     fn handle_login<'a>(&'a mut self, work: &'a mut [u8], pdu: &Pdu) -> Action<'a> {
         let req = &pdu.bhs;
         // Login C bit (byte1 bit6, RFC 3720 §10.12.1) — continuation not
-        // supported; reject if set (M10).
+        // supported; reject if set.
         if req.as_bytes()[1] & 0x40 != 0 {
             return self.reject(work, reject::PROTOCOL_ERROR, req);
         }

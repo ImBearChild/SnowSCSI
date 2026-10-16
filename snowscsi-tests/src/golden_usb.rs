@@ -1,4 +1,4 @@
-//! Golden wire-level scenarios for USB MSC (BOT) — `__ASYNC_SEP_PLAN.md` §5.1.
+//! Golden wire-level scenarios for USB MSC (BOT).
 //!
 //! Each `#[test]` drives one deterministic scenario through
 //! [`crate::golden_drive::serve_usb`] (the library `usb::serve` loop),
@@ -9,7 +9,7 @@
 //! `pub(crate)`-promoted ones from [`crate::usb_bot`] (raw bytes, not the
 //! library's parse-only `Cbw`).
 //!
-//! The thirteen scenarios are the USB half of the M0 baseline: command
+//! The thirteen scenarios are the USB half of the recorded baseline: command
 //! sequences (INQUIRY / READ single / READ multi-chunk / WRITE→READ),
 //! write-through gating (write short residue, host overrun), the Data-In
 //! shortfall policy matrix (Short / ShortNoStall / Pad), the invalid-CBW

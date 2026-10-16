@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn report_luns_on_unsupported_lun_check_condition() {
         // REPORT LUNS is a well-known command (SPC-3 §6.21) and must be
-        // served from any LUN, even an unsupported one (M7).
+        // served from any LUN, even an unsupported one.
         let mut ram = vec![0u8; 16 * 1024];
         let mut backend = RamBackend::new(&mut ram);
         let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();

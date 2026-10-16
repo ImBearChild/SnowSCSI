@@ -641,7 +641,7 @@ impl CdromDrive {
                 }
 
                 // ── READ CD (0xBE) / READ CD MSF (0xB9) ───────────
-                // Minimal Mode-1 alias for CD Read feature (M9, Current=1).
+                // Minimal Mode-1 alias for CD Read feature (Current=1).
                 op::READ_CD | op::READ_CD_MSF => {
                     if !self.loaded() {
                         return Ok(self.not_ready());
@@ -650,7 +650,7 @@ impl CdromDrive {
                 }
 
                 // ── GET PERFORMANCE (0xAC) ─────────────────────────
-                // Minimal empty performance table for RTS feature (M9).
+                // Minimal empty performance table for RTS feature.
                 op::GET_PERFORMANCE => {
                     if !self.loaded() {
                         return Ok(self.not_ready());
@@ -1526,7 +1526,7 @@ impl crate::scsi::device::ScsiDevice for CdromDrive {
         self.xfer_in(transfer_offset, buf)
     }
 
-    /// Device maintenance agenda (`__ASYNC_SEP_PLAN.md` §1.2/§1.5).
+    /// Device maintenance agenda.
     ///
     /// FORMAT UNIT / BLANK arm a whole-disc zero-fill; this yields it as
     /// [`StoreOp::Fill`] in **64 KiB chunks** (a single whole-disc op would

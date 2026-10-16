@@ -1,8 +1,8 @@
-//! Golden USB (BOT) replay driver (`__ASYNC_SEP_PLAN.md` §5.1, "回放 M3 起").
+//! Golden USB (BOT) replay driver.
 //!
-//! At M0 the baseline was recorded with a test-local "driver A"
+//! The baseline was recorded with a test-local "driver A"
 //! (`need()`/`poll()` loop plus the `clear_feature_halt()` unlock dance).
-//! At M3 the USB session core converged on `Action`/`Event` and the loop
+//! The USB session core converged on `Action`/`Event` and the loop
 //! moved into the library as [`snowscsi::usb::serve`], so golden replay now
 //! goes through that shipped loop — the baseline locks the real driver.
 //!

@@ -1,5 +1,4 @@
-//! Path-addressed filesystem plane + LRU handle cache
-//! (`__ASYNC_SEP_PLAN.md` §1.1).
+//! Path-addressed filesystem plane + LRU handle cache.
 //!
 //! [`FsPlane`] is the object-safe seam a driver holds: "random read/write of a
 //! file, addressed by `path` + `off`", plus directory scan / remove / sync.

@@ -1,5 +1,4 @@
-//! Wire-level golden baseline recorder for the M0 milestone
-//! (`__ASYNC_SEP_PLAN.md` §3 / §5.1).
+//! Wire-level golden baseline recorder.
 //!
 //! This module is the **contract** shared by the USB driver
 //! ([`crate::golden_drive`]), the USB scenarios ([`crate::golden_usb`]) and

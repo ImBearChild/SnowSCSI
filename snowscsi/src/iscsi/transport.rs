@@ -14,7 +14,7 @@
 //! fresh [`IscsiSession`], retrying accept failures with a backoff instead of C's
 //! infinite busy retry. Each connection is driven by [`serve_conn`], the
 //! protocol-agnostic shell loop over [`Action`]/[`Event`] (the session owns all
-//! framing; see `__ASYNC_SEP_PLAN.md` §1.4/§1.9).
+//! framing).
 
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -76,8 +76,7 @@ impl embedded_io::Write for TcpConn {
     }
 }
 
-/// Drive one iSCSI connection to completion over any byte stream
-/// (`__ASYNC_SEP_PLAN.md` §1.4/§1.9).
+/// Drive one iSCSI connection to completion over any byte stream.
 ///
 /// The shell is protocol-agnostic: it feeds the [`IscsiSession`]'s next
 /// [`Action`] to the connection (or to a [`Luns`] storage plane for

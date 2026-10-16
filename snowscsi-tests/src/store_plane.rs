@@ -1,5 +1,5 @@
-//! Cross-crate integration tests for the two-store plane vocabulary
-//! (`__ASYNC_SEP_PLAN.md` §1.1): [`StorePlane`] dispatch over a real
+//! Cross-crate integration tests for the two-store plane vocabulary:
+//! [`StorePlane`] dispatch over a real
 //! [`RamBackend`] block plane and an [`FsPlaneAdapter`] over the real
 //! [`StdFsBackend`] filesystem.
 //!

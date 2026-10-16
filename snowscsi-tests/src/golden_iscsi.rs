@@ -1,4 +1,4 @@
-//! Golden wire-level scenarios for iSCSI — `__ASYNC_SEP_PLAN.md` §5.1.
+//! Golden wire-level scenarios for iSCSI.
 //!
 //! Each `#[test]` feeds a byte script into [`crate::golden::RecConn`], runs the
 //! library's [`serve_conn`] shell loop (which drives `IscsiSession::poll` over
