@@ -29,6 +29,9 @@ pub mod golden_usb;
 pub mod golden_iscsi;
 
 #[cfg(test)]
+pub mod async_golden;
+
+#[cfg(test)]
 mod store_plane;
 
 #[cfg(all(test, has_libiscsi))]
