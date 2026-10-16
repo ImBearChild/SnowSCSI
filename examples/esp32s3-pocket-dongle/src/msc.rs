@@ -4,9 +4,8 @@
 //! around `embassy-usb`'s bulk endpoints and lets [`serve_async`] drive the
 //! [`BotSession`] state machine. The seams are:
 //!
-//! * [`ConsolidatingRecv`] wraps the bulk-OUT endpoint, accumulating a whole
-//!   Data-Out chunk before feeding the core (and tallying the RX meter);
-//!   [`CountingIn`] wraps the bulk-IN endpoint for the TX meter;
+//! * [`CountingOut`]/[`CountingIn`] wrap the bulk endpoints and tally the bytes
+//!   the status LCD shows as RX/TX;
 //! * [`GadgetHalf`](snowscsi::usb::GadgetHalf) lifts a Bulk-Only Reset out of
 //!   the shared [`PENDING_RESET`] flag.
 //!
@@ -18,10 +17,8 @@
 //! [`tx_bytes`].
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use core::time::Duration as CoreDuration;
 
 use defmt::warn;
-use embassy_time::{with_timeout, Duration, Instant, TimeoutError};
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, EndpointOut};
 use embassy_usb::Handler;
@@ -29,10 +26,7 @@ use embassy_usb::Handler;
 use snowscsi::common::async_store::AsyncStorePlane;
 use snowscsi::scsi::AsyncLuns;
 use snowscsi::usb::serve::serve_async;
-use snowscsi::usb::{
-    AsyncBotRecv, BotIoErr, BotSession, Event, GadgetHalf, RecvMode, SendHalf, ServeError,
-    BOT_RESET, GET_MAX_LUN,
-};
+use snowscsi::usb::{BotSession, EmbassyBot, Event, ServeError, BOT_RESET, GET_MAX_LUN};
 
 /// Number of LUNs presented to the host, zero-based (SPC Get Max LUN answer).
 ///
@@ -199,124 +193,33 @@ impl Handler for MscHandler {
     }
 }
 
-/// Zero-timeout duration for the non-blocking probe: `with_timeout` polls the
-/// wrapped read once before its timer, so an already-arrived packet wins.
-const ZERO: Duration = Duration::from_ticks(0);
-
-/// Upper bound on a converted timeout (1000 s); mirrors the library adapter so
-/// a maximal `core::time::Duration` cannot overflow `Instant + Duration`.
-const MAX_MICROS: u64 = 1_000_000_000;
-
-/// Convert a seam timeout (`core::time::Duration`) to an embassy duration.
-fn to_embassy(d: CoreDuration) -> Duration {
-    let micros = u64::try_from(d.as_micros().min(u128::from(MAX_MICROS))).unwrap_or(MAX_MICROS);
-    Duration::from_micros(micros)
-}
-
-/// Map an endpoint error to the coarse bulk seam error.
-fn recv_err(err: EndpointError) -> BotIoErr {
-    match err {
-        EndpointError::Disabled => BotIoErr::Disconnected,
-        EndpointError::BufferOverflow => BotIoErr::Io,
-    }
-}
-
-/// Bulk-OUT half: a **consolidating** [`AsyncBotRecv`] over one endpoint.
+/// Bulk-OUT endpoint wrapper that tallies received bytes for the status LCD.
 ///
-/// A Full-Speed link delivers at most one 64-byte packet per `ep.read`, but the
-/// shell hands this half the whole core-requested chunk (or the overlap
-/// scratch) as `buf`. It therefore keeps reading packets into `buf` until it is
-/// full or a short packet ends the bulk transfer. Handing the core one packet
-/// at a time would make it emit a `StoreOp::Write` per 64 bytes, turning each
-/// 512-byte SD sector write into a read-modify-write cycle; consolidating
-/// yields one write per core chunk. The RX meter is tallied per packet, once.
-pub struct ConsolidatingRecv<O> {
-    /// The wrapped bulk-OUT endpoint.
-    pub ep: O,
-}
+/// The serve loop receives through the library's consolidating receive half,
+/// which reads one packet at a time into the caller's buffer (until it is full
+/// or a short packet ends the transfer). Counting here therefore stays exact —
+/// one tally per received packet — and a whole Data-Out chunk still reaches the
+/// core as one `StoreOp::Write` rather than a read-modify-write per 64-byte
+/// packet.
+pub struct CountingOut<O>(pub O);
 
-impl<O: EndpointOut> ConsolidatingRecv<O> {
-    /// Tally one received packet for the LCD RX meter.
-    fn tally(&self, n: usize) {
-        RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
+impl<O: EndpointOut> Endpoint for CountingOut<O> {
+    fn info(&self) -> &EndpointInfo {
+        self.0.info()
     }
 
-    /// Accumulate packets until `buf` is full or a short packet arrives.
-    async fn fill(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
-        let mps = self.ep.info().max_packet_size as usize;
-        let mut n = 0usize;
-        while n < buf.len() {
-            let i = self.ep.read(&mut buf[n..]).await.map_err(recv_err)?;
-            self.tally(i);
-            n += i;
-            // A short packet terminates the host's bulk transfer early.
-            if i < mps {
-                break;
-            }
-        }
-        Ok(n)
-    }
-
-    /// As [`Self::fill`], but bounded by an overall deadline. On expiry the
-    /// bytes already received are returned as progress — they were consumed
-    /// from the endpoint and must not be dropped — while nothing received is
-    /// [`BotIoErr::WouldBlock`]. A zero-length read is a link-down `Ok(0)`, not
-    /// a timeout.
-    async fn fill_until(&mut self, buf: &mut [u8], deadline: Instant) -> Result<usize, BotIoErr> {
-        let mps = self.ep.info().max_packet_size as usize;
-        let mut n = 0usize;
-        while n < buf.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match with_timeout(remaining, self.ep.read(&mut buf[n..])).await {
-                Ok(Ok(i)) => {
-                    self.tally(i);
-                    n += i;
-                    if i < mps {
-                        break;
-                    }
-                }
-                Ok(Err(e)) => return Err(recv_err(e)),
-                // Expiry with nothing received is a would-block; with bytes
-                // already in `buf` it is progress.
-                Err(TimeoutError) => {
-                    return if n > 0 {
-                        Ok(n)
-                    } else {
-                        Err(BotIoErr::WouldBlock)
-                    };
-                }
-            }
-        }
-        Ok(n)
+    async fn wait_enabled(&mut self) {
+        self.0.wait_enabled().await
     }
 }
 
-impl<O: EndpointOut> AsyncBotRecv for ConsolidatingRecv<O> {
-    async fn recv(&mut self, buf: &mut [u8], mode: RecvMode) -> Result<usize, BotIoErr> {
-        match mode {
-            // Non-blocking drain: a single attempt, no consolidation loop.
-            RecvMode::Probe => match with_timeout(ZERO, self.ep.read(buf)).await {
-                Ok(Ok(i)) => {
-                    self.tally(i);
-                    Ok(i)
-                }
-                Ok(Err(e)) => Err(recv_err(e)),
-                Err(TimeoutError) => Err(BotIoErr::WouldBlock),
-            },
-            // A packet is known to be pending: park until the endpoint is live
-            // (a not-yet-configured endpoint returns `Disabled` immediately and
-            // would otherwise spin), then accumulate without a deadline.
-            RecvMode::Forever => {
-                self.ep.wait_enabled().await;
-                self.fill(buf).await
-            }
-            // Bounded total wait: park, then accumulate under a deadline.
-            RecvMode::Until(d) => {
-                self.ep.wait_enabled().await;
-                let deadline = Instant::now().saturating_add(to_embassy(d));
-                self.fill_until(buf, deadline).await
-            }
+impl<O: EndpointOut> EndpointOut for CountingOut<O> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        let r = self.0.read(buf).await;
+        if let Ok(n) = r {
+            RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
         }
+        r
     }
 }
 
@@ -343,29 +246,10 @@ impl<I: EndpointIn> EndpointIn for CountingIn<I> {
     }
 }
 
-/// The three independent seams [`serve_async`] borrows.
-///
-/// The OUT half consolidates (see [`ConsolidatingRecv`]); the IN half uses the
-/// library's chunking [`SendHalf`] (a Data-In chunk is split into MPS packets
-/// correctly there); the control half drains the shared reset flag.
-pub struct Bot<O, I> {
-    /// Bulk-OUT receive half (consolidating).
-    pub out: ConsolidatingRecv<O>,
-    /// Bulk-IN send half (chunked, byte-counting).
-    pub in_: SendHalf<CountingIn<I>>,
-    /// Control-plane half.
-    pub gadget: GadgetHalf,
-}
-
-/// Bundle the two bulk endpoints and the shared reset flag for the serve loop.
-pub fn bot<O, I>(out: O, in_: I) -> Bot<O, I> {
-    Bot {
-        out: ConsolidatingRecv { ep: out },
-        in_: SendHalf {
-            ep: CountingIn(in_),
-        },
-        gadget: GadgetHalf::new(reset_flag()),
-    }
+/// Bundle the two bulk endpoints (behind the byte-counting adapters) and the
+/// shared reset flag into the [`EmbassyBot`] the serve loop drives.
+pub fn bot<O, I>(out: O, in_: I) -> EmbassyBot<CountingOut<O>, CountingIn<I>> {
+    EmbassyBot::new(CountingOut(out), CountingIn(in_), reset_flag())
 }
 
 /// Run the BOT protocol loop forever over a bulk endpoint pair.
@@ -378,7 +262,7 @@ pub fn bot<O, I>(out: O, in_: I) -> Bot<O, I> {
 /// and restarts it after a host disconnect, so the gadget future never returns:
 /// a disconnect parks the next receive until the host re-enumerates.
 pub async fn run<O, I, P>(
-    bot: &mut Bot<O, I>,
+    bot: &mut EmbassyBot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
     scratch: &mut [u8],

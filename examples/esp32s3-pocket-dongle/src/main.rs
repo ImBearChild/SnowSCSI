@@ -49,7 +49,7 @@ use defmt::info;
 use snowscsi::common::async_store::AsyncStorePlane;
 use snowscsi::scsi::device::ScsiDevice;
 use snowscsi::scsi::AsyncLuns;
-use snowscsi::usb::{BotSession, ShortfallPolicy};
+use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -107,7 +107,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 )]
 async fn gadget<'d, D, O, I, P>(
     device: &mut embassy_usb::UsbDevice<'d, D>,
-    bot: &mut msc::Bot<O, I>,
+    bot: &mut EmbassyBot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
     scratch: &mut [u8],
