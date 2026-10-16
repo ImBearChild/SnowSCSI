@@ -1717,6 +1717,8 @@ name = "snowscsi"
 version = "0.1.0"
 dependencies = [
  "defmt 1.1.1",
+ "embassy-time",
+ "embassy-usb",
  "embedded-io 0.7.1",
  "heapless 0.8.0",
  "snowscsi-common",

@@ -1,4 +1,4 @@
-//! ESP32-S3 Pocket-Dongle firmware — M4 integration.
+//! ESP32-S3 Pocket-Dongle firmware.
 //!
 //! Presents the on-board SD card as one whole raw block device to a USB host,
 //! as a UDF-RW (DVD-RAM) optical device driven by `snowscsi`.
@@ -29,6 +29,8 @@
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those holding buffers for the duration of a data transfer."
 )]
 
+use core::sync::atomic::AtomicBool;
+
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::usb::otg::{
@@ -39,11 +41,15 @@ use esp_hal::usb::otg::{
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
+use embassy_usb::driver::{EndpointIn, EndpointOut};
 use static_cell::StaticCell;
 
 use defmt::info;
 
+use snowscsi::common::async_store::AsyncStorePlane;
 use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::scsi::AsyncLuns;
+use snowscsi::usb::{BotSession, ShortfallPolicy};
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -62,7 +68,7 @@ mod usb_mode;
 // See <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// 8 KiB SCSI command/data scratch buffer shared by every BOT transaction.
+/// 8 KiB SCSI command/data buffer the BOT session works on.
 ///
 /// The `#[esp_rtos::main]` task runs on a **small** stack, so the
 /// [`drive::WORK_LEN`] (8192)-byte buffer must not be a stack local.  Parking
@@ -70,11 +76,19 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// `&'static mut [u8]` for the lifetime of the gadget loop.
 static WORK: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 
-/// 8 KiB bulk-OUT receive scratch (CBW fragments and Data-Out chunks).
+/// 8 KiB overlap buffer, same length as [`WORK`].
 ///
-/// Separate from [`WORK`] because the BOT session borrows the SCSI data region
-/// and the receive scratch at the same time. Also kept off the task stack.
-static RECV: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
+/// The shell pre-receives the next Data-Out chunk (or speculatively pre-reads
+/// the next Data-In chunk) into `scratch` while the current chunk is in flight,
+/// then swaps the two. Kept off the task stack.
+static SCRATCH: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
+
+/// Shutdown flag handed to the BOT serve loop.
+///
+/// This firmware tears the gadget down by dropping its future when BOOT is
+/// pressed, so the flag is never set; it exists because the shell requires an
+/// explicit stop signal alongside the future.
+static STOP: AtomicBool = AtomicBool::new(false);
 
 /// Run the whole DVDRAM gadget concurrently: USB stack, BOT loop, LCD refresh.
 ///
@@ -91,25 +105,27 @@ static RECV: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
     clippy::too_many_arguments,
     reason = "the joined USB-stack + BOT-loop future is intentionally one frame and one call"
 )]
-async fn gadget<'d, D, S>(
+async fn gadget<'d, D, O, I, P>(
     device: &mut embassy_usb::UsbDevice<'d, D>,
-    ep_out: &mut D::EndpointOut,
-    ep_in: &mut D::EndpointIn,
-    session: &mut snowscsi::usb::BotSession,
+    bot: &mut msc::Bot<O, I>,
+    session: &mut BotSession,
     work: &mut [u8],
-    recv: &mut [u8],
-    devs: &mut [S],
+    scratch: &mut [u8],
+    luns: &mut AsyncLuns<'_, P>,
+    stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
     boot: Instant,
 ) -> !
 where
     D: embassy_usb::driver::Driver<'d>,
-    S: ScsiDevice,
+    O: EndpointOut,
+    I: EndpointIn,
+    P: AsyncStorePlane,
 {
     embassy_futures::join::join3(
         device.run(),
-        msc::run(ep_out, ep_in, session, work, recv, devs),
+        msc::run(bot, session, work, scratch, luns, stop),
         async {
             // Uptime: seconds since boot, redisplayed every refresh. The
             // readout only advances because *this* loop runs, so a frozen
@@ -169,10 +185,11 @@ async fn main(spawner: Spawner) -> ! {
     let boot = Instant::now();
 
     // Nothing is spawned: the USB device and BOT loop are joined directly in
-    // `main` so their non-`'static` borrows (session, drive) stay valid.
+    // `main` so their non-`'static` borrows (the session, and the LUN view's
+    // `devs`/`planes`/`luns` over `drive`/`card`) stay valid.
     let _ = spawner;
 
-    info!("esp32s3-pocket-dongle: M4 booting (DVDRAM/USB-OTG)");
+    info!("esp32s3-pocket-dongle: booting (DVDRAM/USB-OTG)");
 
     // The LCD's SPI interface borrows this staging buffer, so it must be
     // declared (and outlive) the `Display` below.
@@ -216,7 +233,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // The drive (single LUN) must own the card for the whole program.
     let Some(mut card) = sd.take() else {
-        info!("M4: no SD card; cannot start the USB gadget");
+        info!("no SD card; cannot start the USB gadget");
         if let Some(display) = display.as_mut() {
             display.show(usb_mode::Mode::DvdRam, None, false, uptime_s(boot), None);
         }
@@ -226,17 +243,26 @@ async fn main(spawner: Spawner) -> ! {
     };
 
     // Build the DVD-RAM drive over the SD card (non-destructive — the existing
-    // card content is used as-is). The drive borrows the card for the rest of
-    // `main`.
+    // card content is used as-is). The drive caches geometry from the card and
+    // is otherwise backend-free, so the build borrow ends here.
     let mut drive = drive::build(&mut card);
+
+    // ── LUN view ─────────────────────────────────────────────────────────
+    //
+    // One LUN: the DVD-RAM drive as the device and the SD card as its
+    // asynchronous store plane (the shell executes every `Action::Store`
+    // against it). Both live for the rest of `main`.
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
+    let mut planes = [Some(card)];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
 
     // ── Persistent per-program state ─────────────────────────────────────
     //
     // The 8 KiB scratch statics are initialised exactly once (a second
     // `StaticCell::init` panics); the same buffers are reborrowed into every
-    // gadget build. The BOT session is created once and reset before each
-    // (re)start. `peripherals` itself stays alive so USB_FS/GPIO19/GPIO20 can
-    // be reborrowed per build; the SPI/SD/BOOT singletons were moved out once.
+    // gadget build. `peripherals` itself stays alive so USB_FS/GPIO19/GPIO20
+    // can be reborrowed per build; the SPI/SD/BOOT singletons were moved out
+    // once.
     //
     // NOTE: `embassy-usb-synopsys-otg` keeps its endpoint-allocator slots in a
     // `'static` `StateStorage` (`State::alloc_slot_write`) that `Bus::drop`
@@ -245,13 +271,16 @@ async fn main(spawner: Spawner) -> ! {
     // until allocation would panic; making it unbounded needs library support
     // (fixed endpoints, or retaining the device across the Debug excursion).
     let work: &'static mut [u8] = WORK.init([0u8; drive::WORK_LEN]);
-    let recv: &'static mut [u8] = RECV.init([0u8; drive::WORK_LEN]);
+    let scratch: &'static mut [u8] = SCRATCH.init([0u8; drive::WORK_LEN]);
     // One LUN, Full-Speed bulk MPS (64) for the Data-In short-packet decision.
     // The shortfall policy is pinned explicitly to its validated behaviour so a
-    // future change to the default cannot move the dongle's wire shape.
-    let mut session = snowscsi::usb::BotSession::with_luns(1)
+    // future change to the default cannot move the dongle's wire shape. The
+    // policy must not need a Bulk-In STALL: embassy-usb keeps its `Bus` private,
+    // so a class driver cannot halt an endpoint (`Short` would be rejected by
+    // the serve loop's startup check).
+    let mut session = BotSession::with_luns(1)
         .with_bulk_mps(64)
-        .with_shortfall(snowscsi::usb::ShortfallPolicy::ShortNoStall);
+        .with_shortfall(ShortfallPolicy::ShortNoStall);
     let mut button = button::BootButton::new(peripherals.GPIO0);
 
     // ── Runtime mode toggle ──────────────────────────────────────────────
@@ -311,7 +340,7 @@ async fn main(spawner: Spawner) -> ! {
                 );
                 builder.handler(&mut handler);
 
-                let (mut ep_out, mut ep_in) = {
+                let (ep_out, ep_in) = {
                     let mut func = builder.function(
                         snowscsi::usb::MSC_CLASS,
                         snowscsi::usb::MSC_SUBCLASS,
@@ -330,8 +359,9 @@ async fn main(spawner: Spawner) -> ! {
                 };
                 let mut device = builder.build();
 
-                // Fresh session for the freshly (re)enumerated device.
-                session.reset();
+                // Bundle the endpoints and the shared reset flag. The serve
+                // loop resets the session for each freshly enumerated host.
+                let mut bot = msc::bot(ep_out, ep_in);
 
                 // Status screen: mode + SD size + live USB link bit (the speed
                 // line reads `-` until the refresh loop has a first window).
@@ -351,12 +381,12 @@ async fn main(spawner: Spawner) -> ! {
                 match select(
                     gadget(
                         &mut device,
-                        &mut ep_out,
-                        &mut ep_in,
+                        &mut bot,
                         &mut session,
                         &mut *work,
-                        &mut *recv,
-                        core::slice::from_mut(&mut drive),
+                        &mut *scratch,
+                        &mut luns,
+                        &STOP,
                         &mut display,
                         sd_bytes,
                         boot,

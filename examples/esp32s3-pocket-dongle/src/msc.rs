@@ -1,32 +1,37 @@
 //! USB Mass Storage — Bulk-Only Transport (BOT) class.
 //!
-//! Drives `snowscsi::usb`'s non-blocking [`BotSession`] with the
-//! `embassy-usb` bulk endpoints of the ESP32-S3 USB-OTG device controller.
-//! Unlike the Linux FunctionFS driver, the OTG transport is
-//! fully async: the session state machine is fed one [`SessionEvent`] per
-//! endpoint completion and the next need is read straight from
-//! [`BotSession::need`] / [`BotSession::out_slice`].
+//! The library owns the BOT loop: this module supplies only the platform seams
+//! around `embassy-usb`'s bulk endpoints and lets [`serve_async`] drive the
+//! [`BotSession`] state machine. The seams are:
+//!
+//! * [`ConsolidatingRecv`] wraps the bulk-OUT endpoint, accumulating a whole
+//!   Data-Out chunk before feeding the core (and tallying the RX meter);
+//!   [`CountingIn`] wraps the bulk-IN endpoint for the TX meter;
+//! * [`GadgetHalf`](snowscsi::usb::GadgetHalf) lifts a Bulk-Only Reset out of
+//!   the shared [`PENDING_RESET`] flag.
 //!
 //! Control requests (Get Max LUN / Bulk-Only Reset) are delivered to
 //! [`MscHandler`] by [`embassy_usb::UsbDevice::run`]. The handler cannot borrow
-//! the session, so it signals through the [`PENDING_RESET`] / [`USB_CONNECTED`]
-//! statics; the BOT loop drains the reset flag at the top of each iteration,
-//! and the status LCD (M4) reads [`usb_connected`], [`rx_bytes`] and
+//! the session, so it answers Get Max LUN inline and signals a reset through the
+//! [`PENDING_RESET`] static; the serve loop drains that flag at each loop
+//! boundary. The status LCD reads [`usb_connected`], [`rx_bytes`] and
 //! [`tx_bytes`].
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::time::Duration as CoreDuration;
 
 use defmt::warn;
-use embassy_futures::select::{select, Either};
-use embassy_time::{Duration, Timer};
+use embassy_time::{with_timeout, Duration, Instant, TimeoutError};
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
-use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, EndpointOut};
 use embassy_usb::Handler;
 
-use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::common::async_store::AsyncStorePlane;
+use snowscsi::scsi::AsyncLuns;
+use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{
-    BotSession, BotStepResult, BotTargetError, SessionEvent, SessionNeed, SessionStep, BOT_RESET,
-    GET_MAX_LUN,
+    AsyncBotRecv, BotIoErr, BotSession, Event, GadgetHalf, RecvMode, SendHalf, ServeError,
+    BOT_RESET, GET_MAX_LUN,
 };
 
 /// Number of LUNs presented to the host, zero-based (SPC Get Max LUN answer).
@@ -34,18 +39,8 @@ use snowscsi::usb::{
 /// One LUN: the whole SD card exposed as a DVD-RAM UDF-RW volume.
 pub const MAX_LUN: u8 = 0;
 
-/// Upper bound for the non-blocking overrun-drain probe: the BOT loop races a
-/// bulk-OUT read against this timeout so a host that stops mid-phase cannot
-/// wedge the session. Any real overrun bytes belong to the same bulk stream as
-/// the declared data and are queued in the endpoint FIFO by the time the write
-/// completes, so the read returns immediately; the timeout only bounds the
-/// (normal, conforming-host) no-overrun case and therefore sits on the critical
-/// path of *every* write. 200 µs (systimer resolution, not the 100 Hz scheduler
-/// tick) is ample for the queued case and removes ~0.8 ms/write.
-const PROBE_TIMEOUT: Duration = Duration::from_micros(200);
-
 /// Set by [`MscHandler`] on a Bulk-Only Reset (control request or bus reset)
-/// and consumed at the top of the BOT loop, which calls [`BotSession::reset`].
+/// and drained by the serve loop's gadget half, which feeds it to the session.
 ///
 /// The handler runs inside `UsbDevice::run` and cannot borrow the session, so
 /// the reset request is carried out-of-band through this flag.
@@ -54,19 +49,19 @@ static PENDING_RESET: AtomicBool = AtomicBool::new(false);
 /// Whether the USB device is currently enabled *and* configured.
 ///
 /// Maintained from the [`Handler`] callbacks (there is no public
-/// `UsbDeviceState` getter); the M4 status LCD reads it via [`usb_connected`].
+/// `UsbDeviceState` getter); the status LCD reads it via [`usb_connected`].
 static USB_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 /// Bulk bytes received from the host (CBW fragments, Data-Out payload
-/// chunks), measured at the endpoint-completion points of the BOT loop. The
-/// status LCD divides the refresh-to-refresh delta by the interval to show an
-/// **RX** (host → device) rate.
+/// chunks), measured as each bulk-OUT packet completes. The status LCD divides
+/// the refresh-to-refresh delta by the interval to show an **RX**
+/// (host → device) rate.
 static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// Bulk bytes sent to the host (Data-In chunks, synthesized responses, CSWs),
-/// measured at the endpoint-completion points of the BOT loop. The status LCD
-/// divides the refresh-to-refresh delta by the interval to show a **TX**
-/// (device → host) rate.
+/// measured as each bulk-IN packet completes. The status LCD divides the
+/// refresh-to-refresh delta by the interval to show a **TX** (device → host)
+/// rate.
 static TX_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the host currently has the gadget enabled and configured.
@@ -85,6 +80,12 @@ pub fn rx_bytes() -> u32 {
 /// Total bulk bytes sent to the host (→ LCD RX/TX rate via [`SpeedMark`]).
 pub fn tx_bytes() -> u32 {
     TX_BYTES.load(Ordering::Relaxed)
+}
+
+/// The shared Bulk-Only Reset flag the class [`Handler`] sets and the serve
+/// loop's gadget half drains.
+pub fn reset_flag() -> &'static AtomicBool {
+    &PENDING_RESET
 }
 
 /// Delta-sampler for the LCD speed line: converts the cumulative [`rx_bytes`]
@@ -144,8 +145,7 @@ impl SpeedMark {
 ///
 /// Bus callbacks keep [`USB_CONNECTED`] and [`PENDING_RESET`] in step. Note
 /// that embassy-usb consumes CLEAR FEATURE(ENDPOINT_HALT) itself and never
-/// forwards it to a handler, so a preserved STALL cannot be observed from
-/// here (see the `Stalled` handling in [`handle_done`]).
+/// forwards it to a handler, so a preserved STALL cannot be observed from here.
 pub struct MscHandler;
 
 impl Handler for MscHandler {
@@ -199,29 +199,196 @@ impl Handler for MscHandler {
     }
 }
 
+/// Zero-timeout duration for the non-blocking probe: `with_timeout` polls the
+/// wrapped read once before its timer, so an already-arrived packet wins.
+const ZERO: Duration = Duration::from_ticks(0);
+
+/// Upper bound on a converted timeout (1000 s); mirrors the library adapter so
+/// a maximal `core::time::Duration` cannot overflow `Instant + Duration`.
+const MAX_MICROS: u64 = 1_000_000_000;
+
+/// Convert a seam timeout (`core::time::Duration`) to an embassy duration.
+fn to_embassy(d: CoreDuration) -> Duration {
+    let micros = u64::try_from(d.as_micros().min(u128::from(MAX_MICROS))).unwrap_or(MAX_MICROS);
+    Duration::from_micros(micros)
+}
+
+/// Map an endpoint error to the coarse bulk seam error.
+fn recv_err(err: EndpointError) -> BotIoErr {
+    match err {
+        EndpointError::Disabled => BotIoErr::Disconnected,
+        EndpointError::BufferOverflow => BotIoErr::Io,
+    }
+}
+
+/// Bulk-OUT half: a **consolidating** [`AsyncBotRecv`] over one endpoint.
+///
+/// A Full-Speed link delivers at most one 64-byte packet per `ep.read`, but the
+/// shell hands this half the whole core-requested chunk (or the overlap
+/// scratch) as `buf`. It therefore keeps reading packets into `buf` until it is
+/// full or a short packet ends the bulk transfer. Handing the core one packet
+/// at a time would make it emit a `StoreOp::Write` per 64 bytes, turning each
+/// 512-byte SD sector write into a read-modify-write cycle; consolidating
+/// yields one write per core chunk. The RX meter is tallied per packet, once.
+pub struct ConsolidatingRecv<O> {
+    /// The wrapped bulk-OUT endpoint.
+    pub ep: O,
+}
+
+impl<O: EndpointOut> ConsolidatingRecv<O> {
+    /// Tally one received packet for the LCD RX meter.
+    fn tally(&self, n: usize) {
+        RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
+    }
+
+    /// Accumulate packets until `buf` is full or a short packet arrives.
+    async fn fill(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+        let mps = self.ep.info().max_packet_size as usize;
+        let mut n = 0usize;
+        while n < buf.len() {
+            let i = self.ep.read(&mut buf[n..]).await.map_err(recv_err)?;
+            self.tally(i);
+            n += i;
+            // A short packet terminates the host's bulk transfer early.
+            if i < mps {
+                break;
+            }
+        }
+        Ok(n)
+    }
+
+    /// As [`Self::fill`], but bounded by an overall deadline. On expiry the
+    /// bytes already received are returned as progress — they were consumed
+    /// from the endpoint and must not be dropped — while nothing received is
+    /// [`BotIoErr::WouldBlock`]. A zero-length read is a link-down `Ok(0)`, not
+    /// a timeout.
+    async fn fill_until(&mut self, buf: &mut [u8], deadline: Instant) -> Result<usize, BotIoErr> {
+        let mps = self.ep.info().max_packet_size as usize;
+        let mut n = 0usize;
+        while n < buf.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match with_timeout(remaining, self.ep.read(&mut buf[n..])).await {
+                Ok(Ok(i)) => {
+                    self.tally(i);
+                    n += i;
+                    if i < mps {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => return Err(recv_err(e)),
+                // Expiry with nothing received is a would-block; with bytes
+                // already in `buf` it is progress.
+                Err(TimeoutError) => {
+                    return if n > 0 {
+                        Ok(n)
+                    } else {
+                        Err(BotIoErr::WouldBlock)
+                    };
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+impl<O: EndpointOut> AsyncBotRecv for ConsolidatingRecv<O> {
+    async fn recv(&mut self, buf: &mut [u8], mode: RecvMode) -> Result<usize, BotIoErr> {
+        match mode {
+            // Non-blocking drain: a single attempt, no consolidation loop.
+            RecvMode::Probe => match with_timeout(ZERO, self.ep.read(buf)).await {
+                Ok(Ok(i)) => {
+                    self.tally(i);
+                    Ok(i)
+                }
+                Ok(Err(e)) => Err(recv_err(e)),
+                Err(TimeoutError) => Err(BotIoErr::WouldBlock),
+            },
+            // A packet is known to be pending: park until the endpoint is live
+            // (a not-yet-configured endpoint returns `Disabled` immediately and
+            // would otherwise spin), then accumulate without a deadline.
+            RecvMode::Forever => {
+                self.ep.wait_enabled().await;
+                self.fill(buf).await
+            }
+            // Bounded total wait: park, then accumulate under a deadline.
+            RecvMode::Until(d) => {
+                self.ep.wait_enabled().await;
+                let deadline = Instant::now().saturating_add(to_embassy(d));
+                self.fill_until(buf, deadline).await
+            }
+        }
+    }
+}
+
+/// Bulk-IN endpoint wrapper that tallies sent bytes for the status LCD.
+pub struct CountingIn<I>(pub I);
+
+impl<I: EndpointIn> Endpoint for CountingIn<I> {
+    fn info(&self) -> &EndpointInfo {
+        self.0.info()
+    }
+
+    async fn wait_enabled(&mut self) {
+        self.0.wait_enabled().await
+    }
+}
+
+impl<I: EndpointIn> EndpointIn for CountingIn<I> {
+    async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+        let r = self.0.write(buf).await;
+        if r.is_ok() {
+            TX_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+/// The three independent seams [`serve_async`] borrows.
+///
+/// The OUT half consolidates (see [`ConsolidatingRecv`]); the IN half uses the
+/// library's chunking [`SendHalf`] (a Data-In chunk is split into MPS packets
+/// correctly there); the control half drains the shared reset flag.
+pub struct Bot<O, I> {
+    /// Bulk-OUT receive half (consolidating).
+    pub out: ConsolidatingRecv<O>,
+    /// Bulk-IN send half (chunked, byte-counting).
+    pub in_: SendHalf<CountingIn<I>>,
+    /// Control-plane half.
+    pub gadget: GadgetHalf,
+}
+
+/// Bundle the two bulk endpoints and the shared reset flag for the serve loop.
+pub fn bot<O, I>(out: O, in_: I) -> Bot<O, I> {
+    Bot {
+        out: ConsolidatingRecv { ep: out },
+        in_: SendHalf {
+            ep: CountingIn(in_),
+        },
+        gadget: GadgetHalf::new(reset_flag()),
+    }
+}
+
 /// Run the BOT protocol loop forever over a bulk endpoint pair.
 ///
 /// `work` is the SCSI data region (must be ≥ [`snowscsi::MIN_DATA_LEN`]);
-/// `recv` is the bulk-OUT scratch (≥ `work.len()` and a multiple of the
-/// endpoint MPS is recommended); `devs` is the LUN slice.
+/// `scratch` is the equal-length overlap buffer the shell pre-receives into;
+/// `luns` is the device/plane bundle; `stop` is the shared shutdown flag.
 ///
-/// Mirrors the CLI's `serve_bot` poll loop: a pending reset is applied first,
-/// then exactly one endpoint operation is driven to completion and its result
-/// fed back to the session. `ep_out`/`ep_in` are `embassy-usb` endpoints, so
-/// the loop is cancellation-free (each operation is awaited rather than
-/// polled with a deadline — except the overrun probe, which must not block).
-pub async fn run<O, I, D>(
-    ep_out: &mut O,
-    ep_in: &mut I,
+/// The library shell owns the protocol loop. This wrapper re-arms the session
+/// and restarts it after a host disconnect, so the gadget future never returns:
+/// a disconnect parks the next receive until the host re-enumerates.
+pub async fn run<O, I, P>(
+    bot: &mut Bot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
-    recv: &mut [u8],
-    devs: &mut [D],
+    scratch: &mut [u8],
+    luns: &mut AsyncLuns<'_, P>,
+    stop: &AtomicBool,
 ) -> !
 where
     O: EndpointOut,
     I: EndpointIn,
-    D: ScsiDevice,
+    P: AsyncStorePlane,
 {
     assert!(
         work.len() >= snowscsi::MIN_DATA_LEN,
@@ -229,187 +396,35 @@ where
     );
 
     loop {
-        // Wait until the host has configured the device and enabled the bulk
-        // endpoints, yielding to `UsbDevice::run()` which performs enumeration.
-        //
-        // CRITICAL: before configuration, the Synopsys driver's `read` returns
-        // `Err(Disabled)` *immediately*; awaiting an already-ready future does
-        // not yield, so a naive read loop would spin synchronously and starve
-        // `UsbDevice::run()` (USB never comes up). `wait_enabled` parks the
-        // task until the endpoints are live.
-        ep_out.wait_enabled().await;
-        ep_in.wait_enabled().await;
-
-        // Out-of-band Bulk-Only Reset requested on the control pipe / bus.
-        if PENDING_RESET.swap(false, Ordering::Relaxed) {
-            session.reset();
+        // Drop any transaction left over from a previous host session and
+        // inject the post-reset UNIT ATTENTION, exactly like the shell's own
+        // reset path.
+        {
+            let AsyncLuns { devs, .. } = &mut *luns;
+            let _ = session.poll(Event::Reset, work, devs);
         }
 
-        match session.need() {
-            SessionNeed::NeedOut { len, probe } => {
-                // Never read more than the receive scratch; the core keeps
-                // asking for the remainder on the next iteration.
-                let n = len.min(recv.len());
-                if probe {
-                    // Data-Out overrun drain: try once with a short deadline so
-                    // a host that stops sending cannot wedge the session. If
-                    // nothing arrives, feed OutIdle so the core closes the
-                    // phase with the CSW.
-                    match select(ep_out.read(&mut recv[..n]), Timer::after(PROBE_TIMEOUT)).await {
-                        Either::First(Ok(got)) => {
-                            // Count before the session feed: this is a real
-                            // bulk-OUT reception regardless of the outcome.
-                            RX_BYTES.fetch_add(got as u32, Ordering::Relaxed);
-                            feed(
-                                session,
-                                SessionEvent::OutRecv { data: &recv[..got] },
-                                work,
-                                devs,
-                            );
-                        }
-                        Either::First(Err(EndpointError::Disabled)) => session.reset(),
-                        Either::First(Err(EndpointError::BufferOverflow)) => {
-                            warn!("bot: bulk OUT probe buffer overflow");
-                        }
-                        Either::Second(()) => {
-                            feed(session, SessionEvent::OutIdle, work, devs);
-                        }
-                    }
-                } else {
-                    // Consolidate the whole pending chunk into one OutRecv. Feeding
-                    // one 64-byte packet at a time makes the BOT core call xfer_in
-                    // for every 64 bytes, turning each sector write into many tiny
-                    // read-modify-write SD cycles. `n` is exactly what the core
-                    // wants for this phase.
-                    let mps = ep_out.info().max_packet_size as usize;
-                    let mut got = 0usize;
-                    let mut reset = false;
-                    while got < n {
-                        match ep_out.read(&mut recv[got..n]).await {
-                            Ok(0) => break,
-                            Ok(i) => {
-                                got += i;
-                                // A short packet terminates the host's bulk transfer early.
-                                if i < mps {
-                                    break;
-                                }
-                            }
-                            Err(EndpointError::Disabled) => {
-                                // Link gone: drop the transaction; anything
-                                // already accumulated must NOT be fed, as
-                                // `reset` has returned to the Command phase.
-                                session.reset();
-                                reset = true;
-                                break;
-                            }
-                            Err(EndpointError::BufferOverflow) => {
-                                // A packet larger than the remaining space in
-                                // `recv[got..n]` (non-conforming/overrunning
-                                // host). Keep the bytes already accumulated —
-                                // feeding them keeps the core byte-synchronised
-                                // — and let the outer loop retry the rest.
-                                warn!("bot: bulk OUT packet larger than remaining recv space");
-                                break;
-                            }
-                        }
-                    }
-                    if !reset && got > 0 {
-                        // Count the Data-Out payload once per consolidated
-                        // chunk, before feeding the session.
-                        RX_BYTES.fetch_add(got as u32, Ordering::Relaxed);
-                        feed(
-                            session,
-                            SessionEvent::OutRecv { data: &recv[..got] },
-                            work,
-                            devs,
-                        );
-                    }
-                }
-            }
-            SessionNeed::NeedIn { .. } => {
-                // Borrow the outgoing bytes only for the transfer; the borrow
-                // must end before `feed` re-borrows the session. An empty
-                // slice is a real ZLP (`write_transfer` would send nothing).
-                // Capture the payload length inside the block: it is needed
-                // for the TX byte meter after the borrow ends.
-                let (sent_len, send) = {
-                    let data = session.out_slice(work);
-                    let sent_len = data.len();
-                    let send = if data.is_empty() {
-                        ep_in.write(&[]).await
-                    } else {
-                        ep_in.write_transfer(data, false).await
-                    };
-                    (sent_len, send)
-                };
-                match send {
-                    Ok(()) => {
-                        TX_BYTES.fetch_add(sent_len as u32, Ordering::Relaxed);
-                        feed(session, SessionEvent::InSent, work, devs);
-                    }
-                    Err(EndpointError::Disabled) => session.reset(),
-                    Err(EndpointError::BufferOverflow) => {
-                        warn!("bot: bulk IN packet larger than endpoint");
-                    }
-                }
-            }
-            SessionNeed::NeedStall => {
-                // Unreachable with the pinned `ShortNoStall` policy: only
-                // `ShortfallPolicy::Short` stalls, and embassy-usb cannot expose
-                // endpoint STALL to a class. Defensive reset if it ever happens.
-                warn!("bot: unexpected NeedStall; resetting session");
-                session.reset();
-            }
-            SessionNeed::Done(r) => handle_done(session, r),
+        match serve_async(
+            &mut bot.out,
+            &mut bot.in_,
+            &mut bot.gadget,
+            session,
+            work,
+            scratch,
+            luns,
+            stop,
+        )
+        .await
+        {
+            // `Ok` only on a set stop flag; a closed link restarts the loop.
+            Ok(()) | Err(ServeError::Closed) => {}
+            Err(_) => warn!("bot: serve loop stopped; restarting"),
         }
-    }
-}
 
-/// Feed one bulk event to the session and react to a transaction end.
-///
-/// Keeps the `SessionStep` borrow scoped to this call so `handle_done` can
-/// borrow the session mutably again.
-fn feed<D: ScsiDevice>(
-    session: &mut BotSession,
-    ev: SessionEvent<'_>,
-    work: &mut [u8],
-    devs: &mut [D],
-) {
-    let done = match session.poll(ev, work, devs) {
-        SessionStep::Done(r) => Some(r),
-        _ => None,
-    };
-    if let Some(r) = done {
-        handle_done(session, r);
-    }
-}
-
-/// React to a transaction-end result from the core.
-fn handle_done(session: &mut BotSession, result: BotStepResult) {
-    match result {
-        BotStepResult::Stalled => {
-            // Deviation: the BOT spec wants both bulk endpoints STALLed on an
-            // invalid CBW, but embassy-usb's `Bus` (which owns
-            // `endpoint_set_stalled`) is private to `UsbDevice`. We cannot set
-            // the STALL condition from the class driver. Instead drop the bad
-            // transaction and reset the session; a conforming host never sends
-            // an invalid CBW, and a reset is what the host would do next
-            // anyway.
-            warn!("bot: invalid CBW; endpoint STALL unsupported, resetting session");
-            session.reset();
+        if stop.load(Ordering::Relaxed) {
+            // This firmware has no shutdown path; park so a set flag cannot
+            // spin the restart loop.
+            core::future::pending::<()>().await;
         }
-        BotStepResult::Error(BotTargetError::Internal) => {
-            warn!("bot: internal state error; resetting session");
-            session.reset();
-        }
-        BotStepResult::Error(_) => {
-            warn!("bot: transaction error; continuing");
-        }
-        BotStepResult::Unsupported => {
-            // Emitted only by the blocking `step()` wrapper; this async loop
-            // never calls it. Defensive no-op.
-            warn!("bot: Unsupported step() result; ignoring");
-        }
-        BotStepResult::Processed | BotStepResult::Closed => {}
     }
 }

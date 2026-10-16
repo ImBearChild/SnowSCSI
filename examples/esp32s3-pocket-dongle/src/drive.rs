@@ -23,13 +23,15 @@ pub const WORK_LEN: usize = MIN_DATA_LEN;
 
 /// Build a DVD-RAM drive backed by the SD card.
 ///
-/// The returned drive borrows `sd` for `'a`, so the card must outlive it and
-/// no other borrow of the card may be live at the same time.
-pub fn build<'a>(sd: &'a mut SdCard<'_>) -> CdromDrive<'a> {
+/// The drive is backend-free: it caches geometry from `sd` (via the synchronous
+/// `RwRef` view, whose `capacity()` is all [`DvdRamMedia::open`] reads) and
+/// addresses the SD card only through the LUN's store plane, so the borrow of
+/// `sd` ends when this function returns.
+pub fn build(sd: &mut SdCard<'_>) -> CdromDrive {
     let mut drive = CdromDrive::new();
     // `load` (not `load_quiet`) queues a Unit Attention, which the first
     // TEST UNIT READY reports and consumes — exactly what a real host sees
     // after media insertion.
-    drive.load(CdMedia::Rw(DvdRamMedia::open(RwRef::new(sd))));
+    drive.load(CdMedia::Rw(DvdRamMedia::open(&mut RwRef::new(sd))));
     drive
 }

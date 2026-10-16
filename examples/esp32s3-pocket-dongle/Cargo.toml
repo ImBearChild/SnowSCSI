@@ -54,6 +54,8 @@ embedded-io = "0.7"          # StorageError::Io(ErrorKind) for the SD seam
 embedded-hal-bus = "0.3"     # ExclusiveDevice: adapt SpiBus -> SpiDevice for mipidsi
 heapless = "0.9"             # stack string formatting for the LCD
 
-# --- SnowSCSI workspace seams (unchanged; no_std) ---
-snowscsi = { path = "../../snowscsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt"] }
-snowscsi-common = { path = "../../snowscsi-common", default-features = false, features = ["defmt"] }
+# --- SnowSCSI workspace seams (no_std) ---
+# `async-io` enables the asynchronous storage seams and the `serve_async` shell;
+# `embassy` adds the `embassy-usb` endpoint/gadget adapters.
+snowscsi = { path = "../../snowscsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt", "async-io", "embassy"] }
+snowscsi-common = { path = "../../snowscsi-common", default-features = false, features = ["defmt", "async-io"] }

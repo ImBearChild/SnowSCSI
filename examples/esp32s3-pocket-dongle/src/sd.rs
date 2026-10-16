@@ -17,12 +17,21 @@
 //! batch (also required because the SDMMC IDMAC cannot DMA from PSRAM, and only
 //! the batch is guaranteed to live in internal, DMA-aligned RAM).
 //!
-//! # Async to sync
+//! # Two planes over one card
 //!
 //! `sdio`'s public block surface is async (`block_device_driver::BlockDevice`)
-//! and `esp-hal` only implements `sdio::MmcBus` for the `Async` slot, while the
-//! storage seams are synchronous. The adapter therefore drives each transfer to
-//! completion with [`embassy_futures::block_on`].
+//! and `esp-hal` only implements `sdio::MmcBus` for the `Async` slot. The card
+//! therefore speaks the **asynchronous** storage seams
+//! ([`AsyncFlatData`]/[`AsyncWritableFlatData`]) natively — each transfer is
+//! awaited directly — and the shell executes the device's `Store` ops against
+//! it.
+//!
+//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are also
+//! implemented, because the DVD-RAM media slot needs a synchronous geometry
+//! view ([`DvdRamMedia::open`](snowscsi::cdrom::dvdram::DvdRamMedia::open) reads
+//! `capacity()` through a `&mut dyn WritableFlatData`). They delegate to the
+//! asynchronous implementation with [`embassy_futures::block_on`]; only the
+//! capacity read is exercised on this path at runtime.
 
 use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
@@ -33,6 +42,7 @@ use esp_hal::time::Instant;
 use esp_hal::Async;
 use static_cell::StaticCell;
 
+use snowscsi_common::async_seekable_storage::{AsyncFlatData, AsyncWritableFlatData};
 use snowscsi_common::seekable_storage::{FlatData, StorageError, WritableFlatData};
 
 /// Native SD memory-card block size in bytes.
@@ -168,8 +178,8 @@ impl<'d: 'static> SdCard<'d> {
     }
 }
 
-impl FlatData for SdCard<'_> {
-    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+impl AsyncFlatData for SdCard<'_> {
+    async fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         let end = off
             .checked_add(buf.len() as u64)
             .ok_or(StorageError::OutOfBounds)?;
@@ -192,7 +202,8 @@ impl FlatData for SdCard<'_> {
             if within == 0 && remaining >= SD_BLOCK_SIZE {
                 // Full-block run: one multi-block read for up to `BATCH_BLOCKS`.
                 let k = (remaining / SD_BLOCK_SIZE).min(BATCH_BLOCKS);
-                block_on(dev.read(block, &mut batch[..k]))
+                dev.read(block, &mut batch[..k])
+                    .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
                 for i in 0..k {
                     let start = done + i * SD_BLOCK_SIZE;
@@ -205,7 +216,8 @@ impl FlatData for SdCard<'_> {
                 // Partial head/tail: read the containing block and copy the
                 // wanted sub-range out of the batch's first slot.
                 let n = core::cmp::min(SD_BLOCK_SIZE - within, remaining);
-                block_on(dev.read(block, &mut batch[..1]))
+                dev.read(block, &mut batch[..1])
+                    .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
                 buf[done..done + n].copy_from_slice(&batch[0][within..within + n]);
 
@@ -221,8 +233,8 @@ impl FlatData for SdCard<'_> {
     }
 }
 
-impl WritableFlatData for SdCard<'_> {
-    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+impl AsyncWritableFlatData for SdCard<'_> {
+    async fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
         let end = off
             .checked_add(buf.len() as u64)
             .ok_or(StorageError::OutOfBounds)?;
@@ -250,7 +262,8 @@ impl WritableFlatData for SdCard<'_> {
                     let start = done + i * SD_BLOCK_SIZE;
                     batch[i].copy_from_slice(&buf[start..start + SD_BLOCK_SIZE]);
                 }
-                block_on(dev.write(block, &batch[..k]))
+                dev.write(block, &batch[..k])
+                    .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
                 let consumed = k * SD_BLOCK_SIZE;
                 pos += consumed as u64;
@@ -259,10 +272,12 @@ impl WritableFlatData for SdCard<'_> {
                 // Partial head/tail: read-modify-write the containing block,
                 // preserving the untouched bytes.
                 let n = core::cmp::min(SD_BLOCK_SIZE - within, remaining);
-                block_on(dev.read(block, &mut batch[..1]))
+                dev.read(block, &mut batch[..1])
+                    .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
                 batch[0][within..within + n].copy_from_slice(&buf[done..done + n]);
-                block_on(dev.write(block, &batch[..1]))
+                dev.write(block, &batch[..1])
+                    .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
 
                 pos += n as u64;
@@ -272,7 +287,32 @@ impl WritableFlatData for SdCard<'_> {
         Ok(())
     }
 
-    /// SD writes are already synchronous on the card; there is no write cache.
+    /// SD writes are already durable on the card; there is no write cache.
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+// The synchronous seams delegate to the asynchronous implementation: only the
+// geometry read (`capacity()`) is used through them at runtime (the DVD-RAM
+// media slot's construction), so a `block_on` around the awaited transfer keeps
+// the two planes from drifting apart.
+impl FlatData for SdCard<'_> {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        block_on(AsyncFlatData::read_at(self, off, buf))
+    }
+
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+}
+
+impl WritableFlatData for SdCard<'_> {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+        block_on(AsyncWritableFlatData::write_at(self, off, buf))
+    }
+
+    /// SD writes are already durable on the card; there is no write cache.
     fn sync(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
