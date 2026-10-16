@@ -10,10 +10,10 @@
 //! `serve_async` (feature `async-io`) is the asynchronous mirror: the same
 //! control plane and the same event/action contract, but the bulk seam is
 //! awaited (`AsyncBotRecv` / `AsyncBotSend`) and an [`Action::Store`] runs on
-//! an `AsyncStorePlane`. It is serial — one operation is awaited at a time —
-//! and drains the control plane after every await so a reset supersedes the
-//! in-flight completion. Both loops share [`handle_ctrl`], so reset and
-//! Get Max LUN behave identically.
+//! an `AsyncStorePlane`. It overlaps bulk I/O with the storage plane (a second
+//! `scratch` buffer fetches the next chunk concurrently) and drains the control
+//! plane after every await so a reset supersedes the in-flight completion. Both
+//! loops share [`handle_ctrl`], so reset and Get Max LUN behave identically.
 //!
 //! Platform quirks (e.g. the Linux FunctionFS aio receive needing an
 //! MPS-multiple buffer) live in the platform's `BotIo` implementation, not
@@ -30,6 +30,10 @@ use crate::usb::target::{Action, BotSession, BotTargetError, Event, ShortfallPol
 
 #[cfg(feature = "async-io")]
 use crate::common::async_store::AsyncStorePlane;
+#[cfg(feature = "async-io")]
+use crate::common::seekable_storage::StorageError;
+#[cfg(feature = "async-io")]
+use crate::common::store::StoreOp;
 #[cfg(feature = "async-io")]
 use crate::scsi::AsyncLuns;
 #[cfg(feature = "async-io")]
@@ -236,21 +240,77 @@ pub fn serve<B: BotIo, G: for<'a> Gadget<'a>>(
     }
 }
 
-/// Asynchronous serial shell: the awaited mirror of [`serve`].
+/// Concurrently drive two futures to completion, returning both outputs.
+///
+/// Neither side is cancelled: a side that becomes ready first keeps the other
+/// side alive, and a pending side is never dropped. Built on [`core::pin::pin`]
+/// and [`core::future::poll_fn`] so it stays `no_std` and dependency-free.
+#[cfg(feature = "async-io")]
+async fn join<A, B>(a: A, b: B) -> (A::Output, B::Output)
+where
+    A: core::future::Future,
+    B: core::future::Future,
+{
+    let mut a = core::pin::pin!(a);
+    let mut b = core::pin::pin!(b);
+    let mut out_a = None;
+    let mut out_b = None;
+    core::future::poll_fn(move |cx| {
+        if out_a.is_none() {
+            if let core::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                out_a = Some(v);
+            }
+        }
+        if out_b.is_none() {
+            if let core::task::Poll::Ready(v) = b.as_mut().poll(cx) {
+                out_b = Some(v);
+            }
+        }
+        if out_a.is_some() && out_b.is_some() {
+            core::task::Poll::Ready((out_a.take().unwrap(), out_b.take().unwrap()))
+        } else {
+            core::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Asynchronous serve shell: the awaited mirror of [`serve`], with read-ahead /
+/// write-ahead overlap.
 ///
 /// Same control plane, same event/action contract, same reset semantics — but
 /// the bulk seam is awaited ([`AsyncBotRecv`] / [`AsyncBotSend`]) and an
-/// [`Action::Store`] runs on an [`AsyncStorePlane`]. One operation is in
-/// flight at a time (no overlap), and the control plane is drained after every
-/// await so a reset that arrives while an I/O is in flight supersedes the
-/// in-flight completion (the completion is discarded and `Event::Tick`
-/// carried instead).
+/// [`Action::Store`] runs on an [`AsyncStorePlane`]. The control plane is
+/// drained after every await so a reset that arrives while an I/O is in flight
+/// supersedes the in-flight completion (the completion is discarded and
+/// `Event::Tick` carried instead).
 ///
-/// `work` is the time-multiplexed data buffer (as in [`serve`]); `scratch` is
-/// reserved for read-ahead overlap and unused here. `luns` is the aligned
-/// device/plane bundle, destructured for disjoint borrows. A `Short` session
-/// whose transport cannot STALL Bulk-In is rejected up front
-/// ([`ServeError::PolicyNeedsStall`]), exactly like the synchronous loop.
+/// # Overlap
+///
+/// A single `work` buffer always holds the chunk the core is working on;
+/// `scratch` is a second buffer of the same length (`scratch.len() ==
+/// work.len()`, asserted in debug builds) that fetches the *next* chunk
+/// concurrently. After each overlap the two are swapped so the fetched chunk
+/// sits in `work`:
+///
+/// - **Write phase** — an [`Action::Store`] with `next_recv: Some(budget)` (the
+///   core's write-ahead latch: more Data-Out is coming) is joined with a
+///   bounded receive into `scratch`. The buffers are swapped, the store
+///   completion is fed, and the core's following `HostRecv` is answered from
+///   the pre-received bytes (`min(got, budget)`) without receiving again. A
+///   pre-receive timeout (`WouldBlock`) feeds only the store completion and
+///   lets the core ask again; a disconnect resets; an I/O error is fatal.
+/// - **Read phase** — an [`Action::HostSend`] carrying a `prefetch`
+///   `(lun, off, len)` coordinate is joined with a speculative read into
+///   `scratch`. The buffers are swapped so the pre-read chunk sits in `work`;
+///   the following `Action::Store` read at the same `(lun, off)` for no more
+///   than `len` bytes is then completed without touching the plane. A
+///   speculative read error is swallowed — the real op re-runs and re-reports
+///   its sense.
+///
+/// `luns` is the aligned device/plane bundle, destructured for disjoint
+/// borrows. A `Short` session whose transport cannot STALL Bulk-In is rejected
+/// up front ([`ServeError::PolicyNeedsStall`]), exactly like [`serve`].
 #[cfg(feature = "async-io")]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_async<R, S, G, P>(
@@ -258,8 +318,8 @@ pub async fn serve_async<R, S, G, P>(
     send: &mut S,
     gadget: &mut G,
     session: &mut BotSession,
-    work: &mut [u8],
-    scratch: &mut [u8],
+    mut work: &mut [u8],
+    mut scratch: &mut [u8],
     luns: &mut AsyncLuns<'_, P>,
     stop: &AtomicBool,
 ) -> Result<(), ServeError>
@@ -269,8 +329,9 @@ where
     G: for<'a> Gadget<'a>,
     P: AsyncStorePlane,
 {
-    // Read-ahead scratch is not used by the serial loop.
-    let _ = scratch;
+    // The overlap swaps the two buffers in place, so they must be the same
+    // length: the core sizes every chunk against `work.len()`.
+    debug_assert_eq!(scratch.len(), work.len(), "overlap buffers must match");
 
     // Disjoint borrows: `devs` is handed to `poll`, `planes` executes
     // `Action::Store` ops without aliasing the device slice.
@@ -282,6 +343,16 @@ where
         return Err(ServeError::PolicyNeedsStall);
     }
 
+    // Length to feed as the next `HostRecv` from an already pre-received
+    // write chunk (`None` when no write-ahead receive is outstanding). Set
+    // alongside a `StoreDone` event and consumed by the following non-probe
+    // `HostRecv`; a reset drops it because the pre-received bytes are gone.
+    let mut prefetched: Option<usize> = None;
+    // Coordinate `(lun, off, len)` of a completed speculative read. The next
+    // `Action::Store` read matching it is completed without touching the
+    // plane; a reset drops it.
+    let mut pending_read: Option<(usize, u64, usize)> = None;
+
     let mut ev = Event::Tick;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -289,9 +360,22 @@ where
         }
 
         // 1) Control plane first (arrives at any time, even mid data phase).
+        // A reset replaces `ev` with `Tick` and aborts the in-flight transfer,
+        // so any overlap state prepared for it is now stale.
+        let ev_before = ev;
         if handle_ctrl(gadget, session, work, devs, &mut ev)? {
+            if ev != ev_before {
+                prefetched = None;
+                pending_read = None;
+            }
             continue;
         }
+
+        // Overlap state is only meaningful for the action the core emits
+        // immediately after the event it was prepared for; take it now so any
+        // other action drops it.
+        let recv_from_prefetch = prefetched.take();
+        let speculative = pending_read.take();
 
         // 2) Feed the carried event, execute the returned action, and carry
         // the completion in `ev`.
@@ -306,6 +390,11 @@ where
                         Err(BotIoErr::Disconnected) => Event::Reset,
                         Err(BotIoErr::Io) => return Err(ServeError::Closed),
                     };
+                } else if let Some(n) = recv_from_prefetch {
+                    // The write-ahead receive already put this chunk in
+                    // `work`: answer the core without receiving again. The
+                    // core tolerates the short length.
+                    ev = Event::HostRecv { len: n };
                 } else {
                     ev = match recv
                         .recv(&mut work[..len], RecvMode::Until(CTRL_POLL_GRANULARITY))
@@ -320,24 +409,103 @@ where
                     };
                 }
             }
-            Action::HostSend { bytes, .. } => {
-                ev = match send.send(bytes).await {
-                    Ok(()) => Event::HostSent,
-                    Err(BotIoErr::Disconnected) => Event::Reset,
-                    Err(_) => return Err(ServeError::Closed),
-                };
+            Action::HostSend { bytes, prefetch } => {
+                if let Some((plun, poff, plen)) = prefetch {
+                    // Send this chunk while speculatively reading the next one
+                    // into `scratch`: `bytes` borrows `work`, the read borrows
+                    // `scratch`, so the two do not alias.
+                    let (sent, read) = match planes.get_mut(plun).and_then(Option::as_mut) {
+                        Some(plane) => {
+                            join(
+                                send.send(bytes),
+                                plane.do_op(StoreOp::Read {
+                                    off: poff,
+                                    buf: &mut scratch[..plen],
+                                }),
+                            )
+                            .await
+                        }
+                        // No plane to pre-read from: send only; the real op
+                        // reports the internal error when it arrives.
+                        None => (send.send(bytes).await, Err(StorageError::Unsupported)),
+                    };
+                    // The pre-read chunk now sits in `scratch`; move it into
+                    // `work` so the core's following read finds it there.
+                    core::mem::swap(&mut work, &mut scratch);
+                    match sent {
+                        Ok(()) => {
+                            // Remember the coordinate only when the read
+                            // succeeded: a speculative error must not suppress
+                            // the real op, which re-reports its sense.
+                            pending_read = read.ok().map(|()| (plun, poff, plen));
+                            ev = Event::HostSent;
+                        }
+                        Err(BotIoErr::Disconnected) => ev = Event::Reset,
+                        Err(_) => return Err(ServeError::Closed),
+                    }
+                } else {
+                    ev = match send.send(bytes).await {
+                        Ok(()) => Event::HostSent,
+                        Err(BotIoErr::Disconnected) => Event::Reset,
+                        Err(_) => return Err(ServeError::Closed),
+                    };
+                }
             }
-            Action::Store { lun, op, .. } => {
-                // Execute the storage op on the LUN's plane and hand the result
-                // back to the core (which maps it via `store_done`). A `Store`
-                // on a self-backed / out-of-range LUN is an internal error.
-                let result = planes
+            Action::Store { lun, op, next_recv } => {
+                // A `Store` on a self-backed / out-of-range LUN is an internal
+                // error (as in `serve`).
+                let plane = planes
                     .get_mut(lun)
                     .and_then(Option::as_mut)
-                    .ok_or(ServeError::Internal)?
-                    .do_op(op)
-                    .await;
-                ev = Event::StoreDone { result };
+                    .ok_or(ServeError::Internal)?;
+                match next_recv {
+                    Some(budget) => {
+                        // Write-ahead: run the store while receiving the next
+                        // Data-Out chunk into `scratch` (`op` borrows `work`,
+                        // the receive borrows `scratch`).
+                        let (result, got) = join(
+                            plane.do_op(op),
+                            recv.recv(&mut scratch[..], RecvMode::Until(CTRL_POLL_GRANULARITY)),
+                        )
+                        .await;
+                        // The pre-received chunk now sits in `scratch`; move it
+                        // into `work` for the core's following `HostRecv`.
+                        core::mem::swap(&mut work, &mut scratch);
+                        match got {
+                            Ok(0) => return Err(ServeError::Closed),
+                            Ok(got) => {
+                                // Feed at most the latched budget; anything
+                                // beyond it is host overshoot, dropped with
+                                // `scratch`.
+                                prefetched = Some(got.min(budget));
+                                ev = Event::StoreDone { result };
+                            }
+                            // Timeout: nothing was pre-received. Feed only the
+                            // store completion; the core asks again.
+                            Err(BotIoErr::WouldBlock) => ev = Event::StoreDone { result },
+                            Err(BotIoErr::Disconnected) => ev = Event::Reset,
+                            Err(BotIoErr::Io) => return Err(ServeError::Closed),
+                        }
+                    }
+                    None => {
+                        // No write-ahead latch. A read-phase store: if its read
+                        // was already done speculatively, complete it without
+                        // touching the plane (the speculative bytes are already
+                        // in `work`).
+                        if let (Some((slun, soff, slen)), StoreOp::Read { off, buf }) =
+                            (speculative, &op)
+                        {
+                            if slun == lun && soff == *off && buf.len() <= slen {
+                                ev = Event::StoreDone { result: Ok(()) };
+                                continue;
+                            }
+                        }
+                        // Otherwise execute the op serially (a speculative read
+                        // error is swallowed here: this op re-reports it).
+                        let result = plane.do_op(op).await;
+                        ev = Event::StoreDone { result };
+                    }
+                }
             }
             Action::StallBoth => {
                 // Invalid CBW: STALL both pipes (ignore a missing capability).
@@ -361,10 +529,16 @@ where
 
         // A control request can arrive while an I/O await is in flight. Drain
         // it now, before the completion is fed back, so a reset supersedes the
-        // just-completed I/O (its event is replaced by `Event::Tick`).
+        // just-completed I/O (its event is replaced by `Event::Tick`). A reset
+        // also drops any overlap state prepared for the aborted transfer.
         while !stop.load(Ordering::Relaxed) {
+            let ev_before = ev;
             if !handle_ctrl(gadget, session, work, devs, &mut ev)? {
                 break;
+            }
+            if ev != ev_before {
+                prefetched = None;
+                pending_read = None;
             }
         }
     }

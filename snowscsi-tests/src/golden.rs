@@ -66,7 +66,10 @@ pub enum InStep {
 /// Scripted bulk driver that records every byte it moves.
 #[derive(Default)]
 pub struct RecBotIo {
-    steps: VecDeque<InStep>,
+    /// Pending bulk script steps. Exposed so an asynchronous seam can apply
+    /// its own receive semantics (a packet may be shorter than the caller's
+    /// buffer) instead of the synchronous exact-length assertion.
+    pub steps: VecDeque<InStep>,
     /// Recorded wire/seam trace, in order.
     pub trace: Vec<TraceEntry>,
     /// Number of successful `stall_both` calls.

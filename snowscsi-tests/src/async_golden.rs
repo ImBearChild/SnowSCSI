@@ -14,19 +14,24 @@
 //! a plain `async fn` with no runtime dependency.
 
 use core::cell::RefCell;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use snowscsi::common::async_store::{AsyncStorePlane, BlockingAsync};
-use snowscsi::common::store::StorePlane;
-use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::common::seekable_storage::StorageError;
+use snowscsi::common::store::{StoreOp, StorePlane};
+use snowscsi::scsi::device::{CommandOutcome, DeviceType, ScsiDevice, Xfer};
+use snowscsi::scsi::scsi::Sense;
 use snowscsi::scsi::AsyncLuns;
 use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{
-    AsyncBotRecv, AsyncBotSend, BotIo, BotIoErr, BotSession, RecvMode, ServeError,
+    Action, AsyncBotRecv, AsyncBotSend, BotIo, BotIoErr, BotSession, CtrlReq, Event, Gadget,
+    RecvMode, ServeError,
 };
 
-use crate::golden::{self, InStep, RecBotIo, RecGadget, TraceEntry, CSW_MAGIC};
+use crate::golden::{self, CtrlStep, InStep, RecBotIo, RecGadget, TraceEntry, CSW_MAGIC};
+use crate::mock_bot::{MockAck, MockReply};
 use crate::usb_bot::{block_device, raw_cbw, rw10};
 
 /// Default scenario config: High-Speed BOT, no shortfall STALL, one LUN.
@@ -68,15 +73,30 @@ impl GoldenAsyncBotIo {
 impl AsyncBotRecv for GoldenAsyncBotIo {
     async fn recv(&mut self, buf: &mut [u8], mode: RecvMode) -> Result<usize, BotIoErr> {
         let mut io = self.io.borrow_mut();
-        match mode {
-            RecvMode::Probe => io.try_recv_out(buf),
-            RecvMode::Until(_) | RecvMode::Forever => {
-                if io.is_empty() {
-                    Ok(0)
-                } else {
-                    io.recv_out(buf, None)
-                }
+        match io.steps.pop_front() {
+            // Copy-min: deliver `min(step, buf)`. The core may hand a buffer
+            // larger than the next packet (a write-ahead receive uses the whole
+            // scratch), so the step is never required to equal `buf.len()`.
+            Some(InStep::Bytes(b)) => {
+                let n = b.len().min(buf.len());
+                buf[..n].copy_from_slice(&b[..n]);
+                io.trace.push(TraceEntry::H2D(b));
+                Ok(n)
             }
+            Some(InStep::WouldBlock) => Err(BotIoErr::WouldBlock),
+            Some(InStep::Disconnect) => {
+                io.trace.push(TraceEntry::Mark("disconnected"));
+                Err(BotIoErr::Disconnected)
+            }
+            Some(InStep::Ctrl(_)) => {
+                panic!("RecBotIo: Ctrl step reached the bulk queue (use golden::split)")
+            }
+            // Exhausted script: a probe reports nothing pending, a blocking
+            // receive reports EOF (`Ok(0)`), which ends the finite replay.
+            None => match mode {
+                RecvMode::Probe => Err(BotIoErr::WouldBlock),
+                RecvMode::Until(_) | RecvMode::Forever => Ok(0),
+            },
         }
     }
 
@@ -704,4 +724,1517 @@ fn usb_async_13_format_read_sync() {
         "freshly formatted sector is zero"
     );
     finish(NAME, CONFIG, &io);
+}
+
+// ── Overlap boundary harness ────────────────────────────────────────
+//
+// The 13 replays above already exercise the read-ahead hit path (a multi-chunk
+// Data-In such as the 8192/8192/4096 read speculatively pre-reads the next
+// chunk and skips the core's store), but not the write-ahead pre-receive:
+// their Data-Out writes always finish within the declared length, so
+// `Action::Store.next_recv` is `None` and the shell never pre-receives. The
+// tests below drive the shell with a scripted asynchronous seam and a
+// recording store plane and assert the **event sequence** — the seam calls and
+// the store ops, in order — not just the wire.
+
+/// One bulk-OUT script step for the boundary harness.
+#[derive(Clone, Debug)]
+enum OutStep {
+    /// Deliver `bytes` as one host packet (a receive copies `min(len, buf)`).
+    Bytes(Vec<u8>),
+    /// No data: `WouldBlock` (a probe miss or a bounded-wait timeout).
+    WouldBlock,
+    /// Link drop.
+    Disconnect,
+}
+
+/// Receive mode, recorded without its timeout so events compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecvKind {
+    Probe,
+    Until,
+    Forever,
+}
+
+/// Outcome of one scripted receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecvOut {
+    /// `Ok(n)` bytes delivered.
+    Bytes(usize),
+    WouldBlock,
+    Disconnect,
+}
+
+/// One recorded seam call, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SeamEvent {
+    Recv {
+        kind: RecvKind,
+        /// The caller's buffer length. A write-ahead receive passes the whole
+        /// scratch, so `want` may exceed `got`.
+        want: usize,
+        got: RecvOut,
+    },
+    Send {
+        len: usize,
+    },
+    StallIn,
+    StallBoth,
+}
+
+/// State shared by the two asynchronous seam halves and (optionally) a
+/// control-injecting gadget.
+#[derive(Default)]
+struct SeamState {
+    out: VecDeque<OutStep>,
+    events: Vec<SeamEvent>,
+    wire: Vec<TraceEntry>,
+    /// Bulk-OUT receives performed so far (an arming signal for a mid-overlap
+    /// control request).
+    recv_count: usize,
+    /// Bulk-IN sends performed so far.
+    send_count: usize,
+}
+
+impl SeamState {
+    fn new(steps: Vec<OutStep>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            out: steps.into(),
+            events: Vec::new(),
+            wire: Vec::new(),
+            recv_count: 0,
+            send_count: 0,
+        }))
+    }
+}
+
+/// Bulk-OUT half of the scripted seam.
+struct ScriptRecv(Rc<RefCell<SeamState>>);
+
+/// Bulk-IN half of the scripted seam.
+struct ScriptSend(Rc<RefCell<SeamState>>);
+
+impl AsyncBotRecv for ScriptRecv {
+    async fn recv(&mut self, buf: &mut [u8], mode: RecvMode) -> Result<usize, BotIoErr> {
+        let mut s = self.0.borrow_mut();
+        let kind = match mode {
+            RecvMode::Probe => RecvKind::Probe,
+            RecvMode::Until(_) => RecvKind::Until,
+            RecvMode::Forever => RecvKind::Forever,
+        };
+        let (res, got) = match s.out.pop_front() {
+            // Copy-min: deliver `min(step, buf)`.
+            Some(OutStep::Bytes(b)) => {
+                let n = b.len().min(buf.len());
+                buf[..n].copy_from_slice(&b[..n]);
+                s.wire.push(TraceEntry::H2D(b));
+                (Ok(n), RecvOut::Bytes(n))
+            }
+            Some(OutStep::WouldBlock) => (Err(BotIoErr::WouldBlock), RecvOut::WouldBlock),
+            Some(OutStep::Disconnect) => {
+                s.wire.push(TraceEntry::Mark("disconnected"));
+                (Err(BotIoErr::Disconnected), RecvOut::Disconnect)
+            }
+            None => match kind {
+                RecvKind::Probe => (Err(BotIoErr::WouldBlock), RecvOut::WouldBlock),
+                // Exhausted script on a blocking receive: EOF ends the replay.
+                RecvKind::Until | RecvKind::Forever => (Ok(0), RecvOut::Bytes(0)),
+            },
+        };
+        s.recv_count += 1;
+        s.events.push(SeamEvent::Recv {
+            kind,
+            want: buf.len(),
+            got,
+        });
+        res
+    }
+
+    async fn stall_both(&mut self) -> Result<(), ()> {
+        self.0.borrow_mut().events.push(SeamEvent::StallBoth);
+        Ok(())
+    }
+}
+
+impl AsyncBotSend for ScriptSend {
+    async fn send(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+        let mut s = self.0.borrow_mut();
+        s.send_count += 1;
+        s.wire.push(TraceEntry::D2H(buf.to_vec()));
+        s.events.push(SeamEvent::Send { len: buf.len() });
+        Ok(())
+    }
+
+    async fn stall_in(&mut self) -> Result<(), ()> {
+        self.0.borrow_mut().events.push(SeamEvent::StallIn);
+        Ok(())
+    }
+
+    fn can_stall_in(&self) -> bool {
+        true
+    }
+}
+
+/// One storage op recorded by [`RecPlane`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpRec {
+    Read { off: u64, len: usize },
+    Write { off: u64, len: usize },
+    Fill { off: u64, len: u64, byte: u8 },
+    Sync,
+}
+
+/// Recording asynchronous store plane over a deterministic in-memory pattern.
+///
+/// Reads fill the buffer with `(off + i) % 251` and are recorded; the read at
+/// index `fail_read` (0-based, in call order) fails instead, so a speculative
+/// read-ahead can fail while the real op still re-reports the failure.
+#[derive(Default)]
+struct RecPlane {
+    ops: Vec<OpRec>,
+    /// The bytes of every `Write` op, in call order, so a buffer-ordering bug
+    /// that hands a store the wrong chunk would be visible.
+    written: Vec<(u64, Vec<u8>)>,
+    fail_read: Option<usize>,
+    read_calls: usize,
+}
+
+impl RecPlane {
+    /// Read ops as `(off, len)` pairs, in call order.
+    fn reads(&self) -> Vec<(u64, usize)> {
+        self.ops
+            .iter()
+            .filter_map(|o| match o {
+                OpRec::Read { off, len } => Some((*off, *len)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Write ops as `(off, len)` pairs, in call order.
+    fn writes(&self) -> Vec<(u64, usize)> {
+        self.ops
+            .iter()
+            .filter_map(|o| match o {
+                OpRec::Write { off, len } => Some((*off, *len)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Written `(off, bytes)` pairs, in call order.
+    fn written_bytes(&self) -> &[(u64, Vec<u8>)] {
+        &self.written
+    }
+}
+
+impl AsyncStorePlane for RecPlane {
+    async fn do_op(&mut self, op: StoreOp<'_>) -> Result<(), StorageError> {
+        match op {
+            StoreOp::Read { off, buf } => {
+                let call = self.read_calls;
+                self.read_calls += 1;
+                self.ops.push(OpRec::Read {
+                    off,
+                    len: buf.len(),
+                });
+                if self.fail_read == Some(call) {
+                    return Err(StorageError::Io(embedded_io::ErrorKind::Other));
+                }
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = (off as usize).wrapping_add(i).wrapping_rem(251) as u8;
+                }
+                Ok(())
+            }
+            StoreOp::Write { off, buf } => {
+                self.ops.push(OpRec::Write {
+                    off,
+                    len: buf.len(),
+                });
+                self.written.push((off, buf.to_vec()));
+                Ok(())
+            }
+            StoreOp::Fill { off, len, byte } => {
+                self.ops.push(OpRec::Fill { off, len, byte });
+                Ok(())
+            }
+            StoreOp::Sync => {
+                self.ops.push(OpRec::Sync);
+                Ok(())
+            }
+            StoreOp::FileRead { .. } | StoreOp::FileWrite { .. } | StoreOp::FileRemove { .. } => {
+                Err(StorageError::Unsupported)
+            }
+        }
+    }
+
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+/// Minimal read-only LUN for the read-ahead tests.
+///
+/// A synthetic CDB opcode (`0xC1`) announces an `OutXfer` of `len` bytes; each
+/// `xfer_out` hands the platform a `StoreOp::Read` addressed at
+/// `transfer_offset + shift`. A zero `shift` makes the core's next read match
+/// the read-ahead coordinate (a hit); a non-zero shift forces a miss. With
+/// `first_inline` the first chunk is served in place (`Inline`), so a
+/// read-ahead can be reached even when no store plane is configured.
+#[derive(Default)]
+struct ReadLun {
+    len: u64,
+    shift: u64,
+    sense: Option<Sense>,
+    /// Serve the first `xfer_out` chunk in place (`Inline`); later chunks are
+    /// `Store` reads.
+    first_inline: bool,
+    /// `xfer_out` calls so far.
+    calls: usize,
+}
+
+impl ScsiDevice for ReadLun {
+    fn do_cmd(
+        &mut self,
+        cdb: &[u8],
+        _data: &mut [u8],
+    ) -> Result<CommandOutcome, snowscsi::scsi::device::Error> {
+        if cdb.first() == Some(&0xC1) {
+            return Ok(CommandOutcome::OutXfer { len: self.len });
+        }
+        Ok(CommandOutcome::Status)
+    }
+
+    fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
+        let call = self.calls;
+        self.calls += 1;
+        if self.first_inline && call == 0 {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (transfer_offset as usize).wrapping_add(i).wrapping_rem(251) as u8;
+            }
+            return Xfer::Inline { len: buf.len() };
+        }
+        Xfer::Store(StoreOp::Read {
+            off: transfer_offset + self.shift,
+            buf,
+        })
+    }
+
+    fn xfer_in<'a>(&'a mut self, _transfer_offset: u64, _buf: &'a [u8]) -> Xfer<'a> {
+        Xfer::Inline { len: 0 }
+    }
+
+    fn peek_sense(&self) -> Option<&Sense> {
+        self.sense.as_ref()
+    }
+
+    fn take_sense(&mut self) -> Option<Sense> {
+        self.sense.take()
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Block
+    }
+
+    fn sync(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+/// A scripted control gadget that surfaces its queued requests only once the
+/// seam has performed enough receives or sends, so a request can be injected in
+/// the window between an overlap `join` and the core's next poll (the shell
+/// drains the control plane immediately after every await).
+struct ArmedGadget {
+    shared: Rc<RefCell<SeamState>>,
+    arm: Arm,
+    pending: VecDeque<CtrlStep>,
+    acks: Vec<MockAck>,
+    replies: Vec<MockReply>,
+}
+
+/// When an [`ArmedGadget`] starts surfacing its requests.
+#[derive(Clone, Copy)]
+enum Arm {
+    /// After this many bulk-OUT receives.
+    Recvs(usize),
+    /// After this many bulk-IN sends.
+    Sends(usize),
+}
+
+impl ArmedGadget {
+    fn new(shared: Rc<RefCell<SeamState>>, arm: Arm, steps: Vec<CtrlStep>) -> Self {
+        Self {
+            shared,
+            arm,
+            pending: steps.into(),
+            acks: Vec::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    fn armed(&self) -> bool {
+        let s = self.shared.borrow();
+        match self.arm {
+            Arm::Recvs(n) => s.recv_count >= n,
+            Arm::Sends(n) => s.send_count >= n,
+        }
+    }
+}
+
+impl<'a> Gadget<'a> for ArmedGadget {
+    type Ack = MockAck;
+    type Reply = MockReply;
+
+    fn try_next_ctrl(&'a mut self) -> Option<CtrlReq<MockAck, MockReply>> {
+        if !self.armed() {
+            return None;
+        }
+        match self.pending.pop_front()? {
+            CtrlStep::BotReset => {
+                let ack = MockAck::new();
+                self.acks.push(ack.clone());
+                Some(CtrlReq::BotReset { ack })
+            }
+            CtrlStep::GetMaxLun => {
+                let reply = MockReply::new();
+                self.replies.push(reply.clone());
+                Some(CtrlReq::GetMaxLun { reply })
+            }
+            CtrlStep::LinkReset => Some(CtrlReq::LinkReset),
+        }
+    }
+}
+
+/// Drive one already-built seam state through `serve_async`, returning the
+/// shell's result without asserting it.
+fn run_scripted_with<P: AsyncStorePlane, G: for<'a> Gadget<'a>>(
+    state: Rc<RefCell<SeamState>>,
+    gadget: &mut G,
+    session: &mut BotSession,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    luns: &mut AsyncLuns<'_, P>,
+) -> Result<(), ServeError> {
+    let mut recv = ScriptRecv(Rc::clone(&state));
+    let mut send = ScriptSend(Rc::clone(&state));
+    let stop = AtomicBool::new(false);
+    block_on(async {
+        serve_async(
+            &mut recv, &mut send, gadget, session, work, scratch, luns, &stop,
+        )
+        .await
+    })
+}
+
+/// Drive one scenario through `serve_async`, returning the recorded seam state
+/// and the shell's result.
+fn run_scripted_shell_result<P: AsyncStorePlane, G: for<'a> Gadget<'a>>(
+    steps: Vec<OutStep>,
+    gadget: &mut G,
+    session: &mut BotSession,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    luns: &mut AsyncLuns<'_, P>,
+) -> (Rc<RefCell<SeamState>>, Result<(), ServeError>) {
+    let state = SeamState::new(steps);
+    let result = run_scripted_with(Rc::clone(&state), gadget, session, work, scratch, luns);
+    (state, result)
+}
+
+/// Drive one scenario through `serve_async`, treating `Closed` as a clean end
+/// and panicking on any other error, and return the recorded seam state.
+fn run_scripted_shell<P: AsyncStorePlane, G: for<'a> Gadget<'a>>(
+    steps: Vec<OutStep>,
+    gadget: &mut G,
+    session: &mut BotSession,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    luns: &mut AsyncLuns<'_, P>,
+) -> Rc<RefCell<SeamState>> {
+    let (state, result) = run_scripted_shell_result(steps, gadget, session, work, scratch, luns);
+    match result {
+        Ok(()) | Err(ServeError::Closed) => {}
+        Err(e) => panic!("usb::serve_async failed: {e}"),
+    }
+    state
+}
+
+/// H2D packet lengths, in wire order.
+fn h2d_lens(wire: &[TraceEntry]) -> Vec<usize> {
+    wire.iter()
+        .filter_map(|e| match e {
+            TraceEntry::H2D(b) => Some(b.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D2H packet lengths, in wire order.
+fn d2h_lens(wire: &[TraceEntry]) -> Vec<usize> {
+    wire.iter()
+        .filter_map(|e| match e {
+            TraceEntry::D2H(b) => Some(b.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Assert the wire carries exactly one CSW with `tag`/`residue`/`status`.
+fn assert_wire_csw(wire: &[TraceEntry], tag: u32, residue: u32, status: u8) {
+    let csw = wire
+        .iter()
+        .find_map(|e| match e {
+            TraceEntry::D2H(b) if b.len() == snowscsi::usb::CSW_LEN && b[..4] == CSW_MAGIC => {
+                Some(b.as_slice())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no CSW in wire: {wire:?}"));
+    assert_eq!(u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]), tag);
+    assert_eq!(
+        u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]),
+        residue
+    );
+    assert_eq!(csw[12], status);
+}
+
+/// One core `Action`, reduced to the fields the overlap boundaries care about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreStep {
+    Recv {
+        len: usize,
+        probe: bool,
+    },
+    Send {
+        len: usize,
+        prefetch: Option<(usize, u64, usize)>,
+    },
+    Store {
+        lun: usize,
+        next_recv: Option<usize>,
+        /// The `(off, len)` of a `StoreOp::Read` op, if the store is a read.
+        read: Option<(u64, usize)>,
+    },
+    StallBoth,
+    StallIn,
+    Error,
+}
+
+/// Poll the core once and reduce its `Action` to a `Copy` [`CoreStep`], so the
+/// borrow of `session`/`work` ends before the next poll.
+fn poll_core<D: ScsiDevice>(
+    session: &mut BotSession,
+    ev: Event,
+    work: &mut [u8],
+    devs: &mut [D],
+) -> CoreStep {
+    match session.poll(ev, work, devs) {
+        Action::HostRecv { len, probe } => CoreStep::Recv { len, probe },
+        Action::HostSend { bytes, prefetch } => CoreStep::Send {
+            len: bytes.len(),
+            prefetch,
+        },
+        Action::Store { lun, op, next_recv } => {
+            let read = match op {
+                StoreOp::Read { off, buf } => Some((off, buf.len())),
+                _ => None,
+            };
+            CoreStep::Store {
+                lun,
+                next_recv,
+                read,
+            }
+        }
+        Action::StallBoth => CoreStep::StallBoth,
+        Action::StallIn => CoreStep::StallIn,
+        Action::Error(_) => CoreStep::Error,
+    }
+}
+
+/// Drive a WRITE through the core, feeding each requested receive with its own
+/// length and each store with a success, and collect the action sequence. The
+/// block device hands every write chunk to the plane, so the buffer contents
+/// are irrelevant.
+fn drive_write_core(declared: u32, blocks: u16) -> Vec<CoreStep> {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let cbw = raw_cbw(1, declared, 0x00, 0, &rw10(0x2A, 0, blocks));
+
+    let mut steps = Vec::new();
+    let mut ev = Event::Tick;
+    let mut cbw_pending = true;
+    loop {
+        let step = poll_core(&mut session, ev, &mut work, &mut devs);
+        steps.push(step);
+        ev = match step {
+            CoreStep::Recv { len, probe: false } => {
+                if cbw_pending {
+                    work[..len].copy_from_slice(&cbw[..len]);
+                    cbw_pending = false;
+                }
+                Event::HostRecv { len }
+            }
+            // A probe ends the phase on `HostIdle`; stop here.
+            CoreStep::Recv { probe: true, .. } => break,
+            // A CSW ends the transaction; stop here.
+            CoreStep::Send { len, .. } if len == snowscsi::usb::CSW_LEN => break,
+            CoreStep::Send { .. } => Event::HostSent,
+            CoreStep::Store { .. } => Event::StoreDone { result: Ok(()) },
+            CoreStep::StallBoth | CoreStep::StallIn | CoreStep::Error => break,
+        };
+    }
+    steps
+}
+
+/// Drive a READ through the core (feeding each store as a success) and collect
+/// the action sequence. The synthetic `0xC1` opcode serves `transfer_len` bytes
+/// as `Store(Read)` chunks.
+fn drive_read_core(transfer_len: u64) -> Vec<CoreStep> {
+    let mut lun = ReadLun {
+        len: transfer_len,
+        shift: 0,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    let cbw = raw_cbw(1, transfer_len as u32, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]);
+
+    let mut steps = Vec::new();
+    let mut ev = Event::Tick;
+    let mut cbw_pending = true;
+    loop {
+        let step = poll_core(&mut session, ev, &mut work, &mut devs);
+        steps.push(step);
+        ev = match step {
+            CoreStep::Recv { len, probe: false } => {
+                if cbw_pending {
+                    work[..len].copy_from_slice(&cbw[..len]);
+                    cbw_pending = false;
+                }
+                Event::HostRecv { len }
+            }
+            CoreStep::Recv { probe: true, .. } => break,
+            // A CSW ends the transaction; stop here.
+            CoreStep::Send { len, .. } if len == snowscsi::usb::CSW_LEN => break,
+            CoreStep::Send { .. } => Event::HostSent,
+            CoreStep::Store { .. } => Event::StoreDone { result: Ok(()) },
+            CoreStep::StallBoth | CoreStep::StallIn | CoreStep::Error => break,
+        };
+    }
+    steps
+}
+
+/// A Data-Out write spanning three receive cycles: the core's write-ahead
+/// budget (`Action::Store::next_recv`) equals the length of the `HostRecv` it
+/// asks for next, the last store latches (`None`), and the shell pre-receives
+/// the final chunk into the whole scratch so the wire is unchanged.
+#[test]
+fn overlap_write_three_cycles_next_recv_matches_recv() {
+    // 40 blocks = 20480 bytes = 8192 + 8192 + 4096 (three receive cycles).
+    let core = drive_write_core(20480, 40);
+    let stores: Vec<Option<usize>> = core
+        .iter()
+        .filter_map(|s| match s {
+            CoreStep::Store { next_recv, .. } => Some(*next_recv),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stores, vec![Some(8192), Some(4096), None], "store budgets");
+    // Every write-ahead budget equals the length of the receive that follows.
+    for (i, step) in core.iter().enumerate() {
+        if let CoreStep::Store {
+            next_recv: Some(n), ..
+        } = step
+        {
+            match core.get(i + 1) {
+                Some(CoreStep::Recv { len, probe: false }) => {
+                    assert_eq!(*len, *n, "next_recv must match the next HostRecv")
+                }
+                other => panic!("expected a HostRecv after a Store, got {other:?}"),
+            }
+        }
+    }
+
+    // The same write through the shell. The final 4096-byte chunk is
+    // pre-received into the whole 8192-byte scratch, so its receive has
+    // `want == scratch.len()` while delivering 4096 — the write-ahead marker.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x00, 0, &rw10(0x2A, 0, 40)).to_vec()),
+        OutStep::Bytes(vec![0x5A; 8192]),
+        OutStep::Bytes(vec![0x6B; 8192]),
+        OutStep::Bytes(vec![0x7C; 4096]),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    assert_eq!(
+        h2d_lens(&state.wire),
+        vec![31, 8192, 8192, 4096],
+        "host packets unchanged"
+    );
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+    let plane = planes[0].as_ref().unwrap();
+    assert_eq!(
+        plane.writes(),
+        vec![(0, 8192), (8192, 8192), (16384, 4096)],
+        "one write per receive cycle"
+    );
+    // Each store receives its own chunk's bytes: a buffer-ordering bug that
+    // swapped the in-flight chunk with the pre-received one would show here.
+    assert_eq!(
+        plane.written_bytes(),
+        [
+            (0u64, vec![0x5A; 8192]),
+            (8192, vec![0x6B; 8192]),
+            (16384, vec![0x7C; 4096]),
+        ],
+        "each store writes its own chunk"
+    );
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            // Write-ahead of the second chunk (budget 8192).
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            // Write-ahead of the final chunk: the whole scratch is offered
+            // (want 8192) while only the 4096-byte packet is delivered.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(4096),
+            },
+            // Overrun probe after the declared bytes are consumed.
+            SeamEvent::Recv {
+                kind: RecvKind::Probe,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            SeamEvent::Send { len: 13 },
+            // The next command receive finds the script exhausted.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "overlap event sequence"
+    );
+}
+
+/// A host packet larger than the write-ahead budget: the shell caps the feed at
+/// the budget (not the whole packet), so the declared phase ends exactly and
+/// the core returns an overrun probe — the shell must not feed a plain
+/// `HostRecv` after `StoreDone`.
+#[test]
+fn overlap_store_done_probe_not_fed_a_plain_recv() {
+    // 40 blocks = 20480 = 8192 + 8192 + 8192 (the host sends 4096 too many).
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x00, 0, &rw10(0x2A, 0, 40)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        OutStep::Bytes(vec![0x22; 8192]),
+        OutStep::Bytes(vec![0x33; 8192]),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+    assert_eq!(h2d_lens(&state.wire), vec![31, 8192, 8192, 8192]);
+    // The write-ahead of the final chunk offers the whole scratch but is capped
+    // at the 4096-byte budget, so the phase ends exactly and the shell probes.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Probe,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            SeamEvent::Send { len: 13 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "the shell must probe (not feed a plain HostRecv) after the final chunk"
+    );
+}
+
+/// A write-ahead receive that times out (`WouldBlock`): the shell feeds only
+/// the store result, and the core then asks for the remaining receive normally.
+#[test]
+fn overlap_prerecv_timeout_feeds_store_done_only() {
+    // 32 blocks = 16384 = 8192 + 8192.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 16384, 0x00, 0, &rw10(0x2A, 0, 32)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        OutStep::WouldBlock,
+        OutStep::Bytes(vec![0x22; 8192]),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+    assert_eq!(h2d_lens(&state.wire), vec![31, 8192, 8192]);
+    // The timeout is followed by a normal receive of the same chunk.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            // The write-ahead receive times out.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            // The core re-asks after the store result is fed.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Probe,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            SeamEvent::Send { len: 13 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "a timed-out write-ahead receive feeds only the store result"
+    );
+}
+
+/// Read-ahead **hit**: the speculative read matches the core's next read, so
+/// the core's store is skipped — exactly one read per chunk.
+#[test]
+fn overlap_read_prefetch_hit_skips_the_real_op() {
+    // 40 blocks = 20480 = 8192 + 8192 + 4096, served as `Store(Read)` chunks.
+    let mut lun = ReadLun {
+        len: 20480,
+        shift: 0,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]).to_vec()),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    // One read per chunk: a hit skips the core's store, so the chunk is not
+    // read a second time (a shell that speculates but does not skip would read
+    // six times).
+    assert_eq!(
+        planes[0].as_ref().unwrap().reads(),
+        vec![(0, 8192), (8192, 8192), (16384, 4096)],
+        "one read per chunk (a hit skips the core's store)"
+    );
+    assert_eq!(d2h_lens(&state.wire), vec![8192, 8192, 4096, 13]);
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+}
+
+/// Read-ahead **miss**: the core's next read does not match the read-ahead
+/// coordinate, so the shell executes the real op after the speculative read.
+#[test]
+fn overlap_read_prefetch_miss_executes_the_real_op() {
+    // The device shifts every read by 64 bytes, so the core's store never
+    // matches the read-ahead coordinate.
+    let mut lun = ReadLun {
+        len: 20480,
+        shift: 64,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]).to_vec()),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    // chunk 1 is served serially; chunks 2 and 3 each get a speculative read
+    // followed by the real (shifted) op because the coordinate misses.
+    assert_eq!(
+        planes[0].as_ref().unwrap().reads(),
+        vec![
+            (64, 8192),
+            (8192, 8192),
+            (8256, 8192),
+            (16384, 4096),
+            (16448, 4096),
+        ],
+        "a miss executes the core's op after the speculative read"
+    );
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+}
+
+/// A failing speculative read is swallowed: the shell executes the real op,
+/// which succeeds, and the chunk data on the wire comes from that op.
+#[test]
+fn overlap_read_prefetch_error_is_swallowed_and_real_op_reruns() {
+    let mut lun = ReadLun {
+        len: 20480,
+        shift: 0,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]).to_vec()),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    // Read call #1 is the speculative read-ahead for the second chunk; failing
+    // it must not abort the read.
+    let plane = RecPlane {
+        fail_read: Some(1),
+        ..RecPlane::default()
+    };
+    let mut planes: [Option<RecPlane>; 1] = [Some(plane)];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    // The speculative read fails, then the real op re-reads the same chunk.
+    assert_eq!(
+        planes[0].as_ref().unwrap().reads(),
+        vec![(0, 8192), (8192, 8192), (8192, 8192), (16384, 4096)],
+        "the real op re-runs after a swallowed speculative error"
+    );
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+    // The second chunk's wire data came from the successful real op.
+    let chunks: Vec<&[u8]> = state
+        .wire
+        .iter()
+        .filter_map(|e| match e {
+            TraceEntry::D2H(b) if b.len() == 8192 => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chunks.len(), 2, "two full chunks");
+    let expected: Vec<u8> = (0..8192).map(|i| ((8192 + i) % 251) as u8).collect();
+    assert_eq!(
+        chunks[1],
+        expected.as_slice(),
+        "the real op supplied the chunk data"
+    );
+}
+
+/// The final chunk's write-ahead budget is `None` (a latch): the shell does not
+/// pre-receive, so the data receive is the core's own request.
+#[test]
+fn overlap_final_chunk_latches_without_prerecv() {
+    // A single-chunk write: 16 blocks = 8192 = one receive.
+    let core = drive_write_core(8192, 16);
+    let stores: Vec<Option<usize>> = core
+        .iter()
+        .filter_map(|s| match s {
+            CoreStep::Store { next_recv, .. } => Some(*next_recv),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stores, vec![None], "the final store latches");
+
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut gadget = RecGadget::default();
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 8192, 0x00, 0, &rw10(0x2A, 0, 16)).to_vec()),
+        OutStep::Bytes(vec![0x44; 8192]),
+        OutStep::WouldBlock,
+    ];
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+    assert_eq!(h2d_lens(&state.wire), vec![31, 8192]);
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            // The data receive is the core's own request (want == 8192), not a
+            // whole-scratch write-ahead.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Probe,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            SeamEvent::Send { len: 13 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "a latched final chunk is not pre-received"
+    );
+}
+
+/// A `BotReset` that arrives after a write-ahead pre-receive but before the
+/// core's next poll drops the overlap state: the pre-received chunk is **not**
+/// fed as a plain `HostRecv`, and the core re-emits a fresh command receive.
+#[test]
+fn overlap_write_reset_drops_prerecv() {
+    // 32 blocks = 16384 = 8192 + 8192.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 16384, 0x00, 0, &rw10(0x2A, 0, 32)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        OutStep::Bytes(vec![0x22; 8192]),
+    ];
+    let state = SeamState::new(steps);
+    // The reset surfaces only once the write-ahead pre-receive has happened.
+    let mut gadget = ArmedGadget::new(Rc::clone(&state), Arm::Recvs(3), vec![CtrlStep::BotReset]);
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let result = run_scripted_with(
+        Rc::clone(&state),
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    assert_eq!(result, Err(ServeError::Closed));
+    assert_eq!(gadget.acks.len(), 1);
+    assert!(gadget.acks[0].acked.load(Ordering::SeqCst), "reset acked");
+
+    let state = state.borrow();
+    // The pre-received chunk is dropped: the shell performs a fresh CBW receive
+    // instead of answering the command phase from stale pre-received bytes.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "the pre-received chunk is dropped and a fresh command receive follows"
+    );
+    assert!(
+        !state.wire.iter().any(|e| matches!(e, TraceEntry::D2H(_))),
+        "no CSW for the aborted write"
+    );
+}
+
+/// A `GetMaxLun` that arrives mid-overlap does **not** drop the live
+/// write-ahead pre-receive: the reply is sent and the pre-received chunk is fed
+/// normally, so the write completes without a second receive for that chunk.
+#[test]
+fn overlap_get_max_lun_mid_prerecv_survives() {
+    // 32 blocks = 16384 = 8192 + 8192.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 16384, 0x00, 0, &rw10(0x2A, 0, 32)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        OutStep::Bytes(vec![0x22; 8192]),
+        OutStep::WouldBlock,
+    ];
+    let state = SeamState::new(steps);
+    let mut gadget = ArmedGadget::new(Rc::clone(&state), Arm::Recvs(3), vec![CtrlStep::GetMaxLun]);
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let result = run_scripted_with(
+        Rc::clone(&state),
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    assert_eq!(result, Err(ServeError::Closed));
+    assert_eq!(gadget.replies.len(), 1);
+    assert_eq!(
+        gadget.replies[0].sent.lock().unwrap().as_slice(),
+        &[0u8],
+        "Get Max LUN replied"
+    );
+
+    let state = state.borrow();
+    // No receive for the second chunk: it was answered from the live
+    // pre-received bytes.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Probe,
+                want: 8192,
+                got: RecvOut::WouldBlock,
+            },
+            SeamEvent::Send { len: 13 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "the live pre-receive survives a mid-overlap Get Max LUN"
+    );
+    assert_wire_csw(&state.wire, 1, 0, 0x00);
+}
+
+/// A `BotReset` that arrives after a read-ahead speculative read drops the
+/// stale coordinate: the core re-emits a fresh command receive, and no further
+/// chunk of the aborted read is sent.
+#[test]
+fn overlap_read_reset_mid_prefetch_reemits_fresh_action() {
+    let mut lun = ReadLun {
+        len: 20480,
+        shift: 0,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![OutStep::Bytes(
+        raw_cbw(1, 20480, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]).to_vec(),
+    )];
+    let state = SeamState::new(steps);
+    // The reset surfaces once the first chunk has been sent; its join also
+    // performed the read-ahead speculative read.
+    let mut gadget = ArmedGadget::new(Rc::clone(&state), Arm::Sends(1), vec![CtrlStep::BotReset]);
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let result = run_scripted_with(
+        Rc::clone(&state),
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    assert_eq!(result, Err(ServeError::Closed));
+    assert!(gadget.acks[0].acked.load(Ordering::SeqCst), "reset acked");
+
+    let state = state.borrow();
+    // Only the first chunk went out; the reset re-emits a fresh command
+    // receive and the aborted read sends nothing more.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Send { len: 8192 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "the reset re-emits a fresh command receive after the aborted read"
+    );
+    assert_eq!(d2h_lens(&state.wire), vec![8192], "no second chunk sent");
+}
+
+/// The read-ahead hit test is `buf.len() <= prefetch.len`. In the shipped core
+/// the read op the shell is asked for next is *exactly* the read-ahead
+/// coordinate, so that criterion is always an equality — a strictly-shorter
+/// real read (the relaxed prefix case) cannot be produced by the core. This
+/// pins the invariant across chunk boundaries.
+#[test]
+fn overlap_read_prefetch_len_equals_real_op_len() {
+    for transfer_len in [16384u64, 20480, 16484] {
+        let steps = drive_read_core(transfer_len);
+        let mut checked = 0usize;
+        for (i, step) in steps.iter().enumerate() {
+            if let CoreStep::Send {
+                prefetch: Some((_, poff, plen)),
+                ..
+            } = step
+            {
+                match steps.get(i + 1) {
+                    Some(CoreStep::Store {
+                        read: Some((off, len)),
+                        ..
+                    }) => {
+                        assert_eq!(*off, *poff, "prefetch off == read op off ({transfer_len})");
+                        assert_eq!(*len, *plen, "prefetch len == read op len ({transfer_len})");
+                        checked += 1;
+                    }
+                    other => panic!("expected a read store after a prefetch, got {other:?}"),
+                }
+            }
+        }
+        assert!(checked >= 1, "at least one read-ahead for {transfer_len}");
+    }
+}
+
+/// A write-ahead pre-receive that reports `Disconnected` resets the session
+/// (it is not fed as a plain receive), and the core re-emits a fresh command
+/// receive.
+#[test]
+fn overlap_prerecv_disconnected_resets() {
+    // 32 blocks = 16384 = 8192 + 8192.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 16384, 0x00, 0, &rw10(0x2A, 0, 32)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        OutStep::Disconnect,
+    ];
+    let mut gadget = RecGadget::default();
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let state = run_scripted_shell(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+    let state = state.borrow();
+
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            // The write-ahead receive reports a link drop: reset, not a feed.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Disconnect,
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "a pre-receive disconnect resets (not fed as a plain receive)"
+    );
+    assert!(
+        !state.wire.iter().any(|e| matches!(e, TraceEntry::D2H(_))),
+        "no CSW for the aborted write"
+    );
+}
+
+/// A write-ahead pre-receive that reports `Ok(0)` (link down) closes the loop
+/// with [`ServeError::Closed`].
+#[test]
+fn overlap_prerecv_eof_closes() {
+    // 32 blocks = 16384 = 8192 + 8192.
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 16384, 0x00, 0, &rw10(0x2A, 0, 32)).to_vec()),
+        OutStep::Bytes(vec![0x11; 8192]),
+        // A zero-length pre-receive is a closed link.
+        OutStep::Bytes(Vec::new()),
+    ];
+    let mut gadget = RecGadget::default();
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let (state, result) = run_scripted_shell_result(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    assert_eq!(result, Err(ServeError::Closed));
+    let state = state.borrow();
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(8192),
+            },
+            // The write-ahead receive reports EOF: the loop closes.
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 8192,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "a zero-length write-ahead receive closes the loop"
+    );
+}
+
+/// A read-ahead on a LUN with no store plane: the speculative read is skipped
+/// (no plane to read from) and the core's real read then reports the shell's
+/// own internal error rather than using stale bytes. The first chunk is served
+/// in place so the read-ahead is reached at all.
+#[test]
+fn overlap_prefetch_no_plane_reports_internal() {
+    let mut lun = ReadLun {
+        len: 20480,
+        shift: 0,
+        first_inline: true,
+        ..Default::default()
+    };
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let steps = vec![
+        OutStep::Bytes(raw_cbw(1, 20480, 0x80, 0, &[0xC1, 0, 0, 0, 0, 0]).to_vec()),
+        OutStep::WouldBlock,
+    ];
+    let mut gadget = RecGadget::default();
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
+    let mut planes: [Option<RecPlane>; 1] = [None];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let (state, result) = run_scripted_shell_result(
+        steps,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    // The speculative read is skipped; the real read then reports the shell's
+    // own error (there is no plane to execute it against).
+    assert_eq!(result, Err(ServeError::Internal));
+    let state = state.borrow();
+    assert_eq!(
+        d2h_lens(&state.wire),
+        vec![8192],
+        "the in-place first chunk is sent; no chunk after the failed read"
+    );
 }

@@ -55,9 +55,11 @@ pub enum RecvMode {
 ///   31-byte CBW, or a sub-MPS final data chunk). A host packet larger than
 ///   `buf` is a host overrun — the transport reports it as an error
 ///   ([`BotIoErr::Io`]), not a caller sizing bug.
-/// - `Ok(0)` means the link is down — treat it exactly like
-///   [`BotIoErr::Disconnected`] (a host unplug / device detach is expected
-///   and recoverable: reset the session and re-arm the endpoints).
+/// - `Ok(0)` means the link is down — the stream has ended (host unplug /
+///   device detach). The shell treats it as terminal (it closes the loop, like
+///   a closed connection); a transport that can tell a recoverable disconnect
+///   apart may instead report [`BotIoErr::Disconnected`], which the shell turns
+///   into a session reset.
 /// - `Err(BotIoErr::WouldBlock)` follows [`RecvMode`]: `Probe` and an
 ///   expired `Until` report it; `Forever` never does.
 #[allow(async_fn_in_trait)]
