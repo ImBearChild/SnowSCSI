@@ -2,6 +2,7 @@
 name = "snowscsi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -13,7 +14,7 @@ categories = ["embedded", "no-std", "hardware-support"]
 [package.metadata.docs.rs]
 # `log` and `defmt` are mutually exclusive, so no `all-features`: build every
 # transport/media feature with the `log` backend.
-features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "log"]
+features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "log", "async-io"]
 
 [features]
 default = ["std"]
@@ -28,9 +29,9 @@ bundle = ["snowscsi-common/bundle"]
 log = ["dep:log", "snowscsi-common/log"]
 defmt = ["dep:defmt", "embedded-io/defmt", "snowscsi-common/defmt"]
 # Async facade: model-agnostic async seams + `serve_async` (no runtime).
-async-io = []
+async-io = ["snowscsi-common/async-io", "usb"]
 # embassy-usb adapter for the async facade (`EmbassyBot`).
-embassy = ["async-io", "usb", "dep:embassy-usb", "dep:embassy-time", "dep:embassy-sync"]
+embassy = ["async-io", "usb", "dep:embassy-usb", "dep:embassy-time"]
 
 [dependencies]
 embedded-io.workspace = true
@@ -41,4 +42,3 @@ log = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
 embassy-usb = { workspace = true, optional = true }
 embassy-time = { workspace = true, optional = true }
-embassy-sync = { workspace = true, optional = true }

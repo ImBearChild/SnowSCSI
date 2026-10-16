@@ -67,14 +67,17 @@ snowscsi ──▶ snowscsi-common              │
 
 Feature maps:
 
-- **`snowscsi-common`** — `std` (default), `log`, `defmt`. No feature gate on
-  the crate itself; the seams are always compiled. `defmt` forwards to
-  `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
+- **`snowscsi-common`** — `std` (default), `log`, `defmt`, `async-io`. The
+  core seams are always compiled (no feature gate). `async-io` adds the
+  asynchronous storage seams (`async fn` in trait, no runtime). `defmt` forwards
+  to `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
   `std` + `defmt` is rejected at compile time (see below).
 - **`snowscsi-iso9660`** — `std` (default).
 - **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
+  `async-io` (→`usb` + `snowscsi-common/async-io`), `embassy` (→`async-io`
+  plus the embassy-usb/embassy-time adapters),
   `log`, `defmt`. `defmt` forwards to `embedded-io/defmt` and
   `snowscsi-common/defmt` (no `snowscsi-iso9660` propagation: that crate has
   no `defmt` feature). `std` + `defmt` is unsupported — `std::io::Error`
@@ -93,8 +96,9 @@ Feature maps:
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
   targets.
 - **`tests`** (`snowscsi-tests`) — depends on `snowscsi` with
-  `std, scsi, iscsi, cdrom, livefs, usb`; enables `has_libiscsi`
-  only when the `libiscsi` system library is present (probed in `build.rs`).
+  `std, scsi, iscsi, cdrom, livefs, usb, dvdram, bundle, async-io, embassy`;
+  enables `has_libiscsi` only when the `libiscsi` system library is present
+  (probed in `build.rs`).
 
 `snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
@@ -277,7 +281,7 @@ Notes:
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — rustdoc must stay
    warning-free (broken intra-doc links, links to private items, stale
    paths)
-6. `cargo clippy -p snowscsi --features 'scsi,cdrom,iscsi,usb,dvdram' --
+6. `cargo clippy -p snowscsi --features 'scsi,cdrom,iscsi,usb,dvdram,async-io,embassy' --
    -D warnings` — the feature-gated modules are not compiled by the
    workspace-wide pass (dependencies of `snowscsi-tests` are only
    *compiled*, never linted), so lint them explicitly

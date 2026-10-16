@@ -2,6 +2,7 @@
 name = "snowscsi-common"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -13,7 +14,7 @@ categories = ["embedded", "no-std"]
 [package.metadata.docs.rs]
 # `log` and `defmt` are mutually exclusive (see `logging.rs`), so no
 # `all-features`; `bundle` enables the ini-based flat-bundle backend.
-features = ["std", "log", "bundle"]
+features = ["std", "log", "bundle", "async-io"]
 
 [features]
 default = ["std"]
@@ -21,6 +22,8 @@ std = ["embedded-io/std"]
 log = ["dep:log"]
 defmt = ["dep:defmt", "embedded-io/defmt"]
 bundle = ["dep:ini_core"]
+# Async storage seams (model-agnostic, no runtime).
+async-io = []
 
 [dependencies]
 embedded-io.workspace = true

@@ -20,6 +20,8 @@
 //! - `iscsi_target`: iSCSI target session state machine (RFC 3720 §5/§10).
 //! - `transport`: BSD TCP transport (gated by `std`).
 
+#[cfg(feature = "async-io")]
+pub mod async_luns;
 pub mod backend;
 pub mod block;
 pub mod device;
@@ -33,3 +35,5 @@ pub mod spc;
 pub(crate) mod util;
 
 pub use luns::Luns;
+#[cfg(feature = "async-io")]
+pub use async_luns::AsyncLuns;

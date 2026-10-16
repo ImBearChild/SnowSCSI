@@ -13,6 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ImBearChild/SnowSCSI"
 homepage = "https://github.com/ImBearChild/SnowSCSI"
@@ -32,4 +33,3 @@ defmt = "1"
 # in-repo examples and embassy-usb 0.6's transitive requirements.
 embassy-usb = { version = "0.6", default-features = false }
 embassy-time = { version = "0.5", default-features = false }
-embassy-sync = { version = "0.8", default-features = false }

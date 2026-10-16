@@ -5,6 +5,11 @@
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]
 
+#[cfg(feature = "async-io")]
+pub mod async_seekable_storage;
+#[cfg(feature = "async-io")]
+pub mod async_store;
+
 pub mod flat_bundle;
 pub mod fs_plane;
 pub mod fs_storage;

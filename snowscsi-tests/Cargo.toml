@@ -2,13 +2,14 @@
 name = "snowscsi-tests"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Integration tests for SnowSCSI (mock + libiscsi whitebox)"
 # Test harness only — never published to crates.io.
 publish = false
 
 [dependencies]
-snowscsi = { workspace = true, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb", "dvdram", "bundle"] }
+snowscsi = { workspace = true, features = ["std", "scsi", "iscsi", "cdrom", "livefs", "usb", "dvdram", "bundle", "async-io", "embassy"] }
 snowscsi-iso9660 = { workspace = true, features = ["std"] }
 snowscsi-common = { workspace = true, features = ["std"] }
 embedded-io.workspace = true

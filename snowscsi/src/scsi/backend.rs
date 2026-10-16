@@ -274,6 +274,70 @@ impl SeekableStorage for FileBackend {
     }
 }
 
+/// Asynchronous read plane for the std file backend: the offset-addressed
+/// view of [`FileBackend`] with the same bounds contract as
+/// [`crate::common::seekable_storage::FlatData`] (a past-capacity range is
+/// [`StorageError::OutOfBounds`], never an implicit read of a short extent).
+///
+/// The file backend is host-side and synchronous underneath, so each call
+/// delegates to the cursor-based primitive and returns without an explicit
+/// yield; the `async` shape exists so the type can sit behind the
+/// asynchronous storage seam.
+#[cfg(all(feature = "std", feature = "async-io"))]
+impl crate::common::async_seekable_storage::AsyncFlatData for FileBackend {
+    async fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        <Self as crate::common::seekable_storage::FlatData>::read_at(self, off, buf)
+    }
+
+    fn capacity(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Asynchronous writable plane for the std file backend.
+///
+/// `write_at`/`sync` mirror the synchronous [`WritableFlatData`] contract
+/// (bounds-checked write, read-only policy rejection as
+/// [`StorageError::NotWritable`], `fsync`-grade persistence). `fill_at` is
+/// amortized over a 4 KiB stack chunk — one page — so a whole-disc FORMAT
+/// through the std backend is not syscall-bound (matching the synchronous
+/// override), and it bounds-checks before the first write so a
+/// past-capacity fill can never grow the file.
+///
+/// [`WritableFlatData`]: crate::common::seekable_storage::WritableFlatData
+#[cfg(all(feature = "std", feature = "async-io"))]
+impl crate::common::async_seekable_storage::AsyncWritableFlatData for FileBackend {
+    async fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+        <Self as crate::common::seekable_storage::WritableFlatData>::write_at(self, off, buf)
+    }
+
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        <Self as crate::common::seekable_storage::WritableFlatData>::sync(self)
+    }
+
+    /// 4 KiB-amortized fill (one page per `seek`+`write`), bounded by
+    /// [`Self::capacity`] before the first write.
+    async fn fill_at(&mut self, mut off: u64, mut len: u64, byte: u8) -> Result<(), StorageError> {
+        const CHUNK: usize = 4096;
+        let end = off.checked_add(len).ok_or(StorageError::OutOfBounds)?;
+        if end > self.size {
+            return Err(StorageError::OutOfBounds);
+        }
+        let chunk = [byte; CHUNK];
+        while len > 0 {
+            let n = core::cmp::min(len, CHUNK as u64) as usize;
+            <Self as crate::common::seekable_storage::WritableFlatData>::write_at(
+                self,
+                off,
+                &chunk[..n],
+            )?;
+            off += n as u64;
+            len -= n as u64;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
@@ -431,5 +495,60 @@ mod tests {
         let path = dir.join(format!("snowscsi_fb_miss_{}.img", std::process::id()));
         let r = FileBackend::open(&path.to_string_lossy(), false);
         assert!(r.is_err());
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn file_backend_async_planes_match_sync_contract() {
+        use crate::common::async_seekable_storage::{AsyncFlatData, AsyncWritableFlatData};
+
+        fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+            let mut fut = core::pin::pin!(fut);
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            loop {
+                if let core::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                    return v;
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("snowscsi_fb_async_{}.img", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(64 * 1024).unwrap();
+
+        let mut b = FileBackend::open(&path.to_string_lossy(), true).unwrap();
+        block_on(async {
+            assert_eq!(AsyncFlatData::capacity(&b), 64 * 1024);
+            // 4 KiB-amortized fill spanning more than one chunk.
+            AsyncWritableFlatData::fill_at(&mut b, 0, 10 * 1024, 0x5A)
+                .await
+                .unwrap();
+            // Past capacity, and `off + len` overflow, both reject.
+            assert_eq!(
+                AsyncWritableFlatData::fill_at(&mut b, 60 * 1024, 8 * 1024, 0).await,
+                Err(StorageError::OutOfBounds)
+            );
+            assert_eq!(
+                AsyncWritableFlatData::fill_at(&mut b, u64::MAX, 2, 0).await,
+                Err(StorageError::OutOfBounds)
+            );
+        });
+        // The rejected fill must not have grown the file.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(on_disk[..10 * 1024].iter().all(|&x| x == 0x5A));
+        assert!(on_disk[10 * 1024..].iter().all(|&x| x == 0));
+
+        // A read-only handle rejects the fill as a policy error.
+        let mut ro = FileBackend::open(&path.to_string_lossy(), false).unwrap();
+        block_on(async {
+            assert_eq!(
+                AsyncWritableFlatData::fill_at(&mut ro, 0, 4, 0).await,
+                Err(StorageError::NotWritable)
+            );
+        });
+
+        std::fs::remove_file(&path).unwrap();
     }
 }
