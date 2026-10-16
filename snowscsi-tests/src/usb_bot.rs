@@ -121,7 +121,7 @@ fn next_step<D: ScsiDevice>(
             io.send_in(bytes).unwrap();
             Step::Sent { is_csw }
         }
-        Action::Store { lun, op } => {
+        Action::Store { lun, op, .. } => {
             // Execute the device-produced op on the LUN's plane, exactly like
             // `usb::serve`; the completion is fed back on the next poll.
             let result = planes[lun].as_mut().unwrap().do_op(op);
@@ -836,7 +836,7 @@ fn bot_reset_interrupts_data_phase() {
     let n = io.try_recv_out(&mut work[..512]).unwrap();
     assert_eq!(n, 128);
     let result = match s.poll(Event::HostRecv { len: n }, &mut work, &mut devs) {
-        Action::Store { lun, op } => planes[lun].as_mut().unwrap().do_op(op),
+        Action::Store { lun, op, .. } => planes[lun].as_mut().unwrap().do_op(op),
         _ => panic!("expected a Store for the partial write"),
     };
     match s.poll(Event::StoreDone { result }, &mut work, &mut devs) {

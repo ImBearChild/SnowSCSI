@@ -200,7 +200,7 @@ pub fn serve<B: BotIo, G: for<'a> Gadget<'a>>(
                     Err(_) => return Err(ServeError::Closed),
                 };
             }
-            Action::Store { lun, op } => {
+            Action::Store { lun, op, .. } => {
                 // Execute the storage op on the LUN's plane and hand the result
                 // back to the core (which maps it via `store_done`). A `Store`
                 // on a self-backed / out-of-range LUN is an internal error.
@@ -327,7 +327,7 @@ where
                     Err(_) => return Err(ServeError::Closed),
                 };
             }
-            Action::Store { lun, op } => {
+            Action::Store { lun, op, .. } => {
                 // Execute the storage op on the LUN's plane and hand the result
                 // back to the core (which maps it via `store_done`). A `Store`
                 // on a self-backed / out-of-range LUN is an internal error.

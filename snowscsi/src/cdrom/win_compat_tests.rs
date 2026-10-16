@@ -366,7 +366,7 @@ mod enumeration_sequence {
                     }
                     ev = Event::HostSent;
                 }
-                Action::Store { lun, op } => {
+                Action::Store { lun, op, .. } => {
                     let result = planes[lun]
                         .as_mut()
                         .expect("cdrom LUN must have a store plane")

@@ -179,16 +179,26 @@ pub enum Action<'a> {
     /// [`Event::HostIdle`].
     HostRecv { len: usize, probe: bool },
     /// Send `bytes` on the bulk-IN pipe. `prefetch` is the next read-ahead
-    /// coordinate `(off, len)` for read-phase overlap (`None` in Step 1).
+    /// coordinate `(lun, off, len)` for read-phase overlap: after `bytes` is on
+    /// the wire the core's next read starts at `off` for `len` bytes. `None`
+    /// when there is no further Data-In chunk to read.
     HostSend {
         bytes: &'a [u8],
-        prefetch: Option<(u64, usize)>,
+        prefetch: Option<(usize, u64, usize)>,
     },
     /// Hand a storage op to the platform: the device's `xfer_out`/`xfer_in`
     /// returned [`Xfer::Store`] for the current data-phase chunk. The shell
     /// executes the op and feeds the result back as [`Event::StoreDone`];
     /// the Store is invisible on the wire.
-    Store { lun: usize, op: StoreOp<'a> },
+    Store {
+        lun: usize,
+        op: StoreOp<'a>,
+        /// Write-ahead receive budget: once this op completes the core will
+        /// accept at most `next_recv` further Data-Out bytes (fed as
+        /// `min(got, n)`). `None` is a latch (final chunk / not a Data-Out write
+        /// phase): the shell must not pre-receive.
+        next_recv: Option<usize>,
+    },
     /// Invalid CBW (BOT §6.6.1): STALL both bulk endpoints. The core has
     /// already returned to the Command phase; a new CBW arriving clears the
     /// halt (the host's CLEAR_FEATURE is handled by the USB core).
@@ -486,9 +496,15 @@ impl BotSession {
                 len: CBW_LEN - got,
                 probe: false,
             },
-            BotState::DataIn { chunk, .. } => Action::HostSend {
+            BotState::DataIn {
+                chunk,
+                transfer_len,
+                sent,
+                lun,
+                ..
+            } => Action::HostSend {
                 bytes: &work[..chunk],
-                prefetch: None,
+                prefetch: data_in_prefetch(lun, transfer_len, sent, work.len()),
             },
             BotState::DataOut { chunk, .. } => Action::HostRecv {
                 len: chunk,
@@ -591,7 +607,11 @@ impl BotSession {
                     status,
                     lun,
                 };
-                return Action::Store { lun, op };
+                return Action::Store {
+                    lun,
+                    op,
+                    next_recv: None,
+                };
             }
         }
         self.store_csw(tag, residue, status);
@@ -897,7 +917,7 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: None,
+                    prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
                 }
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
@@ -949,6 +969,7 @@ impl BotSession {
                         return Action::Store {
                             lun,
                             op: desc.attach(&mut work[..chunk]),
+                            next_recv: None,
                         };
                     }
                 };
@@ -968,7 +989,7 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: None,
+                    prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
                 }
             }
             CommandOutcome::InXfer { len: transfer_len } => {
@@ -1078,7 +1099,7 @@ impl BotSession {
         };
         Action::HostSend {
             bytes: &work[..chunk],
-            prefetch: None,
+            prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
         }
     }
 
@@ -1460,6 +1481,7 @@ impl BotSession {
                         return Action::Store {
                             lun,
                             op: desc.attach(&mut work[..next]),
+                            next_recv: None,
                         };
                     }
                 };
@@ -1493,14 +1515,14 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..next],
-                    prefetch: None,
+                    prefetch: data_in_prefetch(lun, transfer_len, sent + next as u64, work.len()),
                 }
             }
             Event::HostRecv { .. } | Event::HostIdle => {
                 // No-op: still need to send the pending chunk.
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: None,
+                    prefetch: data_in_prefetch(lun, transfer_len, sent, work.len()),
                 }
             }
             _ => Action::Error(BotTargetError::Internal),
@@ -1553,7 +1575,7 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..next],
-                    prefetch: None,
+                    prefetch: data_in_prefetch(lun, transfer_len, sent + next as u64, work.len()),
                 }
             }
             _ => Action::Error(BotTargetError::Internal),
@@ -1677,9 +1699,18 @@ impl BotSession {
                                     got: len,
                                     w,
                                 };
+                                // `received` has not been incremented yet, so
+                                // account for this chunk's `len` here: the
+                                // remaining declared bytes (capped to the work
+                                // buffer) are the next write-ahead budget.
+                                let next_recv = declared
+                                    .checked_sub(received + len as u64)
+                                    .map(|r| (r as usize).min(work.len()))
+                                    .filter(|&n| n > 0);
                                 return Action::Store {
                                     lun,
                                     op: desc.attach(&mut work[..w]),
+                                    next_recv,
                                 };
                             }
                         };
@@ -2067,6 +2098,25 @@ impl StoreDesc {
             Self::Sync => StoreOp::Sync,
         }
     }
+}
+
+/// Read-phase read-ahead coordinate: after the current Data-In chunk is on the
+/// wire, where and how much the core will next read. `sent` is the number of
+/// bytes already accounted for (the end offset of the current chunk), so the
+/// next read starts there for `min(transfer_len - sent, work_len)` bytes.
+/// Returns `None` when the transfer is complete (`sent >= transfer_len`) or the
+/// remaining length is zero.
+fn data_in_prefetch(
+    lun: usize,
+    transfer_len: u64,
+    sent: u64,
+    work_len: usize,
+) -> Option<(usize, u64, usize)> {
+    transfer_len
+        .checked_sub(sent)
+        .map(|r| (r as usize).min(work_len))
+        .filter(|&n| n > 0)
+        .map(|n| (lun, sent, n))
 }
 
 /// Feed a finished storage op to `devs[lun].store_done` and report whether the
