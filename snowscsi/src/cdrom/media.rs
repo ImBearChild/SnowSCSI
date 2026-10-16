@@ -237,6 +237,12 @@ pub enum MediaEventStatus {
 /// - `Ro(…)` — read-only disc over any [`FlatData`] source.
 /// - `Rw(…)` (feature `dvdram`) — random-writable DVD-RAM over any writable
 ///   plane.
+//
+// The read-only variant inlines the full track/session geometry (its file
+// list alone makes it several hundred bytes) while the writable variant is
+// small; boxing the large variant would need `alloc`, which this crate does
+// not require.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum CdMedia {
     /// Read-only disc: flat ISO/RAM image or live-generated ISO9660 —

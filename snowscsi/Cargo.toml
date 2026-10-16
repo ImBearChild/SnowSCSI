@@ -28,9 +28,9 @@ usb = ["scsi"]
 bundle = ["snowscsi-common/bundle"]
 log = ["dep:log", "snowscsi-common/log"]
 defmt = ["dep:defmt", "embedded-io/defmt", "snowscsi-common/defmt"]
-# Async facade: model-agnostic async seams + `serve_async` (no runtime).
+# Async facade: model-agnostic async seams (no runtime binding).
 async-io = ["snowscsi-common/async-io", "usb"]
-# embassy-usb adapter for the async facade (`EmbassyBot`).
+# embassy-usb adapters for the async facade.
 embassy = ["async-io", "usb", "dep:embassy-usb", "dep:embassy-time"]
 
 [dependencies]
