@@ -53,6 +53,8 @@
 #[cfg(feature = "async-io")]
 pub mod async_io;
 pub mod bot;
+#[cfg(feature = "embassy")]
+pub mod embassy;
 pub mod gadget;
 pub mod io;
 pub mod serve;
@@ -61,6 +63,8 @@ pub mod target;
 #[cfg(feature = "async-io")]
 pub use async_io::{AsyncBotRecv, AsyncBotSend, RecvMode};
 pub use bot::{BotDir, Cbw, Csw, CswStatus};
+#[cfg(feature = "embassy")]
+pub use embassy::{EmbassyBot, GadgetHalf, RecvHalf, SendHalf};
 pub use gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 pub use io::{BotIo, BotIoErr};
 pub use serve::{serve, ServeError};

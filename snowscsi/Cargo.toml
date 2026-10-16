@@ -42,3 +42,13 @@ log = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
 embassy-usb = { workspace = true, optional = true }
 embassy-time = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `mock-driver` provides the global `embassy-time-driver` symbols (via
+# `embassy_time::MockDriver`) for the embassy adapter's unit tests, so this
+# crate needs no `unsafe` time shim of its own. `generic-queue-8` selects the
+# self-contained timer queue (the default integrated queue needs the executor's
+# `__embassy_time_queue_item_from_waker`), and the `std` critical-section impl
+# backs the mock driver's internal mutex.
+embassy-time = { workspace = true, features = ["mock-driver", "generic-queue-8"] }
+critical-section = { version = "1", features = ["std"] }
