@@ -32,6 +32,18 @@
 //! are therefore kept (`Err(())`) and `can_stall_in` stays `false`: a session
 //! whose shortfall policy needs a Bulk-In halt is rejected by the shell up
 //! front rather than relying on a STALL that cannot be applied.
+//!
+//! # Reset status stage
+//!
+//! Deviation: embassy-usb completes a class control request's status stage as
+//! soon as the handler returns
+//! [`OutResponse::Accepted`](embassy_usb::control::OutResponse::Accepted), so a
+//! Bulk-Only Reset is acknowledged immediately. The Bulk-Only Transport
+//! specification (BOT §6.4) instead requires the status stage to be NAKed until
+//! the reset is complete. [`GadgetHalf`] only surfaces the reset to the shell at
+//! the next loop boundary, so the acknowledgment precedes the reset by a short
+//! window. This is accepted and documented, like the unreachable-STALL
+//! limitation above.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration as CoreDuration;
@@ -89,34 +101,65 @@ pub struct RecvHalf<O> {
     pub ep: O,
 }
 
+impl<O: EndpointOut> RecvHalf<O> {
+    /// Read one bulk transfer into `buf`, starting at `*n`, until the buffer is
+    /// full or a short packet (`< max_packet_size`) ends the transfer. The
+    /// running byte count is accumulated into `*n`, so a caller can keep the
+    /// bytes already consumed from the endpoint if a surrounding timeout fires.
+    async fn read_into(&mut self, buf: &mut [u8], n: &mut usize) -> Result<(), BotIoErr> {
+        let max_packet_size = self.ep.info().max_packet_size as usize;
+        while *n < buf.len() {
+            let i = self.ep.read(&mut buf[*n..]).await.map_err(recv_err)?;
+            *n += i;
+            if i < max_packet_size {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<O: EndpointOut> AsyncBotRecv for RecvHalf<O> {
     async fn recv(&mut self, buf: &mut [u8], mode: RecvMode) -> Result<usize, BotIoErr> {
         match mode {
-            // A packet is known to be pending: a bare read avoids the timer
-            // entirely (and the deadline overflow a maximal timeout would hit).
-            // Parking on `wait_enabled` first matters on hardware: a
-            // not-yet-configured endpoint returns `Disabled` immediately, so
+            // A transfer is known to be pending: consolidate a whole chunk into
+            // `buf` so a block-backed caller does not do a read-modify-write
+            // per packet. Parking on `wait_enabled` first matters on hardware:
+            // a not-yet-configured endpoint returns `Disabled` immediately, so
             // without a yield point a blocking read would spin and starve the
             // device poll task. Once enabled it returns at once.
             RecvMode::Forever => {
                 self.ep.wait_enabled().await;
-                self.ep.read(buf).await.map_err(recv_err)
+                let mut n = 0;
+                self.read_into(buf, &mut n).await?;
+                Ok(n)
             }
-            // Speculative drain: zero timeout and no wait — it must return
-            // promptly. `with_timeout` polls the read first, so an already
-            // arrived packet returns before the timeout.
+            // Speculative drain: a single non-blocking attempt and no wait — it
+            // must return promptly. `with_timeout` polls the read first, so an
+            // already arrived packet returns before the timeout.
             RecvMode::Probe => match with_timeout(ZERO, self.ep.read(buf)).await {
                 Ok(r) => r.map_err(recv_err),
                 Err(TimeoutError) => Err(BotIoErr::WouldBlock),
             },
-            // Bounded wait; expiry is a would-block, not an error. Parking on
-            // `wait_enabled` first keeps a disabled endpoint from spinning
-            // (see `Forever`) before the bounded read starts.
+            // Bounded wait under one overall deadline. Expiry keeps the bytes
+            // already consumed (they are gone from the endpoint and must not be
+            // dropped); with none consumed it is a would-block, not an error.
+            // Parking on `wait_enabled` first keeps a disabled endpoint from
+            // spinning (see `Forever`) before the bounded read starts.
             RecvMode::Until(d) => {
                 self.ep.wait_enabled().await;
-                match with_timeout(to_embassy(d), self.ep.read(buf)).await {
-                    Ok(r) => r.map_err(recv_err),
-                    Err(TimeoutError) => Err(BotIoErr::WouldBlock),
+                let mut n = 0;
+                let outcome = with_timeout(to_embassy(d), self.read_into(buf, &mut n)).await;
+                match outcome {
+                    Ok(Ok(())) => Ok(n),
+                    Ok(Err(e)) => Err(e),
+                    Err(TimeoutError) => {
+                        if n > 0 {
+                            Ok(n)
+                        } else {
+                            Err(BotIoErr::WouldBlock)
+                        }
+                    }
                 }
             }
         }
@@ -391,12 +434,67 @@ mod tests {
     }
 
     #[test]
-    fn recv_probe_returns_an_already_arrived_packet() {
+    fn recv_probe_reads_at_most_one_packet() {
         let mut half = RecvHalf {
-            ep: MockEp::new(Direction::Out, 64, vec![ReadOutcome::Data(vec![1, 2, 3])]),
+            ep: MockEp::new(
+                Direction::Out,
+                64,
+                vec![
+                    ReadOutcome::Data(vec![1, 2, 3]),
+                    ReadOutcome::Data(vec![4, 5, 6]),
+                ],
+            ),
         };
         let mut buf = [0u8; 8];
         assert_eq!(block_on(half.recv(&mut buf, RecvMode::Probe)), Ok(3));
         assert_eq!(&buf[..3], &[1, 2, 3]);
+        // Probe is a single non-blocking attempt: the second packet is untouched.
+        assert_eq!(half.ep.reads.borrow().len(), 1);
+    }
+
+    #[test]
+    fn recv_forever_consolidates_a_multi_packet_transfer() {
+        // MPS 8: two full packets then a short one end the transfer, so a
+        // single `recv` returns the whole 20-byte chunk and leaves the trailing
+        // packet for the next call.
+        let mut half = RecvHalf {
+            ep: MockEp::new(
+                Direction::Out,
+                8,
+                vec![
+                    ReadOutcome::Data(vec![1; 8]),
+                    ReadOutcome::Data(vec![2; 8]),
+                    ReadOutcome::Data(vec![3; 4]),
+                    ReadOutcome::Data(vec![4; 8]),
+                ],
+            ),
+        };
+        let mut buf = [0u8; 32];
+        assert_eq!(block_on(half.recv(&mut buf, RecvMode::Forever)), Ok(20));
+        assert_eq!(&buf[..8], &[1; 8]);
+        assert_eq!(&buf[8..16], &[2; 8]);
+        assert_eq!(&buf[16..20], &[3; 4]);
+        assert_eq!(half.ep.reads.borrow().len(), 1);
+    }
+
+    #[test]
+    fn recv_until_keeps_bytes_received_before_the_deadline() {
+        // One full packet arrives, then the host stalls; the overall deadline
+        // expires but the already-consumed bytes must be returned, not dropped.
+        embassy_time::MockDriver::get().reset();
+
+        let mut half = RecvHalf {
+            ep: MockEp::new(
+                Direction::Out,
+                8,
+                vec![ReadOutcome::Data(vec![7; 8]), ReadOutcome::Pending],
+            ),
+        };
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            block_on(half.recv(&mut buf, RecvMode::Until(core::time::Duration::ZERO))),
+            Ok(8)
+        );
+        assert_eq!(&buf[..8], &[7; 8]);
     }
 }
