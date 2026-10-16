@@ -6,6 +6,7 @@
 
 /// Render `data` as space-separated uppercase hex into `out`; returns the
 /// used subslice. Debug-logging helper (no_std, no alloc).
+#[cfg(any(feature = "cdrom", feature = "usb"))]
 pub(crate) fn hex_of<'o>(out: &'o mut [u8], data: &[u8]) -> &'o [u8] {
     let mut i = 0;
     for (n, b) in data.iter().enumerate() {

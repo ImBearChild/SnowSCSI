@@ -514,7 +514,7 @@ mod tests {
 
         let dir = std::env::temp_dir();
         let path = dir.join(format!("snowscsi_fb_async_{}.img", std::process::id()));
-        let mut f = std::fs::File::create(&path).unwrap();
+        let f = std::fs::File::create(&path).unwrap();
         f.set_len(64 * 1024).unwrap();
 
         let mut b = FileBackend::open(&path.to_string_lossy(), true).unwrap();

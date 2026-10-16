@@ -845,7 +845,7 @@ mod tests {
                 }
             }
             CommandOutcome::OutInline { len } => {
-                let n = len as usize;
+                let n = len;
                 assert!(n <= buf.len());
                 buf[..n].copy_from_slice(&work[..n]);
                 n

@@ -1691,7 +1691,7 @@ mod tests {
     fn data_in(outcome: CommandOutcome, work: &[u8], buf: &mut [u8]) -> usize {
         match outcome {
             CommandOutcome::OutInline { len } => {
-                let n = len as usize;
+                let n = len;
                 buf[..n].copy_from_slice(&work[..n]);
                 n
             }
@@ -1723,7 +1723,7 @@ mod tests {
                 n
             }
             CommandOutcome::OutInline { len } => {
-                let n = len as usize;
+                let n = len;
                 assert!(n <= buf.len());
                 buf[..n].copy_from_slice(&work[..n]);
                 n
@@ -1965,7 +1965,7 @@ mod tests {
         cdw[0] = op::GET_PERFORMANCE;
         cdw[1] = 0x04; // Write=1
         cdw[9] = 0x01;
-        let n = data_in(dev.do_cmd(&cdw, &mut w).unwrap(), &w, &mut buf);
+        let _ = data_in(dev.do_cmd(&cdw, &mut w).unwrap(), &w, &mut buf);
         assert_eq!(buf[4], 0x04);
 
         // Unsupported Type (write speed) → 05/24.

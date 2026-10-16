@@ -535,8 +535,8 @@ mod tests {
     fn data_in(outcome: CommandOutcome, work: &[u8], buf: &mut [u8]) -> usize {
         match outcome {
             CommandOutcome::OutInline { len } => {
-                assert!(len as usize <= buf.len());
-                let n = len as usize;
+                assert!(len <= buf.len());
+                let n = len;
                 buf[..n].copy_from_slice(&work[..n]);
                 n
             }

@@ -17,6 +17,7 @@ use crate::scsi::backend::{BlockBackend, RamBackend};
 use crate::scsi::device::CommandOutcome;
 use crate::scsi::spc::SpcDevice as _;
 
+#[allow(dead_code)]
 fn hex(b: &[u8]) -> String {
     b.iter()
         .map(|x| format!("{x:02X}"))
@@ -83,7 +84,7 @@ fn win_single_cmds_diag() {
     let _ = dev.do_cmd(&[0x00; 6], &mut w);
     let _ = dev.take_sense();
 
-    let cases: &[(&str, Vec<u8>)] = &[
+    let _cases: &[(&str, Vec<u8>)] = &[
         ("GESN class=00", vec![0x4A, 1, 0, 0, 0x00, 0, 0, 0, 0x08, 0]),
         ("GESN class=10", vec![0x4A, 1, 0, 0, 0x10, 0, 0, 0, 0x08, 0]),
         ("GETCFG alloc8", vec![0x46, 0, 0, 0, 0, 0, 0, 0, 0x08, 0]),
@@ -295,6 +296,7 @@ mod enumeration_sequence {
     /// loop below executes each op on the LUN's store plane and feeds the
     /// result back as [`Event::StoreDone`] — invisible on the wire, so the
     /// CSW status and response bytes are unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn tx(
         session: &mut BotSession,
         dev: &mut CdromDrive,
