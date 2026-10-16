@@ -97,6 +97,10 @@ impl BotIo for MockBotIo {
             Err(())
         }
     }
+
+    fn can_stall_in(&self) -> bool {
+        self.stall_in_available
+    }
 }
 
 /// Recording ack handle (records through `Arc`, since `ack` consumes self).

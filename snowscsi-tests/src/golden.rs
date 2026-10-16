@@ -146,6 +146,12 @@ impl BotIo for RecBotIo {
         self.trace.push(TraceEntry::Mark("stall_in"));
         Ok(())
     }
+
+    /// Pure capability query (no trace side effect): the scripted driver
+    /// always reports STALL support.
+    fn can_stall_in(&self) -> bool {
+        true
+    }
 }
 
 /// Scripted control gadget: pops one [`CtrlStep`] at a time and hands back

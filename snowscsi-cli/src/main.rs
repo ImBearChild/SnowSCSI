@@ -1485,6 +1485,11 @@ impl BotIo for FfsBot {
             }
         }
     }
+
+    fn can_stall_in(&self) -> bool {
+        // `stall_in` is implemented above over FunctionFS endpoint halt.
+        true
+    }
 }
 
 #[cfg(target_os = "linux")]

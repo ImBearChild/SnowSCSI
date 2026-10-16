@@ -45,9 +45,10 @@ impl core::error::Error for BotIoErr {}
 
 /// Bulk-OUT / bulk-IN driver seam.
 ///
-/// No fine-grained `stall_in` / `stall_out` / `clear_stall` methods and no
-/// capability probing: STALL is a single optional capability used only for
-/// invalid CBWs (the "capability vs policy" split, §4.7). Data-phase errors
+/// There are no fine-grained `stall_in` / `stall_out` / `clear_stall`
+/// methods: STALL stays a single optional capability, declared once through
+/// [`Self::can_stall_in`] and exercised through [`Self::stall_in`] /
+/// [`Self::stall_both`] (the "capability vs policy" split). Data-phase errors
 /// are never expressed through STALL — they use short packets + CSW
 /// status/residue instead (see the [`target`](crate::usb::target) module's
 /// "Data-In shortfall policy" for the rationale and the BOT §6.7.2 deviation).
@@ -92,6 +93,13 @@ pub trait BotIo {
     /// [`ShortfallPolicy::Short`]: crate::usb::target::ShortfallPolicy::Short
     fn stall_in(&mut self) -> Result<(), ()> {
         Err(())
+    }
+
+    /// Whether this transport can actually STALL Bulk-In (the capability
+    /// behind [`Self::stall_in`]). Defaults to `false`; a transport that
+    /// implements `stall_in` overrides it to `true`.
+    fn can_stall_in(&self) -> bool {
+        false
     }
 }
 

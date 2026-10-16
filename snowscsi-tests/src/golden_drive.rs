@@ -59,6 +59,10 @@ impl BotIo for GoldenBotIo<'_> {
     fn stall_in(&mut self) -> Result<(), ()> {
         self.inner.stall_in()
     }
+
+    fn can_stall_in(&self) -> bool {
+        self.inner.can_stall_in()
+    }
 }
 
 /// Replay the scenario's bulk script to exhaustion through the library serve

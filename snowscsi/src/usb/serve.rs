@@ -17,7 +17,7 @@ use core::time::Duration;
 use crate::scsi::Luns;
 use crate::usb::gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 use crate::usb::io::{BotIo, BotIoErr};
-use crate::usb::target::{Action, BotSession, BotTargetError, Event};
+use crate::usb::target::{Action, BotSession, BotTargetError, Event, ShortfallPolicy};
 
 /// Serve-loop receive granularity: bounds the control-pipe / stop-flag check
 /// latency between bulk receives (mirrors the PC driver's 50ms ctrl poll).
@@ -35,6 +35,9 @@ pub enum ServeError {
     /// A `Store` addressed a LUN with no storage plane (`planes[lun] == None`
     /// or an out-of-range LUN).
     Internal,
+    /// The session's `Short` Data-In shortfall policy needs a Bulk-In STALL
+    /// but the transport cannot STALL.
+    PolicyNeedsStall,
 }
 
 impl core::fmt::Display for ServeError {
@@ -44,6 +47,9 @@ impl core::fmt::Display for ServeError {
             Self::Core(e) => write!(f, "BOT core error: {e}"),
             Self::Control => write!(f, "control-plane reply failed"),
             Self::Internal => write!(f, "internal BOT serve error"),
+            Self::PolicyNeedsStall => {
+                write!(f, "shortfall policy needs a Bulk-In STALL the transport cannot do")
+            }
         }
     }
 }
@@ -74,6 +80,12 @@ pub fn serve<B: BotIo, G: for<'a> Gadget<'a>>(
     // used to execute `Action::Store` ops (whose buffer/path may borrow the
     // device) without aliasing the device slice.
     let Luns { devs, planes } = luns;
+
+    // A `Short` session needs a Bulk-In STALL; a transport that cannot do it
+    // would only degrade into a reset storm, so reject the mismatch up front.
+    if session.shortfall() == ShortfallPolicy::Short && !io.can_stall_in() {
+        return Err(ServeError::PolicyNeedsStall);
+    }
 
     // Carry the completion to feed the core. `Event::Tick` re-emits the
     // current pending `Action` without changing state, so a turn whose outcome
@@ -173,5 +185,101 @@ pub fn serve<B: BotIo, G: for<'a> Gadget<'a>>(
             }
             Action::Error(e) => return Err(ServeError::Core(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usb::gadget::{CtrlAck, CtrlReply};
+
+    /// Minimal bulk driver with a configurable STALL capability.
+    struct StubIo {
+        can_stall: bool,
+    }
+
+    impl BotIo for StubIo {
+        fn try_recv_out(&mut self, _buf: &mut [u8]) -> Result<usize, BotIoErr> {
+            Err(BotIoErr::WouldBlock)
+        }
+
+        fn recv_out(
+            &mut self,
+            _buf: &mut [u8],
+            _timeout: Option<Duration>,
+        ) -> Result<usize, BotIoErr> {
+            Err(BotIoErr::WouldBlock)
+        }
+
+        fn send_in(&mut self, _buf: &[u8]) -> Result<(), BotIoErr> {
+            Ok(())
+        }
+
+        fn can_stall_in(&self) -> bool {
+            self.can_stall
+        }
+    }
+
+    /// Ack handle that does nothing.
+    struct NoAck;
+    impl CtrlAck for NoAck {
+        fn ack(self) {}
+    }
+
+    /// Reply handle that accepts anything.
+    struct NoReply;
+    impl CtrlReply for NoReply {
+        fn send(&mut self, _data: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    /// Gadget that never surfaces a control request.
+    struct NoGadget;
+    impl<'a> Gadget<'a> for NoGadget {
+        type Ack = NoAck;
+        type Reply = NoReply;
+
+        fn try_next_ctrl(&'a mut self) -> Option<CtrlReq<NoAck, NoReply>> {
+            None
+        }
+    }
+
+    /// Drive `serve` with `stop` already set: the policy check runs before the
+    /// loop, so a compatible combination returns `Ok(())` immediately and an
+    /// incompatible one is rejected up front.
+    fn run(policy: ShortfallPolicy, can_stall: bool, stop_set: bool) -> Result<(), ServeError> {
+        let mut io = StubIo { can_stall };
+        let mut gadget = NoGadget;
+        let mut session = BotSession::new().with_shortfall(policy);
+        let mut work = [0u8; crate::MIN_DATA_LEN];
+        let mut luns = Luns::new(&mut [], &mut []);
+        let stop = AtomicBool::new(stop_set);
+        serve(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut luns,
+            &stop,
+        )
+    }
+
+    #[test]
+    fn short_policy_without_stall_capability_is_rejected() {
+        assert_eq!(
+            run(ShortfallPolicy::Short, false, false),
+            Err(ServeError::PolicyNeedsStall)
+        );
+    }
+
+    #[test]
+    fn short_policy_with_stall_capability_is_accepted() {
+        assert_eq!(run(ShortfallPolicy::Short, true, true), Ok(()));
+    }
+
+    #[test]
+    fn non_short_policy_without_stall_capability_is_accepted() {
+        assert_eq!(run(ShortfallPolicy::ShortNoStall, false, true), Ok(()));
     }
 }
