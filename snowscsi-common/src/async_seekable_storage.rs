@@ -186,7 +186,9 @@ mod tests {
         let mut ram = [0xFFu8; 64];
         let mut b = RamBackend::new(&mut ram);
         block_on(async {
-            AsyncWritableFlatData::fill_at(&mut b, 8, 16, 0).await.unwrap();
+            AsyncWritableFlatData::fill_at(&mut b, 8, 16, 0)
+                .await
+                .unwrap();
             assert_eq!(
                 AsyncWritableFlatData::fill_at(&mut b, 60, 8, 0).await,
                 Err(StorageError::OutOfBounds)
@@ -232,7 +234,10 @@ mod tests {
         block_on(async {
             m.fill_at(0, 1500, 0x7E).await.unwrap(); // 512 + 512 + 476
             assert_eq!(m.fill_at(1499, 2, 0).await, Err(StorageError::OutOfBounds));
-            assert_eq!(m.fill_at(u64::MAX, 2, 0).await, Err(StorageError::OutOfBounds));
+            assert_eq!(
+                m.fill_at(u64::MAX, 2, 0).await,
+                Err(StorageError::OutOfBounds)
+            );
         });
         assert!(m.0.iter().all(|&x| x == 0x7E));
     }

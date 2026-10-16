@@ -58,13 +58,13 @@ pub mod io;
 pub mod serve;
 pub mod target;
 
+#[cfg(feature = "async-io")]
+pub use async_io::{AsyncBotRecv, AsyncBotSend, RecvMode};
 pub use bot::{BotDir, Cbw, Csw, CswStatus};
 pub use gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 pub use io::{BotIo, BotIoErr};
 pub use serve::{serve, ServeError};
 pub use target::{Action, BotSession, BotTargetError, Event, ShortfallPolicy, MAX_PAD};
-#[cfg(feature = "async-io")]
-pub use async_io::{AsyncBotRecv, AsyncBotSend, RecvMode};
 
 /// Command Block Wrapper signature (`"USBC"`, BOT §5.1) — stored little
 /// endian in the raw 31-byte CBW.

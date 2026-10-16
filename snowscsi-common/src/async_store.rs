@@ -61,9 +61,9 @@ impl<T: AsyncWritableFlatData + ?Sized> AsyncStorePlane for T {
             StoreOp::Write { off, buf } => self.write_at(off, buf).await,
             StoreOp::Fill { off, len, byte } => self.fill_at(off, len, byte).await,
             StoreOp::Sync => AsyncWritableFlatData::sync(self).await,
-            StoreOp::FileRead { .. }
-            | StoreOp::FileWrite { .. }
-            | StoreOp::FileRemove { .. } => Err(StorageError::Unsupported),
+            StoreOp::FileRead { .. } | StoreOp::FileWrite { .. } | StoreOp::FileRemove { .. } => {
+                Err(StorageError::Unsupported)
+            }
         }
     }
 
@@ -252,12 +252,7 @@ mod tests {
         let mut bridge = BlockingAsync(StorePlane::BlockRo(&mut backend));
         block_on(async {
             assert_eq!(
-                bridge
-                    .do_op(StoreOp::Write {
-                        off: 0,
-                        buf: &[1],
-                    })
-                    .await,
+                bridge.do_op(StoreOp::Write { off: 0, buf: &[1] }).await,
                 Err(StorageError::NotWritable)
             );
         });
@@ -267,10 +262,8 @@ mod tests {
     fn either_dispatches_to_both_sides() {
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
-        let mut left: Either<RamBackend<'_>, RamBackend<'_>> =
-            Either::A(RamBackend::new(&mut a));
-        let mut right: Either<RamBackend<'_>, RamBackend<'_>> =
-            Either::B(RamBackend::new(&mut b));
+        let mut left: Either<RamBackend<'_>, RamBackend<'_>> = Either::A(RamBackend::new(&mut a));
+        let mut right: Either<RamBackend<'_>, RamBackend<'_>> = Either::B(RamBackend::new(&mut b));
         block_on(async {
             left.do_op(StoreOp::Write {
                 off: 0,

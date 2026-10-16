@@ -34,6 +34,6 @@ pub mod scsi;
 pub mod spc;
 pub(crate) mod util;
 
-pub use luns::Luns;
 #[cfg(feature = "async-io")]
 pub use async_luns::AsyncLuns;
+pub use luns::Luns;

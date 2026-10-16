@@ -48,7 +48,10 @@ impl core::fmt::Display for ServeError {
             Self::Control => write!(f, "control-plane reply failed"),
             Self::Internal => write!(f, "internal BOT serve error"),
             Self::PolicyNeedsStall => {
-                write!(f, "shortfall policy needs a Bulk-In STALL the transport cannot do")
+                write!(
+                    f,
+                    "shortfall policy needs a Bulk-In STALL the transport cannot do"
+                )
             }
         }
     }
