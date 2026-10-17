@@ -13,7 +13,7 @@
 //! generic type parameter rather than `&mut dyn` (see
 //! [`crate::async_store::AsyncStorePlane`]).
 
-use crate::seekable_storage::{FlatData, RamBackend, StorageError, WritableFlatData};
+use crate::seekable_storage::{FlatData, RamBackend, StorageError, WritableFlatData, ZeroBackend};
 
 /// Stack chunk size for the default [`AsyncWritableFlatData::fill_at`] loop.
 ///
@@ -137,6 +137,36 @@ impl AsyncWritableFlatData for RamBackend<'_> {
     }
 }
 
+// The all-zero backend likewise satisfies the asynchronous planes by
+// delegating to the synchronous ones: reads never wait (they synthesise
+// zeros) and writes are discarded, so a single body per operation avoids
+// drift between the two seams.
+impl AsyncFlatData for ZeroBackend {
+    async fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        FlatData::read_at(self, off, buf)
+    }
+
+    fn capacity(&self) -> u64 {
+        FlatData::capacity(self)
+    }
+}
+
+impl AsyncWritableFlatData for ZeroBackend {
+    async fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+        WritableFlatData::write_at(self, off, buf)
+    }
+
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        WritableFlatData::sync(self)
+    }
+
+    /// Writes are discarded, so the synchronous bounds-checked fill is a
+    /// bounds check only: no chunk loop, no yield.
+    async fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), StorageError> {
+        WritableFlatData::fill_at(self, off, len, byte)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +270,51 @@ mod tests {
             );
         });
         assert!(m.0.iter().all(|&x| x == 0x7E));
+    }
+
+    #[test]
+    fn zero_async_read_write_and_capacity() {
+        let mut b = ZeroBackend::new(512);
+        block_on(async {
+            assert_eq!(AsyncFlatData::capacity(&b), 512);
+            // Write is accepted and discarded; a subsequent read is zeros.
+            AsyncWritableFlatData::write_at(&mut b, 100, &[1, 2, 3, 4])
+                .await
+                .unwrap();
+            let mut out = [0xAAu8; 4];
+            AsyncFlatData::read_at(&mut b, 100, &mut out).await.unwrap();
+            assert_eq!(out, [0, 0, 0, 0]);
+            // Past capacity and `off + len` overflow both reject.
+            assert_eq!(
+                AsyncFlatData::read_at(&mut b, 510, &mut out).await,
+                Err(StorageError::OutOfBounds)
+            );
+            assert_eq!(
+                AsyncWritableFlatData::write_at(&mut b, u64::MAX, &[0]).await,
+                Err(StorageError::OutOfBounds)
+            );
+            AsyncWritableFlatData::sync(&mut b).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn zero_async_fill_is_discarded_and_bounds_checked() {
+        let mut b = ZeroBackend::new(64);
+        block_on(async {
+            AsyncWritableFlatData::fill_at(&mut b, 8, 16, 0x5A)
+                .await
+                .unwrap();
+            assert_eq!(
+                AsyncWritableFlatData::fill_at(&mut b, 60, 8, 0).await,
+                Err(StorageError::OutOfBounds)
+            );
+            assert_eq!(
+                AsyncWritableFlatData::fill_at(&mut b, u64::MAX, 2, 0).await,
+                Err(StorageError::OutOfBounds)
+            );
+            let mut out = [0xAAu8; 16];
+            AsyncFlatData::read_at(&mut b, 8, &mut out).await.unwrap();
+            assert!(out.iter().all(|&x| x == 0));
+        });
     }
 }

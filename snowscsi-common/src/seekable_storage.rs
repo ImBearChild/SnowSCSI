@@ -420,6 +420,104 @@ impl SeekableStorage for RamBackend<'_> {
     }
 }
 
+/// All-zero backend. Models an unbounded all-zero byte plane truncated to a
+/// caller-supplied capacity and implements `embedded_io::Read + Write + Seek`
+/// + [`SeekableStorage`].
+///
+/// Useful as a synthetic disc/block plane (e.g. a scratch device or a
+/// placeholder LUN) with no resident storage: every read yields `0x00`, every
+/// write is discarded, and only the cursor plus the configured capacity are
+/// kept. Bounds are enforced exactly like [`RamBackend`]: the
+/// [`FlatData`]/[`WritableFlatData`] blankets reject `off + len` overflow and
+/// past-capacity ranges with [`StorageError::OutOfBounds`].
+#[derive(Debug)]
+pub struct ZeroBackend {
+    capacity: u64,
+    pos: u64,
+}
+
+impl ZeroBackend {
+    /// Create a new all-zero backend with the given capacity in bytes.
+    pub const fn new(capacity: u64) -> Self {
+        Self { capacity, pos: 0 }
+    }
+}
+
+impl embedded_io::ErrorType for ZeroBackend {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl embedded_io::Read for ZeroBackend {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let available = self.capacity.saturating_sub(self.pos);
+        let n = (buf.len() as u64).min(available) as usize;
+        buf[..n].fill(0);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl embedded_io::Write for ZeroBackend {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        // Accept (and discard) as many bytes as remain before capacity so the
+        // short-write arithmetic matches `RamBackend`; nothing is stored.
+        let available = self.capacity.saturating_sub(self.pos);
+        let n = (buf.len() as u64).min(available) as usize;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl embedded_io::Seek for ZeroBackend {
+    fn seek(&mut self, pos: embedded_io::SeekFrom) -> Result<u64, Self::Error> {
+        let new_pos = match pos {
+            embedded_io::SeekFrom::Start(off) => off,
+            embedded_io::SeekFrom::Current(off) => {
+                if off >= 0 {
+                    self.pos.saturating_add(off as u64)
+                } else {
+                    self.pos.saturating_sub((-off) as u64)
+                }
+            }
+            embedded_io::SeekFrom::End(off) => {
+                let end = self.capacity;
+                if off >= 0 {
+                    end.saturating_add(off as u64)
+                } else {
+                    end.saturating_sub((-off) as u64)
+                }
+            }
+        };
+        self.pos = new_pos.min(self.capacity);
+        Ok(self.pos)
+    }
+}
+
+impl SeekableStorage for ZeroBackend {
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn sync(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// All writes are discarded, so filling with zero is a no-op and any other
+    /// byte has no effect. The [`WritableFlatData`] blanket bounds-checks
+    /// before delegating; re-check defensively for direct callers (embedded-io
+    /// has no `OutOfBounds` kind, so `Other`).
+    fn fill_at(&mut self, off: u64, len: u64, _byte: u8) -> Result<(), Self::Error> {
+        off.checked_add(len)
+            .filter(|&end| end <= self.capacity)
+            .ok_or(embedded_io::ErrorKind::Other)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +633,82 @@ mod tests {
         assert!(m.0.iter().all(|&x| x == 0x7E));
         assert_eq!(m.fill_at(1499, 2, 0), Err(StorageError::OutOfBounds));
         assert_eq!(m.fill_at(u64::MAX, 2, 0), Err(StorageError::OutOfBounds));
+    }
+
+    #[test]
+    fn zero_read_returns_zeros() {
+        let mut b = ZeroBackend::new(512);
+        let mut out = [0xAAu8; 16];
+        embedded_io::Seek::seek(&mut b, embedded_io::SeekFrom::Start(200)).unwrap();
+        use embedded_io::Read;
+        b.read_exact(&mut out).unwrap();
+        assert!(out.iter().all(|&x| x == 0));
+        assert_eq!(SeekableStorage::capacity(&b), 512);
+        assert_eq!(SeekableStorage::sync(&mut b), Ok(()));
+    }
+
+    #[test]
+    fn zero_capacity_enforced() {
+        let mut b = ZeroBackend::new(64);
+        let mut out = [0u8; 8];
+        // In-bounds read fills zeros.
+        assert_eq!(FlatData::read_at(&mut b, 0, &mut out), Ok(()));
+        assert!(out.iter().all(|&x| x == 0));
+        // Past capacity and `off + len` overflow both reject.
+        assert_eq!(
+            FlatData::read_at(&mut b, 60, &mut out),
+            Err(StorageError::OutOfBounds)
+        );
+        assert_eq!(
+            FlatData::read_at(&mut b, u64::MAX, &mut out),
+            Err(StorageError::OutOfBounds)
+        );
+        assert_eq!(
+            WritableFlatData::write_at(&mut b, 60, &[0u8; 8]),
+            Err(StorageError::OutOfBounds)
+        );
+        assert_eq!(
+            WritableFlatData::write_at(&mut b, u64::MAX, &[0u8; 2]),
+            Err(StorageError::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn zero_writes_are_discarded() {
+        let mut b = ZeroBackend::new(512);
+        // Accepted in-bounds, but nothing is retained.
+        assert_eq!(
+            WritableFlatData::write_at(&mut b, 10, &[0xFFu8; 32]),
+            Ok(())
+        );
+        assert_eq!(WritableFlatData::sync(&mut b), Ok(()));
+        let mut out = [0xAAu8; 32];
+        assert_eq!(FlatData::read_at(&mut b, 10, &mut out), Ok(()));
+        assert!(out.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn zero_fill_at_is_discarded_and_bounds_checked() {
+        let mut b = ZeroBackend::new(64);
+        // In-bounds fill (any byte) is accepted and discarded.
+        assert_eq!(WritableFlatData::fill_at(&mut b, 0, 64, 0x5A), Ok(()));
+        // Past capacity and `off + len` overflow both reject.
+        assert_eq!(
+            WritableFlatData::fill_at(&mut b, 60, 8, 0),
+            Err(StorageError::OutOfBounds)
+        );
+        assert_eq!(
+            WritableFlatData::fill_at(&mut b, u64::MAX, 2, 0),
+            Err(StorageError::OutOfBounds)
+        );
+        let mut out = [0xAAu8; 64];
+        assert_eq!(FlatData::read_at(&mut b, 0, &mut out), Ok(()));
+        assert!(out.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn empty_zero() {
+        let b = ZeroBackend::new(0);
+        assert_eq!(SeekableStorage::capacity(&b), 0);
     }
 }
