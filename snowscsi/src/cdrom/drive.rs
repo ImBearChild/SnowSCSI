@@ -1526,6 +1526,11 @@ impl crate::scsi::device::ScsiDevice for CdromDrive {
         self.xfer_in(transfer_offset, buf)
     }
 
+    fn read_ahead_offset(&self, transfer_offset: u64) -> Option<u64> {
+        let p = self.pending.as_ref()?;
+        (p.dir == XferDir::Out).then(|| p.base_byte + transfer_offset)
+    }
+
     /// Device maintenance agenda.
     ///
     /// FORMAT UNIT / BLANK arm a whole-disc zero-fill; this yields it as
@@ -2783,6 +2788,46 @@ mod tests {
                 2,
                 "still formatted after FORMAT UNIT"
             );
+        }
+    }
+
+    /// The `CdromDrive` read-ahead coordinate is the backend address a media
+    /// read will use (`base_byte + transfer_offset`); a drive with no transfer
+    /// in flight offers none.
+    #[test]
+    fn drive_read_ahead_offset_is_the_backend_address() {
+        use crate::common::store::StoreOp;
+        use crate::scsi::device::{CommandOutcome, ScsiDevice, Xfer};
+
+        let mut dev = CdromDrive::new();
+        assert_eq!(dev.read_ahead_offset(0), None, "no transfer in flight");
+
+        let mut img = vec![0u8; 16 * 2048];
+        let mut bb = BlockBackend::Ram(RamBackend::new(&mut img));
+        dev.load_quiet(CdMedia::ro(&mut bb));
+
+        // READ(10) at LBA 3, 2 CD sectors of 2048.
+        let mut cdb = [0u8; 10];
+        cdb[0] = op::READ_10;
+        cdb[5] = 3;
+        cdb[8] = 2;
+        let mut w = work();
+        assert_eq!(
+            dev.do_cmd(&cdb, &mut w).unwrap(),
+            CommandOutcome::OutXfer { len: 2 * 2048 }
+        );
+
+        let base = 3 * 2048;
+        assert_eq!(dev.read_ahead_offset(0), Some(base));
+        assert_eq!(dev.read_ahead_offset(2048), Some(base + 2048));
+
+        // ...and it agrees with the address `xfer_out` actually produces.
+        let mut buf = vec![0u8; 2048];
+        match dev.xfer_out(2048, &mut buf) {
+            Xfer::Store(StoreOp::Read { off, .. }) => {
+                assert_eq!(Some(off), dev.read_ahead_offset(2048))
+            }
+            other => panic!("expected Xfer::Store(StoreOp::Read), got {other:?}"),
         }
     }
 }

@@ -490,7 +490,7 @@ impl BotSession {
     /// The action for the current state (the old `need()` + `out_slice()`
     /// merged). Used to re-emit the pending [`Action`] on [`Event::Tick`] and
     /// after an out-of-band control event.
-    fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
+    fn pending<'a, D: ScsiDevice>(&'a mut self, work: &'a mut [u8], devs: &[D]) -> Action<'a> {
         match self.state {
             BotState::Command { got } => Action::HostRecv {
                 len: CBW_LEN - got,
@@ -504,7 +504,7 @@ impl BotSession {
                 ..
             } => Action::HostSend {
                 bytes: &work[..chunk],
-                prefetch: data_in_prefetch(lun, transfer_len, sent, work.len()),
+                prefetch: data_in_prefetch(devs, lun, transfer_len, sent, work.len()),
             },
             BotState::DataOut { chunk, .. } => Action::HostRecv {
                 len: chunk,
@@ -667,7 +667,7 @@ impl BotSession {
         match ev {
             Event::Reset => {
                 self.reset_state();
-                return self.pending(work);
+                return self.pending(work, devs);
             }
             Event::StallApplied => {
                 // The `Short` shortfall's STALL is on the wire; the data phase
@@ -682,9 +682,9 @@ impl BotSession {
                 {
                     return self.enter_agenda(tag, declared - actual, status, lun, devs);
                 }
-                return self.pending(work);
+                return self.pending(work, devs);
             }
-            Event::Tick => return self.pending(work),
+            Event::Tick => return self.pending(work, devs),
             // `StoreDone` is consumed by the Data-In/Data-Out store states
             // below; any other state treats it as a mis-fed event.
             Event::StoreDone { .. }
@@ -917,7 +917,7 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
+                    prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
                 }
             }
             CommandOutcome::OutXfer { len: transfer_len } => {
@@ -989,7 +989,7 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
+                    prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
                 }
             }
             CommandOutcome::InXfer { len: transfer_len } => {
@@ -1099,7 +1099,7 @@ impl BotSession {
         };
         Action::HostSend {
             bytes: &work[..chunk],
-            prefetch: data_in_prefetch(lun, actual, chunk as u64, work.len()),
+            prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
         }
     }
 
@@ -1515,14 +1515,20 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..next],
-                    prefetch: data_in_prefetch(lun, transfer_len, sent + next as u64, work.len()),
+                    prefetch: data_in_prefetch(
+                        devs,
+                        lun,
+                        transfer_len,
+                        sent + next as u64,
+                        work.len(),
+                    ),
                 }
             }
             Event::HostRecv { .. } | Event::HostIdle => {
                 // No-op: still need to send the pending chunk.
                 Action::HostSend {
                     bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(lun, transfer_len, sent, work.len()),
+                    prefetch: data_in_prefetch(devs, lun, transfer_len, sent, work.len()),
                 }
             }
             _ => Action::Error(BotTargetError::Internal),
@@ -1575,7 +1581,13 @@ impl BotSession {
                 };
                 Action::HostSend {
                     bytes: &work[..next],
-                    prefetch: data_in_prefetch(lun, transfer_len, sent + next as u64, work.len()),
+                    prefetch: data_in_prefetch(
+                        devs,
+                        lun,
+                        transfer_len,
+                        sent + next as u64,
+                        work.len(),
+                    ),
                 }
             }
             _ => Action::Error(BotTargetError::Internal),
@@ -2106,17 +2118,24 @@ impl StoreDesc {
 /// next read starts there for `min(transfer_len - sent, work_len)` bytes.
 /// Returns `None` when the transfer is complete (`sent >= transfer_len`) or the
 /// remaining length is zero.
-fn data_in_prefetch(
+fn data_in_prefetch<D: ScsiDevice>(
+    devs: &[D],
     lun: usize,
     transfer_len: u64,
     sent: u64,
     work_len: usize,
 ) -> Option<(usize, u64, usize)> {
-    transfer_len
-        .checked_sub(sent)
-        .map(|r| (r as usize).min(work_len))
-        .filter(|&n| n > 0)
-        .map(|n| (lun, sent, n))
+    let n = (transfer_len.checked_sub(sent)? as usize).min(work_len);
+    if n == 0 {
+        return None;
+    }
+    // The address the device will use for this chunk, *not* the transfer-relative
+    // offset: `xfer_out` maps a transfer onto a byte plane at
+    // `base_byte + transfer_offset`, and the shell matches the following
+    // `StoreOp` against this coordinate.
+    devs.get(lun)?
+        .read_ahead_offset(sent)
+        .map(|off| (lun, off, n))
 }
 
 /// Feed a finished storage op to `devs[lun].store_done` and report whether the
@@ -2324,7 +2343,8 @@ mod tests {
     /// Read the pending CSW from the session's internal buffer (via the
     /// private `pending()` re-emit).
     fn read_csw(s: &mut BotSession, work: &mut [u8]) -> (u32, u32, u8) {
-        let csw = match s.pending(work) {
+        let devs: &mut [&mut dyn ScsiDevice] = &mut [];
+        let csw = match s.pending(work, devs) {
             Action::HostSend { bytes, .. } => bytes,
             other => panic!("expected a pending HostSend, got {other:?}"),
         };
@@ -2371,7 +2391,8 @@ mod tests {
     fn need_starts_in_command_phase() {
         let mut s = BotSession::new();
         let mut work = work();
-        match s.pending(&mut work) {
+        let devs: &mut [&mut dyn ScsiDevice] = &mut [];
+        match s.pending(&mut work, devs) {
             Action::HostRecv { len, probe } => {
                 assert_eq!(len, 31);
                 assert!(!probe);

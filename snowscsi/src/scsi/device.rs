@@ -272,6 +272,20 @@ pub trait ScsiDevice {
     /// Actual backend byte = `base_byte + transfer_offset`.
     fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a>;
 
+    /// Backend byte offset that [`Self::xfer_out`] addresses for
+    /// `transfer_offset` in the current transfer: `base_byte + transfer_offset`.
+    ///
+    /// The transport reads the next chunk into its overlap buffer while the
+    /// current one is sent, then matches the following `xfer_out` op against
+    /// this coordinate. The default (`None`) disables read-ahead: a device
+    /// whose read phase is not a plain byte-plane read (synthesized data,
+    /// live generation) has nothing to pre-fetch, and the transport falls
+    /// back to reading each chunk serially.
+    fn read_ahead_offset(&self, transfer_offset: u64) -> Option<u64> {
+        let _ = transfer_offset;
+        None
+    }
+
     /// The device's next maintenance / background op (default `None`).
     ///
     /// The session drains this before any terminating status (the data phase
@@ -357,6 +371,10 @@ impl<T: ScsiDevice + ?Sized> ScsiDevice for &mut T {
 
     fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
         (**self).xfer_in(transfer_offset, buf)
+    }
+
+    fn read_ahead_offset(&self, transfer_offset: u64) -> Option<u64> {
+        (**self).read_ahead_offset(transfer_offset)
     }
 
     fn next_store_op<'a>(&'a mut self) -> Option<StoreOp<'a>> {

@@ -977,18 +977,29 @@ impl AsyncStorePlane for RecPlane {
 ///
 /// A synthetic CDB opcode (`0xC1`) announces an `OutXfer` of `len` bytes; each
 /// `xfer_out` hands the platform a `StoreOp::Read` addressed at
-/// `transfer_offset + shift`. A zero `shift` makes the core's next read match
-/// the read-ahead coordinate (a hit); a non-zero shift forces a miss. With
-/// `first_inline` the first chunk is served in place (`Inline`), so a
-/// read-ahead can be reached even when no store plane is configured.
+/// `transfer_offset + shift`, and [`ScsiDevice::read_ahead_offset`] reports that
+/// same address. `shift` is therefore the media **base offset** of the transfer:
+/// a non-zero value must *not* stop the read-ahead from matching — reporting
+/// the transfer-relative offset instead was a real bug (every chunk was then
+/// read twice). `ahead_skew` is added only to the reported coordinate, modelling
+/// a device whose prediction disagrees with the read it later issues, which is
+/// what a genuine miss looks like. With `first_inline` the first chunk is served
+/// in place (`Inline`), so a read-ahead can be reached even when no store plane
+/// is configured; `no_read_ahead` opts out entirely, like a synthesized device
+/// with no byte plane.
 #[derive(Default)]
 struct ReadLun {
     len: u64,
+    /// Media base offset added to every transfer offset.
     shift: u64,
+    /// Added only to [`ScsiDevice::read_ahead_offset`]'s answer (forces a miss).
+    ahead_skew: u64,
     sense: Option<Sense>,
     /// Serve the first `xfer_out` chunk in place (`Inline`); later chunks are
     /// `Store` reads.
     first_inline: bool,
+    /// Report `None` from [`ScsiDevice::read_ahead_offset`] (no read-ahead).
+    no_read_ahead: bool,
     /// `xfer_out` calls so far.
     calls: usize,
 }
@@ -1022,6 +1033,13 @@ impl ScsiDevice for ReadLun {
 
     fn xfer_in<'a>(&'a mut self, _transfer_offset: u64, _buf: &'a [u8]) -> Xfer<'a> {
         Xfer::Inline { len: 0 }
+    }
+
+    fn read_ahead_offset(&self, transfer_offset: u64) -> Option<u64> {
+        if self.no_read_ahead {
+            return None;
+        }
+        Some(transfer_offset + self.shift + self.ahead_skew)
     }
 
     fn peek_sense(&self) -> Option<&Sense> {
@@ -1295,11 +1313,18 @@ fn drive_write_core(declared: u32, blocks: u16) -> Vec<CoreStep> {
 /// the action sequence. The synthetic `0xC1` opcode serves `transfer_len` bytes
 /// as `Store(Read)` chunks.
 fn drive_read_core(transfer_len: u64) -> Vec<CoreStep> {
-    let mut lun = ReadLun {
+    // A non-zero media base offset: the read-ahead coordinate must be the backend
+    // address, not the transfer-relative offset.
+    let lun = ReadLun {
         len: transfer_len,
-        shift: 0,
+        shift: 4096,
         ..Default::default()
     };
+    drive_read_core_with(lun, transfer_len)
+}
+
+/// [`drive_read_core`] with a caller-supplied LUN.
+fn drive_read_core_with(mut lun: ReadLun, transfer_len: u64) -> Vec<CoreStep> {
     let mut session = BotSession::new();
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let mut devs: [&mut dyn ScsiDevice; 1] = [&mut lun];
@@ -1613,12 +1638,18 @@ fn overlap_prerecv_timeout_feeds_store_done_only() {
 
 /// Read-ahead **hit**: the speculative read matches the core's next read, so
 /// the core's store is skipped — exactly one read per chunk.
+///
+/// The media has a non-zero base offset (`shift`): the read-ahead coordinate
+/// must be the backend address `base + transfer_offset`, not the
+/// transfer-relative offset. A core that emitted the latter would miss here and
+/// read every chunk twice — the ESP32-P4 in-situ measurement was 4.0 MB/s with
+/// the bug and 7.0 MB/s without it.
 #[test]
 fn overlap_read_prefetch_hit_skips_the_real_op() {
     // 40 blocks = 20480 = 8192 + 8192 + 4096, served as `Store(Read)` chunks.
     let mut lun = ReadLun {
         len: 20480,
-        shift: 0,
+        shift: 64,
         ..Default::default()
     };
     let mut session = BotSession::new();
@@ -1647,22 +1678,24 @@ fn overlap_read_prefetch_hit_skips_the_real_op() {
     // six times).
     assert_eq!(
         planes[0].as_ref().unwrap().reads(),
-        vec![(0, 8192), (8192, 8192), (16384, 4096)],
+        vec![(64, 8192), (8256, 8192), (16448, 4096)],
         "one read per chunk (a hit skips the core's store)"
     );
     assert_eq!(d2h_lens(&state.wire), vec![8192, 8192, 4096, 13]);
     assert_wire_csw(&state.wire, 1, 0, 0x00);
 }
 
-/// Read-ahead **miss**: the core's next read does not match the read-ahead
-/// coordinate, so the shell executes the real op after the speculative read.
+/// Read-ahead **miss**: the device's reported coordinate does not match the read
+/// it later issues (`ahead_skew`), so the shell executes the real op after the
+/// speculative read.
 #[test]
 fn overlap_read_prefetch_miss_executes_the_real_op() {
-    // The device shifts every read by 64 bytes, so the core's store never
-    // matches the read-ahead coordinate.
+    // The device over-reports its read-ahead address by 64 bytes, so the core's
+    // store never matches the coordinate. (A non-zero *base* offset, `shift`, is
+    // not a miss: see `overlap_read_prefetch_hit_skips_the_real_op`.)
     let mut lun = ReadLun {
         len: 20480,
-        shift: 64,
+        ahead_skew: 64,
         ..Default::default()
     };
     let mut session = BotSession::new();
@@ -1687,19 +1720,55 @@ fn overlap_read_prefetch_miss_executes_the_real_op() {
     let state = state.borrow();
 
     // chunk 1 is served serially; chunks 2 and 3 each get a speculative read
-    // followed by the real (shifted) op because the coordinate misses.
+    // followed by the real op because the coordinate misses.
     assert_eq!(
         planes[0].as_ref().unwrap().reads(),
         vec![
-            (64, 8192),
-            (8192, 8192),
+            (0, 8192),
             (8256, 8192),
-            (16384, 4096),
+            (8192, 8192),
             (16448, 4096),
+            (16384, 4096),
         ],
         "a miss executes the core's op after the speculative read"
     );
     assert_wire_csw(&state.wire, 1, 0, 0x00);
+}
+
+/// Opting out of read-ahead (`read_ahead_offset` -> `None`, the trait default for
+/// any `ScsiDevice` that does not implement it) must emit no prefetch at all: the
+/// core offers no coordinate, so the shell reads every chunk serially — each one
+/// exactly once, at the address `xfer_out` gave.
+#[test]
+fn overlap_read_prefetch_opt_out_reads_serially() {
+    let lun = ReadLun {
+        len: 16384,
+        shift: 4096,
+        no_read_ahead: true,
+        ..Default::default()
+    };
+    let steps = drive_read_core_with(lun, 16384);
+
+    for (i, step) in steps.iter().enumerate() {
+        if let CoreStep::Send { prefetch, .. } = step {
+            assert_eq!(
+                *prefetch, None,
+                "step {i}: an opted-out device offers no coordinate"
+            );
+        }
+    }
+    let reads: Vec<(u64, usize)> = steps
+        .iter()
+        .filter_map(|s| match s {
+            CoreStep::Store { read: Some(r), .. } => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads,
+        vec![(4096, 8192), (12288, 8192)],
+        "serial reads at the backend address"
+    );
 }
 
 /// A failing speculative read is swallowed: the shell executes the real op,

@@ -664,6 +664,11 @@ impl ScsiDevice for BlockDevice {
         self.xfer_in(transfer_offset, buf)
     }
 
+    fn read_ahead_offset(&self, transfer_offset: u64) -> Option<u64> {
+        let p = self.pending.as_ref()?;
+        (p.dir == XferDir::Out).then(|| p.base_byte + transfer_offset)
+    }
+
     fn peek_sense(&self) -> Option<&Sense> {
         self.peek_sense()
     }
@@ -1514,5 +1519,43 @@ mod tests {
         let mut ram = [0u8; 4096];
         let mut dev = ram_dev(&mut ram);
         assert_eq!(dev.sync(), Ok(()));
+    }
+
+    /// A read's read-ahead coordinate must be the **backend** address
+    /// `xfer_out` hands the plane (`base_byte + transfer_offset`), never the
+    /// transfer-relative offset: the transport matches its next `StoreOp`
+    /// against the coordinate, so a relative one makes the speculative read miss
+    /// and every chunk is read twice.
+    #[test]
+    fn read_ahead_offset_is_the_backend_address() {
+        let mut w = work();
+
+        // Nothing to pre-fetch before a command, and none during a write phase.
+        let mut ram_w = vec![0u8; 8 * 512];
+        let mut dev = ram_dev(&mut ram_w);
+        assert_eq!(dev.read_ahead_offset(0), None, "nothing in flight");
+        let _ = dev.do_cmd(&make_cdb10(op::WRITE_10, 2, 2), &mut w).unwrap();
+        assert_eq!(dev.read_ahead_offset(0), None, "a write phase");
+
+        // READ(10) at LBA 2, 2 blocks of 512: the transfer base is 2 * 512.
+        let mut ram_r = vec![0u8; 8 * 512];
+        let mut dev = ram_dev(&mut ram_r);
+        assert_eq!(
+            dev.do_cmd(&make_cdb10(op::READ_10, 2, 2), &mut w).unwrap(),
+            CommandOutcome::OutXfer { len: 1024 }
+        );
+        let base = 2 * u64::from(dev.sector_size());
+        assert_eq!(dev.read_ahead_offset(0), Some(base));
+        assert_eq!(dev.read_ahead_offset(512), Some(base + 512));
+
+        // ...and it agrees with the address `xfer_out` actually produces: that
+        // equality is exactly what the transport matches on.
+        let mut buf = [0u8; 512];
+        match dev.xfer_out(512, &mut buf[..]) {
+            Xfer::Store(StoreOp::Read { off, .. }) => {
+                assert_eq!(Some(off), dev.read_ahead_offset(512))
+            }
+            other => panic!("expected Xfer::Store(StoreOp::Read), got {other:?}"),
+        }
     }
 }
