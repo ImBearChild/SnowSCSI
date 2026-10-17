@@ -4,10 +4,16 @@ Presents the on-board microSD card of a **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5
 as one whole raw block device to a USB host, as a **UDF-RW (DVD-RAM) optical
 device** driven by `snowscsi`.
 
-This is the ESP32-P4 port of [`esp32s3-pocket-dongle`](../esp32s3-pocket-dongle).
-The reason to move to the P4 is the **USB 2.0 High-Speed** OTG port (480 Mbit/s,
-internal UTMI PHY): the ESP32-S3's Full-Speed PHY caps the whole gadget at
-~0.5 MB/s regardless of firmware, while the P4's HS port lifts that ceiling.
+## Device / board
+
+| | |
+|---|---|
+| **Device (chip)** | **ESP32-P4** — RISC-V, dual-core, `riscv32imafc-unknown-none-elf` (silicon rev ≥ v3.0 required; measured on v3.2) |
+| **Development board** | **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5** |
+| **USB** | USB 2.0 **High-Speed** OTG (480 Mbit/s, internal UTMI PHY, 512 B MPS) |
+| **Storage** | on-board microSD, SDIO 3.0 4-bit @ 40 MHz |
+| **Status panel** | ST7796 3.5" 320×480 (SPI) |
+| **Console** | separate CH343P USB-UART bridge (independent of the OTG port) |
 
 | | ESP32-S3 dongle | this example |
 |---|---|---|
@@ -92,28 +98,6 @@ Measured on the P4 (High-Speed link, `dd` with direct I/O):
 | read (device → host) | 3.4 MB/s | **7.6–7.7 MB/s** |
 | write (host → device) | 1.5 MB/s | **4.1–4.3 MB/s** |
 
-Four limits stack up to produce the starting numbers — the one-packet-per-transfer USB
-device driver, a read-ahead coordinate bug that read every chunk **twice**, a mis-aligned
-SD DMA buffer that capped SD commands at 8 KiB, and the 3.3 V / 40 MHz SD bus ceiling.
-Each is measured, explained and (where possible) fixed in
-**[PERFORMANCE.md](PERFORMANCE.md)**; that file also documents the diagnostics the firmware
-prints and the config knobs that matter.
-
-What the fixes are, in one breath:
-
-- **USB**: a vendored `embassy-usb-synopsys-otg` arms the bulk IN endpoint for a whole
-  5-packet transfer instead of one packet at a time — USB IN ceiling **6.6 → 14.2 MB/s**
-  (`[patch.crates-io]` + `OtgConfig::bulk_in_transfer_bytes`). Writes are still one packet
-  per transfer; that is the remaining write-side limit.
-- **Shell read-ahead**: `ScsiDevice::read_ahead_offset` (new, default `None`) tells the
-  transport which backend address to pre-fetch, so the speculative read is actually used
-  instead of being repeated serially — read **4.0 → 7.0 MB/s**.
-- **SD**: the block batch is 64-byte aligned (the P4's cached internal RAM requires it, and
-  esp-hal's 4-descriptor DMA ring otherwise overruns above 8 KiB), and the storage seam
-  keeps a 16 KiB read-ahead window so the SD bus runs 32-block commands while the BOT shell
-  still works in 8 KiB chunks (which the write path needs).
-- **Panel**: `Display::show` clears only the text band. A full 320x480 clear is ~120 ms of
-  blocking SPI and measurably starves the USB stack.
 
 ## Hardware (Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5)
 
@@ -131,13 +115,6 @@ The SD IO rail is powered by the on-chip LDO4 that the esp-hal `sdmmc` driver
 brings up itself; no board-side power code is needed. The LCD backlight (GPIO28,
 active high) is driven on by `src/display.rs`; the panel itself needs no extra
 rail enable on this board.
-
-## Not implemented (follow-ups)
-
-- **Touch**: the FT6336 capacitive controller is not driven (the display is a
-  plain status panel, no input).
-- **Diagnostic bins**: the S3 example shipped `sdbench` (SD-only throughput) and
-  `cdc` (USB bring-up isolation). Not ported yet.
 
 ## Caveats
 
