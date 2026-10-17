@@ -13,7 +13,7 @@
 //! an `AsyncStorePlane`. It overlaps bulk I/O with the storage plane (a second
 //! `scratch` buffer fetches the next chunk concurrently) and drains the control
 //! plane after every await so a reset supersedes the in-flight completion. Both
-//! loops share [`handle_ctrl`], so reset and Get Max LUN behave identically.
+//! loops share `handle_ctrl`, so reset and Get Max LUN behave identically.
 //!
 //! Platform quirks (e.g. the Linux FunctionFS aio receive needing an
 //! MPS-multiple buffer) live in the platform's `BotIo` implementation, not
