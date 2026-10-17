@@ -1458,11 +1458,14 @@ fn overlap_write_three_cycles_next_recv_matches_recv() {
                 want: 8192,
                 got: RecvOut::Bytes(8192),
             },
-            // Write-ahead of the final chunk: the whole scratch is offered
-            // (want 8192) while only the 4096-byte packet is delivered.
+            // Write-ahead of the final chunk: the receive is bounded by the
+            // latched budget (4096 — the transfer's remainder), not by the
+            // scratch (8192). Offering the whole scratch here makes a real
+            // transport park on the poll granularity waiting for bytes the
+            // host has no more of, one full granularity per command.
             SeamEvent::Recv {
                 kind: RecvKind::Until,
-                want: 8192,
+                want: 4096,
                 got: RecvOut::Bytes(4096),
             },
             // Overrun probe after the declared bytes are consumed.
@@ -1519,8 +1522,8 @@ fn overlap_store_done_probe_not_fed_a_plain_recv() {
 
     assert_wire_csw(&state.wire, 1, 0, 0x00);
     assert_eq!(h2d_lens(&state.wire), vec![31, 8192, 8192, 8192]);
-    // The write-ahead of the final chunk offers the whole scratch but is capped
-    // at the 4096-byte budget, so the phase ends exactly and the shell probes.
+    // The write-ahead of the final chunk is bounded by the 4096-byte budget
+    // (never the scratch), so the phase ends exactly and the shell probes.
     assert_eq!(
         state.events,
         vec![
@@ -1541,8 +1544,8 @@ fn overlap_store_done_probe_not_fed_a_plain_recv() {
             },
             SeamEvent::Recv {
                 kind: RecvKind::Until,
-                want: 8192,
-                got: RecvOut::Bytes(8192),
+                want: 4096,
+                got: RecvOut::Bytes(4096),
             },
             SeamEvent::Recv {
                 kind: RecvKind::Probe,

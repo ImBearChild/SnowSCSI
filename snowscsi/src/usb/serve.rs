@@ -474,9 +474,20 @@ where
                         // Write-ahead: run the store while receiving the next
                         // Data-Out chunk into `scratch` (`op` borrows `work`,
                         // the receive borrows `scratch`).
+                        //
+                        // The receive is bounded by the latched **budget**, not
+                        // by the buffer: the budget is exactly what the core
+                        // will accept next (the transfer's remainder capped to
+                        // the buffer) and anything past it is dropped anyway.
+                        // Waiting for the whole buffer instead parks on the
+                        // poll granularity whenever the remainder is shorter
+                        // than the buffer — true for every command whose length
+                        // is not a multiple of the buffer size, which costs a
+                        // full granularity (50 ms) per chunk *and* per command.
+                        let want = budget.min(scratch.len());
                         let (result, got) = join(
                             plane.do_op(op),
-                            recv.recv(&mut scratch[..], RecvMode::Until(CTRL_POLL_GRANULARITY)),
+                            recv.recv(&mut scratch[..want], RecvMode::Until(CTRL_POLL_GRANULARITY)),
                         )
                         .await;
                         // The pre-received chunk now sits in `scratch`; move it
