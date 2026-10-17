@@ -14,14 +14,28 @@ native xHCI; treat comparisons against native-host numbers accordingly.
 
 | What | Reading |
 |---|---|
-| End-to-end read | **7.6–7.7 MB/s** |
-| End-to-end write | **4.1–4.3 MB/s** |
-| USB IN ceiling (no SD, multi-packet) | 14.2 MB/s |
-| USB OUT ceiling (no SD) | 7.2 MB/s |
+| End-to-end read | **8.8 MB/s** |
+| End-to-end write | **4.9 MB/s** |
+| USB IN ceiling (no SD, multi-packet) | 14.2 MB/s \* |
+| USB OUT ceiling (no SD) | 7.2 MB/s \* |
 | SD bus ceiling, 4-bit @ 40 MHz | 20 MB/s (theoretical) |
-| Best measured SD read (16 KiB commands) | 13.8 MB/s |
+| SD read while a command is in flight | 14.3 MB/s (16 KiB commands) |
+| SD write while a command is in flight | 8.1 MB/s (16 KiB commands) |
+
+\* measured with the 8 KiB-chunk configuration; the driver patch is unchanged,
+so these are still the pipe's ceiling, but they have not been re-measured with
+the 16 KiB chunk.
 
 Starting point was 3.4 MB/s read / 1.5 MB/s write.
+
+Where the time goes now (steady-state read, averaged over 500 ms windows):
+
+| Bucket | Share of wall |
+|---|---|
+| `read_at` — SD command (65 %) plus the window copy (13 %) | 78 % |
+| bulk-IN send (fully overlapped with the storage op) | 39 % |
+| waiting for the next CBW (host turn-around) | 13 % |
+| console refresh (UART lines + panel band) | ~4 % |
 
 ## The pipeline (and where it breaks)
 
@@ -29,12 +43,16 @@ Starting point was 3.4 MB/s read / 1.5 MB/s write.
 host --USB HS bulk--> BOT shell (snowscsi) --Store op--> SD plane --> microSD
 ```
 
-Four independent limits stack up, in this order of impact:
+Five independent limits stack up, in this order of impact:
 
-1. the USB device driver moves **one packet per transfer**,
-2. the shell's **read-ahead never hit**, so every chunk was read twice,
-3. the SD DMA buffer was **mis-aligned**, capping SD commands at 8 KiB,
-4. the **SD bus itself** (40 MHz / 3.3 V).
+1. the USB device driver moves **one packet per transfer** (§1),
+2. the shell's **read-ahead never hit**, so every chunk was read twice (§2),
+3. the SD DMA buffer was **mis-aligned**, capping SD commands at 8 KiB (§3),
+4. the shell's **write-ahead receive waited for bytes the host had none of**,
+   one 50 ms poll granularity per command (§6),
+5. the **SD bus itself** (40 MHz / 3.3 V) and the card's own write speed (§5).
+
+The console takes a slice off the top on every one of them (§8).
 
 ## 1. `embassy-usb-synopsys-otg` moves one packet per transfer
 
@@ -167,8 +185,11 @@ Raw throughput of this storage plane (no USB involved), by transfer size:
 | 16 KiB | 13.8 MB/s |
 
 The per-command overhead (CMD18 + the card's access latency + auto-stop) is
-large, so small commands are mostly overhead. This is why the work buffer
-mattered, and why the read-ahead window (below) is worth having.
+large, so small commands are mostly overhead. Measured **while a command is in
+flight**, the P4's SD bus runs ~14.3 MB/s on 16 KiB commands but only ~10.6 MB/s
+on 8 KiB ones, i.e. roughly 350 µs of fixed cost per command. That is what makes
+the command size — and so the work buffer and the read-ahead window (§7) —
+worth tuning.
 
 ## 5. 40 MHz is the SD bus ceiling at 3.3 V — and it is by design
 
@@ -176,7 +197,7 @@ mattered, and why the read-ahead window (below) is worth having.
   module clock chain lands in the same place (PLL160M ÷ `module_div` 2 =
   80 MHz; card = module / (2·div), `div ≥ 1` ⇒ ≤ 40 MHz).
 - 4-bit × 40 MHz × 1 bit/clk = **20 MB/s** theoretical; the best measured read
-  is 13.8 MB/s (~69 %).
+  is **14.3 MB/s while a command is in flight** (~72 %).
 - **This matches Espressif**: for the P4, ESP-IDF lists Default Speed (20 MHz)
   and High Speed (**40 MHz**) at 3.3 V. UHS-I (SDR50 100 MHz / SDR104 200 MHz /
   DDR50) needs **1.8 V IO**, supplied externally via **VDDPST_5 (SD_VREF)**, and
@@ -194,44 +215,124 @@ Summary: to go beyond 40 MHz you need **both** a board that supplies 1.8 V to
 VDDPST_5 **and** a driver that performs the UHS-I voltage switch and tuning.
 Neither is present today.
 
-## 6. Work-buffer size pulls in two directions (and the read-ahead window)
+## 6. The write-ahead receive must be bounded by its budget
+
+The shell's write overlap pre-receives the *next* Data-Out chunk while the
+current one is being stored. The receive buffer was the whole `scratch`:
+
+```rust
+recv.recv(&mut scratch[..], RecvMode::Until(CTRL_POLL_GRANULARITY /* 50 ms */))
+```
+
+but the core hands the shell a **budget** — `min(declared − received − chunk,
+scratch.len())`, the only bytes it will accept next. Whenever that remainder is
+*shorter* than the buffer, **the host has no more bytes to send**, so the
+receive sat out the full 50 ms poll granularity. That happens exactly when the
+host's command length is not a whole number of chunks:
+
+| Host command | chunk | 120 KiB ÷ chunk | stall per command |
+|---|---|---|---|
+| WRITE(10), 60 DVD blocks (120 KiB) | 8 KiB | 15 — exact | 0 |
+| WRITE(10), 60 DVD blocks (120 KiB) | 16 KiB | 7.5 | **50 ms** |
+
+This is what "a 16 KiB work buffer breaks writes" actually was: 120 KiB ÷ 16 KiB
+= 7.5, so every command paid one 50 ms stall, and writes collapsed to
+**1.6 MB/s**. The bug stayed invisible at 8 KiB only because 60 DVD blocks
+happen to be an exact multiple of 15 chunks — a coincidence of the host's
+`max_sectors_kb` (120), not a property of the protocol.
+
+Fix (`snowscsi/src/usb/serve.rs`): bound the receive by the budget,
+`&mut scratch[..budget]`. Bytes past the budget were dropped as host overshoot
+anyway, and the core's following `HostRecv` is answered from the pre-received
+bytes, so nothing else changes. Two golden tests pin the contract (a 4096-byte
+remainder is offered 4096, not the 8192-byte scratch).
+
+**If you build a shell with a write-ahead receive, bound it by the budget the
+core hands you, never by the buffer size.**
+
+## 7. Work-buffer size and the SD read-ahead window
 
 The BOT shell only overlaps storage I/O with the bulk transfer when a **single
-host command spans several chunks**:
+host command spans several chunks**, so the chunk size sets both the overlap
+granularity and the SD command size:
 
-- **Writes** want a *small* work buffer. With the work buffer at 16 KiB the
-  host's WRITE(10) fits in one chunk, the write-ahead overlap never engages,
-  and writes fall to 1.7 MB/s. At `MIN_DATA_LEN` (8 KiB) writes are 4.1–4.3.
-- **Reads** want a *large* one, so that the SD layer can issue big commands.
+- **Reads** want the chunk as large as the SD ring allows (16 KiB). The read
+  join is `max(send, read)`, and a 16 KiB SD command runs the bus at ~14.3 MB/s
+  against ~10.6 MB/s for 8 KiB (§4). With the chunk *smaller* than the SD
+  command, the SD idles in every other join; with the chunk *equal* to it, every
+  join has real work on both sides.
+- **Writes** only appeared to want a small buffer. Measured with the §6 bug
+  present, 16 KiB chunks took writes from 4.2 to 1.7 MB/s; with §6 fixed, the
+  same 16 KiB chunks are *faster* than 8 KiB (4.9 vs 4.2) because fewer, larger
+  chunks amortise the per-chunk overhead.
 
-Resolved by moving the read-ahead **into the SD plane** (`src/sd.rs`): the seam
-keeps a 32-block (16 KiB) window. A miss issues one 32-block CMD18 into the
-batch; following reads are served straight out of it. The shell still gets
-8 KiB at a time, so the write path keeps its overlap.
-
-Measured effect: `cache:50%` (every second read is served without touching the
-card), `cmd:16K` (mean SD command is 16384 B), read 7.1 → **7.7 MB/s**, write
-unchanged at ~4.3.
+So `WORK_LEN` is `MIN_DATA_LEN * 2` (16 KiB) and the read-ahead window in
+`src/sd.rs` stays at 32 blocks (16 KiB) — the same size as the chunk. The window
+is now a straight pass-through (`cache` ~5 %): every `read_at` issues exactly one
+32-block CMD18 into the aligned batch and then copies it to the caller. It is
+kept because it is also what guarantees the 64-byte-aligned DMA buffer (§3) and
+because a smaller *request* (a partial tail) still services from it.
 
 `MIN_DATA_LEN` (8192) is a hard floor: a smaller buffer is rejected by
-`BotSession::poll` (`WorkBufTooSmall`) and the shell's check. 4 KiB is both
-rejected and slower.
+`BotSession::poll` (`WorkBufTooSmall`) and by the shell's own check.
 
-## 7. The LCD full-screen clear starves the USB stack
+### Still on the table: the first read of every command is serial
 
-A 320×480 `clear()` is ~120 ms of **blocking** SPI every refresh. That is a
-large slice of the executor's time and it starves the USB stack: end-to-end
-read drops from ~4.5 to ~3.5 MB/s. `Display::show` clears only the text band
-(`TEXT_BAND_H`), which costs ~2 % and keeps the panel useful.
+The shell can only pre-read from a `HostSend` on, so chunk 0 of each READ is
+always fetched with no send in flight. With 120 KiB host commands that is 1 of
+8 chunks (~12 % of the storage time). Removing it needs the core to emit a
+read-ahead for chunk 0 too, i.e. a deeper (2-chunk) prefetch in the shell —
+which is also what would let the SD run continuously across the chunk boundary.
 
-## 8. DIY diagnostics
+## 8. The console (panel and UART) starves the USB stack
 
-The firmware prints a plain-ASCII line over the CH343P UART (115200) once per
-refresh window, and shows the same numbers on the panel:
+Everything below runs on the **same executor** as the BOT loop, so console work
+is subtracted from throughput directly — it is not background work.
+
+- A 320×480 `clear()` is ~120 ms of **blocking** SPI every refresh: end-to-end
+  read drops from ~4.5 to ~3.5 MB/s. `Display::show` clears only the text band
+  (`TEXT_BAND_H`, 72 KiB = ~14 ms), which keeps the panel useful and cheap.
+- The UART diagnostic lines are not cheap either: a ~190-character line is
+  ~17 ms at 115200 baud (10 bits/char). The firmware used to print three of
+  them — `DIAG`, `BUSY` and an `info!` line — every 500 ms, i.e. **~50 ms on
+  top of the panel's ~14 ms out of every 570 ms window (12.5 %)**.
+
+Retiming the console (panel every 1 s, the two diagnostic lines every 2 s)
+recovered most of it:
+
+| Console cadence | read | write |
+|---|---|---|
+| panel 500 ms, UART 3 lines every 500 ms | 7.3 MB/s | 3.9 MB/s |
+| panel 1 s, UART 2 lines every 2 s | **7.9 MB/s** | **4.3 MB/s** |
+
+Treat the console cadence as a throughput knob, not a cosmetic one. Any future
+`println!` on the data path pays for itself in MB/s.
+
+## 9. DIY diagnostics
+
+The firmware prints two plain-ASCII lines over the CH343P UART (115200), and
+shows the same numbers on the panel. Both are rate-limited (see §8).
 
 ```
-DIAG sd_rb=51654656 sd_card=7962000B/s cache=50% cmd=16384B sdr=7962kB/s sdw=0kB/s tx_b=51649713
+DIAG sd_rb=51654656 sd_card=7962000B/s cache=5% cmd=16384B sdr=7962kB/s sdw=0kB/s tx_b=51649713
+BUSY wall=500000us rx=63us/12% tx=193us/38% rd=391us/78% sd=326us/65% wr=0us/0% sw=0us/0%
 ```
+
+`BUSY` is the one that answers "where did the time go": it is the *busy time of
+each half of the machine* over the window, so an overlap shows up as the two
+shares summing to more than 100 %:
+
+| Field | Meaning |
+|---|---|
+| `rx` | time blocked in bulk-OUT receives (waiting for the host) |
+| `tx` | time inside bulk-IN `write_transfer` (pushing bytes to the host) |
+| `rd` / `sd` | time inside `read_at`, and the SD command part of it |
+| `wr` / `sw` | time inside `write_at`, and the SD command part of it |
+| `wall` | the sampled window length (the denominator) |
+
+The counters behind `rd`/`sd`/`wr`/`sw` are `Instant`-based accumulators in
+`src/sd.rs` (`READ_NS`, `READ_SD_NS`, `WRITE_NS`, `WRITE_SD_NS`) and `TX_NS` /
+`RX_NS` in `src/msc.rs`; `SpeedMark` / `SdMark` delta-sample them per window.
 
 The status panel (`src/display.rs`):
 
@@ -266,20 +367,26 @@ at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
 
 | Constant / config | Where | Value | Why |
 |---|---|---|---|
-| `WORK_LEN` | `src/drive.rs` | `MIN_DATA_LEN` (8 KiB) | write-ahead overlap; larger breaks it |
+| `WORK_LEN` | `src/drive.rs` | `MIN_DATA_LEN * 2` (16 KiB) | chunk = SD command size; §6 is why 8 KiB used to be needed |
 | `BATCH_BLOCKS` | `src/sd.rs` | 32 (16 KiB) | descriptor-ring maximum |
 | `SD_BUS_FREQ_HZ` | `src/sd.rs` | 40 MHz | 3.3 V ceiling |
 | batch alignment | `src/sd.rs` | `#[repr(align(64))]` | P4 cached internal RAM / IDMAC |
 | `bulk_in_transfer_bytes` | `src/main.rs` | 2560 (5 packets) | OTG HS FIFO budget (896 words) |
 | `ep_out_buffer` | `src/main.rs` | 1024 | EP0 (64) + bulk OUT (512) |
+| panel cadence | `src/main.rs` | every tick (1 s) | product surface, §8 |
+| log cadence | `src/main.rs` | every 4th tick (2 s) | UART costs ~17 ms/line, §8 |
 | SPI clock / band | `src/display.rs` | 40 MHz / `TEXT_BAND_H` | keep the panel off the USB path |
 
 ## Do not repeat these
 
 - Do not size the SD batch to a non-64-byte-aligned type on the P4.
-- Do not raise `WORK_LEN` above 8 KiB without checking the write path.
+- Do not bound a write-ahead receive by its buffer — bound it by the budget the
+  core hands you (§6). A partial remainder otherwise costs a whole poll
+  granularity per command, and it hides as long as your host command size
+  happens to divide evenly.
 - Do not rely on the shell's read-ahead unless your `ScsiDevice` implements
   `read_ahead_offset` (otherwise you pay for two reads per chunk).
 - Do not expect > 40 MHz from the SD bus without 1.8 V signalling support in
   both hardware and `esp-hal`.
-- Do not clear the whole panel on every refresh.
+- Do not clear the whole panel on every refresh, and do not print on the data
+  path casually — the console shares the executor (§8).
