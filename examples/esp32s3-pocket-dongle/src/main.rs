@@ -131,23 +131,36 @@ where
             // readout only advances because *this* loop runs, so a frozen
             // number is exactly the "MCU hung or panicked" signal the old HB
             // tick counter gave — but the value itself is real wall-clock
-            // time. RX/TX are the bulk byte counters of the BOT loop,
-            // delta-sampled once per refresh — a decimal KB/s readout over
-            // the *last* 500 ms window.
+            // time. RX/TX appear twice: the **cumulative** bulk byte counts of
+            // the BOT loop (the diagnostic line — the first transaction is only
+            // tens of bytes, so a per-window rate would round to zero) and the
+            // per-window KB/s rate; `F` is the serve-loop restart count.
             //
-            // Align the sampler to the current cumulative counters — each
-            // gadget rebuild starts a fresh window, counting only new bytes.
+            // Align the sampler to the current counters so the first window
+            // only counts bytes moved after the sampler was created.
             let mut mark = msc::SpeedMark::new(msc::rx_bytes(), msc::tx_bytes());
             loop {
                 Timer::after(Duration::from_millis(500)).await;
                 if let Some(display) = display.as_mut() {
-                    let (rx, tx) = mark.take(msc::rx_bytes(), msc::tx_bytes());
+                    let (rx_kbps, tx_kbps) = mark.take(msc::rx_bytes(), msc::tx_bytes());
+                    let (in_calls, in_disabled, in_overflow) = msc::tx_diag();
+                    let (rx_cbw, rx_other) = msc::rx_diag();
                     display.show(
                         usb_mode::Mode::DvdRam,
                         sd_bytes,
                         msc::usb_connected(),
                         uptime_s(boot),
-                        Some((rx, tx)),
+                        Some((msc::rx_bytes(), msc::tx_bytes())),
+                        Some((rx_kbps, tx_kbps)),
+                        (
+                            msc::restarts(),
+                            msc::bus_resets(),
+                            in_calls,
+                            in_disabled,
+                            in_overflow,
+                            rx_cbw,
+                            rx_other,
+                        ),
                     );
                 }
             }
@@ -208,7 +221,15 @@ async fn main(spawner: Spawner) -> ! {
     // Paint a boot screen as soon as the panel is up (before the slower SD
     // bring-up).
     if let Some(display) = display.as_mut() {
-        display.show(usb_mode::Mode::DvdRam, None, false, uptime_s(boot), None);
+        display.show(
+            usb_mode::Mode::DvdRam,
+            None,
+            false,
+            uptime_s(boot),
+            None,
+            None,
+            (0, 0, 0, 0, 0, 0, 0),
+        );
     }
 
     // SDMMC host + slot 0 on the board's 1-bit/4-bit SD wiring. Bring-up can be
@@ -235,7 +256,15 @@ async fn main(spawner: Spawner) -> ! {
     let Some(mut card) = sd.take() else {
         info!("no SD card; cannot start the USB gadget");
         if let Some(display) = display.as_mut() {
-            display.show(usb_mode::Mode::DvdRam, None, false, uptime_s(boot), None);
+            display.show(
+            usb_mode::Mode::DvdRam,
+            None,
+            false,
+            uptime_s(boot),
+            None,
+            None,
+            (0, 0, 0, 0, 0, 0, 0),
+        );
         }
         loop {
             Timer::after(Duration::from_secs(1)).await;
@@ -273,14 +302,22 @@ async fn main(spawner: Spawner) -> ! {
     let work: &'static mut [u8] = WORK.init([0u8; drive::WORK_LEN]);
     let scratch: &'static mut [u8] = SCRATCH.init([0u8; drive::WORK_LEN]);
     // One LUN, Full-Speed bulk MPS (64) for the Data-In short-packet decision.
-    // The shortfall policy is pinned explicitly to its validated behaviour so a
-    // future change to the default cannot move the dongle's wire shape. The
-    // policy must not need a Bulk-In STALL: embassy-usb keeps its `Bus` private,
-    // so a class driver cannot halt an endpoint (`Short` would be rejected by
-    // the serve loop's startup check).
+    // The shortfall policy is pinned explicitly so a future change to the
+    // default cannot move the dongle's wire shape.
+    //
+    // `Pad` rather than `ShortNoStall`: embassy-usb keeps its `Bus` private, so
+    // a class driver cannot halt an endpoint and the conformant `Short`
+    // (short packet + Bulk-In STALL) is rejected by the serve loop's startup
+    // check. `ShortNoStall` leaves the data phase short with no STALL, which is
+    // the non-conformant ending Linux/EDK2/FreeBSD/U-Boot tolerate but Windows'
+    // usbstor may reject (it surfaces as "USB Mass Storage Device, Code 10"
+    // during driver start, with no CD-ROM child). `Pad` is fully conformant
+    // without touching the control plane: the structural shortfalls Windows
+    // probes with (VPD pages, REQUEST SENSE, GESN) are padded to the declared
+    // length.
     let mut session = BotSession::with_luns(1)
         .with_bulk_mps(64)
-        .with_shortfall(ShortfallPolicy::ShortNoStall);
+        .with_shortfall(ShortfallPolicy::Pad);
     let mut button = button::BootButton::new(peripherals.GPIO0);
 
     // ── Runtime mode toggle ──────────────────────────────────────────────
@@ -320,6 +357,13 @@ async fn main(spawner: Spawner) -> ! {
                 usb_config.manufacturer = Some("SnowSCSI");
                 usb_config.product = Some("SnowSCSI UDF-RW");
                 usb_config.max_packet_size_0 = 64;
+                // USB 2.0 (bcdUSB 0x0200), not the embassy `0x0210` default:
+                // this is a Full-Speed-only device, and a `>= 0x0201` claim
+                // makes Windows 8+ fetch and validate the BOS descriptor
+                // (a validation failure surfaces as "USB Mass Storage Device,
+                // Code 10"); Windows 7 predates BOS entirely. The Linux
+                // FunctionFS gadget this repo also ships advertises 0x0200.
+                usb_config.bcd_usb = embassy_usb::UsbVersion::Two;
                 // Plain single-function Mass Storage device: no Interface
                 // Association Descriptor (the 0xEF/02/01 default is for
                 // composite/IAD devices). Device class 0 lets the host bind
@@ -363,8 +407,8 @@ async fn main(spawner: Spawner) -> ! {
                 // loop resets the session for each freshly enumerated host.
                 let mut bot = msc::bot(ep_out, ep_in);
 
-                // Status screen: mode + SD size + live USB link bit (the speed
-                // line reads `-` until the refresh loop has a first window).
+                // Status screen: mode + SD size + live USB link bit (the RX/TX
+                // line reads `-` until the refresh loop takes over).
                 if let Some(display) = display.as_mut() {
                     display.show(
                         usb_mode::Mode::DvdRam,
@@ -372,6 +416,8 @@ async fn main(spawner: Spawner) -> ! {
                         msc::usb_connected(),
                         uptime_s(boot),
                         None,
+                        None,
+                        (0, 0, 0, 0, 0, 0, 0),
                     );
                 }
 
@@ -414,7 +460,15 @@ async fn main(spawner: Spawner) -> ! {
                 info!("mode: DEBUG - PHY on USB-Serial-JTAG; press BOOT for DVDRAM");
 
                 if let Some(display) = display.as_mut() {
-                    display.show(usb_mode::Mode::Debug, sd_bytes, false, uptime_s(boot), None);
+                    display.show(
+                        usb_mode::Mode::Debug,
+                        sd_bytes,
+                        false,
+                        uptime_s(boot),
+                        None,
+                        None,
+                        (0, 0, 0, 0, 0, 0, 0),
+                    );
                 }
 
                 // Keep the LCD alive and park until the next BOOT press. The
@@ -435,6 +489,8 @@ async fn main(spawner: Spawner) -> ! {
                                     false,
                                     uptime_s(boot),
                                     None,
+                                    None,
+                                    (0, 0, 0, 0, 0, 0, 0),
                                 );
                             }
                         }

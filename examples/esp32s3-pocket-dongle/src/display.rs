@@ -135,16 +135,29 @@ impl<'d> Display<'d> {
     /// unavailable once the PHY is on OTG); the value itself is real
     /// wall-clock time, not a tick count.
     ///
-    /// `speed` carries `(RX, TX)` bulk throughput in decimal KB/s over the
-    /// last refresh interval (host→device / device→host) while the USB gadget
-    /// is the active PHY owner; `None` hides the line (no gadget, e.g. DEBUG).
+    /// `bulk` carries the **cumulative** `(RX, TX)` bulk byte counts
+    /// (host→device / device→host) while the USB gadget is the active PHY
+    /// owner; `rate` is the per-window `(RX, TX)` throughput in decimal KB/s
+    /// over the last refresh. Both lines are hidden when `None` (no gadget,
+    /// e.g. DEBUG). The cumulative line is the diagnostic one: the first BOT
+    /// transaction is only tens of bytes, which a KB/s rate rounds to zero.
+    ///
+    /// `diag` is `(serve_restarts, bus_resets, in_calls, in_disabled,
+    /// in_overflow, rx_cbw, rx_other)`. The USB line shows `F`/`R`/`C`/`D`
+    /// (only when non-zero); the uptime line shows `cbw`/`oth` when
+    /// command-phase reads were seen. `C == 0` with a live host means no
+    /// response was generated; `rx_other > 0` means the device read
+    /// non-`USBC` bytes (stale endpoint data → rejected CBW → no send).
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         mode: crate::usb_mode::Mode,
         sd_bytes: Option<u64>,
         usb_connected: bool,
         uptime_s: u32,
-        speed: Option<(u32, u32)>,
+        bulk: Option<(u32, u32)>,
+        rate: Option<(u32, u32)>,
+        diag: (u32, u32, u32, u32, u32, u32, u32),
     ) {
         // Best-effort: a bus error will resurface on the next write anyway.
         let _ = self.panel.clear(Rgb565::BLACK);
@@ -160,7 +173,7 @@ impl<'d> Display<'d> {
             _ => "DEBUG",
         };
         let _ = write!(line, "MODE: {}", mode_label);
-        draw_line(&mut self.panel, style, &line, 10);
+        draw_line(&mut self.panel, style, &line, 3);
 
         // SD capacity.
         line.clear();
@@ -171,34 +184,59 @@ impl<'d> Display<'d> {
                 let _ = write!(line, "n/a");
             }
         }
-        draw_line(&mut self.panel, style, &line, 26);
+        draw_line(&mut self.panel, style, &line, 16);
 
-        // USB link state.
+        // USB link state + serve/IN diagnostics (only non-zero fields, so the
+        // normal case stays short). `conn`/`disc` keep room for the counters.
         line.clear();
-        let usb = if usb_connected {
-            "connected"
-        } else {
-            "disconnected"
-        };
-        let _ = write!(line, "USB: {}", usb);
-        draw_line(&mut self.panel, style, &line, 42);
+        let usb = if usb_connected { "conn" } else { "disc" };
+        let (restarts, bus_resets, in_calls, in_disabled, _in_overflow, rx_cbw, rx_other) = diag;
+        let _ = write!(line, "USB:{}", usb);
+        if restarts > 0 {
+            let _ = write!(line, " F{}", restarts);
+        }
+        if bus_resets > 0 {
+            let _ = write!(line, " R{}", bus_resets);
+        }
+        if in_calls > 0 {
+            let _ = write!(line, " C{}", in_calls);
+        }
+        if in_disabled > 0 {
+            let _ = write!(line, " D{}", in_disabled);
+        }
+        draw_line(&mut self.panel, style, &line, 29);
 
-        // USB bulk throughput since the previous refresh (decimal KB/s,
-        // measured in the BOT loop) — only meaningful while the USB gadget is
-        // running.
+        // Cumulative USB bulk bytes (measured in the BOT loop) — only
+        // meaningful while the USB gadget is running. `RX==0` with a host
+        // attached means the CBW was never taken off the OUT endpoint.
         line.clear();
-        match speed {
-            Some((rx_kbps, tx_kbps)) => {
+        match bulk {
+            Some((rx_bytes, tx_bytes)) => {
                 let _ = write!(line, "RX:");
-                write_rate(&mut line, rx_kbps);
+                write_tally(&mut line, rx_bytes);
                 let _ = write!(line, " TX:");
-                write_rate(&mut line, tx_kbps);
+                write_tally(&mut line, tx_bytes);
             }
             None => {
                 let _ = write!(line, "RX/TX: -");
             }
         }
-        draw_line(&mut self.panel, style, &line, 56);
+        draw_line(&mut self.panel, style, &line, 42);
+
+        // Instantaneous throughput over the last refresh window (decimal KB/s).
+        line.clear();
+        match rate {
+            Some((rx_kbps, tx_kbps)) => {
+                let _ = write!(line, "RX:");
+                write_rate(&mut line, rx_kbps);
+                let _ = write!(line, "/s TX:");
+                write_rate(&mut line, tx_kbps);
+            }
+            None => {
+                let _ = write!(line, "RX/TX: -/s");
+            }
+        }
+        draw_line(&mut self.panel, style, &line, 55);
 
         // Uptime: hours (unpadded), minutes and seconds (zero-padded). Reads
         // like a clock rather than a tick count; it only advances while this
@@ -211,7 +249,10 @@ impl<'d> Display<'d> {
             (uptime_s % 3600) / 60,
             uptime_s % 60
         );
-        draw_line(&mut self.panel, style, &line, 70);
+        if rx_cbw > 0 || rx_other > 0 {
+            let _ = write!(line, " cbw{} oth{}", rx_cbw, rx_other);
+        }
+        draw_line(&mut self.panel, style, &line, 68);
     }
 }
 
@@ -223,7 +264,24 @@ where
     let _ = Text::new(text, Point::new(2, y), style).draw(target);
 }
 
-/// Append a KB/s rate as `12345KB` or `1.2MB` (decimal kilobytes, no/s).
+/// Append a cumulative byte count compactly: `31B`, `4096K`, `12M`.
+///
+/// Integer units keep the digits stable on a 6x10 font; the diagnostic value
+/// is "is it zero / is it moving", not precision.
+fn write_tally(out: &mut heapless::String<32>, bytes: u32) {
+    const KI: u32 = 1024;
+    const MI: u32 = 1024 * 1024;
+
+    if bytes < KI {
+        let _ = write!(out, "{}B", bytes);
+    } else if bytes < MI {
+        let _ = write!(out, "{}K", bytes / KI);
+    } else {
+        let _ = write!(out, "{}M", bytes / MI);
+    }
+}
+
+/// Append a throughput as `12345K` or `1.2M` (decimal kilobytes-per-second).
 ///
 /// Below 1000 KB/s the value stays an integer KB count so the digits do not
 /// flicker between formats; above it one decimal digit resolves the rates a
@@ -232,11 +290,11 @@ fn write_rate(out: &mut heapless::String<32>, kbps: u32) {
     const KI: u32 = 1000;
 
     if kbps < KI {
-        let _ = write!(out, "{}KB", kbps);
+        let _ = write!(out, "{}K", kbps);
     } else {
         let whole = kbps / KI;
         let tenth = (kbps % KI) * 10 / KI;
-        let _ = write!(out, "{}.{}MB", whole, tenth);
+        let _ = write!(out, "{}.{}M", whole, tenth);
     }
 }
 

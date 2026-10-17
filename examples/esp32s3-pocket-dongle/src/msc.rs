@@ -58,37 +58,90 @@ static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 /// rate.
 static TX_BYTES: AtomicU32 = AtomicU32::new(0);
 
+/// Number of times the serve loop returned and was re-armed (any
+/// [`ServeError`] other than a clean stop). A rising count while a host is
+/// attached means the BOT loop is erroring out (link closed, core error,
+/// control failure) instead of serving — the LCD shows it as `F<n>` next to
+/// the USB state.
+static RESTARTS: AtomicU32 = AtomicU32::new(0);
+
+/// Bulk-IN packets the shell tried to send (`CountingIn::write` calls). Stays
+/// at zero when the device never generates a response; a non-zero count with
+/// `TX_BYTES == 0` means every send failed.
+static TX_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// `CountingIn::write` calls that returned `EndpointError::Disabled` (the
+/// Synopsys IN endpoint's `usbaep` bit was clear — endpoint not enabled).
+static TX_DISABLED: AtomicU32 = AtomicU32::new(0);
+
+/// `CountingIn::write` calls that returned `EndpointError::BufferOverflow`.
+static TX_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+/// Bulk-OUT reads whose first four bytes were the CBW signature `USBC` (a
+/// real command block was received).
+static RX_CBW: AtomicU32 = AtomicU32::new(0);
+
+/// Bulk-OUT reads whose first four bytes were **not** `USBC` (stale/garbage
+/// endpoint data — the BOT core would reject these as invalid CBWs).
+static RX_OTHER: AtomicU32 = AtomicU32::new(0);
+
+/// USB bus resets seen by the class [`Handler`] (`reset()` callback). A bus
+/// reset disables every endpoint (the Synopsys driver's `configure_endpoints`
+/// clears `usbaep`) until the host sends SET_CONFIGURATION again; a reset the
+/// host does not follow with a reconfiguration leaves the bulk-IN endpoint
+/// permanently disabled.
+static BUS_RESETS: AtomicU32 = AtomicU32::new(0);
+
 /// Whether the host currently has the gadget enabled and configured.
 pub fn usb_connected() -> bool {
     USB_CONNECTED.load(Ordering::Relaxed)
 }
 
-/// Total bulk bytes received from the host (→ LCD RX/TX rate via
-/// [`SpeedMark`]). Wraps at 2^32; [`SpeedMark::take`] deltas are immune to
-/// that as long as one refresh window moves less than 4 GiB (a Full-Speed
-/// bulk pipe cannot come close in half a second).
+/// Total bulk bytes received from the host (→ LCD RX meter). Wraps at 2^32;
+/// the LCD only reads it for display, so the wrap is harmless.
 pub fn rx_bytes() -> u32 {
     RX_BYTES.load(Ordering::Relaxed)
 }
 
-/// Total bulk bytes sent to the host (→ LCD RX/TX rate via [`SpeedMark`]).
+/// Total bulk bytes sent to the host (→ LCD TX meter).
 pub fn tx_bytes() -> u32 {
     TX_BYTES.load(Ordering::Relaxed)
 }
 
-/// The shared Bulk-Only Reset flag the class [`Handler`] sets and the serve
-/// loop's gadget half drains.
-pub fn reset_flag() -> &'static AtomicBool {
-    &PENDING_RESET
+/// Number of serve-loop restarts (see `RESTARTS`).
+pub fn restarts() -> u32 {
+    RESTARTS.load(Ordering::Relaxed)
 }
 
-/// Delta-sampler for the LCD speed line: converts the cumulative [`rx_bytes`]
-/// / [`tx_bytes`] counters into a per-window KB/s pair.
+/// Bulk-IN send diagnostics: `(calls, disabled, overflow)` (see `TX_CALLS`).
+pub fn tx_diag() -> (u32, u32, u32) {
+    (
+        TX_CALLS.load(Ordering::Relaxed),
+        TX_DISABLED.load(Ordering::Relaxed),
+        TX_OVERFLOW.load(Ordering::Relaxed),
+    )
+}
+
+/// USB bus resets seen by the class handler (see `BUS_RESETS`).
+pub fn bus_resets() -> u32 {
+    BUS_RESETS.load(Ordering::Relaxed)
+}
+
+/// Command-phase read classification: `(cbw_signature, other)` (see `RX_CBW`).
+pub fn rx_diag() -> (u32, u32) {
+    (
+        RX_CBW.load(Ordering::Relaxed),
+        RX_OTHER.load(Ordering::Relaxed),
+    )
+}
+
+/// Delta-sampler for the LCD throughput line: converts the cumulative
+/// [`rx_bytes`] / [`tx_bytes`] counters into a per-window KB/s pair.
 ///
 /// The gadget's refresh task owns one instance; [`SpeedMark::take`] is called
-/// once per 500 ms refresh with the current counter values and returns the
-/// throughput over the *elapsed* window (interval measured locally, so the
-/// readout stays correct even if the tick drifts).
+/// once per refresh with the current counter values and returns the throughput
+/// over the *elapsed* window (interval measured locally, so the readout stays
+/// correct even if the tick drifts).
 pub struct SpeedMark {
     /// Counters at the previous `take` (cumulative bytes, may have wrapped).
     prev: (u32, u32),
@@ -98,8 +151,8 @@ pub struct SpeedMark {
 
 impl SpeedMark {
     /// Start sampling: `prev` is aligned to the *current* cumulative counter
-    /// values (`rx0`/`tx0`), so the first `take` only reports bytes moved
-    /// after the sampler was created (never the history since boot).
+    /// values (`rx0`/`tx0`), so the first `take` only reports bytes moved after
+    /// the sampler was created (never the history since boot).
     pub fn new(rx0: u32, tx0: u32) -> Self {
         Self {
             prev: (rx0, tx0),
@@ -131,6 +184,12 @@ impl SpeedMark {
     }
 }
 
+/// The shared Bulk-Only Reset flag the class [`Handler`] sets and the serve
+/// loop's gadget half drains.
+pub fn reset_flag() -> &'static AtomicBool {
+    &PENDING_RESET
+}
+
 /// Zero-sized USB class handler for the Mass Storage interface.
 ///
 /// Handles the two BOT class requests on the control pipe:
@@ -150,6 +209,7 @@ impl Handler for MscHandler {
     }
 
     fn reset(&mut self) {
+        BUS_RESETS.fetch_add(1, Ordering::Relaxed);
         PENDING_RESET.store(true, Ordering::Relaxed);
         USB_CONNECTED.store(false, Ordering::Relaxed);
     }
@@ -218,6 +278,15 @@ impl<O: EndpointOut> EndpointOut for CountingOut<O> {
         let r = self.0.read(buf).await;
         if let Ok(n) = r {
             RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
+            // Only the 31-byte command phase is classified, so Data-Out
+            // payload reads are not mistaken for (non-)CBWs.
+            if n == snowscsi::usb::CBW_LEN {
+                if buf[..4] == *b"USBC" {
+                    RX_CBW.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    RX_OTHER.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         r
     }
@@ -238,9 +307,18 @@ impl<I: EndpointIn> Endpoint for CountingIn<I> {
 
 impl<I: EndpointIn> EndpointIn for CountingIn<I> {
     async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+        TX_CALLS.fetch_add(1, Ordering::Relaxed);
         let r = self.0.write(buf).await;
-        if r.is_ok() {
-            TX_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);
+        match &r {
+            Ok(()) => {
+                TX_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);
+            }
+            Err(EndpointError::Disabled) => {
+                TX_DISABLED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(EndpointError::BufferOverflow) => {
+                TX_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+            }
         }
         r
     }
@@ -301,8 +379,14 @@ where
         .await
         {
             // `Ok` only on a set stop flag; a closed link restarts the loop.
-            Ok(()) | Err(ServeError::Closed) => {}
-            Err(_) => warn!("bot: serve loop stopped; restarting"),
+            Ok(()) => {}
+            Err(ServeError::Closed) => {
+                RESTARTS.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                RESTARTS.fetch_add(1, Ordering::Relaxed);
+                warn!("bot: serve loop stopped; restarting");
+            }
         }
 
         if stop.load(Ordering::Relaxed) {
