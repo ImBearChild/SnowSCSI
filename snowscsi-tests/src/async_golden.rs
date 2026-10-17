@@ -2043,6 +2043,68 @@ fn overlap_read_reset_mid_prefetch_reemits_fresh_action() {
     assert_eq!(d2h_lens(&state.wire), vec![8192], "no second chunk sent");
 }
 
+/// A `BotReset` that surfaces **after** a CBW has already been received must
+/// not swallow the command: the bytes are a fact, so the shell resets the
+/// session and then dispatches the received CBW (matching the synchronous
+/// loop, which drains a reset *before* reading). Dropping the `HostRecv` here
+/// leaves the host with no CSW and is fatal under a host that performs reset
+/// recovery around every command.
+#[test]
+fn reset_after_cbw_recv_still_dispatches_the_command() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+    let mut dev = block_device(&mut backend);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    // One TEST UNIT READY CBW, then the script is exhausted (the next receive
+    // closes the link).
+    let steps = vec![OutStep::Bytes(
+        raw_cbw(7, 0, 0x00, 0, &[0x00, 0, 0, 0, 0, 0]).to_vec(),
+    )];
+    let state = SeamState::new(steps);
+    // The reset becomes visible as soon as the CBW receive completed, i.e. in
+    // the shell's post-await control drain.
+    let mut gadget = ArmedGadget::new(Rc::clone(&state), Arm::Recvs(1), vec![CtrlStep::BotReset]);
+    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
+    let mut planes: [Option<RecPlane>; 1] = [Some(RecPlane::default())];
+    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    let result = run_scripted_with(
+        Rc::clone(&state),
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut luns,
+    );
+
+    assert_eq!(result, Err(ServeError::Closed));
+    assert_eq!(gadget.acks.len(), 1);
+    assert!(gadget.acks[0].acked.load(Ordering::SeqCst), "reset acked");
+
+    let state = state.borrow();
+    // The CBW is dispatched to the reset session: the injected UNIT ATTENTION
+    // fails the TUR, so a Failed CSW goes out. A fresh command receive follows.
+    assert_eq!(
+        state.events,
+        vec![
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(31),
+            },
+            SeamEvent::Send { len: 13 },
+            SeamEvent::Recv {
+                kind: RecvKind::Until,
+                want: 31,
+                got: RecvOut::Bytes(0),
+            },
+        ],
+        "the received CBW survives the reset and is dispatched"
+    );
+    assert_wire_csw(&state.wire, 7, 0, 0x01);
+}
+
 /// The read-ahead hit test is `buf.len() <= prefetch.len`. In the shipped core
 /// the read op the shell is asked for next is *exactly* the read-ahead
 /// coordinate, so that criterion is always an equality — a strictly-shorter

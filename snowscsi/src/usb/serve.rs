@@ -377,6 +377,14 @@ where
         let recv_from_prefetch = prefetched.take();
         let speculative = pending_read.take();
 
+        // A receive that actually delivered fresh bytes (not a probe, not the
+        // write-ahead buffer) must survive a control reset drained *after* the
+        // await: the bytes already arrived, and the session is reset before
+        // this event is fed, so dispatching them is correct. Dropping the event
+        // instead loses the CBW, which is fatal when the host resets the bus
+        // (e.g. reset recovery) right around the command.
+        let mut fresh_recv: Option<usize> = None;
+
         // 2) Feed the carried event, execute the returned action, and carry
         // the completion in `ev`.
         match session.poll(ev, work, devs) {
@@ -401,7 +409,10 @@ where
                         .await
                     {
                         Ok(0) => return Err(ServeError::Closed),
-                        Ok(n) => Event::HostRecv { len: n },
+                        Ok(n) => {
+                            fresh_recv = Some(n);
+                            Event::HostRecv { len: n }
+                        }
                         // Timeout: re-check the control plane and stop flag.
                         Err(BotIoErr::WouldBlock) => Event::Tick,
                         Err(BotIoErr::Disconnected) => Event::Reset,
@@ -539,6 +550,16 @@ where
             if ev != ev_before {
                 prefetched = None;
                 pending_read = None;
+            }
+        }
+
+        // A reset drained above replaces the completion with `Event::Tick`. For
+        // a freshly received chunk the bytes are still in `work` and the
+        // session was just reset, so dispatch the chunk instead of dropping it
+        // (`session.poll` below feeds it into the reset Command phase).
+        if let Some(len) = fresh_recv {
+            if ev == Event::Tick {
+                ev = Event::HostRecv { len };
             }
         }
     }
