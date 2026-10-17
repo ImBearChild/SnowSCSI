@@ -25,6 +25,7 @@ use defmt::warn;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, EndpointOut};
 use embassy_usb::Handler;
+use esp_hal::time::Instant;
 
 use snowscsi::common::async_store::AsyncStorePlane;
 use snowscsi::scsi::AsyncLuns;
@@ -93,6 +94,16 @@ static RX_OTHER: AtomicU32 = AtomicU32::new(0);
 /// clears `usbaep`) until the host sends SET_CONFIGURATION again; a reset the
 /// host does not follow with a reconfiguration leaves the bulk-IN endpoint
 /// permanently disabled.
+/// Microseconds spent inside bulk-IN sends (`write_transfer`) since boot.
+///
+/// Delta-sampled by [`SpeedMark`]: together with the storage plane's busy time
+/// this is what shows whether the shell's read overlap is real — see
+/// [`SpeedSample`].
+static TX_NS: AtomicU32 = AtomicU32::new(0);
+
+/// Microseconds spent inside bulk-OUT receives (`read`) since boot.
+static RX_NS: AtomicU32 = AtomicU32::new(0);
+
 static BUS_RESETS: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the host currently has the gadget enabled and configured.
@@ -140,34 +151,58 @@ pub fn rx_diag() -> (u32, u32) {
     )
 }
 
-/// Delta-sampler for the console speed line: converts the cumulative
-/// [`rx_bytes`] / [`tx_bytes`] counters into a per-window KB/s pair.
+/// One refresh window of USB bulk counters, for the console line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedSample {
+    /// Bytes received from the host, KB/s.
+    pub rx_kbps: u32,
+    /// Bytes sent to the host, KB/s.
+    pub tx_kbps: u32,
+    /// Microseconds of the window spent blocked inside bulk-IN sends.
+    pub tx_busy_us: u32,
+    /// Microseconds of the window spent blocked inside bulk-OUT receives.
+    pub rx_busy_us: u32,
+    /// Length of the sampled window, microseconds.
+    pub wall_us: u32,
+}
+
+/// Delta-sampler for the console speed line: converts the cumulative RX/TX
+/// byte and busy-microsecond counters into a per-window rate and busy share.
 ///
 /// The console refresh task owns one instance; [`SpeedMark::take`] is called
-/// once per refresh with the current counter values and returns the
-/// throughput over the *elapsed* window (interval measured locally, so the
-/// readout stays correct even if the tick drifts).
+/// once per refresh with the current counters and returns the throughput over
+/// the *elapsed* window (interval measured locally, so the readout stays
+/// correct even if the tick drifts).
+///
+/// `tx_busy_us`/`rx_busy_us` are what makes the overlap observable: the shell's
+/// `join(send, pread)` is concurrent only if the pipe's busy time **plus** the
+/// plane's busy time exceeds the window. If the two roughly *sum* to the window
+/// instead, the join is running them one after the other.
 pub struct SpeedMark {
-    /// Counters at the previous `take` (cumulative bytes, may have wrapped).
-    prev: (u32, u32),
+    /// Cumulative counters at the previous `take` (each may have wrapped).
+    prev: (u32, u32, u32, u32),
     /// Wall time at the previous `take`.
     at: embassy_time::Instant,
 }
 
 impl SpeedMark {
-    /// Start sampling: `prev` is aligned to the *current* cumulative counter
-    /// values (`rx0`/`tx0`), so the first `take` only reports bytes moved
-    /// after the sampler was created (never the history since boot).
-    pub fn new(rx0: u32, tx0: u32) -> Self {
+    /// Start sampling: the counters are read now, so the first `take` only
+    /// reports activity after this call (never the history since boot).
+    pub fn new() -> Self {
         Self {
-            prev: (rx0, tx0),
+            prev: (
+                rx_bytes(),
+                tx_bytes(),
+                TX_NS.load(Ordering::Relaxed),
+                RX_NS.load(Ordering::Relaxed),
+            ),
             at: embassy_time::Instant::now(),
         }
     }
 
-    /// Sample the current cumulative byte counts and return the `(RX, TX)`
-    /// average KB/s since the previous call (decimal kilobytes, 1 KB = 1000 B).
-    pub fn take(&mut self, rx: u32, tx: u32) -> (u32, u32) {
+    /// Sample the counters and return the throughput and busy shares since the
+    /// previous call (decimal kilobytes, 1 KB = 1000 B).
+    pub fn take(&mut self) -> SpeedSample {
         let now = embassy_time::Instant::now();
         let us = now
             .checked_duration_since(self.at)
@@ -176,15 +211,34 @@ impl SpeedMark {
             .unwrap_or(1);
         self.at = now;
 
-        // wrapping_sub keeps the delta correct across a counter wrap.
-        let d_rx = rx.wrapping_sub(self.prev.0);
-        let d_tx = tx.wrapping_sub(self.prev.1);
-        self.prev = (rx, tx);
+        let (rx, tx, tx_ns, rx_ns) = (
+            rx_bytes(),
+            tx_bytes(),
+            TX_NS.load(Ordering::Relaxed),
+            RX_NS.load(Ordering::Relaxed),
+        );
+        // wrapping_sub keeps each delta correct across a counter wrap.
+        let (d_rx, d_tx) = (rx.wrapping_sub(self.prev.0), tx.wrapping_sub(self.prev.1));
+        let d_tx_ns = tx_ns.wrapping_sub(self.prev.2);
+        let d_rx_ns = rx_ns.wrapping_sub(self.prev.3);
+        self.prev = (rx, tx, tx_ns, rx_ns);
 
         // bytes * 1e6 / µs = bytes/s; ÷1000 → decimal KB/s. Per-window deltas
         // are modest (the 64-bit product per direction stays inside u64).
         let to_kbps = |delta: u32| -> u32 { ((delta as u64 * 1_000_000 / us) / 1000) as u32 };
-        (to_kbps(d_rx), to_kbps(d_tx))
+        SpeedSample {
+            rx_kbps: to_kbps(d_rx),
+            tx_kbps: to_kbps(d_tx),
+            tx_busy_us: d_tx_ns,
+            rx_busy_us: d_rx_ns,
+            wall_us: us as u32,
+        }
+    }
+}
+
+impl Default for SpeedMark {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -279,7 +333,9 @@ impl<O: EndpointOut> Endpoint for CountingOut<O> {
 
 impl<O: EndpointOut> EndpointOut for CountingOut<O> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        let t0 = Instant::now();
         let r = self.0.read(buf).await;
+        RX_NS.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
         if let Ok(n) = r {
             RX_BYTES.fetch_add(n as u32, Ordering::Relaxed);
             // Only the 31-byte command phase is classified, so Data-Out
@@ -332,7 +388,9 @@ impl<I: EndpointIn> EndpointIn for CountingIn<I> {
     /// `write` and throw the batching away).
     async fn write_transfer(&mut self, buf: &[u8], needs_zlp: bool) -> Result<(), EndpointError> {
         TX_CALLS.fetch_add(1, Ordering::Relaxed);
+        let t0 = Instant::now();
         let r = self.0.write_transfer(buf, needs_zlp).await;
+        TX_NS.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
         match &r {
             Ok(()) => {
                 TX_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);

@@ -140,29 +140,69 @@ where
             //
             // Align the sampler to the current counters so the first window
             // only counts bytes moved after the sampler was created.
-            let mut mark = msc::SpeedMark::new(msc::rx_bytes(), msc::tx_bytes());
+            let mut mark = msc::SpeedMark::new();
             let mut sd_mark = sd::SdMark::new();
+            // Refresh cadence, in 500 ms ticks. The console shares this
+            // executor with the BOT loop, so every character printed is taken
+            // straight out of throughput: a ~190-char UART line is ~17 ms at
+            // 115200, and the panel band is a 71 KiB SPI write (~14 ms). Both
+            // used to run every tick, costing ~71 ms of every 570 ms window
+            // (~12%). The panel is the product surface and refreshes every
+            // second; the two diagnostic lines are a bring-up aid and print
+            // every two.
+            const PANEL_EVERY: u32 = 2;
+            const LOG_EVERY: u32 = 4;
+            let mut tick: u32 = 0;
             loop {
                 Timer::after(Duration::from_millis(500)).await;
-                let (rx_kbps, tx_kbps) = mark.take(msc::rx_bytes(), msc::tx_bytes());
+                tick = tick.wrapping_add(1);
+                let sp = mark.take();
                 let sd = sd_mark.take();
+                let (rx_kbps, tx_kbps) = (sp.rx_kbps, sp.tx_kbps);
                 let up = msc::usb_connected();
-                info!(
-                    "usb {} rx={}kB/s tx={}kB/s",
-                    if up { "up" } else { "down" },
-                    rx_kbps,
-                    tx_kbps
-                );
-                esp_println::println!(
-                    "DIAG sd_rb={} sd_card={}B/s cache={}% cmd={}B sdr={}kB/s sdw={}kB/s tx_b={}",
-                    crate::sd::READ_BYTES.load(core::sync::atomic::Ordering::Relaxed),
-                    sd.card_rd_kbps * 1000,
-                    sd.cache_pct,
-                    sd.cmd_bytes,
-                    sd.card_rd_kbps,
-                    sd.wr_kbps,
-                    msc::tx_bytes(),
-                );
+                if tick % LOG_EVERY == 0 {
+                    info!(
+                        "usb {} rx={}kB/s tx={}kB/s",
+                        if up { "up" } else { "down" },
+                        rx_kbps,
+                        tx_kbps
+                    );
+                    esp_println::println!(
+                        "DIAG sd_rb={} sd_card={}B/s cache={}% cmd={}B sdr={}kB/s sdw={}kB/s tx_b={}",
+                        crate::sd::READ_BYTES.load(core::sync::atomic::Ordering::Relaxed),
+                        sd.card_rd_kbps * 1000,
+                        sd.cache_pct,
+                        sd.cmd_bytes,
+                        sd.card_rd_kbps,
+                        sd.wr_kbps,
+                        msc::tx_bytes(),
+                    );
+                    // Busy shares: if the shell's `join(send, pread)` is
+                    // genuinely concurrent, the pipe's busy time plus the
+                    // plane's must exceed the window; if they sum to it
+                    // instead, the join is serial.
+                    let wall = sd.wall_us.max(1) as u64;
+                    let pct = |us: u32| (us as u64 * 100 / wall) as u32;
+                    esp_println::println!(
+                        "BUSY wall={}us rx={}us/{}% tx={}us/{}% rd={}us/{}% sd={}us/{}% wr={}us/{}% sw={}us/{}%",
+                        sd.wall_us,
+                        sp.rx_busy_us,
+                        pct(sp.rx_busy_us),
+                        sp.tx_busy_us,
+                        pct(sp.tx_busy_us),
+                        sd.rd_busy_us,
+                        pct(sd.rd_busy_us),
+                        sd.sd_busy_us,
+                        pct(sd.sd_busy_us),
+                        sd.wr_busy_us,
+                        pct(sd.wr_busy_us),
+                        sd.sw_busy_us,
+                        pct(sd.sw_busy_us),
+                    );
+                }
+                if tick % PANEL_EVERY != 0 {
+                    continue;
+                }
                 if let Some(display) = display.as_mut() {
                     let (in_calls, in_disabled, in_overflow) = msc::tx_diag();
                     let (rx_cbw, rx_other) = msc::rx_diag();

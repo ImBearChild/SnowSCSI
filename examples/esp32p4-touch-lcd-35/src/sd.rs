@@ -68,6 +68,23 @@ pub static CARD_CMDS: AtomicU32 = AtomicU32::new(0);
 /// window over-reads, < it as the cache is consumed).
 pub static CARD_READ_BYTES: AtomicU32 = AtomicU32::new(0);
 
+/// Microseconds spent inside [`AsyncFlatData::read_at`], whole call.
+///
+/// This is the storage half of the shell's read overlap: compared against the
+/// window length it shows how much wall clock the plane owns, and against the
+/// pipe's busy time whether the two actually run concurrently.
+pub static READ_NS: AtomicU32 = AtomicU32::new(0);
+
+/// Microseconds of [`READ_NS`] spent inside the SD multi-block command itself
+/// (the remainder is the window-to-`buf` copy and the bookkeeping).
+pub static READ_SD_NS: AtomicU32 = AtomicU32::new(0);
+
+/// Microseconds spent inside [`AsyncWritableFlatData::write_at`], whole call.
+pub static WRITE_NS: AtomicU32 = AtomicU32::new(0);
+
+/// Microseconds of [`WRITE_NS`] spent inside the SD multi-block command.
+pub static WRITE_SD_NS: AtomicU32 = AtomicU32::new(0);
+
 /// One refresh window of SD-layer counters, for the status panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SdSample {
@@ -80,6 +97,18 @@ pub struct SdSample {
     pub cache_pct: u32,
     /// Mean bytes per SD read command.
     pub cmd_bytes: u32,
+    /// Microseconds of the window spent inside `read_at` (SD command plus the
+    /// window copy): the storage half of the read overlap.
+    pub rd_busy_us: u32,
+    /// Microseconds of that spent inside the SD read command itself.
+    pub sd_busy_us: u32,
+    /// Microseconds of the window spent inside `write_at`.
+    pub wr_busy_us: u32,
+    /// Microseconds of that spent inside the SD write command itself.
+    pub sw_busy_us: u32,
+    /// Length of the sampled window, microseconds (denominator for the busy
+    /// shares).
+    pub wall_us: u32,
 }
 
 /// Delta-sampler over the SD-layer counters (see [`SdSample`]).
@@ -88,21 +117,62 @@ pub struct SdSample {
 /// differs from the shell's TX rate because the bus runs a 32-block window per
 /// command while the storage plane hands the shell 8 KiB at a time.
 pub struct SdMark {
-    prev: (u32, u32, u32, u32, u32),
+    prev: Counters,
     at: Instant,
+}
+
+/// Snapshot of every SD-layer counter, so the sampler can delta them in one
+/// step (a single `load` per field, no interleaving reads).
+#[derive(Debug, Clone, Copy)]
+struct Counters {
+    read_calls: u32,
+    write_bytes: u32,
+    card_read_bytes: u32,
+    card_cmds: u32,
+    cache_hits: u32,
+    read_ns: u32,
+    read_sd_ns: u32,
+    write_ns: u32,
+    write_sd_ns: u32,
+}
+
+impl Counters {
+    fn load() -> Self {
+        let load = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        Self {
+            read_calls: load(&READ_CALLS),
+            write_bytes: load(&WRITE_BYTES),
+            card_read_bytes: load(&CARD_READ_BYTES),
+            card_cmds: load(&CARD_CMDS),
+            cache_hits: load(&CACHE_HITS),
+            read_ns: load(&READ_NS),
+            read_sd_ns: load(&READ_SD_NS),
+            write_ns: load(&WRITE_NS),
+            write_sd_ns: load(&WRITE_SD_NS),
+        }
+    }
+
+    /// Per-field wrapping delta `self - prev` (immune to a u32 wrap).
+    fn delta(&self, prev: Self) -> Self {
+        Self {
+            read_calls: self.read_calls.wrapping_sub(prev.read_calls),
+            write_bytes: self.write_bytes.wrapping_sub(prev.write_bytes),
+            card_read_bytes: self.card_read_bytes.wrapping_sub(prev.card_read_bytes),
+            card_cmds: self.card_cmds.wrapping_sub(prev.card_cmds),
+            cache_hits: self.cache_hits.wrapping_sub(prev.cache_hits),
+            read_ns: self.read_ns.wrapping_sub(prev.read_ns),
+            read_sd_ns: self.read_sd_ns.wrapping_sub(prev.read_sd_ns),
+            write_ns: self.write_ns.wrapping_sub(prev.write_ns),
+            write_sd_ns: self.write_sd_ns.wrapping_sub(prev.write_sd_ns),
+        }
+    }
 }
 
 impl SdMark {
     /// Start sampling from the current counter values.
     pub fn new() -> Self {
         Self {
-            prev: (
-                READ_CALLS.load(Ordering::Relaxed),
-                WRITE_BYTES.load(Ordering::Relaxed),
-                CARD_READ_BYTES.load(Ordering::Relaxed),
-                CARD_CMDS.load(Ordering::Relaxed),
-                CACHE_HITS.load(Ordering::Relaxed),
-            ),
+            prev: Counters::load(),
             at: Instant::now(),
         }
     }
@@ -112,26 +182,21 @@ impl SdMark {
         let us = self.at.elapsed().as_micros().max(1);
         self.at = Instant::now();
 
-        let load = |a: &AtomicU32| a.load(Ordering::Relaxed);
-        let calls = load(&READ_CALLS).wrapping_sub(self.prev.0);
-        let wr = load(&WRITE_BYTES).wrapping_sub(self.prev.1);
-        let card = load(&CARD_READ_BYTES).wrapping_sub(self.prev.2);
-        let cmds = load(&CARD_CMDS).wrapping_sub(self.prev.3);
-        let hits = load(&CACHE_HITS).wrapping_sub(self.prev.4);
-        self.prev = (
-            load(&READ_CALLS),
-            load(&WRITE_BYTES),
-            load(&CARD_READ_BYTES),
-            load(&CARD_CMDS),
-            load(&CACHE_HITS),
-        );
+        let now = Counters::load();
+        let d = now.delta(self.prev);
+        self.prev = now;
 
         let kbps = |b: u32| ((b as u64 * 1_000_000 / us) / 1000) as u32;
         SdSample {
-            card_rd_kbps: kbps(card),
-            wr_kbps: kbps(wr),
-            cache_pct: (hits as u64 * 100 / calls.max(1) as u64) as u32,
-            cmd_bytes: card.checked_div(cmds).unwrap_or(0),
+            card_rd_kbps: kbps(d.card_read_bytes),
+            wr_kbps: kbps(d.write_bytes),
+            cache_pct: (d.cache_hits as u64 * 100 / d.read_calls.max(1) as u64) as u32,
+            cmd_bytes: d.card_read_bytes.checked_div(d.card_cmds).unwrap_or(0),
+            rd_busy_us: d.read_ns,
+            sd_busy_us: d.read_sd_ns,
+            wr_busy_us: d.write_ns,
+            sw_busy_us: d.write_sd_ns,
+            wall_us: us as u32,
         }
     }
 }
@@ -198,6 +263,11 @@ static HOST: StaticCell<SdHostController<'static>> = StaticCell::new();
 /// Number of SD blocks in the aligned batch. 32 × 512 B = 16 KiB: the most a
 /// single CMD18/CMD25 can carry through esp-hal's 4-entry, 4096-byte IDMAC
 /// descriptor ring (`RING_LEN = 4`, `DMA_MAX_BUF_LEN = 4096`).
+///
+/// Measured on the P4: a 16 KiB command runs the bus at ~17.8 MB/s, an 8 KiB
+/// one only ~10.6 MB/s — the per-command overhead is ~360 µs, so the big
+/// window is what makes the SD side efficient. The shell still consumes 8 KiB
+/// at a time because the write path needs it (see `WORK_LEN`).
 const BATCH_BLOCKS: usize = 32;
 
 /// Batch of SD blocks for multi-block (CMD18/CMD25) transfers.
@@ -342,7 +412,22 @@ impl<'d: 'static> SdCard<'d> {
 }
 
 impl AsyncFlatData for SdCard<'_> {
+    /// Timed wrapper: the whole call is the storage half of the shell's read
+    /// overlap, so its wall clock is accumulated (see [`READ_NS`]).
     async fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        let t0 = Instant::now();
+        let r = self.read_at_inner(off, buf).await;
+        READ_NS.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
+        r
+    }
+
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+}
+
+impl SdCard<'_> {
+    async fn read_at_inner(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         READ_CALLS.fetch_add(1, Ordering::Relaxed);
         READ_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);
         let end = off
@@ -387,9 +472,11 @@ impl AsyncFlatData for SdCard<'_> {
                 cache_off,
                 cache_len,
             } = self;
+            let t_sd = Instant::now();
             dev.read(block as u32, &mut batch[..k])
                 .await
                 .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+            READ_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
             CARD_CMDS.fetch_add(1, Ordering::Relaxed);
             CARD_READ_BYTES.fetch_add((k * SD_BLOCK_SIZE) as u32, Ordering::Relaxed);
             *cache_off = block_start;
@@ -402,14 +489,26 @@ impl AsyncFlatData for SdCard<'_> {
         }
         Ok(())
     }
-
-    fn capacity(&self) -> u64 {
-        self.capacity
-    }
 }
 
 impl AsyncWritableFlatData for SdCard<'_> {
+    /// Timed wrapper: the whole call is the storage half of the shell's write
+    /// overlap, so its wall clock is accumulated (see [`WRITE_NS`]).
     async fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+        let t0 = Instant::now();
+        let r = self.write_at_inner(off, buf).await;
+        WRITE_NS.fetch_add(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
+        r
+    }
+
+    /// SD writes are already durable on the card; there is no write cache.
+    async fn sync(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+impl SdCard<'_> {
+    async fn write_at_inner(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
         WRITE_BYTES.fetch_add(buf.len() as u32, Ordering::Relaxed);
         // A write may change bytes the read-ahead window holds.
         self.cache_len = 0;
@@ -442,9 +541,11 @@ impl AsyncWritableFlatData for SdCard<'_> {
                     let start = done + i * SD_BLOCK_SIZE;
                     batch[i].copy_from_slice(&buf[start..start + SD_BLOCK_SIZE]);
                 }
+                let t_sd = Instant::now();
                 dev.write(block, &batch[..k])
                     .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+                WRITE_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
                 let consumed = k * SD_BLOCK_SIZE;
                 pos += consumed as u64;
                 done += consumed;
@@ -456,19 +557,16 @@ impl AsyncWritableFlatData for SdCard<'_> {
                     .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
                 batch[0][within..within + n].copy_from_slice(&buf[done..done + n]);
+                let t_sd = Instant::now();
                 dev.write(block, &batch[..1])
                     .await
                     .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+                WRITE_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
 
                 pos += n as u64;
                 done += n;
             }
         }
-        Ok(())
-    }
-
-    /// SD writes are already durable on the card; there is no write cache.
-    async fn sync(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
 }

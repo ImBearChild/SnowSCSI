@@ -21,7 +21,7 @@ use snowscsi::MIN_DATA_LEN;
 /// chunks, so a smaller (floor-sized) work buffer overlaps more. Measured `dd`
 /// on the P4: writes **1.7 MB/s at 64 KiB vs 4.6 MB/s at 8 KiB**; reads are
 /// unchanged (~4.2). (4 KiB is rejected by the `MIN_DATA_LEN` assert.)
-pub const WORK_LEN: usize = MIN_DATA_LEN;
+pub const WORK_LEN: usize = MIN_DATA_LEN * 2;
 
 /// Build a DVD-RAM drive backed by any random-writable byte plane.
 ///
