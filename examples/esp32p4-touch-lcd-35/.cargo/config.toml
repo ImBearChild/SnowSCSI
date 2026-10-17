@@ -1,0 +1,14 @@
+# Keep user/runtime settings in esp-config.toml.
+include = ["esp-config.toml"]
+
+# ESP32-P4 is RISC-V (not Xtensa): the Tier-2 bare-metal target ships with
+# rustup and links with the bundled `rust-lld`, so no Espressif GCC is needed.
+[target.riscv32imafc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32p4 --log-format defmt"
+
+[build]
+target = "riscv32imafc-unknown-none-elf"
+rustflags = ["-C", "force-frame-pointers"]
+
+[unstable]
+build-std = ["core"]
