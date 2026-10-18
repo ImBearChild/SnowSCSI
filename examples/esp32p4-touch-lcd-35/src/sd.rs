@@ -378,6 +378,7 @@ async fn sd_selftest(
 ) {
     let pat = |i: usize, j: usize| ((i * 31 + j * 7) ^ 0x5a) as u8;
     let total_blocks = (capacity / SD_BLOCK_SIZE as u64) as u32;
+    esp_println::println!("SDTEST card blocks={} MiB={}", total_blocks, capacity >> 20);
 
     // Read integrity first (a failed write wedges the bus and would hide it):
     // two reads of the card's first 32 blocks, checksummed and compared.
