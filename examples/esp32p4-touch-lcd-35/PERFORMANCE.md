@@ -341,13 +341,39 @@ SD clock: 100000000 Hz
 The command **logging was the single biggest lever on this figure**: while the
 driver logged every command (`cmd{index} arg= resp0=`), the same 100 MHz build
 measured 19.2 MB/s; removing that one `info!` took the sequential rate to
-**~28 MB/s**. It is still not the bus ceiling: a slope probe (32-block minus
-1-block per-command time, i.e. 15872 B of pure bus time) read **338 us ->
-46.9 MB/s**, against 100 MHz 4-bit SDR50's theoretical **317 us / 50 MB/s** and
-50 MHz's 635 us. So the link really is SDR50 at 100 MHz, and the sustained
-16 KiB-command rate is what is left after ~240 us of fixed per-command cost
-(CMD23+CMD18, the 4x4 KiB IDMAC ring, interrupt/executor latency). The bus rate
-that matters end to end is still the USB transport (§6).
+**~28 MB/s**.
+
+Two things keep the sequential average below SDR50's 50 MB/s, and neither is the
+clock:
+
+- **Per-command overhead.** A size sweep (`time(n) = fixed + n x slope`,
+  512-byte blocks) fits `fixed ~= 130 us` and `slope ~= 10.8 us/block`:
+
+  | n | 1 | 2 | 4 | 8 | 16 | 32 |
+  |---|---|---|---|---|---|---|
+  | us/cmd | 136 | 157 | 188 | 211 | 298 | 470 |
+
+  `10.8 us/block = 47 MB/s = 100 MHz SDR50` (theoretical 10.24), so the **link
+  is SDR50**; the ~130 us intercept is the fixed cost of one command
+  (CMD23+CMD18, the 4x4 KiB IDMAC ring, cache invalidate, interrupt/executor
+  latency). It is what a 16 KiB command pays on top of its 328 us of data.
+- **Card address region.** Two 50 MiB passes in the same boot, one at block 0
+  and one at block 1,000,000:
+
+  ```
+  pass0 @0        : 50 MiB in 1892660 us = 27701 kB/s   (591 us/cmd)
+  pass1 @1000000  : 50 MiB in 1505913 us = 34815 kB/s   (470 us/cmd)
+  ```
+
+  The 1,000,000 pass matches the `n=32` sweep exactly; the **first 50 MiB are
+  ~20 % slower** on this card. Both passes repeated identically, so it is the
+  address range, not warm-up. The boot benchmark reads from block 0, i.e. the
+  slower region.
+
+So 27 MB/s is `block-0 region` x `16 KiB commands with ~130 us fixed cost`.
+Closing it needs bigger commands (a larger IDMAC ring / staging buffer, so the
+fixed cost amortises over more bytes) — end to end it is still the USB
+transport (§6).
 
 The boot benchmark was reduced to the 50 MiB sequential read above (read-only,
 CMD23+CMD18, `src/sd.rs::sd_read_test`); the earlier 1-/32-block write+read-back
