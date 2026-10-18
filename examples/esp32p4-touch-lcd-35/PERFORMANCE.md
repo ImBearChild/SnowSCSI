@@ -14,13 +14,13 @@ native xHCI; treat comparisons against native-host numbers accordingly.
 
 | What | Reading |
 |---|---|
-| End-to-end read | **8.8 MB/s** |
+| End-to-end read | **9.5–9.8 MB/s** (UHS-I SDR25; 8.8 at 40 MHz / 3.3 V) |
 | End-to-end write | **4.9 MB/s** |
 | USB IN ceiling (no SD, multi-packet) | 14.2 MB/s \* |
 | USB OUT ceiling (no SD) | 7.2 MB/s \* |
-| SD bus ceiling, 4-bit @ 40 MHz | 20 MB/s (theoretical) |
-| SD read while a command is in flight | 14.3 MB/s (16 KiB commands) |
-| SD write while a command is in flight | 8.1 MB/s (16 KiB commands) |
+| SD bus ceiling | 20 MB/s @ 40 MHz, 25 MB/s @ 50 MHz (theoretical) |
+| SD read while a command is in flight | 17.2 MB/s (16 KiB, UHS-I SDR25) |
+| SD write while a command is in flight | 8.1 MB/s (16 KiB, 40 MHz) |
 
 \* measured with the 8 KiB-chunk configuration; the driver patch is unchanged,
 so these are still the pipe's ceiling, but they have not been re-measured with
@@ -253,18 +253,30 @@ worth tuning.
   and High Speed (**40 MHz**) at 3.3 V. UHS-I (SDR50 100 MHz / SDR104 200 MHz /
   DDR50) needs **1.8 V IO**, supplied externally via **VDDPST_5 (SD_VREF)**, and
   is available **only on slot 0** (which this board uses).
-- `esp-hal` currently **does not implement `supports_1v8()`** (it defaults to
-  `false`, so CMD11 / the voltage switch never happens) and forces the on-chip
-  LDO4 that feeds the SD IO rail to **3.3 V**. So even if the board supplied
-  1.8 V, this driver would not use it.
+- The vendored `esp-hal` in `vendor/esp-hal-1.2.2/` **does** implement
+  `supports_1v8()`, the CMD11 voltage switch (`set_io_voltage_1v8` drives
+  `LDO_VO4` → `VDDPST_5`), the 200 MHz SDIO PLL and input-delay tuning. On this
+  board that works: **UHS-I SDR25 (50 MHz, 4-bit at 1.8 V) initialises and runs
+  the bus at 17.2 MB/s while a command is in flight (+20 % over 40 MHz), which
+  is +8–11 % end to end** (8.8 → 9.5–9.8 MB/s). The efficiency is unchanged
+  (17.2 of the 25 MB/s SDR25 payload rate, 69 %).
+- **SDR50 (100 MHz) does not work**, and not because of the card or the tuning.
+  A controlled pair isolates it: the *same* 50 MHz card clock runs fine from a
+  100 MHz module clock (`ClockSource::SdioPll`, `module_div: 2`) but hangs when
+  the module clock is the undivided 200 MHz (`module_div: 1`, the
+  `sdio_hs_mode` divider bypass). With `card = module / (2 · div)` there is then
+  no working route to a 100 MHz card clock at all — so SDR50/DDR50/SDR104 are
+  unreachable in this implementation regardless of the card. Skipping
+  `tune_bus` does not help, so tuning is not involved.
+- Two consequences for the driver: a request the module clock cannot produce is
+  accepted by `set_slot_bus` (its `cap` is just the module clock) and then hangs
+  in the clock setup, and nothing is logged during bus setup, so a hang there is
+  silent. Also, **50 MHz is legal High Speed at 3.3 V**, so raising the cap for
+  non-UHS slots would give part of this win without the 1.8 V switch.
 
-**The card's "V10" marking is not the limit.** V10 (Video Speed Class 10) is a
-*minimum sustained write* guarantee of 10 MB/s — a floor, not a ceiling. The
-reads measured here already exceed it.
-
-Summary: to go beyond 40 MHz you need **both** a board that supplies 1.8 V to
-VDDPST_5 **and** a driver that performs the UHS-I voltage switch and tuning.
-Neither is present today.
+Summary: beyond 50 MHz you need a working module-clock path above 100 MHz
+(the `div == 1` bypass currently hangs), plus a card and wiring that can do
+SDR50.
 
 ## 6. The write-ahead receive must be bounded by its budget
 
@@ -426,7 +438,9 @@ at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
 |---|---|---|---|
 | `WORK_LEN` | `src/drive.rs` | `MIN_DATA_LEN * 2` (16 KiB) | chunk = SD command size; §6 is why 8 KiB used to be needed |
 | `BATCH_BLOCKS` | `src/sd.rs` | 32 (16 KiB) | descriptor-ring maximum |
-| `SD_BUS_FREQ_HZ` | `src/sd.rs` | 40 MHz | 3.3 V ceiling |
+| `SD_BUS_FREQ_HZ` | `src/sd.rs` | 50 MHz | UHS-I SDR25 (40 MHz is the 3.3 V cap) |
+| `clock_source` / `module_div` | `src/sd.rs` | `SdioPll` / 2 | 200 MHz PLL needed for UHS; `div: 1` hangs (§5) |
+| `uhs_1v8` | `src/sd.rs` | `true` | reports 1.8 V support; the CMD11 switch |
 | batch alignment | `src/sd.rs` | `#[repr(align(64))]` | P4 cached internal RAM / IDMAC |
 | `bulk_in_transfer_bytes` | `src/main.rs` | 2560 (5 packets) | OTG HS FIFO budget (896 words) |
 | `ep_out_buffer` | `src/main.rs` | 1024 | EP0 (64) + bulk OUT (512) |
