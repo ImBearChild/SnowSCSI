@@ -72,19 +72,19 @@ snowscsi-common = { path = "../../snowscsi-common", default-features = false, fe
 [patch.crates-io]
 embassy-usb-synopsys-otg = { path = "vendor/embassy-usb-synopsys-otg-0.4.0" }
 sdio = { path = "vendor/sdio-0.5.2" }
-# esp-hal from the local `main` checkout (UHS-I 1.8 V switch + SDR50 port). Its
-# sibling crates are path deps inside that repo, so they must be patched too, or
-# the crates.io copies pulled by esp-bootloader/esp-rtos/... clash over
-# `links = "esp_rom_sys"`. Machine-specific absolute paths: this branch is for
-# local development against the fork.
-esp-hal = { path = "/home/tux/Projects/esp-hal/esp-hal" }
-esp-config = { path = "/home/tux/Projects/esp-hal/esp-config" }
-esp-hal-procmacros = { path = "/home/tux/Projects/esp-hal/esp-hal-procmacros" }
-esp-metadata-generated = { path = "/home/tux/Projects/esp-hal/esp-metadata-generated" }
-esp-riscv-rt = { path = "/home/tux/Projects/esp-hal/esp-riscv-rt" }
-esp-rom-sys = { path = "/home/tux/Projects/esp-hal/esp-rom-sys" }
-esp-sync = { path = "/home/tux/Projects/esp-hal/esp-sync" }
-esp-backtrace = { path = "/home/tux/Projects/esp-hal/esp-backtrace" }
-esp-println = { path = "/home/tux/Projects/esp-hal/esp-println" }
-esp-bootloader-esp-idf = { path = "/home/tux/Projects/esp-hal/esp-bootloader-esp-idf" }
-esp-rtos = { path = "/home/tux/Projects/esp-hal/esp-rtos" }
+# esp-hal from a sibling `../../../esp-hal` checkout (UHS-I 1.8 V switch +
+# SDR50 port). Its sibling crates are path deps inside that repo, so they must
+# be patched too, or the crates.io copies pulled by esp-bootloader/esp-rtos/...
+# clash over `links = "esp_rom_sys"`. This branch is for local development
+# against the fork, not for merge.
+esp-hal = { path = "../../../esp-hal/esp-hal" }
+esp-config = { path = "../../../esp-hal/esp-config" }
+esp-hal-procmacros = { path = "../../../esp-hal/esp-hal-procmacros" }
+esp-metadata-generated = { path = "../../../esp-hal/esp-metadata-generated" }
+esp-riscv-rt = { path = "../../../esp-hal/esp-riscv-rt" }
+esp-rom-sys = { path = "../../../esp-hal/esp-rom-sys" }
+esp-sync = { path = "../../../esp-hal/esp-sync" }
+esp-backtrace = { path = "../../../esp-hal/esp-backtrace" }
+esp-println = { path = "../../../esp-hal/esp-println" }
+esp-bootloader-esp-idf = { path = "../../../esp-hal/esp-bootloader-esp-idf" }
+esp-rtos = { path = "../../../esp-hal/esp-rtos" }

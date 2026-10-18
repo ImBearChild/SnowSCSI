@@ -478,12 +478,13 @@ impl<'d: 'static> SdCard<'d> {
 
         let host = HOST.init(
             SdHostController::new(sdhost, {
-                let mut cfg = SdmmcConfig::default();
                 if SD_UHS_PLL {
-                    cfg.clock_source = ClockSource::SdioPll;
-                    cfg.module_div = 2;
+                    SdmmcConfig::default()
+                        .with_clock_source(ClockSource::SdioPll)
+                        .with_module_div(2)
+                } else {
+                    SdmmcConfig::default()
                 }
-                cfg
             })
             .map_err(|_| SdError::HostInit)?,
         );
