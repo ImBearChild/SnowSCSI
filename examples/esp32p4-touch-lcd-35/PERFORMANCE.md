@@ -293,6 +293,33 @@ worth tuning.
   (`module_div: 1`, the `sdio_hs_mode` bypass), and with `card = module / (2·div)`
   there is then no route to 100 MHz.
 
+### SDR50: this card cannot do it, and it is not the bottleneck anyway
+
+- SDR50 is a UHS-I mode, so it needs 1.8 V signalling and only a card that
+  advertises it will switch. This card does not: its OCR comes back with
+  **S18A = 0**, so `sdio` skips CMD11. That is not a gap on our side —
+  `supports_1v8()` is true here (checked with a temporary log) and `sdio`'s
+  ACMD41 really does set **S18R** (bit 24) together with HCS (bit 30) and the
+  3.2–3.3 V window (bit 20). Forcing CMD11 past that check (patched `sdio`)
+  makes the card **stop answering entirely**: the command times out and sd init
+  dies. The card and its OCR agree.
+- An **A1 / V30 marking does not imply UHS-I**: A1 is an *application
+  performance* class (random IOPS), not a bus mode. The check that matters is
+  the `cmd11` line the vendored esp-hal logs when the switch actually runs.
+- With a UHS-I card, the remaining work is: fix the driver's CMD11 sequence
+  (`SDHOST.UHS.VOLT` is never written, the card clock is not stopped around the
+  switch, and esp-idf's `skip_wait` for a voltage-switch clock-update command is
+  missing — a forced CMD11 timing out may well be *this* rather than the card);
+  reach 100 MHz (`module_div: 1`, the `sdio_hs_mode` bypass, which previously
+  "hung" — very likely just 100 MHz at 3.3 V, out of spec); and re-validate the
+  drive edge at 1.8 V/100 MHz (a drive-side calibration is the proper fix).
+- **End to end it would buy little.** At 50 MHz the SD bus already moves
+  18 MB/s while the read path delivers 9.7 MB/s, so the SD side is only ~54 %
+  utilised: the ceiling is the USB transport (14.2 MB/s IN, plus this test
+  host's `vhci_hcd` turn-around), not the card bus. Writes are pegged by the
+  card's own program speed (5.2 MB/s). Raising the SD clock further only pays
+  once the USB side does.
+
 ## 6. The write-ahead receive must be bounded by its budget
 
 The shell's write overlap pre-receives the *next* Data-Out chunk while the
