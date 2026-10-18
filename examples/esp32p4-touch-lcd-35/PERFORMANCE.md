@@ -145,6 +145,14 @@ release. Note also how the OUT half is exposed: **`EndpointOut::read_transfer`**
 should call `read_transfer` (the trait's default implementation keeps
 per-packet behaviour for drivers that lack it).
 
+**Decision (2026-10-18): keep the vendored stopgap, wait for the release.**
+Hand-writing the OUT half is not worth a fork: upstream's is merged, tested, and
+its own bench shows the write gain is small anyway (0.858 → 0.864 MiB/s). When
+`embassy-usb-synopsys-otg` ships #7236: delete `vendor/` (IN included — the
+spare-FIFO split computes the same 5-packet / 2560 B transfer this board gets
+from `bulk_in_transfer_bytes`), bump the dependency, and point the shell at
+`read_transfer`.
+
 ### Writing is still one packet per transfer
 
 The bulk OUT path has the same shape (and the RX FIFO is shallow too), which is
@@ -376,6 +384,12 @@ shares summing to more than 100 %:
 The counters behind `rd`/`sd`/`wr`/`sw` are `Instant`-based accumulators in
 `src/sd.rs` (`READ_NS`, `READ_SD_NS`, `WRITE_NS`, `WRITE_SD_NS`) and `TX_NS` /
 `RX_NS` in `src/msc.rs`; `SpeedMark` / `SdMark` delta-sample them per window.
+
+**Caveat when reading them:** each counter adds its `elapsed()` *after* the
+await returns, so an operation that never returns contributes **zero**. A wedged
+await therefore looks exactly like an idle loop — all four readings at 0 while
+the console task keeps printing. If that is ambiguous, stamp the entry time as
+well and report the age of the in-flight call.
 
 The status panel (`src/display.rs`):
 
