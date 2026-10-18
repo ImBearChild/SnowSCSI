@@ -86,21 +86,64 @@ Note the wrapper: `msc::CountingIn` **must** forward `write_transfer` to the
 inner endpoint, otherwise the trait's default implementation falls back to
 per-packet `write` and throws the batching away.
 
-### Why upstream does not have this
+### Upstream status (checked 2026-10-18)
 
 There is an upstream PR for the mirror image of this: **embassy-rs/embassy
 #7191** (`Config::bulk_out_transfer_bytes`, multi-packet bulk **OUT**), paired
-with **esp-rs/esp-hal #6465**. Both are **closed unmerged**. The stated reason
-was procedural (the maintainer objected that the PR and its replies were
-largely LLM-authored), not technical — the measurement in the PR was sound
-(OUT 4.54 → 8.40 Mbit/s on an S3). It covers **bulk OUT only**; the IN side is
-untouched, and IN is what limits reads here.
+with **esp-rs/esp-hal #6465**. Both were **closed unmerged** on 2026-10-06,
+about three hours after opening. From the thread:
 
-Because #7191 also changes the driver's public API (`OtgInstance::tx_fifo_count`,
-a mutex-taking `StateStorage::new`, and an unreleased `embassy-sync`), it is not
-a drop-in `[patch]`: using it as-is would also require patching `esp-hal`'s
-glue. The vendored copy here instead keeps 0.4.0's API and adds the batching
-internally.
+1. the review started technical — the esp-hal glue could not build against the
+   driver branch as the PR described, and the new tests were not wired into CI
+   ("are they just dead weight?");
+2. the author answered both (paired esp-hal PR + `ci/test.sh` wiring) and
+   re-measured through that glue;
+3. it was then closed on the reviewer's next remark — *"Please avoid
+   communicating via an LLM, it's annoying to read. Prove to me that a human is
+   involved here."* — about twelve minutes later, with the paired esp-hal draft
+   following eleven seconds after it.
+
+The measurement was never disputed (OUT 4.54 → 8.40 Mbit/s on an S3).
+
+**It was superseded five days later by embassy-rs/embassy #7236**
+("synopsys-otg: multi-packet IN/OUT transfers"), merged 2026-10-11 (merge
+commit `2ee13be`). That one covers both directions — IN by handing spare FIFO
+space to the bulk IN endpoints, OUT by copying each packet straight into the
+caller's buffer — and switches `embassy-usb`'s MSC class to receive WRITE data
+with `read_transfer`. Its own bench barely moves writes, though:
+
+| ESP32-S3, synthetic drive | master | #7236 |
+|---|---|---|
+| read MiB/s | 0.893 | **1.079** |
+| write MiB/s | 0.858 | 0.864 |
+
+("Writes are limited by something else", per the PR.)
+
+**Neither is released.** As of 2026-10-18 `embassy-usb-synopsys-otg`'s newest
+version is 0.4.0 (2026-05-28) and `embassy-usb`'s is 0.6.0 (2026-03-20), both
+older than #7236 — so using it means a `[patch]` (git or vendored).
+
+The vendored copy here is therefore a **stopgap for the IN direction only**: it
+keeps 0.4.0's public API, so `esp-hal` 1.2.2 builds unchanged, and adds the
+batching inside. It should be dropped in favour of #7236 once that is released.
+
+**Adopting #7236 today is not possible with released dependencies** (tried
+2026-10-18, both ways):
+
+- `[patch.crates-io] embassy-usb-synopsys-otg = { git = …, rev = "2ee13be" }`
+  makes cargo fail to resolve at all: the crate on `main` depends on **git**
+  `embassy-time`, so two `embassy-time-driver` packages both claim
+  `links = "embassy-time"` against the released one `esp-hal` uses.
+- Vendoring just the crate's `src/` over the 0.4.0 manifest gets further, then
+  fails on `the trait bound CriticalSectionRawMutex: Copy is not satisfied` —
+  the post-#7236 driver needs an **unreleased `embassy-sync`**, the same trap
+  #7191's author called out. It also pulls `document-features`.
+
+So it waits for the next `embassy-usb-synopsys-otg` (+ `embassy-sync`)
+release. Note also how the OUT half is exposed: **`EndpointOut::read_transfer`**
+— 0.4.0 does not implement it — so adopting it means the shell's receive half
+should call `read_transfer` (the trait's default implementation keeps
+per-packet behaviour for drivers that lack it).
 
 ### Writing is still one packet per transfer
 
