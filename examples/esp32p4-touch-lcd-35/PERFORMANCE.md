@@ -329,25 +329,29 @@ before the sample; with the divider bypassed, edge 1 restores that margin.
 (`chip_specific::set_drive_clk_edge(if card_div == 0 { 1 } else { 0 })`) on every
 clock change, so one build serves both points.
 
-Verified end to end on the UHS-I card (cold boot, in-firmware reset):
+Verified end to end on the UHS-I card (cold boot, in-firmware reset). The
+driver is quiet at `info` now (only the 1.8 V switch can `warn`), so the whole
+SD bring-up prints a single result line:
 
 ```
-cmd11: stage1/volt_sw1/stage2/volt_sw2/stage3     # 1.8 V switch
-cmd6 arg=0x80ff1f02 ... b13=0x1f b16=2            # SDR50 selected
-sdmmc: set_slot_bus hz=100000000 cap=100000000
-sdmmc: tune ... tune chose _1 best_len=4
-cmd13 arg=0xaaaa0000 resp0=0x900                  # addressed command at 100 MHz: OK
-SDTEST bus 2048 KiB in 109463 us = 19158 kB/s
-SDTEST n=1  write OK / read OK diff=0
-SDTEST n=32 write OK / read OK diff=0
+SD read: 50 MiB in 1893333 us = 27691 kB/s
 SD clock: 100000000 Hz
 ```
 
-The `SDTEST bus` figure is **not** the card clock: the 16 KiB-command rate is
-software-bound at 100 MHz (per-command overhead ~500 us vs ~330 us of data), so
-it sits near the 50 MHz number even though the bus runs at 100 MHz. The bus rate
-that matters is still the USB transport (§6), and per §5's earlier note raising
-the card clock does not move the end-to-end figure.
+The command **logging was the single biggest lever on this figure**: while the
+driver logged every command (`cmd{index} arg= resp0=`), the same 100 MHz build
+measured 19.2 MB/s; removing that one `info!` took the sequential rate to
+**~28 MB/s**. It is still not the bus ceiling: a slope probe (32-block minus
+1-block per-command time, i.e. 15872 B of pure bus time) read **338 us ->
+46.9 MB/s**, against 100 MHz 4-bit SDR50's theoretical **317 us / 50 MB/s** and
+50 MHz's 635 us. So the link really is SDR50 at 100 MHz, and the sustained
+16 KiB-command rate is what is left after ~240 us of fixed per-command cost
+(CMD23+CMD18, the 4x4 KiB IDMAC ring, interrupt/executor latency). The bus rate
+that matters end to end is still the USB transport (§6).
+
+The boot benchmark was reduced to the 50 MiB sequential read above (read-only,
+CMD23+CMD18, `src/sd.rs::sd_read_test`); the earlier 1-/32-block write+read-back
+and bus-probe phases are gone.
 
 ### The earlier, non-UHS card
 

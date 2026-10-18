@@ -1012,13 +1012,8 @@ impl Settings {
             && hz > 50_000_000
             && !UHS_1V8_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
         {
-            info!(
-                "sdmmc: set_slot_bus clamping {} -> 50000000 (bus still at 3.3 V)",
-                hz
-            );
             hz = 50_000_000;
         }
-        info!("sdmmc: set_slot_bus hz={} cap={} width={:?}", hz, cap, width);
         if hz == 0 || hz > cap {
             return Err(Error::Unsupported);
         }
@@ -1921,9 +1916,6 @@ impl<'d, const S: u8> Slot<'d, S, Async> {
         };
         let crc = <C::Resp<'a> as sdio::Response>::CRC;
         diag::set(&diag::LAST_CMD, C::INDEX as u32);
-        if C::INDEX == 11 {
-            info!("cmd11: sending (S18A was 1)");
-        }
         diag::set(&diag::LAST_CMD_ARG, cmd.arg());
         // A card that missed the first commands after a cold power-up leaves
         // them unanswered; the spec has the host keep repeating identification,
@@ -1956,17 +1948,10 @@ impl<'d, const S: u8> Slot<'d, S, Async> {
                 }
             }
         };
-        if attempt > 0 {
-            info!("cmd{} responded on retry {}", C::INDEX, attempt);
-        }
-        // TEMP DIAG: ACMD41 carries S18R in the argument and S18A in the
-        // response; CMD11's response says whether the card took the switch.
-        info!(
-            "cmd{} arg={=u32:#x} resp0={=u32:#x}",
-            C::INDEX,
-            cmd.arg(),
-            words[0]
-        );
+        // ACMD41 carries S18R in the argument and S18A in the response; CMD11's
+        // response says whether the card took the switch. Kept as atomics only
+        // (read back by the board, e.g. on the P4 example's panel): logging every
+        // command costs more than the transfer itself at 50-100 MHz.
         if C::INDEX == 41 {
             diag::set(&diag::ACMD41_ARG, cmd.arg());
             diag::set(&diag::ACMD41_RESP0, words[0]);
@@ -2029,17 +2014,13 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         let words = session
             .read_async(slot, C::INDEX, arg, cmd.buf(), bs, auto_stop)
             .await?;
-        // TEMP DIAG: CMD6 (SWITCH_FUNC) returns the 64-byte function status.
-        // Bytes 4..20 carry the per-group supported/selected fields; we print
-        // them raw so the SD spec layout (4.3.10.4) can be applied to the data.
+        // CMD6 (SWITCH_FUNC) returns the 64-byte function status; byte 13 is the
+        // supported set and byte 16 the selected value of access-mode group 1
+        // (SD spec 4.3.10.4). Exposed as atomics (panel/diagnostics), not logged.
         if C::INDEX == 6 {
             let d: &[u8] = cmd.buf();
             diag::set(&diag::CMD6_FG1_SUPPORT, d[13] as u32);
             diag::set(&diag::CMD6_FG1_SELECTED, d[16] as u32);
-            info!(
-                "cmd6 arg={=u32:#x} b4={} b5={} b6={} b7={} b8={} b9={} b10={} b11={} b12={} b13={} b14={} b15={} b16={} b17={} b18={} b19={}",
-                arg, d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19]
-            );
         }
         Ok(<C::Resp<'a> as sdio::Response>::from_words(&words))
     }
@@ -2192,7 +2173,6 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         #[cfg(sdmmc_delay_phase_num_is_set)]
         {
             if self.config.uhs_1v8 && S == 0 && hz >= 50_000_000 {
-                info!("sdmmc: tune start hz={}", hz);
                 const TAPS: usize = 4;
                 let phases = [
                     DelayPhase::_0,
@@ -2206,9 +2186,7 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
                 let mut good = [false; TAPS];
                 for (i, phase) in phases.iter().enumerate() {
                     chip_specific::set_input_delay_phase(*phase, hz);
-                    info!("sdmmc: tap {} phase {:?} begin", i, phase);
                     good[i] = op.exec(&mut *self).await.unwrap_or(false);
-                    info!("sdmmc: tap {} good={}", i, good[i]);
                 }
 
                 // Lock in the centre of the longest run of consecutive good
@@ -2233,7 +2211,6 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
                 } else {
                     phases[best_end - best_len / 2]
                 };
-                info!("sdmmc: tune chose {:?} best_len={}", chosen, best_len);
                 chip_specific::set_input_delay_phase(chosen, hz);
                 // Remember the tuned phase: otherwise a later engine
                 // re-program would revert it to the configured default.
@@ -2607,7 +2584,6 @@ fn cmd11_voltage_switch(slot: SlotId) -> Result<[u32; 4], Error> {
         w.lp_enable().bits(rd.lp_enable().bits() & !clk_mask)
     });
     clock_update_command(slot, false)?;
-    info!("cmd11: stage1 (clk always on)");
 
     // ── CMD11 with volt_switch; the controller raises VOLT_SW, not CDONE ─────
     let cmd11 = ((idx as u32) << CMD_CARD_NUMBER_SHIFT)
@@ -2621,17 +2597,11 @@ fn cmd11_voltage_switch(slot: SlotId) -> Result<[u32; 4], Error> {
     r.cmd().write(|w| unsafe { w.bits(cmd11) });
     wait_command_accepted()?;
 
-    let t0 = Instant::now();
     // The controller's CMD11 handshake is slow (Linux budgets ~130 ms before the
     // interrupt), so allow a generous 1 s.
     let sts = wait_volt_sw(Duration::from_millis(1_000))?;
     map_rintsts(sts & !EVT_VOLT_SW)?;
     let resp0 = r.resp0().read().bits();
-    info!(
-        "cmd11: volt_sw1 after {} us r1={=u32:#x}",
-        t0.elapsed().as_micros(),
-        resp0
-    );
 
     // ── stage 2: stop clock, move the rail, restart the clock ───────────────
     r.rintsts().write(|w| unsafe { w.bits(EVT_VOLT_SW) });
@@ -2648,26 +2618,16 @@ fn cmd11_voltage_switch(slot: SlotId) -> Result<[u32; 4], Error> {
     });
     clock_update_command(slot, true)?;
     r.uhs().modify(|rd, w| unsafe { w.bits(rd.bits() | bit) });
-    info!("cmd11: stage2 (rail 1.8V, clock restarted)");
 
     // ── stage 3: second VOLT_SW, then back to low-power clock gating ────────
-    let t1 = Instant::now();
     let sts = wait_volt_sw(Duration::from_millis(1_000))?;
     map_rintsts(sts & !EVT_VOLT_SW)?;
-    info!(
-        "cmd11: volt_sw2 after {} us (cclk_en={=u32:#x} lp_en={=u32:#x} dat_busy={})",
-        t1.elapsed().as_micros(),
-        r.clkena().read().cclk_enable().bits() as u32,
-        r.clkena().read().lp_enable().bits() as u32,
-        r.status().read().data_busy().bit_is_set()
-    );
 
     r.rintsts().write(|w| unsafe { w.bits(EVT_VOLT_SW) });
     r.clkena().modify(|rd, w| unsafe {
         w.lp_enable().bits(rd.lp_enable().bits() | clk_mask)
     });
     clock_update_command(slot, false)?;
-    info!("cmd11: stage3 (1.8V switch complete)");
 
     Ok([resp0, 0, 0, 0])
 }

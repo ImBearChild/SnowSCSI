@@ -360,95 +360,41 @@ impl DelayNs for BusyDelay {
     }
 }
 
-/// Boot-time SD write/read self-test, run before the medium is exposed.
-///
-/// Diagnostic for the write path (it is the only code that exercises CMD25
-/// without a host): writes `BATCH_BLOCKS` blocks of a pattern to the **last**
-/// 32 KiB of the card, reads them back and reports the differing byte count.
-/// The DVD-RAM image never reaches that offset, so it is safe to run.
-const SD_SELFTEST: bool = true;
+/// Boot-time SD read benchmark: sequentially reads 50 MiB with 16 KiB
+/// (CMD23+CMD18) commands and prints the achieved rate. Read-only, so it never
+/// touches card contents.
+const SD_READ_TEST: bool = true;
 
-/// See [`SD_SELFTEST`]. Prints one `SDTEST` line per phase over UART.
-///
-/// The single-block (CMD24) phase runs first so its result is not polluted by a
-/// failed multi-block (CMD25) transfer, which may leave the card mid-stream.
-async fn sd_selftest(
+/// Bytes read by [`sd_read_test`]: 50 MiB.
+const SD_READ_TEST_BYTES: u64 = 50 * 1024 * 1024;
+
+/// See [`SD_READ_TEST`]. Prints one result line over UART.
+async fn sd_read_test(
     dev: &mut sdio::BlockDevice<sdio::sd::Card, Slot<'_, 0, Async>, BusyDelay, SD_BLOCK_SIZE>,
     batch: &mut [Aligned<A4, [u8; SD_BLOCK_SIZE]>],
-    capacity: u64,
 ) {
-    let pat = |i: usize, j: usize| ((i * 31 + j * 7) ^ 0x5a) as u8;
-    let total_blocks = (capacity / SD_BLOCK_SIZE as u64) as u32;
-    esp_println::println!("SDTEST card blocks={} MiB={}", total_blocks, capacity >> 20);
-
-    // Read integrity first (a failed write wedges the bus and would hide it):
-    // two reads of the card's first 32 blocks, checksummed and compared.
-    let mut sum = [0u32; 2];
-    let mut ok = [false; 2];
-    for (k, s) in sum.iter_mut().enumerate() {
-        ok[k] = dev.read(0, &mut batch[..32]).await.is_ok();
-        if ok[k] {
-            for b in batch[..32].iter() {
-                for v in b.iter() {
-                    *s = s.wrapping_mul(31).wrapping_add(*v as u32);
-                }
-            }
-        }
-    }
-    // Bus-rate probe: reads are bus-limited here (14.3 MB/s at 40 MHz, 17.2 at
-    // 50 MHz), so the achieved rate reports the *actual* card clock.
+    let total = SD_READ_TEST_BYTES;
+    let mut off: u64 = 0;
     let t0 = Instant::now();
-    let mut n = 0u32;
-    for i in 0..128u32 {
-        if dev.read(i * 32, &mut batch[..32]).await.is_ok() {
-            n += 1;
+    while off < total {
+        let blocks = core::cmp::min(
+            batch.len() as u64,
+            (total - off) / SD_BLOCK_SIZE as u64,
+        ) as usize;
+        let block = (off / SD_BLOCK_SIZE as u64) as u32;
+        if let Err(e) = dev.read(block, &mut batch[..blocks]).await {
+            esp_println::println!("SD read: ERR at {} B: {}", off, err_tag(&e));
+            return;
         }
+        off += blocks as u64 * SD_BLOCK_SIZE as u64;
     }
     let us = t0.elapsed().as_micros().max(1) as u64;
     esp_println::println!(
-        "SDTEST bus {} KiB in {} us = {} kB/s",
-        n * 16,
+        "SD read: {} MiB in {} us = {} kB/s",
+        total >> 20,
         us,
-        n as u64 * 16384 * 1000 / us
+        total * 1000 / us
     );
-    esp_println::println!(
-        "SDTEST rd ok={}/{} sum={:x}/{:x} stable={}",
-        ok[0],
-        ok[1],
-        sum[0],
-        sum[1],
-        sum[0] == sum[1]
-    );
-
-    for &n in &[1usize, BATCH_BLOCKS] {
-        let base = total_blocks.saturating_sub(n as u32 + 64);
-        for (i, b) in batch[..n].iter_mut().enumerate() {
-            for (j, v) in b.iter_mut().enumerate() {
-                *v = pat(i, j);
-            }
-        }
-        match dev.write(base, &batch[..n]).await {
-            Ok(()) => esp_println::println!("SDTEST n={} write OK", n),
-            Err(e) => esp_println::println!("SDTEST n={} write ERR {}", n, err_tag(&e)),
-        }
-        for b in batch[..n].iter_mut() {
-            b.fill(0);
-        }
-        match dev.read(base, &mut batch[..n]).await {
-            Ok(()) => {
-                let mut diff = 0u32;
-                for (i, b) in batch[..n].iter().enumerate() {
-                    for (j, v) in b.iter().enumerate() {
-                        if *v != pat(i, j) {
-                            diff += 1;
-                        }
-                    }
-                }
-                esp_println::println!("SDTEST n={} read OK diff={}", n, diff);
-            }
-            Err(e) => esp_println::println!("SDTEST n={} read ERR {}", n, err_tag(&e)),
-        }
-    }
 }
 
 /// An initialized SD card presented as a byte-addressed plane.
@@ -575,8 +521,8 @@ impl<'d: 'static> SdCard<'d> {
             ))
             .0;
 
-        if SD_SELFTEST {
-            sd_selftest(&mut dev, batch, capacity).await;
+        if SD_READ_TEST {
+            sd_read_test(&mut dev, batch).await;
         }
 
         Ok(Self {

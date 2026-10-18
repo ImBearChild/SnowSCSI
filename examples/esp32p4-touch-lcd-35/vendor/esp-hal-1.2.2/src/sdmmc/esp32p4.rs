@@ -52,7 +52,6 @@ pub fn chip_setup() {
 /// module clock is the upper bound for the card clock (`card = module / (2 *
 /// div)`, or `module` when the card divider is bypassed).
 pub fn set_module_clock(source: ClockSource, div: u8) {
-    info!("sdmmc: module clock src={:?} div={}", source, div);
     let c = crate::peripherals::HP_SYS_CLKRST::regs();
 
     // PLL_F160M is always available; the SDIO PLL must be powered up first.
