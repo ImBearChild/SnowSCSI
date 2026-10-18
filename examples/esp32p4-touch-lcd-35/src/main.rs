@@ -251,7 +251,9 @@ async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    // esp-rtos 0.4.0 in the esp-hal `main` checkout dropped the second
+    // (interrupt) argument.
+    esp_rtos::start(timg0.timer0);
 
     // Origin of the on-panel uptime clock (`UPT:` line). Captured right after
     // `esp_rtos::start` so `embassy_time` ticks are already being driven.

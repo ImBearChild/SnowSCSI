@@ -20,7 +20,13 @@ path = "src/main.rs"
 # --- Espressif HAL / RTOS / boot glue ---
 # `unstable` is required: esp-hal gates `usb`, `sdmmc`, `psram`, `timer` and the
 # `USB_HS`/`FROM_CPU_INTR0` singletons behind it on the P4.
-esp-hal = { version = "~1.2.2", features = ["esp32p4", "unstable", "defmt"] }
+#
+# On this branch esp-hal is the local `main` checkout with the P4 UHS/SDR50 port
+# applied (see `[patch.crates-io]` below). Its version line is `1.2.0`, so the
+# requirement is `1.2.0` (caret): a path patch only applies when its version
+# satisfies the requirement, and caret still resolves to the newest 1.2.x from
+# crates.io when the patch is not in play.
+esp-hal = { version = "1.2.0", features = ["esp32p4", "unstable", "defmt"] }
 esp-rtos = { version = "0.4", features = ["embassy", "esp32p4", "defmt"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32p4", "defmt"] }
 
@@ -62,8 +68,23 @@ snowscsi-common = { path = "../../snowscsi-common", default-features = false, fe
 # --- Local driver patch (measurement) ---
 # Vendor embassy-usb-synopsys-otg 0.4.0 with multi-packet bulk IN transfers
 # (`Config::bulk_in_transfer_bytes`); public API kept compatible with 0.4.0 so
-# esp-hal 1.2.2 builds unchanged.
+# esp-hal 1.2.x builds unchanged.
 [patch.crates-io]
 embassy-usb-synopsys-otg = { path = "vendor/embassy-usb-synopsys-otg-0.4.0" }
-esp-hal = { path = "vendor/esp-hal-1.2.2" }
 sdio = { path = "vendor/sdio-0.5.2" }
+# esp-hal from the local `main` checkout (UHS-I 1.8 V switch + SDR50 port). Its
+# sibling crates are path deps inside that repo, so they must be patched too, or
+# the crates.io copies pulled by esp-bootloader/esp-rtos/... clash over
+# `links = "esp_rom_sys"`. Machine-specific absolute paths: this branch is for
+# local development against the fork.
+esp-hal = { path = "/home/tux/Projects/esp-hal/esp-hal" }
+esp-config = { path = "/home/tux/Projects/esp-hal/esp-config" }
+esp-hal-procmacros = { path = "/home/tux/Projects/esp-hal/esp-hal-procmacros" }
+esp-metadata-generated = { path = "/home/tux/Projects/esp-hal/esp-metadata-generated" }
+esp-riscv-rt = { path = "/home/tux/Projects/esp-hal/esp-riscv-rt" }
+esp-rom-sys = { path = "/home/tux/Projects/esp-hal/esp-rom-sys" }
+esp-sync = { path = "/home/tux/Projects/esp-hal/esp-sync" }
+esp-backtrace = { path = "/home/tux/Projects/esp-hal/esp-backtrace" }
+esp-println = { path = "/home/tux/Projects/esp-hal/esp-println" }
+esp-bootloader-esp-idf = { path = "/home/tux/Projects/esp-hal/esp-bootloader-esp-idf" }
+esp-rtos = { path = "/home/tux/Projects/esp-hal/esp-rtos" }
