@@ -66,3 +66,4 @@ snowscsi-common = { path = "../../snowscsi-common", default-features = false, fe
 [patch.crates-io]
 embassy-usb-synopsys-otg = { path = "vendor/embassy-usb-synopsys-otg-0.4.0" }
 esp-hal = { path = "vendor/esp-hal-1.2.2" }
+sdio = { path = "vendor/sdio-0.5.2" }

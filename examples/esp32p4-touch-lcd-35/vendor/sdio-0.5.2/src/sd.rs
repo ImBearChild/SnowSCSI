@@ -1,0 +1,1194 @@
+//! SD-specific extensions to the core SDMMC protocol.
+
+use aligned::{A4, Aligned};
+use embedded_hal_async::delay::DelayNs;
+
+pub use crate::common::*;
+use crate::{
+    Acquirable, Addressable, BlockCommand, BlockDevice, BlockReadCommand, BusAdapter, BusWidth,
+    Command, ControlCommand, MmcBus, MmcError, R1, R3, R6, R7, Signalling, TuningOp, common, sd,
+};
+
+/// Type marker for SD-specific extensions.
+#[derive(Clone, Copy, Default)]
+pub struct SD;
+
+use core::{convert::TryInto, fmt, str};
+
+// ============================================================================
+// SD MEMORY COMMANDS
+// ============================================================================
+
+/// CMD3 — SEND_RELATIVE_ADDR (RCA)
+pub struct Cmd3;
+impl Command for Cmd3 {
+    const INDEX: u8 = 3;
+    type Resp<'a> = R6;
+    fn arg(&self) -> u32 {
+        0
+    }
+}
+impl ControlCommand for Cmd3 {}
+
+/// CMD3 — SEND_RELATIVE_ADDR (RCA)
+pub fn send_relative_address() -> Cmd3 {
+    Cmd3
+}
+
+/// CMD6 — SWITCH_FUNCTION
+pub struct Cmd6<'a> {
+    pub arg: u32,
+    pub buf: &'a mut Aligned<A4, [u8; 64]>,
+}
+impl<'a> Command for Cmd6<'a> {
+    const INDEX: u8 = 6;
+    type Resp<'b>
+        = R1
+    where
+        Self: 'b;
+    fn arg(&self) -> u32 {
+        self.arg
+    }
+}
+impl<'a> BlockCommand for Cmd6<'a> {
+    fn block_size(&self) -> BlockSize {
+        block_size(64)
+    }
+
+    fn block_count(&self) -> u32 {
+        1
+    }
+}
+
+impl<'a> BlockReadCommand for Cmd6<'a> {
+    fn buf(&mut self) -> &mut Aligned<A4, [u8]> {
+        &mut *self.buf
+    }
+}
+
+/// CMD6 — SWITCH_FUNCTION
+pub fn cmd6(arg: u32, buf: &mut Aligned<A4, [u8; 64]>) -> Cmd6<'_> {
+    Cmd6 { arg, buf }
+}
+
+/// CMD8 — SEND_IF_COND
+pub struct Cmd8 {
+    pub voltage: u8,
+    pub checkpattern: u8,
+}
+impl Command for Cmd8 {
+    const INDEX: u8 = 8;
+    type Resp<'a> = R7;
+    fn arg(&self) -> u32 {
+        ((self.voltage as u32 & 0xF) << 8) | (self.checkpattern as u32)
+    }
+}
+impl ControlCommand for Cmd8 {}
+
+/// CMD8 — SEND_IF_COND
+pub fn send_if_cond(voltage: u8, checkpattern: u8) -> Cmd8 {
+    Cmd8 {
+        voltage,
+        checkpattern,
+    }
+}
+
+/// CMD11 — VOLTAGE_SWITCH
+pub struct Cmd11;
+impl Command for Cmd11 {
+    const INDEX: u8 = 11;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        0
+    }
+}
+impl ControlCommand for Cmd11 {}
+
+/// CMD11 — VOLTAGE_SWITCH
+pub fn voltage_switch() -> Cmd11 {
+    Cmd11
+}
+
+/// CMD19 — SEND_TUNING_BLOCK
+pub struct Cmd19<'b> {
+    pub addr: u32,
+    pub buf: &'b mut Aligned<A4, [u8; 64]>,
+}
+impl<'b> Command for Cmd19<'b> {
+    const INDEX: u8 = 19;
+    type Resp<'a>
+        = R1
+    where
+        Self: 'a;
+    fn arg(&self) -> u32 {
+        self.addr
+    }
+}
+impl<'a> BlockCommand for Cmd19<'a> {
+    fn block_count(&self) -> u32 {
+        1
+    }
+
+    fn block_size(&self) -> BlockSize {
+        block_size(64)
+    }
+}
+
+impl<'a> BlockReadCommand for Cmd19<'a> {
+    fn buf(&mut self) -> &mut Aligned<A4, [u8]> {
+        self.buf
+    }
+}
+
+impl<'a> TuningOp for Cmd19<'a> {
+    async fn exec<B: MmcBus>(&mut self, bus: &mut B) -> Result<bool, MmcError> {
+        // The official 64-byte SD 4-bit tuning pattern (SD Physical Layer spec
+        // §4.2.4.5, == Linux `tuning_blk_pattern_4bit`). CMD19 tuning runs in the
+        // active bus width, which is 4-bit here.
+        const TUNING_PATTERN: [u8; 64] = [
+            0xFF, 0x0F, 0xFF, 0x00, 0xFF, 0xCC, 0xC3, 0xCC, 0xC3, 0x3C, 0xCC, 0xFF, 0xFE, 0xFF,
+            0xFE, 0xEF, 0xFF, 0xDF, 0xFF, 0xDD, 0xFF, 0xFB, 0xFF, 0xFB, 0xBF, 0xFF, 0x7F, 0xFF,
+            0x77, 0xF7, 0xBD, 0xEF, 0xFF, 0xF0, 0xFF, 0xF0, 0x0F, 0xFC, 0xCC, 0x3C, 0xCC, 0x33,
+            0xCC, 0xCF, 0xFF, 0xEF, 0xFF, 0xEE, 0xFF, 0xFD, 0xFF, 0xFD, 0xDF, 0xFF, 0xBF, 0xFF,
+            0xBB, 0xFF, 0xF7, 0xFF, 0xF7, 0x7F, 0x7B, 0xDE,
+        ];
+
+        if bus.read_blocks(&mut *self, false).await.is_ok() && self.buf[..] == TUNING_PATTERN {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// CMD19 — SEND_TUNING_BLOCK
+pub fn send_tuning_block(addr: u32, buf: &mut Aligned<A4, [u8; 64]>) -> Cmd19<'_> {
+    Cmd19 { addr, buf }
+}
+
+/// CMD20 — SPEED_CLASS_CONTROL
+pub struct Cmd20 {
+    pub arg: u32,
+}
+impl Command for Cmd20 {
+    const INDEX: u8 = 20;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.arg
+    }
+}
+impl ControlCommand for Cmd20 {}
+
+/// CMD20 — SPEED_CLASS_CONTROL
+pub fn speed_class_control(arg: u32) -> Cmd20 {
+    Cmd20 { arg }
+}
+
+/// CMD22 — ADDRESS_EXTENSION
+pub struct Cmd22 {
+    pub arg: u32,
+}
+impl Command for Cmd22 {
+    const INDEX: u8 = 22;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.arg
+    }
+}
+impl ControlCommand for Cmd22 {}
+
+/// CMD22 — ADDRESS_EXTENSION
+pub fn address_extension(arg: u32) -> Cmd22 {
+    Cmd22 { arg }
+}
+
+/// CMD23 — SET_BLOCK_COUNT
+pub struct Cmd23 {
+    pub blockcount: u32,
+}
+impl Command for Cmd23 {
+    const INDEX: u8 = 23;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.blockcount
+    }
+}
+impl ControlCommand for Cmd23 {}
+
+/// CMD23 — SET_BLOCK_COUNT
+pub fn set_block_count(blockcount: u32) -> Cmd23 {
+    Cmd23 { blockcount }
+}
+
+/// CMD32 — ERASE_WR_BLK_START_ADDR
+pub struct Cmd32 {
+    pub address: u32,
+}
+impl Command for Cmd32 {
+    const INDEX: u8 = 32;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.address
+    }
+}
+impl ControlCommand for Cmd32 {}
+
+/// CMD32 — ERASE_WR_BLK_START_ADDR
+pub fn erase_wr_blk_start_addr(address: u32) -> Cmd32 {
+    Cmd32 { address }
+}
+
+/// CMD33 — ERASE_WR_BLK_END_ADDR
+pub struct Cmd33 {
+    pub address: u32,
+}
+impl Command for Cmd33 {
+    const INDEX: u8 = 33;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.address
+    }
+}
+impl ControlCommand for Cmd33 {}
+
+/// CMD33 — ERASE_WR_BLK_END_ADDR
+pub fn erase_wr_blk_end_addr(address: u32) -> Cmd33 {
+    Cmd33 { address }
+}
+
+/// CMD36 — ERASE_GROUP_END
+pub struct Cmd36 {
+    pub address: u32,
+}
+impl Command for Cmd36 {
+    const INDEX: u8 = 36;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        self.address
+    }
+}
+impl ControlCommand for Cmd36 {}
+
+/// CMD36: Sets the address of the last erase group within a continuous range to
+/// be selected for erase
+///
+/// Address is either byte address or sector address (set in OCR)
+pub fn erase_group_end(address: u32) -> Cmd36 {
+    Cmd36 { address }
+}
+
+/// CMD58 — READ_OCR
+pub struct Cmd58;
+impl Command for Cmd58 {
+    const INDEX: u8 = 58;
+    type Resp<'a> = R3;
+    fn arg(&self) -> u32 {
+        0
+    }
+}
+impl ControlCommand for Cmd58 {}
+
+pub fn read_ocr() -> Cmd58 {
+    Cmd58
+}
+
+// ============================================================================
+// APPLICATION COMMANDS (ACMD) — treated as normal commands (Option A)
+// ============================================================================
+
+/// ACMD6 — SET_BUS_WIDTH
+pub struct Acmd6 {
+    pub bw4bit: bool,
+}
+impl Command for Acmd6 {
+    const INDEX: u8 = 6;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        if self.bw4bit { 0b10 } else { 0b00 }
+    }
+}
+impl ControlCommand for Acmd6 {}
+
+/// ACMD6 — SET_BUS_WIDTH
+pub fn set_bus_width(bw4bit: bool) -> Acmd6 {
+    Acmd6 { bw4bit }
+}
+
+/// ACMD13 — SD_STATUS (block read, 64 bytes)
+pub struct Acmd13<'a> {
+    pub buf: &'a mut Aligned<A4, [u8; 64]>,
+}
+impl<'a> Command for Acmd13<'a> {
+    const INDEX: u8 = 13;
+    type Resp<'b>
+        = R1
+    where
+        Self: 'b;
+    fn arg(&self) -> u32 {
+        0
+    }
+}
+impl<'a> BlockCommand for Acmd13<'a> {
+    fn block_size(&self) -> BlockSize {
+        block_size(64)
+    }
+    fn block_count(&self) -> u32 {
+        1
+    }
+}
+impl<'a> BlockReadCommand for Acmd13<'a> {
+    fn buf(&mut self) -> &mut Aligned<A4, [u8]> {
+        &mut *self.buf
+    }
+}
+
+/// ACMD13: SD Status
+pub fn sd_status(status: &mut SDStatus) -> Acmd13<'_> {
+    Acmd13 {
+        buf: &mut status.inner,
+    }
+}
+
+/// ACMD23 — SET_WR_BLK_ERASE_COUNT
+pub struct Acmd23 {
+    pub block_count: u32,
+}
+impl Command for Acmd23 {
+    const INDEX: u8 = 23;
+    type Resp<'a> = R1;
+    fn arg(&self) -> u32 {
+        // Number of write blocks to be pre-erased is a 23-bit field [22:0].
+        self.block_count & 0x7F_FFFF
+    }
+}
+impl ControlCommand for Acmd23 {}
+
+/// ACMD23 — SET_WR_BLK_ERASE_COUNT: set the number of write blocks to be
+/// pre-erased before the next multi-block write, to speed up the write.
+pub fn set_wr_blk_erase_count(block_count: u32) -> Acmd23 {
+    Acmd23 { block_count }
+}
+
+/// ACMD41 — SD_SEND_OP_COND
+pub struct Acmd41 {
+    pub host_high_capacity_support: bool,
+    pub sdxc_power_control: bool,
+    pub switch_to_1_8v_request: bool,
+    pub voltage_window: u16,
+}
+impl Command for Acmd41 {
+    const INDEX: u8 = 41;
+    type Resp<'a> = R3;
+    fn arg(&self) -> u32 {
+        (u32::from(self.host_high_capacity_support) << 30)
+            | (u32::from(self.sdxc_power_control) << 28)
+            | (u32::from(self.switch_to_1_8v_request) << 24)
+            | ((self.voltage_window as u32 & 0x1FF) << 15)
+    }
+}
+impl ControlCommand for Acmd41 {}
+
+/// ACMD41 — SD_SEND_OP_COND
+pub fn sd_send_op_cond(
+    host_high_capacity_support: bool,
+    sdxc_power_control: bool,
+    switch_to_1_8v_request: bool,
+    voltage_window: u16,
+) -> Acmd41 {
+    Acmd41 {
+        host_high_capacity_support,
+        sdxc_power_control,
+        switch_to_1_8v_request,
+        voltage_window,
+    }
+}
+
+/// ACMD51 — SEND_SCR (block read, 8 bytes)
+pub struct Acmd51<'a> {
+    pub inner: &'a mut Aligned<A4, [u8; 8]>,
+}
+impl<'a> Command for Acmd51<'a> {
+    const INDEX: u8 = 51;
+    type Resp<'b>
+        = R1
+    where
+        Self: 'b;
+    fn arg(&self) -> u32 {
+        0
+    }
+}
+impl<'a> BlockCommand for Acmd51<'a> {
+    fn block_size(&self) -> BlockSize {
+        block_size(8)
+    }
+    fn block_count(&self) -> u32 {
+        1
+    }
+}
+impl<'a> BlockReadCommand for Acmd51<'a> {
+    fn buf(&mut self) -> &mut Aligned<A4, [u8]> {
+        &mut *self.inner
+    }
+}
+
+/// ACMD51: Reads the SCR
+pub fn send_scr(scr: &mut SCR) -> Acmd51<'_> {
+    Acmd51 { inner: &mut scr.0 }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SDSpecVersion {
+    /// Version 1.0 and and 1.0.1
+    V1_0,
+    /// Version 1.10
+    V1_10,
+    /// Version 2.0
+    V2,
+    /// Version 3.0
+    V3,
+    /// Version 4.0
+    V4,
+    /// Version 5.0
+    V5,
+    /// Version 6.0
+    V6,
+    /// Version 7.0
+    V7,
+    /// Version not known by this crate
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SDSecurity {
+    /// No security (rare)
+    None,
+    /// SDSC security version 1.x
+    V1,
+    /// SDHC security version 2.x
+    V2,
+    /// SDXC security version 3.x
+    V3,
+    /// Reserved / unknown
+    Unknown(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SDEraseDataStatus {
+    /// Erased data is all 0x00
+    Zero,
+    /// Erased data is all 0xFF
+    Ones,
+    /// Erased data is something else (vendor-defined)
+    Other,
+}
+
+/// SD CARD Configuration Register (SCR)
+#[derive(Clone, Copy, Default)]
+pub struct SCR(pub Aligned<A4, [u8; 8]>);
+
+impl SCR {
+    /// Create a new `SCR`
+    #[inline]
+    pub const fn new() -> Self {
+        Self(Aligned([0u8; 8]))
+    }
+
+    /// Create SDStatus from raw 8 bytes
+    #[inline]
+    pub const fn from(bytes: [u8; 8]) -> Self {
+        Self(Aligned(bytes))
+    }
+
+    fn inner_word(&self) -> u64 {
+        u64::from_be_bytes(*self.0)
+    }
+
+    /// SD Security Version
+    pub fn security(&self) -> SDSecurity {
+        let val = ((self.inner_word() >> 52) & 0x7) as u8;
+        match val {
+            0 => SDSecurity::None,
+            1 => SDSecurity::V1,
+            2 => SDSecurity::V2,
+            3 => SDSecurity::V3,
+            other => SDSecurity::Unknown(other),
+        }
+    }
+
+    pub fn data_after_erase(&self) -> SDEraseDataStatus {
+        let val = ((self.inner_word() >> 55) & 0x1) as u8;
+        match val {
+            0 => SDEraseDataStatus::Zero,
+            1 => SDEraseDataStatus::Ones,
+            _ => SDEraseDataStatus::Other,
+        }
+    }
+
+    /// Physical Layer Specification Version Number
+    pub fn version(&self) -> SDSpecVersion {
+        let spec = (self.inner_word() >> 56) & 0xF;
+        let spec3 = (self.inner_word() >> 47) & 1;
+        let spec4 = (self.inner_word() >> 42) & 1;
+        let specx = (self.inner_word() >> 38) & 0xF;
+
+        // Ref PLSS_v7_10 Table 5-17
+        match (spec, spec3, spec4, specx) {
+            (0, 0, 0, 0) => SDSpecVersion::V1_0,
+            (1, 0, 0, 0) => SDSpecVersion::V1_10,
+            (2, 0, 0, 0) => SDSpecVersion::V2,
+            (2, 1, 0, 0) => SDSpecVersion::V3,
+            (2, 1, 1, 0) => SDSpecVersion::V4,
+            (2, 1, _, 1) => SDSpecVersion::V5,
+            (2, 1, _, 2) => SDSpecVersion::V6,
+            (2, 1, _, 3) => SDSpecVersion::V7,
+            _ => SDSpecVersion::Unknown,
+        }
+    }
+    /// Bus widths supported
+    pub fn bus_widths(&self) -> u8 {
+        // Ref PLSS_v7_10 Table 5-21
+        ((self.inner_word() >> 48) as u8) & 0xF
+    }
+    /// Supports 1-bit bus width
+    pub fn bus_width_one(&self) -> bool {
+        (self.inner_word() >> 48) & 1 != 0
+    }
+    /// Supports 4-bit bus width
+    pub fn bus_width_four(&self) -> bool {
+        (self.inner_word() >> 50) & 1 != 0
+    }
+
+    /// Returns the 4-bit Command Support field (SCR[35:32])
+    fn command_support(&self) -> u8 {
+        ((self.inner_word() >> 32) as u8) & 0xF
+    }
+
+    /// CMD20 supported
+    pub fn supports_cmd20(&self) -> bool {
+        (self.command_support() & 0b0001) != 0
+    }
+
+    /// Returns true if CMD23 (SET_BLK_COUNT) is supported
+    pub fn supports_cmd23(&self) -> bool {
+        (self.command_support() & 0b10) != 0
+    }
+
+    /// CMD48 supported
+    pub fn supports_cmd48(&self) -> bool {
+        (self.command_support() & 0b0100) != 0
+    }
+
+    /// CMD49 supported
+    pub fn supports_cmd49(&self) -> bool {
+        (self.command_support() & 0b1000) != 0
+    }
+}
+
+impl core::fmt::Debug for SCR {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SCR: SD CARD Configuration Register")
+            .field("Version", &self.version())
+            .field("Security", &self.security())
+            .field("DataAfterErase", &self.data_after_erase())
+            .field(
+                "BusWidths",
+                &format_args!(
+                    "1-bit: {}, 4-bit: {} (mask=0x{:X})",
+                    self.bus_width_one(),
+                    self.bus_width_four(),
+                    self.bus_widths()
+                ),
+            )
+            .field("CMD20", &self.supports_cmd20())
+            .field("CMD23", &self.supports_cmd23())
+            .field("CMD48", &self.supports_cmd48())
+            .field("CMD49", &self.supports_cmd49())
+            .finish()
+    }
+}
+
+impl OCR<SD> {
+    /// VDD voltage window.
+    // 00000000 00000000 00000000 00000000
+    // 00000000 00000000 0
+    //          11111111 1
+    // OCR [23:15].
+    pub fn voltage_window_mv(&self) -> Option<(u16, u16)> {
+        let mut window = (self.0 >> 15) & 0x1FF;
+        let mut min = 2_700;
+
+        while window & 1 == 0 && window != 0 {
+            min += 100;
+            window >>= 1;
+        }
+        let mut max = min;
+        while window != 0 {
+            max += 100;
+            window >>= 1;
+        }
+
+        if max == min { None } else { Some((min, max)) }
+    }
+    /// Switching to 1.8V Accepted (S18A). Only UHS-I cards support this bit
+    // 00000000 00000000 00000000 00000000
+    //        1
+    // OCR [24].
+    pub fn v18_allowed(&self) -> bool {
+        self.0 & 0x0100_0000 != 0
+    }
+    /// Over 2TB support Status. Only SDUC card support this bit
+    // 00000000 00000000 00000000 00000000
+    //     1
+    // OCR [27].
+    pub fn over_2tb(&self) -> bool {
+        self.0 & 0x0800_0000 != 0
+    }
+    /// Indicates whether the card supports UHS-II Interface
+    // 00000000 00000000 00000000 00000000
+    //   1
+    // OCR [29].
+    pub fn uhs2_card_status(&self) -> bool {
+        self.0 & 0x2000_0000 != 0
+    }
+    /// Card Capacity Status (CCS)
+    ///
+    /// For SD cards, this is true for SDHC/SDXC/SDUC, false for SDSC
+    pub fn high_capacity(&self) -> bool {
+        self.0 & 0x4000_0000 != 0
+    }
+}
+impl fmt::Debug for OCR<SD> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OCR: Operation Conditions Register")
+            .field(
+                "Voltage Window (mV)",
+                &self.voltage_window_mv().unwrap_or((0, 0)),
+            )
+            .field("S18A (UHS-I only)", &self.v18_allowed())
+            .field("Over 2TB flag (SDUC only)", &self.over_2tb())
+            .field("UHS-II Card", &self.uhs2_card_status())
+            .field(
+                "Card Capacity Status (CSS)",
+                &if self.high_capacity() {
+                    "SDHC/SDXC/SDUC"
+                } else {
+                    "SDSC"
+                },
+            )
+            .field("Busy", &self.is_busy())
+            .finish()
+    }
+}
+
+impl CID<SD> {
+    /// OEM/Application ID
+    pub fn oem_id(&self) -> &str {
+        str::from_utf8(&self.bytes[1..3]).unwrap_or("<ERR>")
+    }
+    /// Product name
+    pub fn product_name(&self) -> &str {
+        str::from_utf8(&self.bytes[3..8]).unwrap_or("<ERR>")
+    }
+    /// Product revision
+    pub fn product_revision(&self) -> u8 {
+        self.bytes[8]
+    }
+    /// Product serial number
+    pub fn serial(&self) -> u32 {
+        (self.inner() >> 24) as u32
+    }
+    /// Manufacturing date
+    pub fn manufacturing_date(&self) -> (u8, u16) {
+        (
+            (self.inner() >> 8) as u8 & 0xF,             // Month
+            ((self.inner() >> 12) as u16 & 0xFF) + 2000, // Year
+        )
+    }
+}
+
+impl fmt::Debug for CID<SD> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CID: Card Identification")
+            .field("Manufacturer ID", &self.manufacturer_id())
+            .field("OEM ID", &self.oem_id())
+            .field("Product Name", &self.product_name())
+            .field("Product Revision", &self.product_revision())
+            .field("Product Serial Number", &self.serial())
+            .field("Manufacturing Date", &self.manufacturing_date())
+            .finish()
+    }
+}
+
+impl CSD<SD> {
+    /// Number of blocks in the card
+    pub fn block_count(&self) -> u64 {
+        match self.version() {
+            0 => {
+                // SDSC
+                let c_size: u16 = ((self.0 >> 62) as u16) & 0xFFF;
+                let c_size_mult: u8 = ((self.0 >> 47) as u8) & 7;
+
+                ((c_size + 1) as u64) * ((1 << (c_size_mult + 2)) as u64)
+            }
+            1 => {
+                // SDHC/SDXC
+                (((self.0 >> 48) as u64 & 0x3F_FFFF) + 1) * 1024
+            }
+            2 => {
+                // SDUC
+                (((self.0 >> 48) as u64 & 0xFFF_FFFF) + 1) * 1024
+            }
+            _ => 0,
+        }
+    }
+    /// Card size in bytes
+    pub fn card_size(&self) -> u64 {
+        self.block_count() * self.block_length().len() as u64
+    }
+
+    /// Whether cmd23 is supported
+    pub fn supports_cmd23(&self) -> bool {
+        (self.0 >> 30) & 0b11 != 0
+    }
+
+    /// Erase size (in blocks)
+    pub fn erase_size_blocks(&self) -> u32 {
+        if (self.0 >> 46) & 1 == 1 {
+            // ERASE_BLK_EN
+            1
+        } else {
+            let sector_size_tens = (self.0 >> 43) & 0x7;
+            let sector_size_units = (self.0 >> 39) & 0xF;
+
+            (sector_size_tens as u32 * 10) + (sector_size_units as u32)
+        }
+    }
+}
+
+impl fmt::Debug for CSD<SD> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CSD: Card Specific Data")
+            .field("Transfer Rate", &self.transfer_rate())
+            .field("Block Count", &self.block_count())
+            .field("Card Size (bytes)", &self.card_size())
+            .field("Read I (@min VDD)", &self.read_current_minimum_vdd())
+            .field("Write I (@min VDD)", &self.write_current_minimum_vdd())
+            .field("Read I (@max VDD)", &self.read_current_maximum_vdd())
+            .field("Write I (@max VDD)", &self.write_current_maximum_vdd())
+            .field("Erase Size (Blocks)", &self.erase_size_blocks())
+            .finish()
+    }
+}
+
+impl CardStatus<SD> {
+    /// Command was executed without internal ECC
+    pub fn ecc_disabled(&self) -> bool {
+        self.0 & 0x4000 != 0
+    }
+    /// Extension function specific status
+    pub fn fx_event(&self) -> bool {
+        self.0 & 0x40 != 0
+    }
+    /// Authentication sequence error
+    pub fn ake_seq_error(&self) -> bool {
+        self.0 & 0x8 != 0
+    }
+}
+
+impl fmt::Debug for CardStatus<SD> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Card Status")
+            .field("Out of range error", &self.out_of_range())
+            .field("Address error", &self.address_error())
+            .field("Block len error", &self.block_len_error())
+            .field("Erase seq error", &self.erase_seq_error())
+            .field("Erase param error", &self.erase_param())
+            .field("Write protect error", &self.wp_violation())
+            .field("Card locked", &self.card_is_locked())
+            .field("Password lock unlock error", &self.lock_unlock_failed())
+            .field(
+                "Crc check for the previous command failed",
+                &self.com_crc_error(),
+            )
+            .field("Illegal command", &self.illegal_command())
+            .field("Card internal ecc failed", &self.card_ecc_failed())
+            .field("Internal card controller error", &self.cc_error())
+            .field("General Error", &self.error())
+            .field("Csd error", &self.csd_overwrite())
+            .field("Write protect error", &self.wp_erase_skip())
+            .field("Command ecc disabled", &self.ecc_disabled())
+            .field("Erase sequence cleared", &self.erase_reset())
+            .field("Card state", &self.state())
+            .field("Buffer empty", &self.ready_for_data())
+            .field("Extension event", &self.fx_event())
+            .field("Card expects app cmd", &self.app_cmd())
+            .field("Auth process error", &self.ake_seq_error())
+            .finish()
+    }
+}
+
+/// SD Status
+///
+/// Status bits related to SD Memory Card proprietary features
+///
+/// Ref PLSS_v7_10 Section 4.10.2 SD Status
+#[derive(Clone, Copy)]
+pub struct SDStatus {
+    inner: Aligned<A4, [u8; 64]>,
+}
+
+impl Default for SDStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SDStatus {
+    /// Create a new empty SDStatus
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            inner: Aligned([0u8; 64]),
+        }
+    }
+
+    /// Create SDStatus from raw 64 bytes
+    #[inline]
+    pub const fn from(bytes: [u8; 64]) -> Self {
+        Self {
+            inner: Aligned(bytes),
+        }
+    }
+
+    /// Read a 32‑bit big‑endian word from the SD Status structure.
+    ///
+    /// WORD0 = bytes 0..4
+    /// WORD15 = bytes 60..64
+    #[inline]
+    fn word(&self, index: usize) -> u32 {
+        let start = index * 4;
+        u32::from_be_bytes(self.inner[start..start + 4].try_into().unwrap())
+    }
+
+    /// Current data bus width (W1 or W4)
+    pub fn bus_width(&self) -> Option<BusWidth> {
+        match (self.word(0) >> 30) & 0b11 {
+            0 => Some(BusWidth::W1),
+            2 => Some(BusWidth::W4),
+            _ => None,
+        }
+    }
+
+    /// Is the card currently in secured mode
+    pub fn secure_mode(&self) -> bool {
+        (self.word(0) & 0x2000_0000) != 0
+    }
+
+    /// SD Memory Card type (ROM, OTP, etc)
+    pub fn sd_memory_card_type(&self) -> u16 {
+        (self.word(0) & 0xFFFF) as u16
+    }
+
+    /// SDHC/SDXC: Protected area size in bytes
+    pub fn protected_area_size(&self) -> u32 {
+        self.word(1)
+    }
+
+    /// Speed Class (C2, C4, C6, C10)
+    pub fn speed_class(&self) -> u8 {
+        (self.word(2) >> 24) as u8
+    }
+
+    /// "Performance Move" indicator in MB/s
+    pub fn move_performance(&self) -> u8 {
+        (self.word(2) >> 16) as u8
+    }
+
+    /// Allocation Unit (AU) size (Table 4‑47)
+    pub fn allocation_unit_size(&self) -> u8 {
+        ((self.word(2) >> 12) & 0xF) as u8
+    }
+
+    /// N_Erase (erase size in units of AU)
+    pub fn erase_size(&self) -> u16 {
+        let low = (self.word(2) & 0xFF) as u16;
+        let high = ((self.word(3) >> 24) & 0xFF) as u16;
+        (low << 8) | high
+    }
+
+    /// T_Erase (erase timeout in seconds)
+    pub fn erase_timeout(&self) -> u8 {
+        ((self.word(3) >> 18) & 0x3F) as u8
+    }
+
+    /// Video Speed Class (V6, V10, V30, etc)
+    pub fn video_speed_class(&self) -> u8 {
+        (self.word(3) & 0xFF) as u8
+    }
+
+    /// Application Performance Class (A1, A2)
+    pub fn app_perf_class(&self) -> u8 {
+        ((self.word(5) >> 16) & 0xF) as u8
+    }
+
+    /// Discard/TRIM support
+    pub fn discard_support(&self) -> bool {
+        (self.word(6) & 0x0200_0000) != 0
+    }
+}
+
+impl fmt::Debug for SDStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SD Status")
+            .field("Bus Width", &self.bus_width())
+            .field("Secured Mode", &self.secure_mode())
+            .field("SD Memory Card Type", &self.sd_memory_card_type())
+            .field("Protected Area Size (B)", &self.protected_area_size())
+            .field("Speed Class", &self.speed_class())
+            .field("Video Speed Class", &self.video_speed_class())
+            .field("Application Performance Class", &self.app_perf_class())
+            .field("Move Performance (MB/s)", &self.move_performance())
+            .field("AU Size", &self.allocation_unit_size())
+            .field("Erase Size (units of AU)", &self.erase_size())
+            .field("Erase Timeout (s)", &self.erase_timeout())
+            .field("Discard Support", &self.discard_support())
+            .finish()
+    }
+}
+
+/// Card interface condition (R7)
+pub type CIC = R7;
+
+impl RCA<SD> {
+    /// Status
+    pub fn status(&self) -> u16 {
+        self.0 as u16
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+/// SD Card
+pub struct Card {
+    /// Operation Conditions Register
+    pub ocr: OCR<SD>,
+    /// Card ID
+    pub cid: CID<SD>,
+    /// Card Specific Data
+    pub csd: CSD<SD>,
+    /// SD CARD Configuration Register
+    pub scr: SCR,
+    /// SD Status
+    pub status: SDStatus,
+}
+
+impl Addressable for Card {
+    type Ext = SD;
+
+    /// Is this a standard or high capacity peripheral?
+    fn get_capacity(&self) -> CardCapacity {
+        if self.ocr.high_capacity() {
+            CardCapacity::HighCapacity
+        } else {
+            CardCapacity::StandardCapacity
+        }
+    }
+
+    fn block_count(&self) -> u32 {
+        self.csd.block_count() as u32
+    }
+
+    fn supports_cmd23(&self) -> bool {
+        self.scr.supports_cmd23()
+    }
+
+    fn supports_acmd23(&self) -> bool {
+        true // mandatory for SD cards
+    }
+}
+
+impl Acquirable for Card {
+    async fn acquire<B: MmcBus, D: DelayNs>(
+        bus: &mut BusAdapter<B, D>,
+        block_size: BlockSize,
+        bus_width: BusWidth,
+        mut freq: u32,
+    ) -> Result<(Self, u32), MmcError> {
+        let mut this = Self::default();
+        let mut buf = Aligned([0u8; 64]);
+
+        if matches!(bus_width, BusWidth::W8) {
+            return Err(MmcError::BusWidth);
+        }
+
+        // CMD8 — check voltage + pattern
+        let cic: CIC = bus.send_command(send_if_cond(1, 0xAA), false).await?;
+        if cic.check_pattern != 0xAA || (cic.voltage & 1) == 0 {
+            return Err(MmcError::Voltage);
+        }
+
+        // ACMD41 — negotiate OCR (with S18A if host supports 1.8V)
+        this.ocr = bus
+            .get_ocr(
+                // XPC (ACMD41 arg bit 28): the card's power class. XPC=0 caps
+                // an SDXC card at 0.36 W, while the UHS-I modes need 1.44-2.88 W
+                // (spec 3.9.6 Table 3-6); a card may refuse the 1.8 V switch
+                // when the host has not declared it can supply that. Linux sets
+                // it whenever the host can give >150 mA.
+                &sd_send_op_cond(true, true, bus.bus.supports_1v8(), 1 << 5),
+                true,
+            )
+            .await?;
+
+        // SPI mode fallback
+        if !bus.bus.supports_mmc() {
+            this.ocr = bus.send_command(read_ocr(), false).await?.into();
+            bus.bus.set_bus(BusWidth::W1, freq)?;
+
+            return Ok((this, freq));
+        }
+
+        // UHS-I voltage switch. Per SD Physical Layer Spec §3.7.5 the
+        // voltage switch must happen here — between ACMD41 (which
+        // moved the card to "ready" state) and CMD2 (which moves it
+        // to "identification" state). CMD11 is only honoured by the
+        // card while it's in the ready state. Doing the switch later
+        // (e.g. after CMD2/CMD3) makes CMD11 time out.
+        if bus.bus.supports_1v8() && this.ocr.v18_allowed() {
+            bus.send_command(voltage_switch(), false).await?;
+        }
+
+        // CMD2 — read CID
+        this.cid = bus
+            .send_command(common::all_send_cid(), false)
+            .await?
+            .into();
+
+        // CMD3 — get RCA
+        bus.rca =
+            RCA::<SD>::from(bus.send_command(send_relative_address(), false).await?).address();
+
+        // CMD9 — read CSD (must be ≤25 MHz, 1-bit)
+        this.csd = bus
+            .send_command(common::send_csd(bus.rca), false)
+            .await?
+            .into();
+
+        // CMD7 — select card
+        bus.select_card(Some(bus.rca)).await?;
+
+        // ACMD51 — read SCR (must be ≤25 MHz, 1-bit)
+        bus.read_blocks(sd::send_scr(&mut this.scr), false, true)
+            .await?;
+
+        // ACMD6 — set bus width BEFORE high-speed signalling switch
+        let (bus_width, bw4bit) = match bus_width {
+            BusWidth::W4 if this.scr.bus_width_four() => (BusWidth::W4, true),
+            _ => (BusWidth::W1, false),
+        };
+
+        bus.send_command(set_bus_width(bw4bit), true).await?;
+
+        // Up to 25Mhz
+        bus.bus.set_bus(bus_width, freq.min(25_000_000))?;
+
+        if freq > 25_000_000 {
+            // Clamp the frequency at the highest frequency that the card supports
+            freq = freq.min(
+                Self::switch_signalling_mode(bus, &mut buf, Signalling::from_freq(freq))
+                    .await?
+                    .to_freq(),
+            );
+
+            bus.bus.set_bus(bus_width, freq)?;
+
+            bus.bus
+                .tune_bus(bus_width, freq, send_tuning_block(0, &mut buf))
+                .await?;
+        }
+
+        if CardStatus::<SD>::from(
+            bus.send_command(common::card_status(bus.rca, false), false)
+                .await?,
+        )
+        .state()
+            != CurrentState::Transfer
+        {
+            return Err(MmcError::Signaling);
+        }
+
+        // ACMD13 — SD Status (after signalling switch)
+        bus.read_blocks(sd::sd_status(&mut this.status), false, true)
+            .await?;
+
+        // CMD16 — set block length
+        bus.send_command(set_block_length(block_size.len() as u32), false)
+            .await?
+            .to_result()?;
+
+        Ok((this, freq))
+    }
+}
+
+impl Card {
+    /// Switch mode using CMD6.
+    ///
+    /// Attempt to set a new signalling mode. The selected
+    /// signalling mode is returned. Expects the current clock
+    /// frequency to be > 12.5MHz.
+    ///
+    /// SD only.
+    async fn switch_signalling_mode<B: MmcBus, D: DelayNs>(
+        bus: &mut BusAdapter<B, D>,
+        buf: &mut Aligned<A4, [u8; 64]>,
+        signalling: Signalling,
+    ) -> Result<Signalling, MmcError> {
+        // NB PLSS v7_10 4.3.10.4: "the use of SET_BLK_LEN command is not
+        // necessary"
+
+        let set_function = 0x8000_0000
+            | match signalling {
+                // See PLSS v7_10 Table 4-11
+                Signalling::DDR50 => 0xFF_FF04,
+                Signalling::SDR104 => 0xFF_1F03,
+                Signalling::SDR50 => 0xFF_1F02,
+                Signalling::SDR25 => 0xFF_FF01,
+                Signalling::SDR12 => 0xFF_FF00,
+            };
+
+        bus.read_blocks(cmd6(set_function, buf), false, false)
+            .await?;
+
+        // Host is allowed to use the new functions at least 8
+        // clocks after the end of the switch command
+        // transaction. We know the current clock period is < 80ns,
+        // so a total delay of 640ns is required here
+        bus.delay.delay_ns(640).await;
+
+        // Function Selection of Function Group 1
+        let selection =
+            (u32::from_be(u32::from_le_bytes(buf[16..16 + 4].try_into().unwrap())) >> 24) & 0xF;
+
+        match selection {
+            0 => Ok(Signalling::SDR12),
+            1 => Ok(Signalling::SDR25),
+            2 => Ok(Signalling::SDR50),
+            3 => Ok(Signalling::SDR104),
+            4 => Ok(Signalling::DDR50),
+            _ => Err(MmcError::Signaling),
+        }
+    }
+}
+
+/// Card Storage Device
+impl<B: MmcBus, D: DelayNs, const BLOCK_SIZE: usize> BlockDevice<Card, B, D, BLOCK_SIZE> {
+    /// Create a new SD card
+    pub async fn new_sd_card(bus: B, freq: u32, delay: D) -> Result<Self, MmcError> {
+        Self::new(bus, delay, freq).await
+    }
+
+    /// Create a uninit SD card
+    pub fn new_uninit_sd_card(bus: B, delay: D) -> Self {
+        Self::new_uninit(bus, delay)
+    }
+}
