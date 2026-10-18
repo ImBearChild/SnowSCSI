@@ -14,7 +14,7 @@ native xHCI; treat comparisons against native-host numbers accordingly.
 
 | What | Reading |
 |---|---|
-| End-to-end read | **9.7 MB/s** (50 MHz UHS-I SDR25; 8.8 at 40 MHz — §5) |
+| End-to-end read | **9.7 MB/s** (50 MHz UHS-I SDR25; 8.8 at 40 MHz — §5; 100 MHz SDR50 now works, §5.1) |
 | End-to-end write | **5.2 MB/s** (50 MHz; 4.9 at 40 MHz) |
 | USB IN ceiling (no SD, multi-packet) | 14.2 MB/s \* |
 | USB OUT ceiling (no SD) | 7.2 MB/s \* |
@@ -280,41 +280,93 @@ worth tuning.
 - At 50 MHz end to end: **read 9.7 MB/s** (8.8 at 40 MHz), **write 5.2 MB/s**
   (4.9), a 40 MiB read and a 32 MiB write with **zero SD errors**, and an 8 MiB
   write that reads back byte-identical, twice.
-- Two things a driver-level follow-up should really fix: the drive edge is now a
-  constant that happens to work at both of our operating points — the honest fix
-  is a *drive*-side calibration (a write/read-back sweep, the mirror of
-  `tune_bus`); and `SlotConfig::uhs_1v8` couples two unrelated things, raising the
-  frequency cap above 40 MHz *and* opting into the 1.8 V CMD11 switch. This card
-  does not advertise UHS-I, so the switch never runs and 50 MHz happens at 3.3 V
-  (legal High Speed); with a UHS-I card the rail would switch and the write path
-  would be untested again.
-- SDR50 (100 MHz) is still out of reach: the same 50 MHz card clock runs from a
-  100 MHz module clock (`module_div: 2`) but hangs from the undivided 200 MHz one
-  (`module_div: 1`, the `sdio_hs_mode` bypass), and with `card = module / (2·div)`
-  there is then no route to 100 MHz.
+- One driver-level follow-up remains: `SlotConfig::uhs_1v8` couples two unrelated
+  things — raising the frequency cap above 40 MHz *and* opting into the 1.8 V
+  CMD11 switch. On the card measured here that never mattered (it does not
+  advertise UHS-I, so the switch never runs and 50 MHz happens at 3.3 V — legal
+  High Speed), but the coupling is the reason `supports_frequency` needs the
+  capability-vs-runtime split described in §5.1.
+- The **drive edge is no longer a constant**: it is now selected from the card
+  divider (`card_div == 0` → edge 1, divided → edge 0). That is the whole of the
+  100 MHz SDR50 result in §5.1; a full write/read-back drive calibration would
+  still be the more honest fix, and is the mirror of `tune_bus`.
 
-### SDR50: this card cannot do it, and it is not the bottleneck anyway
+### 5.1 SDR50 (100 MHz): the bypassed divider needs the other drive edge
+
+Once the card comes up cold (the Q1 + LDO_VO4 cut, §2 of the UHS handoff) and
+advertises UHS-I, `sdio` runs CMD11 and the switch succeeds. Reaching SDR50 is
+then only about the clock plumbing, and the vendor driver had two blockers:
+
+- `sdio` clamped the requested frequency to `supports_frequency()` *before*
+  `Card::acquire` ran CMD11. Reporting the runtime UHS state there capped every
+  request to 50 MHz, so CMD6 never asked for SDR50. `supports_frequency` now
+  reports the bus **capability** (the module clock), the same fix
+  `embassy-stm32` uses; the electrical 3.3 V limit is enforced where the clock
+  is actually programmed (`Settings::set_slot_bus` clamps to 50 MHz until the
+  switch is active).
+- With the request at 100 MHz and `module_div: 2`, `freq_to_card_div(100 MHz,
+  100 MHz)` returns **0**, i.e. the SDHOST card divider is **bypassed**
+  (`CLKDIV=0`; the spec comment on the register says "0 bypasses the divider
+  (divisor of 1)"). That is exactly esp-idf's SDR50 configuration (`host_div 2`,
+  `card_div 0`), and it is the first time this tree has used the bypass.
+
+The bypass then re-created the same class of failure the 50 MHz fix addressed,
+but in the *other* direction: `sdio` selected SDR50, `set_slot_bus
+hz=100000000`, the driver tuned CMD19 cleanly (all four sample taps), and then
+the very next command — `CMD13` — timed out (`ResponseTimeout`) and SD init
+died. The failure was **argument-dependent**: every command carrying the RCA
+`0xaaaa0000` (CMD13/CMD7/CMD55) timed out, while `CMD16 arg=0x200` and CMD19
+`arg=0` succeeded. `0xaaaa` is the worst-case alternating pattern, so the card
+was mis-sampling the addressed commands — the host→card **drive** path, again.
+
+The drive edge that works there is the one esp-idf ships (`1`), but `1` cannot
+be used unconditionally: at the *divided* 50 MHz point it is what corrupts
+host→card writes (the table above). The two operating points need different
+edges because the card samples on a different module-clock edge relative to the
+launch: with the card divider dividing, edge 0 lands the data half a card period
+before the sample; with the divider bypassed, edge 1 restores that margin.
+`EngineSession::program_slot_hw` now programs the edge from the divider
+(`chip_specific::set_drive_clk_edge(if card_div == 0 { 1 } else { 0 })`) on every
+clock change, so one build serves both points.
+
+Verified end to end on the UHS-I card (cold boot, in-firmware reset):
+
+```
+cmd11: stage1/volt_sw1/stage2/volt_sw2/stage3     # 1.8 V switch
+cmd6 arg=0x80ff1f02 ... b13=0x1f b16=2            # SDR50 selected
+sdmmc: set_slot_bus hz=100000000 cap=100000000
+sdmmc: tune ... tune chose _1 best_len=4
+cmd13 arg=0xaaaa0000 resp0=0x900                  # addressed command at 100 MHz: OK
+SDTEST bus 2048 KiB in 109463 us = 19158 kB/s
+SDTEST n=1  write OK / read OK diff=0
+SDTEST n=32 write OK / read OK diff=0
+SD clock: 100000000 Hz
+```
+
+The `SDTEST bus` figure is **not** the card clock: the 16 KiB-command rate is
+software-bound at 100 MHz (per-command overhead ~500 us vs ~330 us of data), so
+it sits near the 50 MHz number even though the bus runs at 100 MHz. The bus rate
+that matters is still the USB transport (§6), and per §5's earlier note raising
+the card clock does not move the end-to-end figure.
+
+### The earlier, non-UHS card
+
+Everything below is the historical record for the first microSD used here, which
+did **not** advertise UHS-I; it explains why SDR50 looked unreachable before the
+card was swapped for a UHS-I one.
 
 - SDR50 is a UHS-I mode, so it needs 1.8 V signalling and only a card that
-  advertises it will switch. This card does not: its OCR comes back with
-  **S18A = 0**, so `sdio` skips CMD11. That is not a gap on our side —
-  `supports_1v8()` is true here (checked with a temporary log) and `sdio`'s
-  ACMD41 really does set **S18R** (bit 24) together with HCS (bit 30) and the
-  3.2–3.3 V window (bit 20). Forcing CMD11 past that check (patched `sdio`)
-  makes the card **stop answering entirely**: the command times out and sd init
-  dies. The card and its OCR agree.
+  advertises it will switch. That card did not: its OCR came back with
+  **S18A = 0**, so `sdio` skipped CMD11. That was not a gap on our side —
+  `supports_1v8()` was true (checked with a temporary log) and `sdio`'s ACMD41
+  really did set **S18R** (bit 24) together with HCS (bit 30) and the 3.2–3.3 V
+  window (bit 20). Forcing CMD11 past that check made that card **stop answering
+  entirely**. The card and its OCR agreed.
 - An **A1 / V30 marking does not imply UHS-I**: A1 is an *application
   performance* class (random IOPS), not a bus mode. The check that matters is
   the `cmd11` line the vendored esp-hal logs when the switch actually runs.
-- With a UHS-I card, the remaining work is: fix the driver's CMD11 sequence
-  (`SDHOST.UHS.VOLT` is never written, the card clock is not stopped around the
-  switch, and esp-idf's `skip_wait` for a voltage-switch clock-update command is
-  missing — a forced CMD11 timing out may well be *this* rather than the card);
-  reach 100 MHz (`module_div: 1`, the `sdio_hs_mode` bypass, which previously
-  "hung" — very likely just 100 MHz at 3.3 V, out of spec); and re-validate the
-  drive edge at 1.8 V/100 MHz (a drive-side calibration is the proper fix).
-- **End to end it would buy little.** At 50 MHz the SD bus already moves
-  18 MB/s while the read path delivers 9.7 MB/s, so the SD side is only ~54 %
+- **End to end it buys little.** At 50 MHz the SD bus already moved 18 MB/s
+  while the read path delivered 9.7 MB/s, so the SD side was only ~54 %
   utilised: the ceiling is the USB transport (14.2 MB/s IN, plus this test
   host's `vhci_hcd` turn-around), not the card bus. Writes are pegged by the
   card's own program speed (5.2 MB/s). Raising the SD clock further only pays
@@ -481,7 +533,7 @@ at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
 | `WORK_LEN` | `src/drive.rs` | `MIN_DATA_LEN * 2` (16 KiB) | chunk = SD command size; §6 is why 8 KiB used to be needed |
 | `BATCH_BLOCKS` | `src/sd.rs` | 32 (16 KiB) | descriptor-ring maximum |
 | `SD_BUS_FREQ_HZ` | `src/sd.rs` | 50 MHz | needs the SDIO PLL module clock; 40 MHz is the `Pll160m` ceiling, §5 |
-| `SD_UHS_PLL` | `src/sd.rs` | `true` | take the 50 MHz UHS-I SDR25 path; fall back to 40 MHz with `false` |
+| `SD_UHS_PLL` | `src/sd.rs` | `true` | take the UHS-I path (100 MHz SDR50 on a cold UHS-I card, clamped to 50 MHz SDR25 otherwise); fall back to 40 MHz with `false` |
 | SDMMC drive clock edge | vendor `esp-hal` | `0` | esp-idf's `1` corrupts host→card writes from the PLL source, §5 |
 | `SD_SELFTEST` | `src/sd.rs` | `true` | boot write/read self-test at the card's end — needs no host |
 | `clock_source` / `module_div` | `src/sd.rs` | `SdioPll` / 2 | 200 MHz PLL → 100 MHz module → 50 MHz card; `module_div: 1` hangs (§5) |

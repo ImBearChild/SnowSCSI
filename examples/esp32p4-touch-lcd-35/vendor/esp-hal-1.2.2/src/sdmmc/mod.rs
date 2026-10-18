@@ -543,6 +543,11 @@ impl EngineSession {
         self.set_card_width(slot, cached.width);
         let card_div =
             freq_to_card_div(module_hz(module.clock_source, module.module_div), cached.hz);
+        // The host->card drive edge must follow the card divider: a bypassed
+        // divider (`card_div == 0`, the SDR50 100 MHz point) needs edge 1, a
+        // divided one edge 0. See `set_drive_clk_edge`.
+        #[cfg(esp32p4)]
+        chip_specific::set_drive_clk_edge(if card_div == 0 { 1 } else { 0 });
         self.set_card_clock(slot, card_div)?;
         #[cfg(sdmmc_delay_phase_num_is_set)]
         if cached.hz > 25_000_000 {
@@ -988,13 +993,31 @@ impl Settings {
         let idx = slot.index() as usize;
         // Non-UHS slots keep the classic 40 MHz ceiling. UHS-I slots may run up
         // to the module clock (the card divider can be bypassed); with the
-        // default PLL_F160M / divider 2 that is 80 MHz, and 200 MHz with the
-        // SDIO PLL.
+        // default PLL_F160M / divider 2 that is 80 MHz, and 100 MHz with the
+        // SDIO PLL at divider 2.
         let cap = if self.slots[idx].uhs {
             module_hz(self.module.clock_source, self.module.module_div)
         } else {
             40_000_000
         };
+        // UHS-I modes (SDR50 and up) are only legal at 1.8 V. `sdio` derives
+        // the CMD6 mode from the *requested* frequency and `supports_frequency`
+        // now honestly reports the bus capability, so a card that has not
+        // completed the CMD11 switch (warm/legacy, or S18A refused) can arrive
+        // here asking for 100 MHz at 3.3 V -- clamp to legal High Speed
+        // instead of erroring. After CMD11 (`UHS_1V8_ACTIVE`) the full module
+        // clock is fair game.
+        let mut hz = hz;
+        if self.slots[idx].uhs
+            && hz > 50_000_000
+            && !UHS_1V8_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                "sdmmc: set_slot_bus clamping {} -> 50000000 (bus still at 3.3 V)",
+                hz
+            );
+            hz = 50_000_000;
+        }
         info!("sdmmc: set_slot_bus hz={} cap={} width={:?}", hz, cap, width);
         if hz == 0 || hz > cap {
             return Err(Error::Unsupported);
@@ -1922,7 +1945,15 @@ impl<'d, const S: u8> Slot<'d, S, Async> {
                     attempt += 1;
                     crate::rom::ets_delay_us(2_000);
                 }
-                Err(e) => return Err(MmcError::from(e)),
+                Err(e) => {
+                    warn!(
+                        "sdmmc: cmd{} arg={=u32:#x} failed: {:?}",
+                        C::INDEX,
+                        cmd.arg(),
+                        e
+                    );
+                    return Err(MmcError::from(e));
+                }
             }
         };
         if attempt > 0 {
@@ -2110,17 +2141,23 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
 
     fn supports_frequency(&self) -> u32 {
         // Without the UHS-I 1.8 V switch, keep the conservative 40 MHz ceiling.
-        // Once the switch is enabled the card clock may run up to the module
-        // clock (the card divider can be bypassed).
+        //
+        // A UHS-capable slot reports its **capability** (the module clock --
+        // the card divider can be bypassed down to 1:1), NOT the runtime UHS
+        // state: `sdio` clamps the requested frequency against this value
+        // *before* `Card::acquire` runs CMD11, so gating on `UHS_1V8_ACTIVE`
+        // capped every request at 50 MHz, `Signalling::from_freq` then picked
+        // SDR25 and CMD6 never asked for SDR50 (same trap embassy-stm32 hit --
+        // see its `supports_frequency` comment). The electrical limit at
+        // 3.3 V is enforced where the clock is actually programmed:
+        // `Settings::set_slot_bus` clamps to 50 MHz while the switch is not
+        // active.
         #[cfg(esp32p4)]
         if self.config.uhs_1v8 && S == 0 {
-            // 3.3 V: 50 MHz is legal High Speed (and measured working here), but
-            // 100 MHz is not in spec until the card has switched to 1.8 V.
-            return if UHS_1V8_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
-                100_000_000
-            } else {
-                50_000_000
-            };
+            return module_hz(
+                SETTINGS.with(|s| s.module.clock_source),
+                SETTINGS.with(|s| s.module.module_div),
+            );
         }
         40_000_000
     }

@@ -106,16 +106,10 @@ pub fn set_module_clock(source: ClockSource, div: u8) {
     // these the controller never drives the card clock out, so commands never
     // complete.
     //
-    // The **drive** edge is 0, not the 1 esp-idf's `sdmmc_ll_init_phase_delay`
-    // uses: with 1 and the module clock taken from the SDIO PLL (`ClockSource::
-    // SdioPll`) the card rejects every host->card write with a data CRC error
-    // (the DCRC bit), while reads are bit-perfect -- at *any* card clock
-    // (measured at 5, 25 and 50 MHz), single and multi block, with every other
-    // register identical to a working configuration. 0 works for both clock
-    // sources (PLL_F160M at 40 MHz and SDIO PLL at 50 MHz) on this part; a
-    // proper fix is a *drive*-side calibration analogue to `tune_bus` (which
-    // only sweeps the sample edge). See examples/esp32p4-touch-lcd-35/
-    // PERFORMANCE.md section 5.
+    // The drive edge starts at 0 (correct for every divided card clock; see
+    // [`set_drive_clk_edge`] for why esp-idf's 1 breaks writes at 50 MHz here
+    // and why the *bypassed* SDR50 point needs 1). `EngineSession` re-programs
+    // it on every clock change.
     c.peri_clk_ctrl02().modify(|_, w| unsafe {
         w.sdio_ls_drv_clk_en().set_bit();
         w.sdio_ls_sam_clk_en().set_bit();
@@ -134,6 +128,32 @@ pub fn set_module_clock(source: ClockSource, div: u8) {
 
 /// Card-clock frequency at which the P4 DLL delay path is used (SDR104).
 const SDR104_HZ: u32 = 200_000_000;
+
+/// Programs the **drive** (host→card) clock edge.
+///
+/// `sdio_ls_drv_clk_edge_sel` picks which phase of the module clock launches
+/// command/data to the card. It is not output-tunable by `tune_bus` (that
+/// sweeps only the sample edge), so the value must match the card-clock
+/// divider: with the divider active (the card sees every other module edge)
+/// edge 0 is correct, but with the divider **bypassed** (`card_div == 0`, the
+/// SDR50 100 MHz point) the card samples the same module edge that edge 0
+/// launches on. Edge 1 restores the setup margin there; edge 0 at 100 MHz loses
+/// the worst-case command argument (`0xaaaa0000`, the RCA) while benign
+/// arguments still pass, which shows up as `ResponseTimeout` on the first
+/// addressed command after the SDR50 switch.
+///
+/// `EngineSession::program_slot_hw` calls this on every clock change with
+/// `card_div == 0`, so one build serves both the bypassed SDR50 point and the
+/// divided High Speed one.
+pub fn set_drive_clk_edge(edge: u8) {
+    let c = crate::peripherals::HP_SYS_CLKRST::regs();
+    c.peri_clk_ctrl02()
+        .modify(|_, w| unsafe { w.sdio_ls_drv_clk_edge_sel().bits(edge & 0b11) });
+    c.peri_clk_ctrl02()
+        .modify(|_, w| w.sdio_ls_clk_edge_cfg_update().set_bit());
+    c.peri_clk_ctrl02()
+        .modify(|_, w| w.sdio_ls_clk_edge_cfg_update().clear_bit());
+}
 
 /// Programs the input sampling delay phase (LS edge select below SDR104, DLL above).
 pub fn set_input_delay_phase(phase: DelayPhase, hz: u32) {
