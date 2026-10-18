@@ -717,6 +717,11 @@ impl EngineSession {
         // event. Set it before starting the command.
         if index == 11 {
             let p = r.cmd().as_ptr();
+            // `volt_switch` (bit 28) is not modelled by the PAC. It must be set
+            // on the *card* command: `update_clock_registers_only` (bit 21)
+            // belongs to the separate clock-update steps either side of it (see
+            // `cmd11_clock_update`) -- setting it here means "send no command",
+            // and the card then never answers CMD11.
             unsafe { p.write_volatile(p.read_volatile() | (1 << 28)) };
         }
         r.cmd().modify(|_, w| w.start_cmd().set_bit());
@@ -1884,9 +1889,27 @@ impl<'d, const S: u8> Slot<'d, S, Async> {
             busy: <C::Resp<'a> as sdio::Response>::BUSY,
         };
         let crc = <C::Resp<'a> as sdio::Response>::CRC;
+        // esp-idf issues the clock-update half of the CMD11 sequence before the
+        // command itself (and again, with the rail switched, after it).
+        if C::INDEX == 11 {
+            cmd11_clock_update(slot).map_err(MmcError::from)?;
+        }
         let words = session
             .send_command_async(slot, C::INDEX, cmd.arg(), resp_len, crc, flags)
             .await?;
+        // TEMP DIAG: ACMD41 carries S18R in the argument and S18A in the
+        // response; CMD11's response says whether the card took the switch.
+        if C::INDEX == 41 || C::INDEX == 11 {
+            info!(
+                "cmd{} arg={=u32:#x} resp0={=u32:#x} resp1={=u32:#x} resp2={=u32:#x} resp3={=u32:#x}",
+                C::INDEX,
+                cmd.arg(),
+                words[0],
+                words[1],
+                words[2],
+                words[3]
+            );
+        }
         Ok(<C::Resp<'a> as sdio::Response>::from_words(&words))
     }
 }
@@ -1916,9 +1939,20 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         if C::INDEX == 11 && self.config.uhs_1v8 {
             drop(session);
             chip_specific::set_io_voltage_1v8();
+            // Tell the controller this slot now speaks 1.8 V -- esp-idf does the
+            // same from its CMD11 helper (`sdmmc_ll_enable_1v8_mode`). The PAC
+            // models only the `ddr` field of `UHS`, so `volt` (one bit per slot)
+            // takes a raw RMW.
+            let r = SDHOST::regs();
+            let bit = 1u32 << S;
+            r.uhs()
+                .modify(|rd, w| unsafe { w.bits(rd.bits() | bit) });
+            UHS_1V8_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+            // esp-idf's `sdmmc_host_enable_clk_cmd11(slot, true)` is a clock
+            // update taken *together* with the rail switch.
+            let _ = cmd11_clock_update(slot_id(S));
             // The card needs time to settle on the 1.8 V rail; esp-idf waits
-            // 10 ms here (it additionally stops the card clock around the
-            // switch, which this driver does not).
+            // 10 ms here.
             crate::rom::ets_delay_us(10_000);
         }
 
@@ -1995,6 +2029,7 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         #[cfg(esp32p4)]
         if self.config.uhs_1v8 {
             chip_specific::set_io_voltage_3v3();
+            UHS_1V8_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
         }
         self.set_bus_low_level(BusWidth::Bit1, hz)?;
         session.send_init_sequence(slot_id(S))?;
@@ -2042,7 +2077,13 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         // clock (the card divider can be bypassed).
         #[cfg(esp32p4)]
         if self.config.uhs_1v8 && S == 0 {
-            return SETTINGS.with(|s| module_hz(s.module.clock_source, s.module.module_div));
+            // 3.3 V: 50 MHz is legal High Speed (and measured working here), but
+            // 100 MHz is not in spec until the card has switched to 1.8 V.
+            return if UHS_1V8_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                100_000_000
+            } else {
+                50_000_000
+            };
         }
         40_000_000
     }
@@ -2301,6 +2342,12 @@ fn read_response(resp_len: ResponseLen) -> [u32; 4] {
     }
 }
 
+/// Set when the slot has completed the UHS-I CMD11 voltage switch, i.e. the bus
+/// really is at 1.8 V. Only then may the card clock go past the 3.3 V ceiling
+/// (50 MHz High Speed); 100 MHz is only in spec at 1.8 V.
+static UHS_1V8_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Maps `rintsts` error bits to an [`Error`]; errors take priority.
 fn map_rintsts(sts: u32) -> Result<(), Error> {
     if sts & EVT_HLE != 0 {
@@ -2328,6 +2375,26 @@ fn map_rintsts(sts: u32) -> Result<(), Error> {
         return Err(Error::FifoOverrun);
     }
     Ok(())
+}
+
+/// esp-idf `sdmmc_host_clock_update_command(slot, is_cmd11 = true)`: push the
+/// clock registers into the card-clock domain and arm the voltage switch
+/// **without sending anything to the card** (CMD bit 21). The P4's CMD11
+/// handshake is sequenced with one of these on either side of the real command --
+/// esp-hal previously skipped them entirely.
+fn cmd11_clock_update(slot: SlotId) -> Result<(), Error> {
+    let r = SDHOST::regs();
+    r.cmdarg().write(|w| unsafe { w.bits(0) });
+    r.cmd().write(|w| unsafe {
+        w.update_clock_registers_only().set_bit();
+        w.wait_prvdata_complete().set_bit();
+        w.card_number().bits(slot.index());
+        w.start_cmd().set_bit()
+    });
+    // `volt_switch` (bit 28) is not modelled by the PAC.
+    let p = r.cmd().as_ptr();
+    unsafe { p.write_volatile(p.read_volatile() | (1 << 28)) };
+    wait_command_accepted()
 }
 
 /// Polls DAT0 until the card releases the busy signal.

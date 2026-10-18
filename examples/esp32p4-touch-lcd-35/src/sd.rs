@@ -264,11 +264,18 @@ pub const SD_BLOCK_SIZE: usize = 512;
 /// (module clock 80 MHz, `card = module / (2 * div)`); 50 MHz needs the SDIO PLL
 /// module clock, which breaks writes (see [`SD_UHS_PLL`]). `sdio` may still
 /// clamp below the request (see [`SdCard::freq`]).
-const SD_BUS_FREQ_HZ: u32 = if SD_UHS_PLL { 50_000_000 } else { 40_000_000 };
+const SD_BUS_FREQ_HZ: u32 = if SD_UHS_PLL { 100_000_000 } else { 40_000_000 };
 
-/// Take the 50 MHz **UHS-I SDR25** path: module clock from the 200 MHz SDIO PLL
-/// (`module_div: 2` → 100 MHz), a 50 MHz card clock, and the slot reporting 1.8 V
-/// support, which is what raises the frequency cap above 40 MHz.
+/// Take the **UHS-I** path: module clock from the 200 MHz SDIO PLL
+/// (`module_div: 2` → 100 MHz) and a 100 MHz card-clock request, with the slot
+/// reporting 1.8 V support.
+///
+/// The driver caps the request at **50 MHz** (legal High Speed at 3.3 V, measured
+/// working here) until the card has completed the CMD11 switch to 1.8 V, and only
+/// then allows 100 MHz (SDR50) — which its `freq_to_card_div` reaches with
+/// `card_div = 0`, i.e. by bypassing the divider, not by racing the module clock
+/// (`module_div: 1` never gets through init). One build therefore serves both a
+/// UHS-I card and a plain DS/HS one.
 ///
 /// Writes only work with the drive-clock-edge fix in `vendor/esp-hal-1.2.2/`
 /// (PERFORMANCE.md §5): with the vendored default drive edge the card rejects
