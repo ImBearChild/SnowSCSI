@@ -194,7 +194,13 @@ pub fn enable_sdio_pll() {
         });
 
     // Give the PLL time to power up and lock before the source is selected.
-    crate::rom::ets_delay_us(100);
+    //
+    // 10 ms, not the 100 us esp-idf uses: on a *cold* start the PLL has not been
+    // powered before, and if the module clock is not running yet the SDHOST
+    // produces no events at all -- a command issued then never completes and the
+    // driver waits for an interrupt that can never arrive (a hang that a warm
+    // reset hides, because the PLL is already locked by then).
+    crate::rom::ets_delay_us(10_000);
 }
 
 /// Switches the SD IO signalling rail (`LDO_VO4` → `VDDPST_5`/SD_VREF and the

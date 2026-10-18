@@ -711,19 +711,12 @@ impl EngineSession {
             w.card_number().bits(slot.index())
         });
 
-        // `volt_switch` (bit 28) is not modelled by the PAC and, per the P4
-        // register documentation, "must be set for CMD11 only": it makes the
-        // controller run the 1.8 V switch handshake that raises the VOLT_SW
-        // event. Set it before starting the command.
-        if index == 11 {
-            let p = r.cmd().as_ptr();
-            // `volt_switch` (bit 28) is not modelled by the PAC. It must be set
-            // on the *card* command: `update_clock_registers_only` (bit 21)
-            // belongs to the separate clock-update steps either side of it (see
-            // `cmd11_clock_update`) -- setting it here means "send no command",
-            // and the card then never answers CMD11.
-            unsafe { p.write_volatile(p.read_volatile() | (1 << 28)) };
-        }
+        // CMD11 (VOLTAGE_SWITCH) never reaches here: `Slot::send_command`
+        // routes it through [`cmd11_voltage_switch`], which sets `volt_switch`
+        // (bit 28) and writes the CMD register itself. A plain CMD11 *without*
+        // bit 28 (what this path would send) does not start the controller's
+        // voltage-switch handshake and leaves the card holding DAT low forever,
+        // so it is deliberately not supported.
         r.cmd().modify(|_, w| w.start_cmd().set_bit());
 
         wait_command_accepted()
@@ -1889,26 +1882,48 @@ impl<'d, const S: u8> Slot<'d, S, Async> {
             busy: <C::Resp<'a> as sdio::Response>::BUSY,
         };
         let crc = <C::Resp<'a> as sdio::Response>::CRC;
-        // esp-idf issues the clock-update half of the CMD11 sequence before the
-        // command itself (and again, with the rail switched, after it).
+        diag::set(&diag::LAST_CMD, C::INDEX as u32);
         if C::INDEX == 11 {
-            cmd11_clock_update(slot).map_err(MmcError::from)?;
+            info!("cmd11: sending (S18A was 1)");
         }
-        let words = session
-            .send_command_async(slot, C::INDEX, cmd.arg(), resp_len, crc, flags)
-            .await?;
+        diag::set(&diag::LAST_CMD_ARG, cmd.arg());
+        // A card that missed the first commands after a cold power-up leaves
+        // them unanswered; the spec has the host keep repeating identification,
+        // so retry a command that shows no response at all (a timeout means
+        // nothing was executed, which makes this safe for CMD0/8/55/41 -- unlike
+        // a CRC error, where the card did act).
+        let mut attempt = 0u8;
+        let words = loop {
+            match session
+                .send_command_async(slot, C::INDEX, cmd.arg(), resp_len, crc, flags)
+                .await
+            {
+                Ok(w) => break w,
+                Err(e)
+                    if attempt < 3
+                        && matches!(C::INDEX, 0 | 8 | 55 | 41)
+                        && matches!(e, Error::ResponseTimeout | Error::DataTimeout) =>
+                {
+                    attempt += 1;
+                    crate::rom::ets_delay_us(2_000);
+                }
+                Err(e) => return Err(MmcError::from(e)),
+            }
+        };
+        if attempt > 0 {
+            info!("cmd{} responded on retry {}", C::INDEX, attempt);
+        }
         // TEMP DIAG: ACMD41 carries S18R in the argument and S18A in the
         // response; CMD11's response says whether the card took the switch.
-        if C::INDEX == 41 || C::INDEX == 11 {
-            info!(
-                "cmd{} arg={=u32:#x} resp0={=u32:#x} resp1={=u32:#x} resp2={=u32:#x} resp3={=u32:#x}",
-                C::INDEX,
-                cmd.arg(),
-                words[0],
-                words[1],
-                words[2],
-                words[3]
-            );
+        info!(
+            "cmd{} arg={=u32:#x} resp0={=u32:#x}",
+            C::INDEX,
+            cmd.arg(),
+            words[0]
+        );
+        if C::INDEX == 41 {
+            diag::set(&diag::ACMD41_ARG, cmd.arg());
+            diag::set(&diag::ACMD41_RESP0, words[0]);
         }
         Ok(<C::Resp<'a> as sdio::Response>::from_words(&words))
     }
@@ -1925,37 +1940,32 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         C: sdio::ControlCommand + 'a,
     {
         let mut session = lock_engine(slot_id(S)).await?;
-        let resp = self.cmd_async(&mut session, cmd).await?;
 
-        // UHS-I: CMD11 (VOLTAGE_SWITCH) asks the card to move to 1.8 V
-        // signalling. Once the card has acknowledged it, move the host IO rail
-        // (LDO_VO4 / VDDPST_5) over too. Drop the engine guard first so the
-        // ~1 ms settling delay does not block it. (Approximates esp-idf's
-        // VOLT_SW interrupt handler.)
+        // UHS-I: CMD11 (VOLTAGE_SWITCH) is driven by the DesignWare
+        // `volt_switch` (CMD bit 28) hardware handshake, which the controller
+        // sequences through the VOLT_SW interrupt -- it raises no CDONE while
+        // `volt_switch` is set, so it cannot go through the generic command
+        // path above (`cmd_async` would wait for CDONE forever). See
+        // [`cmd11_voltage_switch`] for the full esp-idf port.
         #[cfg(esp32p4)]
-        if C::INDEX == 11 {
-            info!("sdmmc: cmd11 uhs={}", self.config.uhs_1v8);
-        }
         if C::INDEX == 11 && self.config.uhs_1v8 {
-            drop(session);
-            chip_specific::set_io_voltage_1v8();
-            // Tell the controller this slot now speaks 1.8 V -- esp-idf does the
-            // same from its CMD11 helper (`sdmmc_ll_enable_1v8_mode`). The PAC
-            // models only the `ddr` field of `UHS`, so `volt` (one bit per slot)
-            // takes a raw RMW.
-            let r = SDHOST::regs();
-            let bit = 1u32 << S;
-            r.uhs()
-                .modify(|rd, w| unsafe { w.bits(rd.bits() | bit) });
-            UHS_1V8_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
-            // esp-idf's `sdmmc_host_enable_clk_cmd11(slot, true)` is a clock
-            // update taken *together* with the rail switch.
-            let _ = cmd11_clock_update(slot_id(S));
-            // The card needs time to settle on the 1.8 V rail; esp-idf waits
-            // 10 ms here.
-            crate::rom::ets_delay_us(10_000);
+            let slot = slot_id(S);
+            let res = cmd11_voltage_switch(slot);
+            match &res {
+                Ok(_) => {
+                    UHS_1V8_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+                    diag::set(&diag::CMD11, 1);
+                }
+                Err(_) => {
+                    warn!("sdmmc: 1.8V voltage switch (CMD11) failed");
+                    diag::set(&diag::CMD11, 2);
+                }
+            }
+            let words = res.map_err(MmcError::from)?;
+            return Ok(<C::Resp<'a> as sdio::Response>::from_words(&words));
         }
 
+        let resp = self.cmd_async(&mut session, cmd).await?;
         Ok(resp)
     }
 
@@ -1973,6 +1983,18 @@ impl<'d, const S: u8> sdio::MmcBus for Slot<'d, S, Async> {
         let words = session
             .read_async(slot, C::INDEX, arg, cmd.buf(), bs, auto_stop)
             .await?;
+        // TEMP DIAG: CMD6 (SWITCH_FUNC) returns the 64-byte function status.
+        // Bytes 4..20 carry the per-group supported/selected fields; we print
+        // them raw so the SD spec layout (4.3.10.4) can be applied to the data.
+        if C::INDEX == 6 {
+            let d: &[u8] = cmd.buf();
+            diag::set(&diag::CMD6_FG1_SUPPORT, d[13] as u32);
+            diag::set(&diag::CMD6_FG1_SELECTED, d[16] as u32);
+            info!(
+                "cmd6 arg={=u32:#x} b4={} b5={} b6={} b7={} b8={} b9={} b10={} b11={} b12={} b13={} b14={} b15={} b16={} b17={} b18={} b19={}",
+                arg, d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19]
+            );
+        }
         Ok(<C::Resp<'a> as sdio::Response>::from_words(&words))
     }
 
@@ -2210,9 +2232,29 @@ fn connect_bidir(
 
 /// Spins up to `POLL_LIMIT` times until `ready` holds, else times out.
 fn poll_until(mut ready: impl FnMut() -> bool) -> Result<(), Error> {
+    // Time-bounded, and loud while it waits. The count bound alone can mean
+    // *minutes* of silence, which is indistinguishable from a dead boot: a cold
+    // start that lands here prints nothing at all and a late serial attach sees
+    // nothing. The heartbeat names the last command issued, so a stall is
+    // self-identifying on the UART and (after the failure) on the panel.
+    let start = Instant::now();
+    let mut last = start;
+    const LIMIT: Duration = Duration::from_millis(4_000);
+    const BEAT: Duration = Duration::from_millis(500);
     for _ in 0..POLL_LIMIT {
         if ready() {
             return Ok(());
+        }
+        if last.elapsed() > BEAT {
+            last = Instant::now();
+            warn!(
+                "sdmmc: poll stalled {} ms (last cmd {})",
+                start.elapsed().as_millis(),
+                diag::get(&diag::LAST_CMD)
+            );
+        }
+        if start.elapsed() > LIMIT {
+            break;
         }
     }
     Err(Error::Timeout)
@@ -2342,6 +2384,42 @@ fn read_response(resp_len: ResponseLen) -> [u32; 4] {
     }
 }
 
+/// Host-side UHS-I handshake state, for callers that want to show it (the P4
+/// example paints it on its panel). All zero until the first ACMD41.
+pub mod diag {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Argument and `resp0` of the last ACMD41. In the argument bit 24 is S18R
+    /// (1.8 V request) and bit 28 is XPC; in the response bit 31 is busy, bit 30
+    /// is CCS and **bit 24 is S18A** (1 = switch allowed). Only the response with
+    /// bit 31 set is meaningful (spec Figure 4-5).
+    pub static ACMD41_ARG: AtomicU32 = AtomicU32::new(0);
+    /// The matching `resp0` (bit 24 = S18A, bit 30 = CCS, bit 31 = busy).
+    pub static ACMD41_RESP0: AtomicU32 = AtomicU32::new(0);
+    /// CMD6 status bytes 13 (function group 1 supported) and 16 (group 1
+    /// selected): the supported bits advertising SDR50/SDR104/DDR50 say the card
+    /// is UHS-I capable; the selected value 1 means High Speed at 3.3 V.
+    pub static CMD6_FG1_SUPPORT: AtomicU32 = AtomicU32::new(0);
+    /// CMD6 status byte 16: the function group 1 value currently selected.
+    pub static CMD6_FG1_SELECTED: AtomicU32 = AtomicU32::new(0);
+    /// 1 once the CMD11 voltage-switch sequence ran on the host side.
+    pub static CMD11: AtomicU32 = AtomicU32::new(0);
+    /// Index of the last control command issued (paired with [`LAST_CMD_ARG`]):
+    /// a boot that stalls shows which command it stalled on.
+    pub static LAST_CMD: AtomicU32 = AtomicU32::new(0);
+    /// Argument of that command.
+    pub static LAST_CMD_ARG: AtomicU32 = AtomicU32::new(0);
+
+    /// Store a new value (relaxed: this is diagnostics).
+    pub(crate) fn set(reg: &AtomicU32, v: u32) {
+        reg.store(v, Ordering::Relaxed);
+    }
+    /// Read the current value.
+    pub fn get(reg: &AtomicU32) -> u32 {
+        reg.load(Ordering::Relaxed)
+    }
+}
+
 /// Set when the slot has completed the UHS-I CMD11 voltage switch, i.e. the bus
 /// really is at 1.8 V. Only then may the card clock go past the 3.3 V ceiling
 /// (50 MHz High Speed); 100 MHz is only in spec at 1.8 V.
@@ -2377,24 +2455,169 @@ fn map_rintsts(sts: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// esp-idf `sdmmc_host_clock_update_command(slot, is_cmd11 = true)`: push the
-/// clock registers into the card-clock domain and arm the voltage switch
-/// **without sending anything to the card** (CMD bit 21). The P4's CMD11
-/// handshake is sequenced with one of these on either side of the real command --
-/// esp-hal previously skipped them entirely.
-fn cmd11_clock_update(slot: SlotId) -> Result<(), Error> {
+/// `RINTSTS` bit 10: the DesignWare voltage-switch completion interrupt.
+///
+/// On the P4 it is aliased onto HTO (`SDMMC_INTMASK_VOLT_SW ==
+/// SDMMC_INTMASK_HTO`, per `soc/esp32p4/register/*/soc/sdmmc_reg.h`). While a
+/// `volt_switch` command runs the *controller* raises it -- never the card, and
+/// never CDONE.
+const EVT_VOLT_SW: u32 = EVT_HTO;
+
+// `CMD` register field bits that the PAC does not model.
+const CMD_CARD_NUMBER_SHIFT: u32 = 16;
+const CMD_WAIT_PRVDATA_COMPLETE: u32 = 1 << 13;
+const CMD_UPDATE_CLOCK_REGISTERS_ONLY: u32 = 1 << 21;
+const CMD_VOLT_SWITCH: u32 = 1 << 28;
+const CMD_USE_HOLD_REG: u32 = 1 << 29;
+const CMD_START: u32 = 1 << 31;
+// Modelled fields, spelled out for the raw writes below.
+const CMD_RESPONSE_EXPECT: u32 = 1 << 6;
+const CMD_CHECK_RESPONSE_CRC: u32 = 1 << 8;
+
+/// esp-idf `sdmmc_host_clock_update_command(slot, is_cmd11)`: push
+/// CLKDIV/CLKSRC/CLKENA into the card-clock domain **without sending anything
+/// to the card** (CMD bit 21). `volt_switch` (bit 28) turns it into one of the
+/// two clock-update steps of the 1.8 V handshake; esp-idf sets it on both and
+/// the controller will not complete the sequence without it.
+fn clock_update_command(slot: SlotId, volt_switch: bool) -> Result<(), Error> {
+    let mut bits = ((slot.index() as u32) << CMD_CARD_NUMBER_SHIFT)
+        | CMD_WAIT_PRVDATA_COMPLETE
+        | CMD_UPDATE_CLOCK_REGISTERS_ONLY
+        | CMD_USE_HOLD_REG
+        | CMD_START;
+    if volt_switch {
+        bits |= CMD_VOLT_SWITCH;
+    }
+
     let r = SDHOST::regs();
     r.cmdarg().write(|w| unsafe { w.bits(0) });
-    r.cmd().write(|w| unsafe {
-        w.update_clock_registers_only().set_bit();
-        w.wait_prvdata_complete().set_bit();
-        w.card_number().bits(slot.index());
-        w.start_cmd().set_bit()
-    });
-    // `volt_switch` (bit 28) is not modelled by the PAC.
-    let p = r.cmd().as_ptr();
-    unsafe { p.write_volatile(p.read_volatile() | (1 << 28)) };
+    r.cmd().write(|w| unsafe { w.bits(bits) });
     wait_command_accepted()
+}
+
+/// Waits for the voltage-switch completion interrupt (or a command error) and
+/// returns the full `rintsts` snapshot.
+fn wait_volt_sw(timeout: Duration) -> Result<u32, Error> {
+    let r = SDHOST::regs();
+    let start = Instant::now();
+    loop {
+        let sts = r.rintsts().read().bits();
+        if sts & (EVT_VOLT_SW | EVT_RTO | EVT_RCRC | EVT_RESP_ERR | EVT_HLE) != 0 {
+            return Ok(sts);
+        }
+        if start.elapsed() >= timeout {
+            return Err(Error::Timeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// The SD UHS-I 1.8 V voltage-switch sequence for CMD11, ported from esp-idf
+/// (`sd_host_slot_sdmmc_do_transaction` / `handle_voltage_switch_stage{1,2,3}`
+/// in `sd_trans_sdmmc.c`, with `handle_voltage_switch_stage{1,2,3}` in
+/// `sd_transaction.c` for v5.x). Linux `dw_mmc` and U-Boot `dw_mmc` implement
+/// the same controller dance.
+///
+/// The DesignWare controller drives the handshake, not the host:
+///
+/// 1. keep the card clock always on during the whole dance -- clear
+///    `CLKENA.LOW_PWR` and push it with a plain clock-update command (the
+///    low-power auto clock stop would otherwise fire mid-switch and confuse the
+///    card);
+/// 2. issue CMD11 with `volt_switch` (bit 28). The controller sends the command,
+///    captures the R1 and then raises the **VOLT_SW** interrupt (it never raises
+///    CDONE for a `volt_switch` command);
+/// 3. on VOLT_SW: stop the card clock (`cclk_enable = 0`, pushed with a
+///    **`volt_switch`** clock update), wait 100 us, move the SD IO rail (LDO_VO4
+///    / VDDPST_5) to 1.8 V, wait 10 ms for it to settle, then restart the clock
+///    (pushed with another **`volt_switch`** clock update);
+/// 4. on a second VOLT_SW: restore `CLKENA.LOW_PWR` with a plain clock update.
+///
+/// Completion is the pair of VOLT_SW interrupts, *not* `STATUS.data_busy`:
+/// esp-idf's CMD11 carries no `SCF_WAIT_BUSY` (the card's DAT-low is not the
+/// handshake's completion signal on this controller). `UHS.VOLT` is written for
+/// parity but is a documented no-op on the P4 -- the rail is the on-chip LDO.
+fn cmd11_voltage_switch(slot: SlotId) -> Result<[u32; 4], Error> {
+    let r = SDHOST::regs();
+    let idx = slot.index();
+    // The CLKENA fields are 2 bits wide (u8); UHS/VOLT is a raw u32 write.
+    let clk_mask = 1u8 << idx;
+    let bit = 1u32 << idx;
+
+    // Poll RINTSTS by hand: keep VOLT_SW out of INTMASK so the (card-detect) ISR
+    // cannot write-1-clear it before we observe it, and clear any stale copy.
+    r.intmask().write(|w| unsafe { w.bits(idle_intmask()) });
+    r.rintsts().write(|w| unsafe { w.bits(EVT_VOLT_SW) });
+    r.idinten().write(|w| unsafe { w.bits(0) });
+
+    // ── stage 1: clock always on (clear LOW_PWR) before CMD11 ────────────────
+    r.clkena().modify(|rd, w| unsafe {
+        w.lp_enable().bits(rd.lp_enable().bits() & !clk_mask)
+    });
+    clock_update_command(slot, false)?;
+    info!("cmd11: stage1 (clk always on)");
+
+    // ── CMD11 with volt_switch; the controller raises VOLT_SW, not CDONE ─────
+    let cmd11 = ((idx as u32) << CMD_CARD_NUMBER_SHIFT)
+        | 11
+        | CMD_RESPONSE_EXPECT
+        | CMD_CHECK_RESPONSE_CRC
+        | CMD_USE_HOLD_REG
+        | CMD_VOLT_SWITCH
+        | CMD_START;
+    r.cmdarg().write(|w| unsafe { w.bits(0) });
+    r.cmd().write(|w| unsafe { w.bits(cmd11) });
+    wait_command_accepted()?;
+
+    let t0 = Instant::now();
+    // The controller's CMD11 handshake is slow (Linux budgets ~130 ms before the
+    // interrupt), so allow a generous 1 s.
+    let sts = wait_volt_sw(Duration::from_millis(1_000))?;
+    map_rintsts(sts & !EVT_VOLT_SW)?;
+    let resp0 = r.resp0().read().bits();
+    info!(
+        "cmd11: volt_sw1 after {} us r1={=u32:#x}",
+        t0.elapsed().as_micros(),
+        resp0
+    );
+
+    // ── stage 2: stop clock, move the rail, restart the clock ───────────────
+    r.rintsts().write(|w| unsafe { w.bits(EVT_VOLT_SW) });
+    r.clkena().modify(|rd, w| unsafe {
+        w.cclk_enable().bits(rd.cclk_enable().bits() & !clk_mask)
+    });
+    clock_update_command(slot, true)?;
+    crate::rom::ets_delay_us(100);
+    chip_specific::set_io_voltage_1v8();
+    r.uhs().modify(|rd, w| unsafe { w.bits(rd.bits() & !bit) });
+    crate::rom::ets_delay_us(10_000);
+    r.clkena().modify(|rd, w| unsafe {
+        w.cclk_enable().bits(rd.cclk_enable().bits() | clk_mask)
+    });
+    clock_update_command(slot, true)?;
+    r.uhs().modify(|rd, w| unsafe { w.bits(rd.bits() | bit) });
+    info!("cmd11: stage2 (rail 1.8V, clock restarted)");
+
+    // ── stage 3: second VOLT_SW, then back to low-power clock gating ────────
+    let t1 = Instant::now();
+    let sts = wait_volt_sw(Duration::from_millis(1_000))?;
+    map_rintsts(sts & !EVT_VOLT_SW)?;
+    info!(
+        "cmd11: volt_sw2 after {} us (cclk_en={=u32:#x} lp_en={=u32:#x} dat_busy={})",
+        t1.elapsed().as_micros(),
+        r.clkena().read().cclk_enable().bits() as u32,
+        r.clkena().read().lp_enable().bits() as u32,
+        r.status().read().data_busy().bit_is_set()
+    );
+
+    r.rintsts().write(|w| unsafe { w.bits(EVT_VOLT_SW) });
+    r.clkena().modify(|rd, w| unsafe {
+        w.lp_enable().bits(rd.lp_enable().bits() | clk_mask)
+    });
+    clock_update_command(slot, false)?;
+    info!("cmd11: stage3 (1.8V switch complete)");
+
+    Ok([resp0, 0, 0, 0])
 }
 
 /// Polls DAT0 until the card releases the busy signal.
