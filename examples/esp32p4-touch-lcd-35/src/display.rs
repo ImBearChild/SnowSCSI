@@ -292,6 +292,48 @@ impl<'d> Display<'d> {
         let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
         let mut line = heapless::String::<32>::new();
 
+        // UHS-I handshake state, pinned to the bottom of the screen so it never
+        // fights the counters above and survives a band refresh. This is what
+        // makes a power-cycle test readable without a UART console.
+        {
+            use esp_hal::sdmmc::diag;
+            let style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
+            let mut l = heapless::String::<32>::new();
+
+            let a = diag::get(&diag::ACMD41_ARG);
+            let r = diag::get(&diag::ACMD41_RESP0);
+            let _ = write!(
+                l,
+                "UHS a18r={} s18a={} busy={}",
+                (a >> 24) & 1,
+                (r >> 24) & 1,
+                (r >> 31) & 1
+            );
+            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 60), style, Baseline::Top)
+                .draw(&mut self.panel);
+
+            l.clear();
+            let _ = write!(
+                l,
+                "FG1 {:02x}/{:02x} CMD11={}",
+                diag::get(&diag::CMD6_FG1_SUPPORT),
+                diag::get(&diag::CMD6_FG1_SELECTED),
+                diag::get(&diag::CMD11)
+            );
+            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 48), style, Baseline::Top)
+                .draw(&mut self.panel);
+
+            l.clear();
+            let _ = write!(
+                l,
+                "lastcmd {} arg={:08x}",
+                diag::get(&diag::LAST_CMD),
+                diag::get(&diag::LAST_CMD_ARG)
+            );
+            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 36), style, Baseline::Top)
+                .draw(&mut self.panel);
+        }
+
         // Title.
         let _ = write!(line, "ESP32-P4 DVD-RAM");
         draw_line(&mut self.panel, style, &line, 3);

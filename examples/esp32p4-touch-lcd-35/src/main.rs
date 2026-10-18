@@ -304,6 +304,7 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO40, // SD D1
         peripherals.GPIO41, // SD D2
         peripherals.GPIO42, // SD D3
+        peripherals.GPIO45, // TF slot VDD switch (transistor)
     )
     .await
     {

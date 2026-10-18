@@ -39,6 +39,7 @@ use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
 use embassy_futures::block_on;
 use embedded_hal_async::delay::DelayNs;
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::sdmmc::{ClockSource, Config as SdmmcConfig, SdHostController, Slot, SlotConfig};
 use esp_hal::time::Instant;
 use esp_hal::Async;
@@ -486,7 +487,33 @@ impl<'d: 'static> SdCard<'d> {
         d1: esp_hal::peripherals::GPIO40<'d>,
         d2: esp_hal::peripherals::GPIO41<'d>,
         d3: esp_hal::peripherals::GPIO42<'d>,
+        card_power: esp_hal::peripherals::GPIO45<'d>,
     ) -> Result<Self, SdError> {
+        // Power-cycle the TF slot before anything else. Its VDD is switched by a
+        // transistor on GPIO45. Per the SD spec a card that has been left in 1.8 V
+        // signalling *stays* there across CMD0 and even across a warm reset -- only
+        // a VDD cycle returns it to 3.3 V -- and our earlier forced-CMD11 attempts
+        // may well have latched this card. 50 ms either side is far more than the
+        // card needs.
+        {
+            // Flip these two if the card does not come up at all: a high-side
+            // P-MOSFET (gate pulled up) powers the card with the pin LOW, a
+            // low-side N-FET with the pin HIGH.
+            // Measured: this board's switch is active LOW (the first attempt
+            // with HIGH left the card unpowered -- timeout on every command).
+            const POWERED: Level = Level::Low;
+            const OFF: Level = Level::High;
+            let mut pwr = Output::new(card_power, OFF, OutputConfig::default());
+            let mut d = BusyDelay;
+            // 50 ms was not enough: the SD pull-ups (R37-R40, 10k to 3V3) feed
+            // the card through its IO clamp diodes, so a short VDD cut leaves it
+            // partially alive and it keeps its signalling state (S18A stayed 0).
+            // A physical removal -- which resets it -- cuts the leak path too.
+            d.delay_ms(500).await;
+            pwr.set_level(POWERED);
+            d.delay_ms(100).await;
+        }
+
         let host = HOST.init(
             SdHostController::new(sdhost, {
                 let mut cfg = SdmmcConfig::default();
