@@ -266,19 +266,17 @@ pub const SD_BLOCK_SIZE: usize = 512;
 /// clamp below the request (see [`SdCard::freq`]).
 const SD_BUS_FREQ_HZ: u32 = if SD_UHS_PLL { 50_000_000 } else { 40_000_000 };
 
-/// Reproduce the **UHS-I SDR25** configuration: the module clock from the
-/// 200 MHz SDIO PLL (`module_div: 2` → 100 MHz), a 50 MHz card clock, and the
-/// slot opting into the 1.8 V CMD11 switch.
+/// Take the 50 MHz **UHS-I SDR25** path: module clock from the 200 MHz SDIO PLL
+/// (`module_div: 2` → 100 MHz), a 50 MHz card clock, and the slot reporting 1.8 V
+/// support, which is what raises the frequency cap above 40 MHz.
 ///
-/// **Keep this `false`.** With the SDIO PLL as the module clock source — and
-/// only then — the card rejects every host→card write with a data CRC error,
-/// while reads run at full speed; the bus then wedges and needs a power cycle.
-/// It is a defect in the driver's PLL clock path, not signal integrity and not
-/// the card clock: it reproduces at 5 MHz as well as at 50 MHz, single and
-/// multi block, and disappears as soon as the default `Pll160m` source is used.
-/// PERFORMANCE.md §5 has the measurements, the register-level evidence and how
-/// to re-run them.
-const SD_UHS_PLL: bool = false;
+/// Writes only work with the drive-clock-edge fix in `vendor/esp-hal-1.2.2/`
+/// (PERFORMANCE.md §5): with the vendored default drive edge the card rejects
+/// every host→card write with a data CRC error at *any* card clock. 1.8 V itself
+/// is untested here — `sdio` issues CMD11 only for a card that advertises UHS-I
+/// and this one does not, so the bus stays at 3.3 V, where 50 MHz is legal High
+/// Speed. `false` falls back to the 40 MHz default clock source.
+const SD_UHS_PLL: bool = true;
 
 /// SD bring-up / access failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -373,6 +371,45 @@ async fn sd_selftest(
 ) {
     let pat = |i: usize, j: usize| ((i * 31 + j * 7) ^ 0x5a) as u8;
     let total_blocks = (capacity / SD_BLOCK_SIZE as u64) as u32;
+
+    // Read integrity first (a failed write wedges the bus and would hide it):
+    // two reads of the card's first 32 blocks, checksummed and compared.
+    let mut sum = [0u32; 2];
+    let mut ok = [false; 2];
+    for (k, s) in sum.iter_mut().enumerate() {
+        ok[k] = dev.read(0, &mut batch[..32]).await.is_ok();
+        if ok[k] {
+            for b in batch[..32].iter() {
+                for v in b.iter() {
+                    *s = s.wrapping_mul(31).wrapping_add(*v as u32);
+                }
+            }
+        }
+    }
+    // Bus-rate probe: reads are bus-limited here (14.3 MB/s at 40 MHz, 17.2 at
+    // 50 MHz), so the achieved rate reports the *actual* card clock.
+    let t0 = Instant::now();
+    let mut n = 0u32;
+    for i in 0..128u32 {
+        if dev.read(i * 32, &mut batch[..32]).await.is_ok() {
+            n += 1;
+        }
+    }
+    let us = t0.elapsed().as_micros().max(1) as u64;
+    esp_println::println!(
+        "SDTEST bus {} KiB in {} us = {} kB/s",
+        n * 16,
+        us,
+        n as u64 * 16384 * 1000 / us
+    );
+    esp_println::println!(
+        "SDTEST rd ok={}/{} sum={:x}/{:x} stable={}",
+        ok[0],
+        ok[1],
+        sum[0],
+        sum[1],
+        sum[0] == sum[1]
+    );
 
     for &n in &[1usize, BATCH_BLOCKS] {
         let base = total_blocks.saturating_sub(n as u32 + 64);

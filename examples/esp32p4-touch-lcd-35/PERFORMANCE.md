@@ -14,12 +14,12 @@ native xHCI; treat comparisons against native-host numbers accordingly.
 
 | What | Reading |
 |---|---|
-| End-to-end read | **8.8 MB/s** (UHS-I 50 MHz reads reach 9.5–9.8, but its SDIO PLL module clock breaks writes — §5) |
-| End-to-end write | **4.9 MB/s** |
+| End-to-end read | **9.7 MB/s** (50 MHz UHS-I SDR25; 8.8 at 40 MHz — §5) |
+| End-to-end write | **5.2 MB/s** (50 MHz; 4.9 at 40 MHz) |
 | USB IN ceiling (no SD, multi-packet) | 14.2 MB/s \* |
 | USB OUT ceiling (no SD) | 7.2 MB/s \* |
 | SD bus ceiling | 20 MB/s @ 40 MHz, 25 MB/s @ 50 MHz (theoretical) |
-| SD read while a command is in flight | 14.3 MB/s (16 KiB, 40 MHz; 17.2 at UHS-I 50 MHz, not landable — §5) |
+| SD read while a command is in flight | 14.3 MB/s @ 40 MHz, 18.0 @ 50 MHz (bus probe; §5) |
 | SD write while a command is in flight | 8.1 MB/s (16 KiB, 40 MHz) |
 
 \* measured with the 8 KiB-chunk configuration; the driver patch is unchanged,
@@ -242,63 +242,56 @@ on 8 KiB ones, i.e. roughly 350 µs of fixed cost per command. That is what make
 the command size — and so the work buffer and the read-ahead window (§7) —
 worth tuning.
 
-## 5. UHS-I 50 MHz is unusable: the SDIO PLL module clock breaks writes
+## 5. UHS-I 50 MHz: the driver's drive-clock edge was the whole story
 
-- The default clock chain lands at 40 MHz: `Pll160m` ÷ `module_div`(2) = 80 MHz
-  module, `card = module / (2·div)`, `div ≥ 1` ⇒ **40 MHz max**. That is 4-bit ×
-  40 MHz = 20 MB/s theoretical, best measured **14.3 MB/s while a command is in
-  flight** (~72 %).
+- The default clock chain lands at 40 MHz (`Pll160m` ÷ 2 = 80 MHz module,
+  `card = module / (2·div)`): 20 MB/s theoretical, **14.3 MB/s measured while a
+  command is in flight** (~72 %).
 - 50 MHz needs the module clock from the **200 MHz SDIO PLL**
-  (`ClockSource::SdioPll`, `module_div: 2` → 100 MHz → 50 MHz card). That is what
-  the vendored `esp-hal` implements (plus `LDO_VO4` → `VDDPST_5` for the CMD11
-  1.8 V switch, and input-delay tuning). **Reads work well there** — 17.2 MB/s in
-  flight, 9.5–9.8 MB/s end to end — **writes do not, and the whole bus wedges
-  afterwards.** So the example runs the default `Pll160m` source at 40 MHz and
-  `SD_UHS_PLL` in `src/sd.rs` is the reproduction switch.
-- The failure is a **data CRC error raised by the card against our data**
-  (`rintsts` bit 7 `DCRC`, `Error::DataCrc`), i.e. host→card data is wrong.
-  Measured with the boot self-test (`SDTEST`, no host involved):
+  (`ClockSource::SdioPll`, `module_div: 2` → 100 MHz → 50 MHz card). As vendored,
+  that path **corrupted every host→card write** — the card rejected the data with
+  a data CRC error (`rintsts` bit 7 `DCRC` → `Error::DataCrc`) while reads stayed
+  bit-perfect — and then wedged the bus for good (every later command
+  `ResponseTimeout`, the host loses the device, the board needs re-flashing).
+- **The cause was one register field**: `HP_SYS_CLKRST.peri_clk_ctrl02.
+  sdio_ls_drv_clk_edge_sel`, the **drive** (host→card) clock edge, hard-coded to
+  the `1` that esp-idf's `sdmmc_ll_init_phase_delay` uses. `0` is clean for both
+  clock sources; `1` lands the PLL-sourced data on the card's sampling edge. It is
+  exactly the asymmetry of the driver's tuning: `tune_bus` sweeps the **sample**
+  edge (input) and never the **drive** edge (output). The vendored
+  `vendor/esp-hal-1.2.2/src/sdmmc/esp32p4.rs` now programs `0`.
+- Isolation, one full boot + self-test per row (`SDTEST`, no host involved):
 
-  | module clock | card clock | 1-block write (CMD24) | 32-block write (CMD25) |
-  |---|---|---|---|
-  | `SdioPll` 100 MHz | 50 MHz | `Crc` | `Crc` |
-  | `SdioPll` 100 MHz | 5 MHz | `Crc` | `Crc` |
-  | `Pll160m` 80 MHz | 40 MHz | **OK, read-back diff=0** | **OK, read-back diff=0** |
+  | module clock | card clock | drive edge | 1-block | 32-block | read-back | bus rate |
+  |---|---|---|---|---|---|---|
+  | `Pll160m` 80 MHz | 40 MHz | 1 | OK | OK | diff=0 | 15.0 MB/s |
+  | `SdioPll` 100 MHz | 5 MHz | 1 | `Crc` | `Crc` | n/a | 2.3 MB/s |
+  | `SdioPll` 100 MHz | 50 MHz | 1 | `Crc` | `Crc` | n/a | 18.0 MB/s |
+  | `SdioPll` 100 MHz | 50 MHz | **0** | **OK** | **OK** | **diff=0** | 18.0 MB/s |
+  | `Pll160m` 80 MHz | 40 MHz | **0** | **OK** | **OK** | **diff=0** | 15.0 MB/s |
 
-  It follows the module-clock **source** exactly, so it is *not* the card clock
-  (5 MHz fails identically), *not* 1.8 V (the card never leaves 3.3 V here —
-  `supports_1v8()` requires the PLL and `sdio` skips CMD11 when the card does not
-  advertise UHS-I; the driver's `cmd11` log line never appears), and *not*
-  multi-block framing. The data really does not land: the read-back differs in
-  ~16 KiB of 16 KiB, because the card discards the block on a CRC error.
-- **After the first failed write the bus wedges**: every later command reports
-  `ResponseTimeout`, the host eventually resets the port, and the medium stays
-  absent until the board is re-flashed. `esp-hal` never resyncs the bus after a
-  data error — that half is worth fixing on its own.
-- Ruled out on hardware: `SDHOST.UHS.VOLT` (the per-slot 1.8 V signalling bit
-  esp-idf sets from its CMD11 helper; unmodelled by the PAC, so it takes a raw
-  RMW) — no effect; `ref_clk_ctrl2.ref_160m_clk_en` before the source select — no
-  effect; tuning — `tune_bus` runs and every tap reports `good=true`; the PLL
-  power-up — it matches esp-idf's `sdmmc_ll_enable_sdio_pll` bit for bit.
-- Prime suspect for the driver author: the PLL-sourced `cclk_in` reaching the
-  SDHOST data path. Because the corruption does **not** scale with the card clock,
-  look at what runs on the **module** clock — FIFO/DMA thresholds,
-  `cardthrctl`, or a phase/edge setting that is only valid for the 160 MHz
-  source. This driver never touches `clk_edge_sel`/`enshift`; `HP_SYS_CLKRST` gets
-  `sdio_ls_drv_clk_edge_sel = 1` once and `sdio_ls_sam_clk_edge_sel` (input only).
-- **SDR50 (100 MHz) is unreachable anyway**, and not because of the card or
-  tuning: the *same* 50 MHz card clock runs from a 100 MHz module clock
-  (`module_div: 2`) but hangs from the undivided 200 MHz one (`module_div: 1`,
-  the `sdio_hs_mode` bypass). With `card = module / (2 · div)` there is no route
-  to 100 MHz. Separately: an unsatisfiable `set_slot_bus` request is accepted
-  (`cap` is just the module clock) and then hangs in clock setup, silently.
-- Also worth the driver author's attention: **50 MHz is legal High Speed at
-  3.3 V**; the cap could be raised for non-UHS slots once the write path is
-  trusted.
-
-Summary: UHS-I buys ~+10 % end to end on reads, but it cannot be landed while the
-SDIO PLL module clock corrupts writes. Beyond 50 MHz there is also the
-`div == 1` module-clock bypass to fix.
+  The 5 MHz row is the important one: it is *not* frequency (the divider works —
+  2.3 MB/s is what a 5 MHz card clock predicts), *not* 1.8 V (this card never
+  advertises UHS-I, so `sdio` skips CMD11 and the bus stays at 3.3 V), and *not*
+  multi-block framing. A register dump agrees: for the same request the failing
+  and working runs differ **only** in `peri_clk_ctrl01` bit 23
+  (`sdio_ls_clk_src_sel`) and the divider arithmetic — `peri_clk_ctrl02`, the
+  SDHOST timing registers and the achieved bus rate are identical.
+- At 50 MHz end to end: **read 9.7 MB/s** (8.8 at 40 MHz), **write 5.2 MB/s**
+  (4.9), a 40 MiB read and a 32 MiB write with **zero SD errors**, and an 8 MiB
+  write that reads back byte-identical, twice.
+- Two things a driver-level follow-up should really fix: the drive edge is now a
+  constant that happens to work at both of our operating points — the honest fix
+  is a *drive*-side calibration (a write/read-back sweep, the mirror of
+  `tune_bus`); and `SlotConfig::uhs_1v8` couples two unrelated things, raising the
+  frequency cap above 40 MHz *and* opting into the 1.8 V CMD11 switch. This card
+  does not advertise UHS-I, so the switch never runs and 50 MHz happens at 3.3 V
+  (legal High Speed); with a UHS-I card the rail would switch and the write path
+  would be untested again.
+- SDR50 (100 MHz) is still out of reach: the same 50 MHz card clock runs from a
+  100 MHz module clock (`module_div: 2`) but hangs from the undivided 200 MHz one
+  (`module_div: 1`, the `sdio_hs_mode` bypass), and with `card = module / (2·div)`
+  there is then no route to 100 MHz.
 
 ## 6. The write-ahead receive must be bounded by its budget
 
@@ -460,10 +453,11 @@ at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
 |---|---|---|---|
 | `WORK_LEN` | `src/drive.rs` | `MIN_DATA_LEN * 2` (16 KiB) | chunk = SD command size; §6 is why 8 KiB used to be needed |
 | `BATCH_BLOCKS` | `src/sd.rs` | 32 (16 KiB) | descriptor-ring maximum |
-| `SD_BUS_FREQ_HZ` | `src/sd.rs` | 40 MHz | ceiling of the default `Pll160m` module clock; §5 |
-| `SD_UHS_PLL` | `src/sd.rs` | `false` | the 50 MHz UHS-I repro switch (default source + 1.8 V); **breaks writes**, §5 |
+| `SD_BUS_FREQ_HZ` | `src/sd.rs` | 50 MHz | needs the SDIO PLL module clock; 40 MHz is the `Pll160m` ceiling, §5 |
+| `SD_UHS_PLL` | `src/sd.rs` | `true` | take the 50 MHz UHS-I SDR25 path; fall back to 40 MHz with `false` |
+| SDMMC drive clock edge | vendor `esp-hal` | `0` | esp-idf's `1` corrupts host→card writes from the PLL source, §5 |
 | `SD_SELFTEST` | `src/sd.rs` | `true` | boot write/read self-test at the card's end — needs no host |
-| `clock_source` / `module_div` | vendor `esp-hal` | `Pll160m` (default) | `SdioPll` is the broken path; `module_div: 1` hangs (§5) |
+| `clock_source` / `module_div` | `src/sd.rs` | `SdioPll` / 2 | 200 MHz PLL → 100 MHz module → 50 MHz card; `module_div: 1` hangs (§5) |
 | batch alignment | `src/sd.rs` | `#[repr(align(64))]` | P4 cached internal RAM / IDMAC |
 | `bulk_in_transfer_bytes` | `src/main.rs` | 2560 (5 packets) | OTG HS FIFO budget (896 words) |
 | `ep_out_buffer` | `src/main.rs` | 1024 | EP0 (64) + bulk OUT (512) |
