@@ -102,15 +102,25 @@ pub fn set_module_clock(source: ClockSource, div: u8) {
         });
     }
 
-    // Enable the drive (output), sample (input) and self (core) clocks with
-    // their default edge phases (drive=1, sample=0, self=0). Without these the
-    // controller never drives the card clock out, so commands never complete.
-    // Mirrors esp-idf `sdmmc_ll_init_phase_delay`.
+    // Enable the drive (output), sample (input) and self (core) clocks. Without
+    // these the controller never drives the card clock out, so commands never
+    // complete.
+    //
+    // The **drive** edge is 0, not the 1 esp-idf's `sdmmc_ll_init_phase_delay`
+    // uses: with 1 and the module clock taken from the SDIO PLL (`ClockSource::
+    // SdioPll`) the card rejects every host->card write with a data CRC error
+    // (the DCRC bit), while reads are bit-perfect -- at *any* card clock
+    // (measured at 5, 25 and 50 MHz), single and multi block, with every other
+    // register identical to a working configuration. 0 works for both clock
+    // sources (PLL_F160M at 40 MHz and SDIO PLL at 50 MHz) on this part; a
+    // proper fix is a *drive*-side calibration analogue to `tune_bus` (which
+    // only sweeps the sample edge). See examples/esp32p4-touch-lcd-35/
+    // PERFORMANCE.md section 5.
     c.peri_clk_ctrl02().modify(|_, w| unsafe {
         w.sdio_ls_drv_clk_en().set_bit();
         w.sdio_ls_sam_clk_en().set_bit();
         w.sdio_ls_slf_clk_en().set_bit();
-        w.sdio_ls_drv_clk_edge_sel().bits(1);
+        w.sdio_ls_drv_clk_edge_sel().bits(0);
         w.sdio_ls_sam_clk_edge_sel().bits(0);
         w.sdio_ls_slf_clk_edge_sel().bits(0)
     });
