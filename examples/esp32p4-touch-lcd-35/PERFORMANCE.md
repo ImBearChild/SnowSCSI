@@ -14,7 +14,7 @@ native xHCI; treat comparisons against native-host numbers accordingly.
 
 | What | Reading |
 |---|---|
-| End-to-end read | **9.5–9.8 MB/s** (UHS-I SDR25; 8.8 at 40 MHz / 3.3 V) |
+| End-to-end read | **8.8 MB/s** (UHS-I SDR25 reads reach 9.5-9.8 but hang writes — §5) |
 | End-to-end write | **4.9 MB/s** |
 | USB IN ceiling (no SD, multi-packet) | 14.2 MB/s \* |
 | USB OUT ceiling (no SD) | 7.2 MB/s \* |
@@ -255,11 +255,24 @@ worth tuning.
   is available **only on slot 0** (which this board uses).
 - The vendored `esp-hal` in `vendor/esp-hal-1.2.2/` **does** implement
   `supports_1v8()`, the CMD11 voltage switch (`set_io_voltage_1v8` drives
-  `LDO_VO4` → `VDDPST_5`), the 200 MHz SDIO PLL and input-delay tuning. On this
-  board that works: **UHS-I SDR25 (50 MHz, 4-bit at 1.8 V) initialises and runs
-  the bus at 17.2 MB/s while a command is in flight (+20 % over 40 MHz), which
-  is +8–11 % end to end** (8.8 → 9.5–9.8 MB/s). The efficiency is unchanged
-  (17.2 of the 25 MB/s SDR25 payload rate, 69 %).
+  `LDO_VO4` → `VDDPST_5`), the 200 MHz SDIO PLL and input-delay tuning, and on
+  this board **reads** work at UHS-I SDR25 (50 MHz, 1.8 V): the SD bus then runs
+  at 17.2 MB/s while a command is in flight (+20 % over 40 MHz), +8–11 % end to
+  end (8.8 → 9.5–9.8 MB/s), with unchanged efficiency (17.2 of SDR25's 25 MB/s).
+- **But writes hang under UHS**, reproducibly, so the example stays at 40 MHz.
+  Fresh flash, same card, same test (3 x `dd if=<8 MiB file> of=/dev/sr0 bs=1M
+  count=8 oflag=direct`):
+
+  | config | writes | integrity |
+  |---|---|---|
+  | 50 MHz, UHS-I SDR25 | first write hangs (~120 s timeout), then every later I/O fails until the MCU is re-flashed | n/a |
+  | 40 MHz, 3.3 V | 3/3 pass, ~1–2 s each | byte-identical read-back |
+
+  The MCU does not reset (its counters survive); the *gadget* is reset by the
+  host after the timeout, re-enumerates, and the host then reports the medium as
+  absent until the board is re-flashed. Reads are unaffected. The 1.8 V write
+  path is the suspect — write timing (host-driven DAT0) and the card's busy
+  signalling at 1.8 V/50 MHz are the parts reads do not exercise.
 - **SDR50 (100 MHz) does not work**, and not because of the card or the tuning.
   A controlled pair isolates it: the *same* 50 MHz card clock runs fine from a
   100 MHz module clock (`ClockSource::SdioPll`, `module_div: 2`) but hangs when

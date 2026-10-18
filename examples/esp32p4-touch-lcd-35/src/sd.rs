@@ -39,7 +39,7 @@ use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
 use embassy_futures::block_on;
 use embedded_hal_async::delay::DelayNs;
-use esp_hal::sdmmc::{ClockSource, Config as SdmmcConfig, SdHostController, Slot, SlotConfig};
+use esp_hal::sdmmc::{Config as SdmmcConfig, SdHostController, Slot, SlotConfig};
 use esp_hal::time::Instant;
 use esp_hal::Async;
 use static_cell::StaticCell;
@@ -235,7 +235,7 @@ pub const SD_BLOCK_SIZE: usize = 512;
 /// on-board slot is wired for SDIO 3.0. `sdio` may still clamp below this value
 /// (see [`SdCard::freq`]); fall back to a lower rate only after verifying 4-bit
 /// signal integrity on the vendor pins if transfers corrupt.
-const SD_BUS_FREQ_HZ: u32 = 50_000_000;
+const SD_BUS_FREQ_HZ: u32 = 40_000_000;
 
 /// SD bring-up / access failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -349,20 +349,11 @@ impl<'d: 'static> SdCard<'d> {
         d3: esp_hal::peripherals::GPIO42<'d>,
     ) -> Result<Self, SdError> {
         let host = HOST.init(
-            SdHostController::new(sdhost, {
-                let mut cfg = SdmmcConfig::default();
-                cfg.clock_source = ClockSource::SdioPll;
-                cfg.module_div = 2;
-                cfg
-            }).map_err(|_| SdError::HostInit)?,
+            SdHostController::new(sdhost, SdmmcConfig::default()).map_err(|_| SdError::HostInit)?,
         );
 
         let slot = host
-            .slot::<0>({
-                let mut cfg = SlotConfig::default();
-                cfg.uhs_1v8 = true;
-                cfg
-            })
+            .slot::<0>(SlotConfig::default())
             .map_err(|_| SdError::SlotInit)?
             .with_clk(clk)
             .with_cmd(cmd)
