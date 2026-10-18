@@ -477,8 +477,9 @@ impl<'d: 'static> SdCard<'d> {
     /// Slot 0 on the ESP32-P4 uses the **fixed IO_MUX pads**, so these GPIO
     /// numbers are mandated by the silicon (CLK=43, CMD=44, D0..D3=39..42) and
     /// cannot be remapped. The `with_*` calls therefore always compile for this
-    /// slot. The sdmmc driver powers the SD IO rail through on-chip LDO4 itself;
-    /// no board-side power/rail setup is required here.
+    /// slot. Before anything else the card is power-cycled in-firmware
+    /// (Q1 on GPIO45 + the LDO_VO4 pull-up rail, see the block below), so it
+    /// always comes up cold in 3.3 V signalling.
     pub async fn new(
         sdhost: esp_hal::peripherals::SDHOST<'d>,
         clk: esp_hal::peripherals::GPIO43<'d>,
@@ -489,29 +490,44 @@ impl<'d: 'static> SdCard<'d> {
         d3: esp_hal::peripherals::GPIO42<'d>,
         card_power: esp_hal::peripherals::GPIO45<'d>,
     ) -> Result<Self, SdError> {
-        // Power-cycle the TF slot before anything else. Its VDD is switched by a
-        // transistor on GPIO45. Per the SD spec a card that has been left in 1.8 V
-        // signalling *stays* there across CMD0 and even across a warm reset -- only
-        // a VDD cycle returns it to 3.3 V -- and our earlier forced-CMD11 attempts
-        // may well have latched this card. 50 ms either side is far more than the
-        // card needs.
+        // ── Card clean-slate power cycle at boot ───────────────────────────
+        //
+        // A card left in 1.8 V signalling keeps that latch across CMD0 and a
+        // warm reset; only a real VDD cycle returns it to 3.3 V. Cutting Q1
+        // (GPIO45 high) *alone* never does: the 51 k bus pull-ups, fed by
+        // LDO_VO4 (the SD IO rail), back-feed the card through its IO clamp
+        // diodes -- measured: the card still answered every command after a
+        // 120 s Q1-only cut with the lines held low. Cutting the pull-up rail
+        // together with Q1 removes that feed. 100 ms is enough because at
+        // boot the card is still in its power-up activity (mA-level draw),
+        // so its own consumption empties C7+C8 (10 uF) inside the window --
+        // no bleeder resistor needed. (A card deep in standby would leak
+        // only sub-uA and would need minutes; this sequence is deliberately
+        // the first thing `new` does.)
+        //
+        // Restore order matters: LDO_VO4 first (the slot-0 pads are powered
+        // from it and the pull-ups must settle the lines), then Q1. The card
+        // then cold-boots: the bring-up's ACMD41 shows `bit24 = 1` (S18A=1,
+        // a cold card) and CMD11 runs. See `__SD_UHS_HANDOFF.md` §2.
         {
-            // Flip these two if the card does not come up at all: a high-side
-            // P-MOSFET (gate pulled up) powers the card with the pin LOW, a
-            // low-side N-FET with the pin HIGH.
-            // Measured: this board's switch is active LOW (the first attempt
-            // with HIGH left the card unpowered -- timeout on every command).
+            // High = off, Low = powered (confirmed twice: leaving the pin High
+            // fails SD init, and the long-standing firmware leaves it Low and
+            // works).
             const POWERED: Level = Level::Low;
             const OFF: Level = Level::High;
-            let mut pwr = Output::new(card_power, OFF, OutputConfig::default());
+            let mut pwr = Output::new(card_power, POWERED, OutputConfig::default());
             let mut d = BusyDelay;
-            // 50 ms was not enough: the SD pull-ups (R37-R40, 10k to 3V3) feed
-            // the card through its IO clamp diodes, so a short VDD cut leaves it
-            // partially alive and it keeps its signalling state (S18A stayed 0).
-            // A physical removal -- which resets it -- cuts the leak path too.
-            d.delay_ms(500).await;
+
+            defmt::info!("Resetting SD");
+            pwr.set_level(OFF);
+            esp_hal::sdmmc::set_io_power(false);
+            d.delay_ms(100).await;
+            // Restore: IO rail first (the slot-0 pads need it), then the card.
+            esp_hal::sdmmc::set_io_power(true);
+            d.delay_ms(100).await;
             pwr.set_level(POWERED);
             d.delay_ms(100).await;
+            defmt::info!("Resetting DONE");
         }
 
         let host = HOST.init(

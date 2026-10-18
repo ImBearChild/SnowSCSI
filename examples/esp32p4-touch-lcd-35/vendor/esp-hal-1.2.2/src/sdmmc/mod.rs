@@ -72,6 +72,21 @@ use crate::{
 #[cfg_attr(esp32s31, path = "esp32s31.rs")]
 mod chip_specific;
 
+/// Enables or removes power from the SD IO rail on the ESP32-P4 (`LDO_VO4` ->
+/// `VDDPST_5`/SD_VREF). See [`chip_specific::set_io_power`].
+#[cfg(esp32p4)]
+pub use chip_specific::set_io_power;
+
+/// Drives (or releases) the ESP32-P4 slot-0 SD lines as GPIO outputs, for a
+/// board-side card power cycle. See [`chip_specific::set_slot0_lines_low`].
+#[cfg(esp32p4)]
+pub use chip_specific::set_slot0_lines_low;
+
+/// Samples the released ESP32-P4 slot-0 SD lines (see
+/// [`chip_specific::probe_slot0_lines`]).
+#[cfg(esp32p4)]
+pub use chip_specific::probe_slot0_lines;
+
 #[cfg(any(soc_internal_memory_cached, dma_can_access_psram))]
 mod bounce;
 

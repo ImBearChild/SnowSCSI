@@ -237,3 +237,114 @@ pub fn set_io_voltage_3v3() {
         w._0p2a_tieh_1().set_bit() // tie to the 3.3 V rail
     });
 }
+
+/// Enables or removes power from the SD IO rail (`LDO_VO4` -> `VDDPST_5`).
+///
+/// On boards that tie the SD DAT/CMD pull-ups to this rail (the Waveshare P4
+/// boards do) this also unpowers them. That matters for a **software card
+/// power cycle**: cutting the card's own VDD switch while the rail stays up
+/// leaves the card back-fed through its IO clamp diodes -- it stays partially
+/// alive and keeps its 1.8 V signalling latch. With the rail down too the card
+/// truly loses VDD and returns to 3.3 V.
+///
+/// `true` re-runs the [`chip_setup`] bring-up (inrush limit, 3.3 V tie, enable,
+/// settle), so the rail comes back exactly as at boot.
+pub fn set_io_power(enabled: bool) {
+    let pmu = crate::peripherals::PMU::regs();
+    if enabled {
+        chip_setup();
+    } else {
+        pmu.ext_ldo_p1_0p2a()
+            .modify(|_, w| w._0p2a_xpd_1().clear_bit());
+    }
+}
+
+/// Drives (or releases) the ESP32-P4 slot-0 SD bus lines as plain GPIO outputs.
+///
+/// The SD Physical Layer spec's power-up/down rule has the host hold CMD and
+/// DAT (and CLK) low while the card's VDD is removed. Without that the board
+/// pull-ups keep the signal lines high and the card is powered through its IO
+/// protection diodes -- so a "power cycle" that only cuts VDD never actually
+/// removes power (measured here: 20 s with VDD cut and the IO rail off still
+/// left the card's 1.8 V signalling latch set).
+///
+/// Slot 0's pads are fixed by the IO_MUX: CLK = GPIO43, CMD = GPIO44,
+/// D0..D3 = GPIO39..42. Any later `Slot::with_*` re-routes them to the SDMMC
+/// function, so this is only meaningful before the controller claims them.
+pub fn set_slot0_lines_low(low: bool) {
+    use crate::gpio::AnyPin;
+
+    let mut high = 0u32;
+    for n in [43u8, 44, 39, 40, 41, 42] {
+        // SAFETY: at the only call site (a board-init power cycle) the slot-0
+        // pads have not been handed to the SDMMC controller yet.
+        let pin = unsafe { AnyPin::steal(n) };
+        if low {
+            pin.init_gpio();
+            pin.set_output_high(false);
+            pin.set_output_enable(true);
+            // Read the pad back so a failure to actually drive it is visible.
+            pin.set_input_enable(true);
+            if pin.is_input_high() {
+                high |= 1 << (n % 32);
+            }
+        } else {
+            pin.set_output_enable(false);
+        }
+    }
+    if low {
+        info!("sdmmc: slot0 lines driven low, pad-high mask={=u32:#x}", high);
+    }
+}
+
+/// Samples the slot-0 bus lines while they are released (`Hi-Z`).
+///
+/// Meant to be called between `set_slot0_lines_low(true)` and the final
+/// release, i.e. while the card's VDD is cut: the board's 51 kΩ pull-ups to
+/// `VDDPST_5` try to pull each line high, but the card's IO clamp diodes cap
+/// them at `V_card + Vf`, so the returned pattern follows the card-VDD node
+/// once it has fallen about a diode drop below the IO rail. It is a coarse,
+/// uncalibrated sensor (the digital input threshold sits near 2.5 V with a
+/// 3.3 V IO rail), not a voltmeter.
+///
+/// Bit 0 = CLK(43), 1 = CMD(44), 2 = D0(39), 3 = D1(40), 4 = D2(41),
+/// 5 = D3(42); a set bit means the line read high.
+///
+/// The lines are released for a few tens of microseconds only: the clamp
+/// current is ~30 µA, which over that window injects ~0.3 nC into the 10.1 µF
+/// card-VDD node (~30 µV), so the probe does not perturb the decay it measures.
+pub fn probe_slot0_lines() -> u8 {
+    use crate::gpio::{AnyPin, InputConfig, Pull};
+    use embedded_hal::delay::DelayNs as _;
+
+    const PINS: [u8; 6] = [43, 44, 39, 40, 41, 42];
+
+    for n in PINS {
+        // SAFETY: same contract as `set_slot0_lines_low` -- the caller owns the
+        // slot-0 pads at this point (they have not been handed to SDMMC yet).
+        let pin = unsafe { AnyPin::steal(n) };
+        pin.apply_input_config(&InputConfig::default().with_pull(Pull::Up));
+        pin.set_input_enable(true);
+        pin.set_output_enable(false);
+    }
+
+    let mut delay = crate::delay::Delay;
+    delay.delay_us(50);
+
+    let mut bits = 0u8;
+    for (i, n) in PINS.into_iter().enumerate() {
+        let pin = unsafe { AnyPin::steal(n) };
+        if pin.is_input_high() {
+            bits |= 1 << i;
+        }
+    }
+
+    for n in PINS {
+        let pin = unsafe { AnyPin::steal(n) };
+        pin.set_output_high(false);
+        pin.set_output_enable(true);
+        pin.apply_input_config(&InputConfig::default());
+    }
+
+    bits
+}

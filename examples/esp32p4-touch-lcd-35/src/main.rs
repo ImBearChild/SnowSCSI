@@ -64,6 +64,11 @@ use esp_println as _;
 mod display;
 mod drive;
 mod msc;
+// The PMIC power-cycle path is superseded: `sd::SdCard::new` now cycles the
+// card in-firmware (Q1 + LDO_VO4 dual cut), so every init starts from a cold
+// card. Kept as a reference fallback (`src/pmic.rs`).
+#[allow(dead_code)]
+mod pmic;
 mod sd;
 
 // Creates the app descriptor required by the ESP-IDF bootloader.
@@ -295,6 +300,28 @@ async fn main(_spawner: Spawner) -> ! {
         display.boot_stage("BOOT 2/5 SD");
     }
 
+    // ── AXP2101 PMIC (I2C: SDA = GPIO7, SCL = GPIO8) — DISABLED ──────────
+    //
+    // Superseded: `sd::SdCard::new` power-cycles the card in-firmware (Q1 +
+    // LDO_VO4 dual cut) before every init, so the card always comes up cold
+    // and no board reboot is needed. Kept as a reference fallback; un-
+    // comment together with `mod pmic;`'s uses below if a card ever comes up
+    // latched anyway.
+    /*
+    let mut pmic = pmic::Pmic::new(peripherals.I2C0, peripherals.GPIO7, peripherals.GPIO8);
+    if let Some(p) = pmic.as_mut() {
+        match p.ic_type() {
+            Ok(id) => {
+                let st = p.status1().unwrap_or(0xff);
+                esp_println::println!("PMIC: axp2101 ic_type=0x{:02x} status1=0x{:02x}", id, st);
+            }
+            Err(_) => esp_println::println!("PMIC: no AXP2101 answer at 0x34 (SDA=7 SCL=8)"),
+        }
+    } else {
+        esp_println::println!("PMIC: i2c init failed");
+    }
+    */
+
     // ── SD card over SDMMC slot 0 (fixed IO_MUX pins, up to 40 MHz) ──────
     let mut card = match sd::SdCard::new(
         peripherals.SDHOST,
@@ -327,6 +354,38 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
     };
+    // ── Latched-card whole-board power cycle (PMIC) — DISABLED ───────────
+    //
+    // A UHS-I card answers S18A=0 across a warm reset because it is still
+    // latched in 1.8 V signalling; CMD11 is then skipped and the bus stays at
+    // 3.3 V/SDR25. The AXP2101 software restart below is a genuine power
+    // cycle for both the board and the card (card VDD comes off the PMIC's
+    // DCDC1).
+    //
+    // Disabled: superseded by the in-firmware Q1 + LDO_VO4 power cycle in
+    // `sd::SdCard::new` (the card comes up cold every boot, so `S18A=0`
+    // should never be observed; treat it as the tripwire that re-arms this
+    // fallback if that ever changes).
+    /*
+    {
+        use esp_hal::sdmmc::diag;
+        let s18a = diag::get(&diag::ACMD41_RESP0) & 0x0100_0000 != 0;
+        let fg1 = diag::get(&diag::CMD6_FG1_SUPPORT);
+        if !s18a && fg1 & 0b1_1100 != 0 {
+            esp_println::println!(
+                "PMIC: latched UHS-I card (S18A=0, FG1=0x{:02x}) -> board power cycle",
+                fg1
+            );
+            if let Some(p) = pmic.as_mut() {
+                let _ = p.restart();
+            }
+            // If the restart does not take, fall through at 50 MHz rather than
+            // spinning here.
+            Timer::after(Duration::from_secs(3)).await;
+        }
+    }
+    */
+
     info!("SD card ready: {} bytes", card.capacity_bytes());
     let sd_bytes = Some(card.capacity_bytes());
     if let Some(display) = display.as_mut() {
