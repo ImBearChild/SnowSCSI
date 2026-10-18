@@ -39,7 +39,7 @@ use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
 use embassy_futures::block_on;
 use embedded_hal_async::delay::DelayNs;
-use esp_hal::sdmmc::{Config as SdmmcConfig, SdHostController, Slot, SlotConfig};
+use esp_hal::sdmmc::{ClockSource, Config as SdmmcConfig, SdHostController, Slot, SlotConfig};
 use esp_hal::time::Instant;
 use esp_hal::Async;
 use static_cell::StaticCell;
@@ -84,6 +84,36 @@ pub static WRITE_NS: AtomicU32 = AtomicU32::new(0);
 
 /// Microseconds of [`WRITE_NS`] spent inside the SD multi-block command.
 pub static WRITE_SD_NS: AtomicU32 = AtomicU32::new(0);
+
+/// SD commands that the card/driver rejected, per direction (diagnostics: a
+/// non-zero value here is the root of any host-visible medium error).
+pub static SD_RD_ERRORS: AtomicU32 = AtomicU32::new(0);
+pub static SD_WR_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Short tag for the `sdio` error a failed transfer returned.
+///
+/// `sdio`'s `MmcError` is `#[non_exhaustive]` and its `defmt::Format` is off in
+/// this build, so the variant is spelled out here (and the `Card`/`Sdio`
+/// payloads are surfaced separately by [`err_tag`]'s callers when needed).
+pub fn err_tag(e: &sdio::MmcError) -> &'static str {
+    use sdio::MmcError as M;
+    match e {
+        M::Timeout => "Timeout",
+        M::Crc => "Crc",
+        M::Busy => "Busy",
+        M::Io => "Io",
+        M::BlockSize => "BlockSize",
+        M::Signaling => "Signaling",
+        M::BusWidth => "BusWidth",
+        M::Voltage => "Voltage",
+        M::CardType => "CardType",
+        M::Unsupported => "Unsupported",
+        M::Card(_) => "Card",
+        M::Sdio(_) => "Sdio",
+        M::Other => "Other",
+        _ => "Unknown",
+    }
+}
 
 /// One refresh window of SD-layer counters, for the status panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,12 +260,25 @@ pub const SD_BLOCK_SIZE: usize = 512;
 ///
 /// Card initialization always runs at 400 kHz internally (`sdio`'s `INIT_FREQ`);
 /// this value is the *operating* clock selected once the card is identified.
-/// 40 MHz is the **cap** for the ESP32-P4 SDMMC peripheral — `sdio`'s
-/// `MmcBus::supports_frequency()` for this SoC rejects anything higher, and the
-/// on-board slot is wired for SDIO 3.0. `sdio` may still clamp below this value
-/// (see [`SdCard::freq`]); fall back to a lower rate only after verifying 4-bit
-/// signal integrity on the vendor pins if transfers corrupt.
-const SD_BUS_FREQ_HZ: u32 = 40_000_000;
+/// 40 MHz is the ceiling the default `Pll160m` module source can produce here
+/// (module clock 80 MHz, `card = module / (2 * div)`); 50 MHz needs the SDIO PLL
+/// module clock, which breaks writes (see [`SD_UHS_PLL`]). `sdio` may still
+/// clamp below the request (see [`SdCard::freq`]).
+const SD_BUS_FREQ_HZ: u32 = if SD_UHS_PLL { 50_000_000 } else { 40_000_000 };
+
+/// Reproduce the **UHS-I SDR25** configuration: the module clock from the
+/// 200 MHz SDIO PLL (`module_div: 2` → 100 MHz), a 50 MHz card clock, and the
+/// slot opting into the 1.8 V CMD11 switch.
+///
+/// **Keep this `false`.** With the SDIO PLL as the module clock source — and
+/// only then — the card rejects every host→card write with a data CRC error,
+/// while reads run at full speed; the bus then wedges and needs a power cycle.
+/// It is a defect in the driver's PLL clock path, not signal integrity and not
+/// the card clock: it reproduces at 5 MHz as well as at 50 MHz, single and
+/// multi block, and disappears as soon as the default `Pll160m` source is used.
+/// PERFORMANCE.md §5 has the measurements, the register-level evidence and how
+/// to re-run them.
+const SD_UHS_PLL: bool = false;
 
 /// SD bring-up / access failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -311,6 +354,57 @@ impl DelayNs for BusyDelay {
     }
 }
 
+/// Boot-time SD write/read self-test, run before the medium is exposed.
+///
+/// Diagnostic for the write path (it is the only code that exercises CMD25
+/// without a host): writes `BATCH_BLOCKS` blocks of a pattern to the **last**
+/// 32 KiB of the card, reads them back and reports the differing byte count.
+/// The DVD-RAM image never reaches that offset, so it is safe to run.
+const SD_SELFTEST: bool = true;
+
+/// See [`SD_SELFTEST`]. Prints one `SDTEST` line per phase over UART.
+///
+/// The single-block (CMD24) phase runs first so its result is not polluted by a
+/// failed multi-block (CMD25) transfer, which may leave the card mid-stream.
+async fn sd_selftest(
+    dev: &mut sdio::BlockDevice<sdio::sd::Card, Slot<'_, 0, Async>, BusyDelay, SD_BLOCK_SIZE>,
+    batch: &mut [Aligned<A4, [u8; SD_BLOCK_SIZE]>],
+    capacity: u64,
+) {
+    let pat = |i: usize, j: usize| ((i * 31 + j * 7) ^ 0x5a) as u8;
+    let total_blocks = (capacity / SD_BLOCK_SIZE as u64) as u32;
+
+    for &n in &[1usize, BATCH_BLOCKS] {
+        let base = total_blocks.saturating_sub(n as u32 + 64);
+        for (i, b) in batch[..n].iter_mut().enumerate() {
+            for (j, v) in b.iter_mut().enumerate() {
+                *v = pat(i, j);
+            }
+        }
+        match dev.write(base, &batch[..n]).await {
+            Ok(()) => esp_println::println!("SDTEST n={} write OK", n),
+            Err(e) => esp_println::println!("SDTEST n={} write ERR {}", n, err_tag(&e)),
+        }
+        for b in batch[..n].iter_mut() {
+            b.fill(0);
+        }
+        match dev.read(base, &mut batch[..n]).await {
+            Ok(()) => {
+                let mut diff = 0u32;
+                for (i, b) in batch[..n].iter().enumerate() {
+                    for (j, v) in b.iter().enumerate() {
+                        if *v != pat(i, j) {
+                            diff += 1;
+                        }
+                    }
+                }
+                esp_println::println!("SDTEST n={} read OK diff={}", n, diff);
+            }
+            Err(e) => esp_println::println!("SDTEST n={} read ERR {}", n, err_tag(&e)),
+        }
+    }
+}
+
 /// An initialized SD card presented as a byte-addressed plane.
 ///
 /// The embedded `sdio::BlockDevice` owns the async SD bus; `batch` is the
@@ -349,11 +443,23 @@ impl<'d: 'static> SdCard<'d> {
         d3: esp_hal::peripherals::GPIO42<'d>,
     ) -> Result<Self, SdError> {
         let host = HOST.init(
-            SdHostController::new(sdhost, SdmmcConfig::default()).map_err(|_| SdError::HostInit)?,
+            SdHostController::new(sdhost, {
+                let mut cfg = SdmmcConfig::default();
+                if SD_UHS_PLL {
+                    cfg.clock_source = ClockSource::SdioPll;
+                    cfg.module_div = 2;
+                }
+                cfg
+            })
+            .map_err(|_| SdError::HostInit)?,
         );
 
         let slot = host
-            .slot::<0>(SlotConfig::default())
+            .slot::<0>({
+                let mut cfg = SlotConfig::default();
+                cfg.uhs_1v8 = SD_UHS_PLL;
+                cfg
+            })
             .map_err(|_| SdError::SlotInit)?
             .with_clk(clk)
             .with_cmd(cmd)
@@ -375,13 +481,19 @@ impl<'d: 'static> SdCard<'d> {
         // here and cached; `capacity()`/`capacity_bytes()` are `&self`.
         let capacity = block_on(dev.size()).map_err(|_| SdError::CardInit)?;
 
+        let batch = &mut BATCH
+            .init(Batch(
+                [const { Aligned([0u8; SD_BLOCK_SIZE]) }; BATCH_BLOCKS],
+            ))
+            .0;
+
+        if SD_SELFTEST {
+            sd_selftest(&mut dev, batch, capacity).await;
+        }
+
         Ok(Self {
             dev,
-            batch: &mut BATCH
-                .init(Batch(
-                    [const { Aligned([0u8; SD_BLOCK_SIZE]) }; BATCH_BLOCKS],
-                ))
-                .0,
+            batch,
             capacity,
             cache_off: 0,
             cache_len: 0,
@@ -473,9 +585,17 @@ impl SdCard<'_> {
                 cache_len,
             } = self;
             let t_sd = Instant::now();
-            dev.read(block as u32, &mut batch[..k])
-                .await
-                .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+            if let Err(e) = dev.read(block as u32, &mut batch[..k]).await {
+                SD_RD_ERRORS.fetch_add(1, Ordering::Relaxed);
+                esp_println::println!(
+                    "SD READ ERR block={} blocks={} err={} total={}",
+                    block,
+                    k,
+                    err_tag(&e),
+                    SD_RD_ERRORS.load(Ordering::Relaxed)
+                );
+                return Err(StorageError::Io(embedded_io::ErrorKind::Other));
+            }
             READ_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
             CARD_CMDS.fetch_add(1, Ordering::Relaxed);
             CARD_READ_BYTES.fetch_add((k * SD_BLOCK_SIZE) as u32, Ordering::Relaxed);
@@ -542,9 +662,17 @@ impl SdCard<'_> {
                     batch[i].copy_from_slice(&buf[start..start + SD_BLOCK_SIZE]);
                 }
                 let t_sd = Instant::now();
-                dev.write(block, &batch[..k])
-                    .await
-                    .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+                if let Err(e) = dev.write(block, &batch[..k]).await {
+                    SD_WR_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    esp_println::println!(
+                        "SD WRITE ERR block={} blocks={} err={} total={}",
+                        block,
+                        k,
+                        err_tag(&e),
+                        SD_WR_ERRORS.load(Ordering::Relaxed)
+                    );
+                    return Err(StorageError::Io(embedded_io::ErrorKind::Other));
+                }
                 WRITE_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
                 let consumed = k * SD_BLOCK_SIZE;
                 pos += consumed as u64;
@@ -553,14 +681,28 @@ impl SdCard<'_> {
                 // Partial head/tail: read-modify-write the containing block,
                 // preserving the untouched bytes.
                 let n = core::cmp::min(SD_BLOCK_SIZE - within, remaining);
-                dev.read(block, &mut batch[..1])
-                    .await
-                    .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+                if let Err(e) = dev.read(block, &mut batch[..1]).await {
+                    SD_RD_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    esp_println::println!(
+                        "SD RMW READ ERR block={} err={} total={}",
+                        block,
+                        err_tag(&e),
+                        SD_RD_ERRORS.load(Ordering::Relaxed)
+                    );
+                    return Err(StorageError::Io(embedded_io::ErrorKind::Other));
+                }
                 batch[0][within..within + n].copy_from_slice(&buf[done..done + n]);
                 let t_sd = Instant::now();
-                dev.write(block, &batch[..1])
-                    .await
-                    .map_err(|_| StorageError::Io(embedded_io::ErrorKind::Other))?;
+                if let Err(e) = dev.write(block, &batch[..1]).await {
+                    SD_WR_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    esp_println::println!(
+                        "SD RMW WRITE ERR block={} err={} total={}",
+                        block,
+                        err_tag(&e),
+                        SD_WR_ERRORS.load(Ordering::Relaxed)
+                    );
+                    return Err(StorageError::Io(embedded_io::ErrorKind::Other));
+                }
                 WRITE_SD_NS.fetch_add(t_sd.elapsed().as_micros() as u32, Ordering::Relaxed);
 
                 pos += n as u64;
