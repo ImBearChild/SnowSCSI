@@ -18,12 +18,15 @@ use snowscsi::core::storage::{
 };
 use snowscsi::core::{
     cons, decide_eject, At, BoundaryPermit, BoundaryReject, Change, CommandContext, CommandPermit,
-    Completion, Cons, DataPlan, Delivery, Device, Direction, Effect, EjectOrigin, Fault, Feedback,
-    Here, InterruptReason, KnownEffects, LongInfo, LongPhase, Lu, LuImpl, Nil, NoMedium, Pair,
-    PollStep, RemovalLocks, RunEnd, RunOutcome, SlotSet, Spc, StaticTarget, Target,
-    INTERNAL_FAILURE, MEDIUM_NOT_PRESENT, MEDIUM_REMOVAL_PREVENTED, WRITE_ERROR,
+    Completion, Cons, Control, DataPlan, Delivery, Device, Direction, DriveStep, Effect,
+    EjectOrigin, Fault, Feedback, Here, InterruptReason, KnownEffects, LongInfo, LongPhase, Lu,
+    LuImpl, Nil, NoMedium, Pair, PollStep, RemovalLocks, RunEnd, RunOutcome, SlotSet, Spc,
+    StaticTarget, Target, ABORTED_COMMAND, INTERNAL_FAILURE, MEDIUM_NOT_PRESENT,
+    MEDIUM_REMOVAL_PREVENTED, WRITE_ERROR,
 };
 use snowscsi::mmc::{DvdRamMedium, FlatCdMedium, MmcDrive};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
@@ -155,6 +158,17 @@ fn ctx() -> CommandContext {
     CommandContext {
         lun: 0,
         lun_count: 1,
+        host_bytes: 0,
+        host_direction: Direction::None,
+    }
+}
+
+/// Command context for a multi-slot runtime LUN (`Target::drive_start_rt`
+/// refills `lun_count` from `slot_count()`).
+fn ctx_at(lun: u64) -> CommandContext {
+    CommandContext {
+        lun,
+        lun_count: 2,
         host_bytes: 0,
         host_direction: Direction::None,
     }
@@ -702,8 +716,38 @@ fn runtime_force_remove_sets_the_result_barrier_until_take() {
 // The block/MMC profiles cannot fail `commit`/`install_medium` on demand, so
 // the failure rows are driven through a test-local `Device` double. It is
 // used only through `Target`/`LuImpl`; nothing here is public API. Every hook
-// is counted so a fixture can observe the real transaction steps (commit called
-// once, one detach, two installs, …) instead of inferring them.
+// is counted and recorded in call order so a fixture can observe the real
+// transaction steps (commit called once, one detach, two installs, …) and their
+// order instead of inferring them.
+
+/// One management hook observed by [`ScriptedDevice`], in call order. Order
+/// matters for the design (`03 §3.6`): a host eject is commit → detach, a force
+/// is interrupt → detach, and Abort never detaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hook {
+    Interrupt,
+    Commit,
+    Take,
+    Install,
+}
+
+/// Shared hook log for devices that a fixture cannot reach after construction.
+///
+/// A runtime array target (`[&mut dyn Lu; N]`) does not implement [`At`], so
+/// the two-slot fixtures cannot read `device_ref()` once the target owns the
+/// slots. A `Spy` handle is cloned before construction and records the same
+/// hooks (`interrupt`, `take_medium`) the static fixtures read from the device.
+#[derive(Default)]
+struct Spy {
+    interrupts: Cell<u32>,
+    events: RefCell<Vec<Hook>>,
+}
+
+impl Spy {
+    fn events(&self) -> std::cell::Ref<'_, Vec<Hook>> {
+        self.events.borrow()
+    }
+}
 
 /// Scripted `Device` double with a settable commit result, an install-failure
 /// budget and a settable detach/settlement failure.
@@ -721,6 +765,15 @@ struct ScriptedDevice {
     commits: u32,
     installs: u32,
     takes: u32,
+    /// `interrupt` calls observed (the force/abort settlement path).
+    interrupts: u32,
+    /// Call order of the management hooks, for the order-sensitive fixtures.
+    events: Vec<Hook>,
+    /// `poll` completes on its first step instead of using the `Idle` model
+    /// fallback (a command that must be stepped to `Good` and clears `active`).
+    completes: bool,
+    /// Optional shared log for fixtures that cannot reach the device afterwards.
+    spy: Option<Rc<Spy>>,
 }
 
 impl ScriptedDevice {
@@ -735,6 +788,36 @@ impl ScriptedDevice {
             commits: 0,
             installs: 0,
             takes: 0,
+            interrupts: 0,
+            events: Vec::new(),
+            completes: false,
+            spy: None,
+        }
+    }
+
+    /// A ready device whose hooks are also recorded in `spy`.
+    fn spied(spy: Rc<Spy>) -> Self {
+        Self {
+            spy: Some(spy),
+            ..Self::ready()
+        }
+    }
+
+    /// A spied device whose command completes on its first step.
+    fn completing(spy: Rc<Spy>) -> Self {
+        Self {
+            completes: true,
+            ..Self::spied(spy)
+        }
+    }
+
+    /// Record `hook` in the shared spy, if this device has one.
+    fn spy_hook(&self, hook: Hook) {
+        if let Some(spy) = &self.spy {
+            if hook == Hook::Interrupt {
+                spy.interrupts.set(spy.interrupts.get().saturating_add(1));
+            }
+            spy.events.borrow_mut().push(hook);
         }
     }
 
@@ -794,6 +877,12 @@ impl Device for ScriptedDevice {
         _feedback: Feedback,
         _data: &'a mut [u8],
     ) -> PollStep<'a> {
+        if self.completes {
+            // No data phase: the first step completes and the device stops
+            // being active (a real profile clears its query/operation).
+            self.active = false;
+            return PollStep::Complete(Completion::Good);
+        }
         PollStep::Idle
     }
 
@@ -816,6 +905,9 @@ impl Device for ScriptedDevice {
         _reason: InterruptReason,
         _known: KnownEffects,
     ) -> Result<(), Fault> {
+        self.interrupts = self.interrupts.saturating_add(1);
+        self.events.push(Hook::Interrupt);
+        self.spy_hook(Hook::Interrupt);
         self.active = false;
         match self.interrupt_fault {
             Some(fault) => Err(fault),
@@ -827,11 +919,14 @@ impl Device for ScriptedDevice {
 
     fn commit(&mut self, _permit: &BoundaryPermit) -> Result<(), Completion> {
         self.commits = self.commits.saturating_add(1);
+        self.events.push(Hook::Commit);
         self.commit_result
     }
 
     fn take_medium(&mut self, _permit: &BoundaryPermit) -> Option<NoMedium> {
         self.takes = self.takes.saturating_add(1);
+        self.events.push(Hook::Take);
+        self.spy_hook(Hook::Take);
         if self.takes >= self.take_medium_fails_at {
             return None;
         }
@@ -844,6 +939,7 @@ impl Device for ScriptedDevice {
         medium: NoMedium,
     ) -> Result<(), (NoMedium, Fault)> {
         self.installs = self.installs.saturating_add(1);
+        self.events.push(Hook::Install);
         if self.install_faults > 0 {
             self.install_faults -= 1;
             // An install failure is a known failure but **not** a commit
@@ -1379,4 +1475,557 @@ fn a_force_that_cannot_settle_ends_the_service_with_needs_recovery() {
         target.take_static_at::<Here>(0),
         Err(BoundaryReject::NothingToTake)
     );
+}
+
+// ── Multi-LUN deferred force ───────────────────────────────────────────────
+// `Runner::force_pending` used to be a single LUN. A force that arrived while
+// another LUN held the global host-eject handback barrier was therefore lost:
+// the `take` that cleared the barrier only continued the *same* LUN, leaving
+// the deferred slot installed with no result. The deferred mask is per LUN
+// (bounded to 64, `Fault::Contract` above), and a take releases one deferred
+// force at a time because `await_take` is a single global handback.
+
+/// §4.10 force row: a force deferred behind a barrier on **another** LUN is
+/// released by the take that clears that barrier, and its pair is handed back
+/// exactly once.
+#[test]
+fn a_take_releases_a_force_deferred_on_another_lun() {
+    let mut slots = [
+        LuImpl::new(ScriptedDevice::ready(), 7u8),
+        LuImpl::new(ScriptedDevice::ready(), 8u8),
+    ];
+    let [slot0, slot1] = &mut slots;
+    let table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 2] = [slot0, slot1];
+    let mut target = Target::new(table);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+
+    // LUN 0 publishes the global `await_take` handback barrier.
+    target.host_eject_succeeded_rt(0).expect("host eject");
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+    assert!(!target.snapshot_rt(0).expect("slot").ready);
+
+    // The force on LUN 1 is accepted but deferred: the barrier belongs to LUN 0.
+    assert_eq!(target.force_remove_rt(1, &mut storage, &mut host), Ok(()));
+    assert!(
+        target.snapshot_rt(1).expect("slot").ready,
+        "deferred: LUN 1 is still installed"
+    );
+    assert_eq!(target.take_rt(1), Err(BoundaryReject::NothingToTake));
+
+    // The take that clears the barrier must also complete the LUN 1 force.
+    let ejected = target.take_rt(0).expect("ejected pair");
+    assert_eq!(ejected.pair, Some(pair_none(7)));
+    assert!(
+        !target.snapshot_rt(1).expect("slot").ready,
+        "the deferred force detached LUN 1"
+    );
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 1 });
+
+    let forced = target.take_rt(1).expect("forced pair");
+    assert_eq!(
+        forced.pair,
+        Some(pair_none(8)),
+        "the forced pair, exactly once"
+    );
+    assert_eq!(forced.local, Ok(()));
+    assert_eq!(forced.delivery, Delivery::NotApplicable);
+    assert!(!forced.effects.sync_durable, "force claims no durability");
+    assert_eq!(target.take_rt(1), Err(BoundaryReject::NothingToTake));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+/// §4.10 force row: two forces deferred on different LUNs are both accepted
+/// (not `Fault::Contract`) and are released one handback at a time, because the
+/// runner publishes at most one `ResourcesReady` before the next `take`.
+#[test]
+fn two_deferred_forces_are_released_one_handback_at_a_time() {
+    let mut slots = [
+        LuImpl::new(ScriptedDevice::ready(), 7u8),
+        LuImpl::new(ScriptedDevice::ready(), 8u8),
+        LuImpl::new(ScriptedDevice::ready(), 9u8),
+    ];
+    let [slot0, slot1, slot2] = &mut slots;
+    let table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 3] = [slot0, slot1, slot2];
+    let mut target = Target::new(table);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+
+    target.host_eject_succeeded_rt(0).expect("host eject");
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+
+    // Both forces are accepted and deferred behind the LUN 0 barrier; the
+    // second one must not be a `Contract` reject.
+    assert_eq!(target.force_remove_rt(1, &mut storage, &mut host), Ok(()));
+    assert_eq!(target.force_remove_rt(2, &mut storage, &mut host), Ok(()));
+    assert!(target.snapshot_rt(1).expect("slot").ready);
+    assert!(target.snapshot_rt(2).expect("slot").ready);
+
+    // First take: releases exactly one deferred handback (lowest LUN).
+    let first = target.take_rt(0).expect("ejected pair");
+    assert_eq!(first.pair, Some(pair_none(7)));
+    assert!(!target.snapshot_rt(1).expect("slot").ready);
+    assert!(
+        target.snapshot_rt(2).expect("slot").ready,
+        "only one handback may be pending"
+    );
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 1 });
+
+    // Taking the LUN 1 result releases the LUN 2 force.
+    let second = target.take_rt(1).expect("forced pair");
+    assert_eq!(second.pair, Some(pair_none(8)));
+    assert!(!target.snapshot_rt(2).expect("slot").ready);
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 2 });
+
+    let third = target.take_rt(2).expect("forced pair");
+    assert_eq!(third.pair, Some(pair_none(9)));
+    assert_eq!(target.take_rt(2), Err(BoundaryReject::NothingToTake));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+// ── Multi-LUN force settlement ─────────────────────────────────────────────
+// `drive_state` is target-global, but a command belongs to exactly one slot.
+// A force aimed at LUN 1 while LUN 0 runs must neither interrupt LUN 1 (which
+// owns nothing) nor clear the LUN 0 command it does not own: LUN 0 would stay
+// `active()` with no state left to step (`step_command` → `Fault::Contract`),
+// and a later force would detach a device that was never settled.
+
+/// §3.3 immediate-cancel / §4.10 force row: forcing an idle LUN while another
+/// LUN runs detaches only the addressed slot and leaves the running command
+/// untouched and steppable.
+#[test]
+fn a_force_on_one_lun_leaves_the_active_command_on_another_lun_alone() {
+    let spy0 = Rc::new(Spy::default());
+    let spy1 = Rc::new(Spy::default());
+    let mut slots = [
+        LuImpl::new(ScriptedDevice::completing(Rc::clone(&spy0)), 7u8),
+        LuImpl::new(ScriptedDevice::spied(Rc::clone(&spy1)), 8u8),
+    ];
+    let [slot0, slot1] = &mut slots;
+    let table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 2] = [slot0, slot1];
+    let mut target = Target::new(table);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+    let mut work = [0u8; 128];
+    let mut scratch = [0u8; 64];
+
+    // LUN 0 owns the one live command (`drive_state.ctx.lun == 0`); no slot has
+    // a resident result.
+    assert_eq!(
+        target.drive_start_rt(0, ctx_at(0), &[0x12, 0, 0, 0, 0, 0]),
+        Ok(())
+    );
+    assert!(!target.snapshot_rt(0).expect("slot 0").boundary);
+    assert!(target.snapshot_rt(1).expect("slot 1").boundary);
+
+    // Forcing the idle LUN 1 detaches it; it must not interrupt its idle device
+    // and must not settle the LUN 0 command it does not own.
+    assert_eq!(target.force_remove_rt(1, &mut storage, &mut host), Ok(()));
+    assert!(!target.snapshot_rt(1).expect("slot 1").ready);
+    assert_eq!(spy1.events().as_slice(), [Hook::Take].as_slice());
+    assert_eq!(spy1.interrupts.get(), 0, "LUN 1 owned no command");
+    assert_eq!(spy0.interrupts.get(), 0, "LUN 0's command was not settled");
+    assert!(spy0.events().is_empty(), "force never touched LUN 0");
+    assert!(
+        !target.snapshot_rt(0).expect("slot 0").boundary,
+        "the LUN 0 command is still live"
+    );
+
+    // …and it still completes normally instead of a `Contract` fault.
+    assert_eq!(
+        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Good))
+    );
+    assert!(target.snapshot_rt(0).expect("slot 0").boundary);
+    assert!(spy0.events().is_empty());
+
+    // The forced LUN 1 pair is handed back exactly once.
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 1 });
+    let forced = target.take_rt(1).expect("forced pair");
+    assert_eq!(forced.pair, Some(pair_none(8)));
+    assert_eq!(target.take_rt(1), Err(BoundaryReject::NothingToTake));
+
+    // LUN 0 is idle again and can be forced itself.
+    assert_eq!(target.force_remove_rt(0, &mut storage, &mut host), Ok(()));
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+    let old = target.take_rt(0).expect("forced pair");
+    assert_eq!(old.pair, Some(pair_none(7)));
+    assert_eq!(target.take_rt(0), Err(BoundaryReject::NothingToTake));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+/// §4.10 deferred force row, second trigger: repeating a force for a LUN whose
+/// result is resident used to re-settle the *global* `drive_state`, i.e. the
+/// command another LUN owns. The repeat may only re-arm the deferral.
+#[test]
+fn a_repeated_deferred_force_does_not_settle_a_command_on_another_lun() {
+    let spy0 = Rc::new(Spy::default());
+    let spy1 = Rc::new(Spy::default());
+    let mut slots = [
+        LuImpl::new(ScriptedDevice::completing(Rc::clone(&spy0)), 7u8),
+        LuImpl::new(ScriptedDevice::spied(Rc::clone(&spy1)), 8u8),
+    ];
+    let [slot0, slot1] = &mut slots;
+    let table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 2] = [slot0, slot1];
+    let mut target = Target::new(table);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+    let mut work = [0u8; 128];
+    let mut scratch = [0u8; 64];
+
+    // LUN 1 holds its old pair (8) as a resident result after a Replace; 9 is
+    // the current pair.
+    assert_eq!(target.propose_rt(1, Change::Replace(pair_none(9))), Ok(()));
+    assert_eq!(target.advance_rt(1), Ok(()));
+    assert!(target.snapshot_rt(1).expect("slot 1").ready);
+
+    // A command now runs on LUN 0 and owns the global `drive_state`.
+    assert_eq!(
+        target.drive_start_rt(0, ctx_at(0), &[0x12, 0, 0, 0, 0, 0]),
+        Ok(())
+    );
+
+    // The force on LUN 1 is deferred behind its resident result; the repeat
+    // must not settle the LUN 0 command that the global state belongs to.
+    assert_eq!(target.force_remove_rt(1, &mut storage, &mut host), Ok(()));
+    assert_eq!(target.force_remove_rt(1, &mut storage, &mut host), Ok(()));
+    assert!(
+        target.snapshot_rt(1).expect("slot 1").ready,
+        "still deferred: the result must be taken first"
+    );
+    assert_eq!(spy1.interrupts.get(), 0, "LUN 1 owns no command");
+    assert_eq!(spy0.interrupts.get(), 0, "LUN 0's command was not settled");
+    assert!(spy0.events().is_empty(), "force never touched LUN 0");
+    assert!(
+        !target.snapshot_rt(0).expect("slot 0").boundary,
+        "the LUN 0 command is still live"
+    );
+
+    // LUN 0 still completes normally.
+    assert_eq!(
+        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Good))
+    );
+
+    // The take that clears the barrier releases the deferred LUN 1 force once.
+    let old = target.take_rt(1).expect("old pair");
+    assert_eq!(old.pair, Some(pair_none(8)));
+    assert!(!target.snapshot_rt(1).expect("slot 1").ready);
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 1 });
+    let forced = target.take_rt(1).expect("forced pair");
+    assert_eq!(forced.pair, Some(pair_none(9)));
+    assert_eq!(target.take_rt(1), Err(BoundaryReject::NothingToTake));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(spy1.interrupts.get(), 0);
+    assert_eq!(spy0.interrupts.get(), 0);
+}
+
+// ── Host eject full chain ──────────────────────────────────────────────────
+
+/// Host eject with no locks — local commit, detach/result, status and
+/// `ResourcesReady`; the old pair is taken once, the slot is empty, and
+/// installing the returned pair restores service (empty reentry).
+#[test]
+fn host_eject_commits_detaches_and_the_returned_pair_restores_service() {
+    let mut target = script_target(ScriptedDevice::ready(), 7);
+
+    assert_eq!(target.host_eject_succeeded_static::<Here>(), Ok(()));
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.commits, 1, "local commit ran");
+    assert_eq!(device.takes, 1, "the pair was detached");
+    assert_eq!(device.installs, 0);
+    // The fixed host-eject order (`03 §3.6`): local commit, then detach.
+    assert_eq!(device.events, [Hook::Commit, Hook::Take]);
+    assert!(slot0(&target).has_result());
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+
+    let info = target.snapshot_static::<Here>();
+    assert!(!info.ready, "the slot is empty after the eject");
+    assert!(!info.is_locked(), "no locks were set");
+    assert_eq!(slot0(&target).backing_ref(), None);
+
+    let result = target.take_static_at::<Here>(0).expect("ejected pair");
+    assert_eq!(result.pair, Some(pair_none(7)), "the old pair, once");
+    assert_eq!(result.local, Ok(()));
+    // The result was produced before the status was sent (§3.6 order).
+    assert_eq!(result.delivery, Delivery::Pending);
+    assert_eq!(result.effects, KnownEffects::NONE);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(slot0(&target).device_ref().commits, 1);
+
+    // Empty reentry: the returned pair installs back and commands are admitted
+    // again (the scripted device answers the model fallback, not
+    // `MEDIUM NOT PRESENT`).
+    assert_eq!(target.install_static::<Here>(pair_none(7)), Ok(()));
+    assert!(target.snapshot_static::<Here>().ready);
+    assert!(slot0(&target).device_ref().medium.is_some());
+    assert_eq!(
+        slot0(&target).device_ref().events,
+        [Hook::Commit, Hook::Take, Hook::Install],
+        "empty reentry installs the returned pair after the commit/detach"
+    );
+    let mut work = [0u8; 128];
+    let mut scratch = [0u8; 64];
+    assert_eq!(tur(&mut target, &mut work, &mut scratch), Completion::Busy);
+}
+
+/// Host eject with normal + persistent PREVENT set still succeeds, clears
+/// normal, keeps persistent and hands the pair back once.
+#[test]
+fn host_eject_with_both_locks_clears_normal_keeps_persistent_and_returns_the_pair() {
+    let mut target = mmc_target();
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut work = [0u8; 128];
+    let mut scratch = [0u8; 64];
+
+    // MMC bit1 selects persistent, bit0 selects set.
+    assert_eq!(
+        prevent(&mut target, &mut storage, &mut work, &mut scratch, 0b01),
+        Completion::Good
+    );
+    assert_eq!(
+        prevent(&mut target, &mut storage, &mut work, &mut scratch, 0b11),
+        Completion::Good
+    );
+    let info = target.snapshot_static::<Here>();
+    assert!(info.prevent && info.persistent_prevent);
+
+    assert_eq!(target.host_eject_succeeded_static::<Here>(), Ok(()));
+    let info = target.snapshot_static::<Here>();
+    assert!(!info.prevent, "host eject clears the normal latch");
+    assert!(info.persistent_prevent, "the persistent latch survives");
+    assert!(info.is_locked());
+    assert!(!info.ready);
+
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+    let result = target.take_static_at::<Here>(0).expect("ejected pair");
+    assert_eq!(result.pair.as_ref().map(|pair| pair.backing), Some(1));
+    assert_eq!(result.local, Ok(()));
+    assert_eq!(result.delivery, Delivery::Pending);
+    assert_eq!(
+        target.take_static_at::<Here>(0).err(),
+        Some(BoundaryReject::NothingToTake)
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+/// A local-commit failure during host eject detaches nothing, produces no
+/// result, leaves the slot ready and does not end the service.
+#[test]
+fn host_eject_commit_failure_keeps_the_slot_ready() {
+    let mut target = script_target(ScriptedDevice::with_commit_fault(), 5);
+
+    assert_eq!(
+        target.host_eject_succeeded_static::<Here>(),
+        Err(Fault::Commit)
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.commits, 1, "the commit was attempted");
+    assert_eq!(device.takes, 0, "nothing is detached before a commit");
+    assert_eq!(device.events, [Hook::Commit]);
+    assert!(!slot0(&target).has_result());
+    assert_eq!(slot0(&target).backing_ref(), Some(&5));
+
+    let info = target.snapshot_static::<Here>();
+    assert!(info.ready);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    // No `eject_pending` leaked: normal management is accepted again.
+    assert_eq!(target.propose_static::<Here>(Change::Remove), Ok(()));
+}
+
+/// §4.14: a failed status send after the detach does not roll back the
+/// commit/detach; the result stays resident and is takeable once even after the
+/// transport ends.
+#[test]
+fn a_failed_host_status_keeps_the_result_takeable() {
+    let mut target = script_target(ScriptedDevice::ready(), 3);
+
+    assert_eq!(target.host_eject_succeeded_static::<Here>(), Ok(()));
+    let commits = slot0(&target).device_ref().commits;
+    let takes = slot0(&target).device_ref().takes;
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+
+    // The application's full-status send failed and the transport ended; the
+    // library must not re-commit, re-detach or discard the fixed result.
+    target.transport_ended();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::TransportEnded,
+            error: None,
+        }
+    );
+    let result = target
+        .take_static_at::<Here>(0)
+        .expect("the result survives the failed status");
+    assert_eq!(result.pair, Some(pair_none(3)));
+    assert_eq!(result.local, Ok(()));
+    assert_eq!(
+        result.delivery,
+        Delivery::Pending,
+        "the snapshot is not rewritten to Complete"
+    );
+    assert_eq!(slot0(&target).device_ref().commits, commits);
+    assert_eq!(slot0(&target).device_ref().takes, takes);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+}
+
+// ── Force from abnormal states / Abort ─────────────────────────────────────
+
+/// §3.3/§4.10: force from an active command settles it with `interrupt` before
+/// detaching; the old pair is handed back once and no commit runs.
+#[test]
+fn force_settles_an_active_command_before_detaching() {
+    let mut target = script_target(ScriptedDevice::ready(), 4);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx(), &[0x12, 0, 0, 0, 0, 0]),
+        Ok(())
+    );
+    assert!(
+        !target.snapshot_static::<Here>().boundary,
+        "command is live"
+    );
+
+    assert_eq!(
+        target.force_remove_static::<Here>(&mut storage, &mut host),
+        Ok(())
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1, "the command was settled first");
+    assert!(!device.active);
+    assert_eq!(device.takes, 1, "then the pair was detached");
+    assert_eq!(device.commits, 0, "force never commits");
+    // The settle must precede the detach; a detach-first order would leave a
+    // live command on a pair the application is about to receive.
+    assert_eq!(device.events, [Hook::Interrupt, Hook::Take]);
+    assert!(slot0(&target).has_result());
+
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+    let result = target.take_static_at::<Here>(0).expect("forced pair");
+    assert_eq!(result.pair, Some(pair_none(4)));
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+}
+
+/// §3.6/§4.10 delayed-force failure: a detach that cannot run is reported, not
+/// hidden — the pair stays installed, no result is invented and the next
+/// settled `tick` ends the service with the fault.
+#[test]
+fn a_force_that_cannot_detach_ends_the_service_without_a_result() {
+    let mut target = script_target(ScriptedDevice::failing_take_medium_at(1), 5);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+
+    assert_eq!(
+        target.force_remove_static::<Here>(&mut storage, &mut host),
+        Err(Fault::Contract)
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.takes, 1);
+    assert_eq!(device.commits, 0);
+    assert_eq!(device.events, [Hook::Take]);
+    assert_eq!(
+        slot0(&target).backing_ref(),
+        Some(&5),
+        "a failed detach keeps the pair installed"
+    );
+    assert!(!slot0(&target).has_result());
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::Contract),
+        }
+    );
+}
+
+/// §4.10: `Control::Abort` ends the command (`0B/45/00`) but never detaches the
+/// medium, produces no management result and leaves the target serving.
+#[test]
+fn abort_ends_the_command_without_detaching_the_medium() {
+    let mut target = script_target(ScriptedDevice::ready(), 6);
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 32];
+
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx(), &[0x12, 0, 0, 0, 0, 0]),
+        Ok(())
+    );
+    assert_eq!(target.request_control(Control::Abort), Ok(()));
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Check(ABORTED_COMMAND)))
+    );
+
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1, "Abort settles the command");
+    assert_eq!(device.takes, 0, "Abort never detaches the medium");
+    assert_eq!(device.commits, 0);
+    assert_eq!(device.events, [Hook::Interrupt]);
+    assert!(device.medium.is_some());
+    assert_eq!(slot0(&target).backing_ref(), Some(&6));
+    assert!(!slot0(&target).has_result());
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+}
+
+/// §4.14: operator eject is a policy decision, not a library detach entry — the
+/// application reads the live latches, calls `decide_eject`, and a refused
+/// request changes no slot state.
+#[test]
+fn operator_eject_policy_reads_live_latches_and_detaches_nothing() {
+    let mut target = mmc_target();
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut work = [0u8; 128];
+    let mut scratch = [0u8; 64];
+
+    assert_eq!(
+        prevent(&mut target, &mut storage, &mut work, &mut scratch, 0b01),
+        Completion::Good
+    );
+    let info = target.snapshot_static::<Here>();
+    let locks = RemovalLocks {
+        prevent: info.prevent,
+        persistent_prevent: info.persistent_prevent,
+    };
+    let decision = decide_eject(locks, EjectOrigin::Operator);
+    assert!(!decision.allowed);
+    assert_eq!(
+        decision.completion,
+        Completion::Check(MEDIUM_REMOVAL_PREVENTED)
+    );
+
+    // The policy is the only library seam: nothing was detached or produced.
+    assert!(target.snapshot_static::<Here>().ready);
+    assert_eq!(slot0(&target).backing_ref(), Some(&1));
+    assert_eq!(
+        target.take_static_at::<Here>(0).err(),
+        Some(BoundaryReject::NothingToTake)
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
 }

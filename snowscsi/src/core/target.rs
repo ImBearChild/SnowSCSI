@@ -239,6 +239,19 @@ impl<S: RuntimeSet> Target<S> {
     }
 
     /// Record a successful host EJECT for a runtime LUN.
+    ///
+    /// # Operator eject is application policy, not a library entry
+    ///
+    /// `02-api-core §4.14`/§4.20 name only the host-side success entries and a
+    /// closed public API list; the operator/control-plane eject (GUI/hardware
+    /// button) belongs to the application. The application reads the latches
+    /// from [`Self::snapshot_rt`], calls
+    /// [`decide_eject`](super::eject::decide_eject) with
+    /// [`EjectOrigin::Operator`](super::eject::EjectOrigin), and performs or
+    /// refuses its own removal. The library deliberately offers no
+    /// `operator_eject_*` entry and never detaches on that path: a refused
+    /// request changes no slot state. Pinning fixture:
+    /// `core_p3::operator_eject_policy_reads_live_latches_and_detaches_nothing`.
     pub fn host_eject_succeeded_rt(&mut self, lun: usize) -> Result<(), Fault> {
         if self.runner.terminal_outcome().is_some() || self.runner.has_pending_control() {
             return Err(Fault::Boundary);
@@ -274,10 +287,41 @@ impl<S: RuntimeSet> Target<S> {
     }
 
     /// Take a detached pair exactly once; an out-of-range LUN is `WrongSlot`.
+    ///
+    /// A successful take may clear the global host-eject handback barrier
+    /// (`await_take`). That releases the forces deferred on other LUNs: the
+    /// runner detaches such a LUN and publishes its `ResourcesReady`, so a
+    /// later `take` can claim it. "One handback per take" counts *handbacks*,
+    /// not forces: a force on an empty (already detached) slot detaches nothing
+    /// and publishes no `ResourcesReady`, so several deferred forces may
+    /// complete inside the same take while their pairs are claimed by later
+    /// takes.
     pub fn take_rt(&mut self, lun: usize) -> Result<ChangeResult<S::Pair>, BoundaryReject> {
         let Self { runner, slots, .. } = self;
-        let slot = slots.get(lun).ok_or(BoundaryReject::WrongSlot)?;
-        runner.take_rt(lun, slot)
+        let result = {
+            let slot = slots.get(lun).ok_or(BoundaryReject::WrongSlot)?;
+            runner.take_rt(lun, slot)?
+        };
+        let count = slots.slot_count();
+        for other in 0..count {
+            if runner.result_barrier().is_err() {
+                break;
+            }
+            if !runner.force_pending(other) {
+                continue;
+            }
+            let had_terminal = runner.terminal_outcome().is_some();
+            let Some(slot) = slots.get(other) else {
+                break;
+            };
+            runner.resume_pending_force(other, slot);
+            // A failed detach ends the service; do not keep detaching other
+            // LUNs after that first fault.
+            if !had_terminal && runner.terminal_outcome().is_some() {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     /// Save a candidate change on a runtime LUN.
@@ -312,6 +356,34 @@ impl<S: RuntimeSet> Target<S> {
     }
 
     /// Emergency removal on a runtime LUN.
+    ///
+    /// # Settle target
+    ///
+    /// `drive_state` is target-global, but a command belongs to one slot, so
+    /// only the LUN that owns the live command is settled. Forcing an idle LUN
+    /// while another one runs detaches the addressed LUN and leaves the running
+    /// command active and steppable. A slot that reports `Lu::active()` while
+    /// the live command belongs elsewhere is refused with `Fault::Contract`
+    /// rather than detaching an unsettled device or settling the wrong slot.
+    ///
+    /// # Deferred forces and bounds
+    ///
+    /// A force accepted while a result (on this or another LUN) or the global
+    /// host-eject handback is resident detaches nothing yet: it arms a per-LUN
+    /// deferral that a later `take` completes (`02-api-core.md` §4.10,
+    /// `03-lifecycles.md` §3.6). The deferral set is an allocation-free `u64`
+    /// mask (`no_std`), so **`lun >= 64` is rejected with `Fault::Contract`**
+    /// before any slot state is touched (a LUN outside this target is
+    /// `Fault::LunNotFound` first).
+    ///
+    /// # Static multi-slot limitation
+    ///
+    /// [`StaticTarget::take_static_at`] takes one compile-time slot and cannot
+    /// enumerate the others, so it releases only the deferred force belonging to
+    /// that same slot. A force deferred on a *second* static slot stays armed
+    /// after that barrier clears; the application must re-issue
+    /// [`StaticTarget::force_remove_static`] for it explicitly. [`Self::take_rt`]
+    /// sweeps the whole runtime set instead.
     pub fn force_remove_rt(
         &mut self,
         lun: usize,

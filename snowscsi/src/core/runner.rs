@@ -175,8 +175,16 @@ pub struct Runner {
     eject_pending: Option<usize>,
     long_feedback: Option<Feedback>,
     drive_state: Cell<Option<DriveState>>,
-    /// A force accepted while a result was still resident; completed on take.
-    force_pending: Option<usize>,
+    /// Deferred emergency removals, one bit per LUN.
+    ///
+    /// A force accepted while a result/handback barrier is resident must not
+    /// overwrite that result (`02-api-core.md` §4.10); it is recorded here and
+    /// completed by the `take` that clears the barrier. The slot used to be a
+    /// single `Option<usize>`, which silently lost a force aimed at another
+    /// LUN: the take that released the barrier only ever continued its own
+    /// LUN. The mask stays allocation-free (`no_std`); LUNs >= 64 are rejected
+    /// with `Fault::Contract` (documented bound).
+    force_pending: u64,
     /// Consumed control events (probe counter, not a business API).
     #[doc(hidden)]
     pub control_events: u32,
@@ -217,7 +225,7 @@ impl Runner {
             eject_pending: None,
             long_feedback: None,
             drive_state: Cell::new(None),
-            force_pending: None,
+            force_pending: 0,
             control_events: 0,
             take_events: 0,
             eject_events: 0,
@@ -1358,6 +1366,11 @@ impl Runner {
     /// Take a detached pair exactly once. `take_gate` is the boundary (which
     /// already contains `long_settled`); it deliberately excludes ended,
     /// control-pending and await-take so a fixed result stays claimable.
+    ///
+    /// A successful take that clears the global handback barrier also releases
+    /// the deferred force for **this** LUN (see [`Self::resume_pending_force`]);
+    /// forces deferred on other LUNs are released by `Target::take_rt`, which
+    /// can reach their slots.
     #[allow(dead_code)] // `Target::take_rt` (C2); driven by tests here
     pub(crate) fn take_rt<L: Lu + ?Sized>(
         &mut self,
@@ -1374,22 +1387,80 @@ impl Runner {
             self.await_take = None;
             self.take_events = self.take_events.saturating_add(1);
         }
-        if self.force_pending == Some(lun) {
-            // The old result has just been handed back, so the deferred force
-            // can now detach the current pair. An empty slot produces no
-            // second handback, and a failed detach ends the service.
-            self.force_pending = None;
-            match lu.force_remove_rt(&permit) {
-                Ok(()) if lu.has_result() => {
-                    if self.host_eject_succeeded(lun).is_err() {
-                        self.set_fatal(Fault::Contract);
-                    }
-                }
-                Ok(()) => {}
-                Err(fault) => self.set_fatal(fault),
-            }
-        }
+        self.resume_pending_force(lun, lu);
         Ok(result)
+    }
+
+    /// Bit for `lun` in the deferred-force mask, or `Fault::Contract` for a
+    /// LUN outside the allocation-free bound.
+    fn force_bit(lun: usize) -> Result<u64, Fault> {
+        if lun < u64::BITS as usize {
+            Ok(1u64 << lun)
+        } else {
+            Err(Fault::Contract)
+        }
+    }
+
+    /// Whether a force is deferred for `lun`.
+    pub(crate) const fn force_pending(&self, lun: usize) -> bool {
+        lun < u64::BITS as usize && self.force_pending & (1u64 << lun) != 0
+    }
+
+    /// Finish a force that was deferred behind a resident result or the global
+    /// handback barrier, after a `take` cleared that barrier.
+    ///
+    /// `take_rt` has no storage/host adapter, so this only runs a slot that is
+    /// idle: no result, no command (`Lu::active()` cover the device side). An
+    /// idle `force_remove_rt` is a no-op settlement, and the detach itself
+    /// needs no adapter. A slot that started a new command while its force was
+    /// deferred stays pending; the application must call `force_remove_*` again
+    /// with the adapters so the command is settled before the detach.
+    ///
+    /// A failed detach (or a failure to publish the handback) ends the service
+    /// with `Fatal`/`NeedsRecovery`; it is never a silent success
+    /// (`03 §3.6`, delayed-force failure row). One call completes at most one
+    /// LUN. The caller loops while [`Self::result_barrier`] is clear: a force
+    /// that actually detached a pair publishes `await_take` and stops the
+    /// sweep, while a force on an empty slot detaches nothing, so more than one
+    /// such force can complete without an `await_take` in between.
+    pub(crate) fn resume_pending_force<L: Lu + ?Sized>(&mut self, lun: usize, lu: &mut L) {
+        let bit = match Self::force_bit(lun) {
+            Ok(bit) if self.force_pending & bit != 0 => bit,
+            _ => return,
+        };
+        // Still blocked: the result/handback must be taken first. A busy
+        // device is never detached here (`Lu::active()`); its command needs the
+        // adapters to settle, so the force stays armed.
+        if lu.has_result()
+            || lu.active()
+            || self.await_take.is_some()
+            || self.eject_pending.is_some()
+        {
+            return;
+        }
+        // A live command needs the adapters to cancel/settle before detaching.
+        if self.drive_state.get().is_some() {
+            return;
+        }
+        self.force_pending &= !bit;
+        let permit = self.permit();
+        if !lu.accepts_permit(&permit) {
+            self.set_fatal(Fault::ForeignBoundary);
+            return;
+        }
+        match lu.force_remove_rt(&permit) {
+            Ok(()) if lu.has_result() => {
+                if let Err(reject) = self.host_eject_succeeded(lun) {
+                    let fault = match reject {
+                        BoundaryReject::EjectPending => Fault::Contract,
+                        _ => Fault::NeedsRecovery,
+                    };
+                    self.set_fatal(fault);
+                }
+            }
+            Ok(()) => {}
+            Err(fault) => self.set_fatal(fault),
+        }
     }
 
     /// Propose a candidate change. The transaction cannot cross an ended,
@@ -1440,7 +1511,24 @@ impl Runner {
     }
 
     /// Emergency removal. Any pending token is cancelled first; an already
-    /// resident result defers the force until the application takes it.
+    /// resident result (or the global handback barrier) defers the force until
+    /// the application takes, per LUN.
+    ///
+    /// **Settle target.** `drive_state` is target-global but a command belongs
+    /// to exactly one slot, so only the LUN in `drive_state.ctx.lun` is
+    /// settled. A force aimed at another, idle LUN detaches that LUN and leaves
+    /// the running command untouched; settling the addressed slot instead would
+    /// interrupt a device that owns nothing and clear a state the running LUN
+    /// can no longer step (`03 §3.3` immediate-cancel, `03 §3.6` force row). A
+    /// slot that still reports `Lu::active()` while `drive_state` is empty or
+    /// belongs elsewhere is refused with `Fault::Contract`: detaching it would
+    /// leave its command unsettled, and settling it would corrupt the owner.
+    ///
+    /// The deferral mask covers LUNs `0..64`; a larger LUN is rejected with
+    /// `Fault::Contract` before anything is touched (allocation-free bound,
+    /// see [`Self::force_bit`]). Repeating the force for an already-deferred
+    /// LUN is still allowed and re-settles any command that started after the
+    /// first request — but only if that LUN owns the command.
     #[allow(dead_code)] // `Target::force_remove_rt` (C2); driven by tests here
     pub(crate) fn force_remove_rt<L: Lu + ?Sized>(
         &mut self,
@@ -1449,28 +1537,30 @@ impl Runner {
         storage: &mut dyn Storage,
         host: &mut dyn HostTransport,
     ) -> Result<(), Fault> {
-        if let Some(pending_lun) = self.force_pending {
-            if pending_lun != lun {
-                return Err(Fault::Contract);
+        let bit = Self::force_bit(lun)?;
+        // Force is one of the immediate-cancel paths (`03 §3.3`). Settle first,
+        // even when an earlier force is still deferred: a command may have
+        // started on this LUN while its result was resident.
+        match self.drive_state.get() {
+            Some(state) if state.ctx.lun == lun as u64 => {
+                self.settle_abnormally(lu, storage, host, InterruptReason::Stop)?;
             }
-            if lu.has_result() || self.await_take.is_some() || self.eject_pending.is_some() {
-                return Ok(());
-            }
-            // The earlier result is gone and no barrier remains: finish the
-            // deferred force now instead of dropping it silently.
-            self.force_pending = None;
+            // Another LUN owns the live command (or there is none). A slot that
+            // still has a command of its own has no state to settle from here.
+            _ if lu.active() => return Err(Fault::Contract),
+            _ => {}
         }
-        // Force is one of the immediate-cancel paths (`03 §3.3`).
-        self.settle_abnormally(lu, storage, host, InterruptReason::Stop)?;
         let permit = self.permit();
         if !lu.accepts_permit(&permit) {
             return Err(Fault::ForeignBoundary);
         }
         if lu.has_result() || self.await_take.is_some() {
             // Never overwrite a resident result; finish after the take.
-            self.force_pending = Some(lun);
+            self.force_pending |= bit;
             return Ok(());
         }
+        // No barrier remains: this call completes any earlier deferral.
+        self.force_pending &= !bit;
         lu.force_remove_rt(&permit).inspect_err(|fault| {
             self.set_fatal(*fault);
         })?;
