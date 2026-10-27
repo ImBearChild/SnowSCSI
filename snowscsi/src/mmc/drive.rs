@@ -96,7 +96,7 @@ enum LongOp {
         /// Bytes of the single in-flight write (`0` when none).
         in_flight: u64,
     },
-    /// Finished; the result is resident until P3 management takes it.
+    /// Finished; the result is resident until management takes it.
     Settled { error: Option<Fault> },
 }
 
@@ -1014,7 +1014,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         data: &'a mut [u8],
     ) -> PollStep<'a> {
         // Only a resident (IMMED=1) fill is advanced here; a Settled result is
-        // resident until P3 management takes it.
+        // resident until management takes it.
         if matches!(self.long, LongOp::Foreground { .. }) {
             self.fill_step(fb, data)
         } else {

@@ -1557,7 +1557,7 @@ impl Runner {
 
     /// One service entry: at most one reason, never a queued event.
     ///
-    /// Order (`§4.11` R30): fatal → transport ended → stopped → await take →
+    /// Order (`§4.11`): fatal → transport ended → stopped → await take →
     /// pending `Nop` → `ServiceReady`. A live command is never reported as
     /// `Ended`.
     #[allow(dead_code)] // `Target::tick` (C2); driven by tests here

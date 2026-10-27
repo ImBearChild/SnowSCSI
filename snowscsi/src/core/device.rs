@@ -13,6 +13,7 @@
 //! (`Io`/`Prefetch`) variants of [`PollStep`] arrive with the `StorageOp`
 //! vocabulary in the storage/host card.
 
+use super::eject::RemovalLocks;
 use super::errors::{Completion, Delivery, Fault, KnownEffects};
 use super::long::LongInfo;
 use super::permit::{BoundaryPermit, CommandPermit};
@@ -345,6 +346,12 @@ pub trait Device {
     /// NOTIFICATION). Default: `None`, so the wrapper delegates those opcodes
     /// to the device unchanged.
     fn spc_profile(&self) -> Option<&dyn SpcProfile> {
+        None
+    }
+
+    /// Optional removal-lock projection for the management view. Default:
+    /// the slot has no lock state to expose.
+    fn removal_locks(&self) -> Option<RemovalLocks> {
         None
     }
 

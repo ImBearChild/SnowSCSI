@@ -43,10 +43,22 @@ pub struct LuInfo {
     pub long: LongInfo,
     /// Whether the slot can accept commands.
     pub ready: bool,
-    /// Whether a removal lock (normal or persistent) is set.
-    pub locked: bool,
+    /// Normal PREVENT latch (cleared by a successful host eject).
+    pub prevent: bool,
+    /// Persistent PREVENT latch (never implicitly cleared).
+    pub persistent_prevent: bool,
     /// Command + long-operation projection only; not an authority.
     pub boundary: bool,
+}
+
+impl LuInfo {
+    /// Whether either removal lock is set. This is the derived view; the two
+    /// latches stay separately observable so a host eject (normal cleared,
+    /// persistent kept) is distinguishable from an unlocked slot.
+    #[must_use]
+    pub const fn is_locked(&self) -> bool {
+        self.prevent || self.persistent_prevent
+    }
 }
 
 /// Why a management/boundary-dependent operation was refused.
@@ -110,11 +122,13 @@ mod tests {
         let info = LuInfo {
             long: LongInfo::IDLE,
             ready: true,
-            locked: false,
+            prevent: false,
+            persistent_prevent: false,
             boundary: true,
         };
         assert!(info.ready);
         assert!(info.boundary);
+        assert!(!info.is_locked());
         assert_eq!(info.long, LongInfo::IDLE);
     }
 

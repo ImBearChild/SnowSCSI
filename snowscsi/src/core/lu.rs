@@ -20,6 +20,7 @@
 use super::device::{
     Admission, CommandContext, Device, Feedback, InterruptReason, Pair, PollStep, TargetId,
 };
+use super::eject::RemovalLocks;
 use super::errors::{
     commit_fault, Completion, Delivery, Fault, KnownEffects, FORMAT_IN_PROGRESS, INTERNAL_FAILURE,
     MEDIUM_NOT_PRESENT, NEEDS_RECOVERY,
@@ -370,12 +371,17 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
     }
 
     fn snapshot(&self) -> LuInfo {
+        let locks = self.device.removal_locks().unwrap_or(RemovalLocks {
+            prevent: false,
+            persistent_prevent: false,
+        });
         LuInfo {
             long: self.device.long_info(),
             ready: self.backing.is_some() && !self.needs_recovery,
-            // The PREVENT latch lives in the device profile; this projection is
-            // the management view only (§4.7).
-            locked: false,
+            // The PREVENT latches live in the device profile; this projection
+            // is the management view only (§4.7).
+            prevent: locks.prevent,
+            persistent_prevent: locks.persistent_prevent,
             // Command + long-operation projection only; the runner owns the
             // authoritative conjunction (§4.11).
             boundary: !self.device.active() && self.long_settled(),

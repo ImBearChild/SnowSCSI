@@ -31,12 +31,14 @@ use super::device::{
     CommandContext, DataPlan, Device, Direction, Feedback, FeedbackKind, InquiryData,
     InterruptReason, PollStep, RemovalEncoding,
 };
+use super::eject::RemovalLocks;
 use super::errors::{
-    Completion, Delivery, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS, INVALID_FIELD,
-    MEDIUM_NOT_PRESENT,
+    Completion, Delivery, Effect, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS, INVALID_FIELD,
+    MEDIUM_NOT_PRESENT, WRITE_ERROR,
 };
 use super::long::{LongInfo, LongPhase};
 use super::permit::{BoundaryPermit, CommandPermit};
+use super::storage::StorageOp;
 
 /// TEST UNIT READY.
 const TEST_UNIT_READY: u8 = 0x00;
@@ -79,6 +81,9 @@ enum Query {
     Tur,
     /// Immediate completion, no data phase.
     NoData,
+    /// Clear the normal PREVENT latch after a successful Sync
+    /// (unlock-flush); the latch stays set on failure.
+    UnlockFlush,
     /// INQUIRY.
     Inquiry,
     /// REQUEST SENSE.
@@ -395,6 +400,10 @@ impl<D: Device> Spc<D> {
                 if cdb.len() < 6 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
+                // Unlock-flush: clearing the normal latch requires a
+                // successful Sync. The latch is only cleared after the Sync
+                // completes with a known effect; a failure keeps the lock.
+                self.published = false;
                 match self.inner.removal_encoding() {
                     // MMC-6 Table 329: bit1 selects normal/persistent, bit0
                     // selects clear/set. The two bits are not independent flags.
@@ -403,19 +412,28 @@ impl<D: Device> Spc<D> {
                         let set = cdb[4] & 0x01 != 0;
                         if persistent {
                             self.persistent_prevent = set;
+                            self.query = Query::NoData;
+                        } else if set {
+                            self.prevent = true;
+                            self.query = Query::NoData;
+                        } else if self.prevent {
+                            self.query = Query::UnlockFlush;
                         } else {
-                            self.prevent = set;
+                            self.query = Query::NoData;
                         }
                     }
                     // SPC-3 Table 119 two-bit enum. Without a changer, 10b/11b
                     // are treated as prevent (documented deviation from the
                     // changer meaning, not a persistent lock).
                     RemovalEncoding::Scsi => match cdb[4] & 0x03 {
-                        0 => self.prevent = false,
-                        _ => self.prevent = true,
+                        0 if self.prevent => self.query = Query::UnlockFlush,
+                        0 => self.query = Query::NoData,
+                        _ => {
+                            self.prevent = true;
+                            self.query = Query::NoData;
+                        }
                     },
                 }
-                self.query = Query::NoData;
                 Ok(())
             }
             START_STOP_UNIT => {
@@ -564,6 +582,13 @@ impl<D: Device> Device for Spc<D> {
         self.inner.removal_encoding()
     }
 
+    fn removal_locks(&self) -> Option<RemovalLocks> {
+        Some(RemovalLocks {
+            prevent: self.prevent,
+            persistent_prevent: self.persistent_prevent,
+        })
+    }
+
     fn prepare(
         &mut self,
         permit: &CommandPermit,
@@ -619,6 +644,27 @@ impl<D: Device> Device for Spc<D> {
             Query::NoData => {
                 self.query = Query::None;
                 PollStep::Complete(Completion::Good)
+            }
+            Query::UnlockFlush => {
+                if !self.published {
+                    self.published = true;
+                    return PollStep::Io(StorageOp::Sync { resource: 0 });
+                }
+                if fb.kind() != FeedbackKind::IoDone {
+                    return PollStep::Idle;
+                }
+                let known = fb
+                    .io()
+                    .map(|r| r.error().is_none() && r.effect() == Effect::Known)
+                    .unwrap_or(false);
+                self.query = Query::None;
+                self.published = false;
+                if known {
+                    self.prevent = false;
+                    PollStep::Complete(Completion::Good)
+                } else {
+                    PollStep::Complete(Completion::Check(WRITE_ERROR))
+                }
             }
             Query::ReportLuns => {
                 if self.len == 0 {
@@ -892,7 +938,7 @@ impl<D: Device> Device for Spc<D> {
 mod tests {
     use super::*;
     use crate::block::{BlockAttrs, BlockDevice};
-    use crate::core::storage::HostReceipt;
+    use crate::core::storage::{HostReceipt, IoReceipt};
     use crate::core::{Capacity, NoMedium, SpcProfile, TargetId};
 
     fn permit() -> CommandPermit {
@@ -1052,7 +1098,19 @@ mod tests {
         cdb[4] = 0;
         spc.prepare(&permit, ctx(Direction::None, 0), &cdb)
             .expect("clear");
-        spc.poll(&permit, Feedback::begin(), &mut [0u8; 0]);
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut [0u8; 0]),
+            PollStep::Io(StorageOp::Sync { resource: 0 })
+        ));
+        assert!(spc.is_prevented(), "lock stays until the Sync completes");
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
+                &mut [0u8; 0]
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
         assert!(!spc.is_prevented());
         // 10b/11b are treated as prevent on a non-changer (documented
         // deviation from SPC-3 Table 119).
@@ -1134,7 +1192,20 @@ mod tests {
         let step = |spc: &mut Spc<MmcDevice>, cdb: &[u8]| {
             spc.prepare(&permit, ctx(Direction::None, 0), cdb)
                 .expect("prepare");
-            let _ = spc.poll(&permit, Feedback::begin(), &mut [0u8; 0]);
+            match spc.poll(&permit, Feedback::begin(), &mut [0u8; 0]) {
+                PollStep::Io(StorageOp::Sync { resource: 0 }) => {
+                    assert!(matches!(
+                        spc.poll(
+                            &permit,
+                            Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
+                            &mut [0u8; 0]
+                        ),
+                        PollStep::Complete(Completion::Good)
+                    ));
+                }
+                PollStep::Complete(Completion::Good) => {}
+                other => panic!("unexpected step {other:?}"),
+            }
         };
         cdb[4] = 0b01; // set normal
         step(&mut spc, &cdb);
