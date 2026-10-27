@@ -16,6 +16,7 @@
 use super::errors::{Completion, Delivery, Fault, KnownEffects};
 use super::long::LongInfo;
 use super::permit::{BoundaryPermit, CommandPermit};
+use super::profile::SpcProfile;
 use super::storage::{HostReceipt, IoReceipt, PrefetchOp, StorageOp};
 
 /// Core's zero-sized placeholder pair member. It implements no trait; a
@@ -337,6 +338,14 @@ pub trait Device {
     /// PREVENT/ALLOW encoding family. Default: SBC / SPC-3 Table 119.
     fn removal_encoding(&self) -> RemovalEncoding {
         RemovalEncoding::Scsi
+    }
+
+    /// Optional capability set for the public SPC query commands added in P2
+    /// (MODE SENSE, READ CAPACITY, GET CONFIGURATION, GET EVENT STATUS
+    /// NOTIFICATION). Default: `None`, so the wrapper delegates those opcodes
+    /// to the device unchanged.
+    fn spc_profile(&self) -> Option<&dyn SpcProfile> {
+        None
     }
 
     /// Decode and admit a command. Returns `Busy` if a command is active.

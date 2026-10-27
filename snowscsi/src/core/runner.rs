@@ -264,6 +264,24 @@ impl Runner {
 
     /// Boundary over any slot reference (also used by the generic entries).
     fn boundary_of<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
+        self.boundary_checks(slot, true)
+    }
+
+    /// Boundary for starting a command.
+    ///
+    /// A resident foreground long operation (MMC FORMAT/BLANK) must **not**
+    /// reject the command at the runner: the medium gate belongs to the device
+    /// (`Lu::admit` returns `2/04/04` and the profile refuses before any IO).
+    /// Management entries keep the stricter [`Self::boundary_of`].
+    fn command_boundary_of<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
+        self.boundary_checks(slot, false)
+    }
+
+    fn boundary_checks<L: Lu + ?Sized>(
+        &self,
+        slot: &L,
+        require_long_settled: bool,
+    ) -> Result<(), BoundaryReject> {
         if self.command_active.get() || slot.active() {
             return Err(BoundaryReject::CommandActive);
         }
@@ -282,7 +300,9 @@ impl Runner {
         if self.execution_borrow.get() > 0 {
             return Err(BoundaryReject::ExecutionBorrowAlive);
         }
-        if !matches!(slot.long_info().phase, LongPhase::Idle | LongPhase::Settled) {
+        if require_long_settled
+            && !matches!(slot.long_info().phase, LongPhase::Idle | LongPhase::Settled)
+        {
             return Err(BoundaryReject::LongOperationActive);
         }
         Ok(())
@@ -351,6 +371,22 @@ impl Runner {
         }
         self.result_barrier()?;
         self.boundary_of(slot)
+    }
+
+    /// Service gate for starting a command. Unlike [`Self::service_gate`] it
+    /// lets the device answer the foreground-format rejection itself.
+    fn command_gate<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
+        if self.terminal_outcome().is_some() {
+            return Err(BoundaryReject::Ended);
+        }
+        if self.pending_control.is_some() {
+            return Err(BoundaryReject::ControlPending);
+        }
+        if self.eject_pending.is_some() {
+            return Err(BoundaryReject::EjectPending);
+        }
+        self.result_barrier()?;
+        self.command_boundary_of(slot)
     }
 
     /// Terminal outcome regardless of in-flight work, in the fixed order
@@ -441,7 +477,7 @@ impl Runner {
         ctx: CommandContext,
         cdb: &[u8],
     ) -> Result<(), Fault> {
-        if self.drive_state.get().is_some() || self.service_gate(lu).is_err() {
+        if self.drive_state.get().is_some() || self.command_gate(lu).is_err() {
             return Err(Fault::Boundary);
         }
         let permit = self.command_permit();

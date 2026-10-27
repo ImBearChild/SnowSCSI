@@ -15,6 +15,13 @@
 //! (0x1E) and START STOP UNIT (0x1B). `0x1B` stores only the start bit; it
 //! never ejects or handles `LoEj`.
 //!
+//! P2b adds the public query commands MODE SENSE(6/10) (0x1A/0x5A), READ
+//! CAPACITY(10) (0x25), GET CONFIGURATION (0x46) and GET EVENT STATUS
+//! NOTIFICATION (0x4A). They are intercepted **only** when the inner device
+//! opts in through [`Device::spc_profile`]; otherwise the CDB is delegated to
+//! the inner device exactly as in P2a. The profile encodes the response, so
+//! the wrapper still owns no response buffer.
+//!
 //! REPORT LUNS uses the R31 layout: 8-byte header (`LUN LIST LENGTH` =
 //! `8 * lun_count`, then reserved) followed by SAM-3 single-level LUN
 //! descriptors `[0x00, lun, 0, 0, 0, 0, 0, 0]` — the LUN number is in byte 1,
@@ -26,6 +33,7 @@ use super::device::{
 };
 use super::errors::{
     Completion, Delivery, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS, INVALID_FIELD,
+    MEDIUM_NOT_PRESENT,
 };
 use super::long::{LongInfo, LongPhase};
 use super::permit::{BoundaryPermit, CommandPermit};
@@ -36,10 +44,20 @@ const TEST_UNIT_READY: u8 = 0x00;
 const REQUEST_SENSE: u8 = 0x03;
 /// INQUIRY.
 const INQUIRY: u8 = 0x12;
+/// MODE SENSE(6).
+const MODE_SENSE_6: u8 = 0x1A;
 /// START STOP UNIT.
 const START_STOP_UNIT: u8 = 0x1B;
 /// PREVENT/ALLOW MEDIUM REMOVAL.
 const PREVENT_ALLOW: u8 = 0x1E;
+/// READ CAPACITY(10) (SBC-3 5.16).
+const READ_CAPACITY_10: u8 = 0x25;
+/// GET CONFIGURATION (MMC-6 6.5).
+const GET_CONFIGURATION: u8 = 0x46;
+/// GET EVENT STATUS NOTIFICATION (MMC-6 6.7).
+const EVENT_STATUS_NOTIFICATION: u8 = 0x4A;
+/// MODE SENSE(10).
+const MODE_SENSE_10: u8 = 0x5A;
 /// REPORT LUNS.
 const REPORT_LUNS: u8 = 0xA0;
 
@@ -47,6 +65,10 @@ const REPORT_LUNS: u8 = 0xA0;
 const INQUIRY_LEN: usize = 36;
 /// Fixed-format sense response length (SPC-3 4.5.1).
 const SENSE_LEN: usize = 18;
+/// READ CAPACITY(10) response length: last LBA + block length (SBC-3 5.16).
+const READ_CAPACITY_LEN: usize = 8;
+/// ILLEGAL REQUEST / SAVING PARAMETERS NOT SUPPORTED (SPC-3 6.9, PC=11b).
+const SAVING_PARAMETERS_NOT_SUPPORTED: Sense = Sense::new(0x05, 0x39, 0x00);
 
 /// Which Spc-owned query is in progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +85,31 @@ enum Query {
     RequestSense,
     /// REPORT LUNS.
     ReportLuns,
+    /// MODE SENSE(6/10) answered by the profile.
+    ModeSense {
+        /// 10-byte CDB layout (`0x5A`) instead of the 6-byte one (`0x1A`).
+        ten: bool,
+        /// Page code (`cdb[2] & 0x3F`).
+        page: u8,
+        /// Disable block descriptors (`cdb[1] & 0x10`).
+        dbd: bool,
+        /// Page control (`cdb[2] >> 6`).
+        pc: u8,
+    },
+    /// READ CAPACITY(10) answered by the profile.
+    ReadCapacity,
+    /// GET CONFIGURATION answered by the profile.
+    GetConfiguration {
+        /// RT field (`cdb[1] & 0x03`).
+        rt: u8,
+        /// Starting feature number (`cdb[2..4]`).
+        start_feature: u16,
+    },
+    /// GET EVENT STATUS NOTIFICATION answered by the profile.
+    EventStatus {
+        /// Notification class (`cdb[4]`).
+        class: u8,
+    },
 }
 
 /// Public SPC wrapper over a profile device.
@@ -198,6 +245,151 @@ impl<D: Device> Spc<D> {
                 self.query = Query::ReportLuns;
                 Ok(())
             }
+            MODE_SENSE_6 | MODE_SENSE_10 => {
+                // Interception is profile-gated: without a profile the CDB
+                // belongs to the inner device exactly as in P2a.
+                if self.inner.spc_profile().is_none() {
+                    return self.inner.prepare(permit, ctx, cdb);
+                }
+                check_direction(ctx, Direction::ToHost)?;
+                let ten = opcode == MODE_SENSE_10;
+                let need = if ten { 10 } else { 6 };
+                if cdb.len() < need {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                // Foreground FORMAT blocks the medium query commands before
+                // any profile access (`02-api-core.md` §4.12, MMC-6 6.5).
+                if foreground_format(self.inner.long_info()) {
+                    return Err(Completion::Check(FORMAT_IN_PROGRESS));
+                }
+                // MODE SENSE(6): DBD is byte 1 bit 4. MODE SENSE(10): DBD is
+                // byte 1 bit 3 and bit 4 is LLBAA (unsupported here).
+                if ten && cdb[1] & 0x10 != 0 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                let dbd = if ten {
+                    cdb[1] & 0x08 != 0
+                } else {
+                    cdb[1] & 0x10 != 0
+                };
+                let pc = cdb[2] >> 6;
+                let page = cdb[2] & 0x3F;
+                if pc == 3 {
+                    // Saved pages are not supported (SP=0 in every page).
+                    return Err(Completion::Check(SAVING_PARAMETERS_NOT_SUPPORTED));
+                }
+                let alloc = if ten {
+                    be16(&cdb[7..9]) as usize
+                } else {
+                    cdb[4] as usize
+                };
+                // `None` asks the profile for the complete response length.
+                let total = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.mode_sense(ten, page, dbd, pc, None));
+                let Some(total) = total else {
+                    return Err(Completion::Check(INVALID_FIELD));
+                };
+                self.len = total.min(alloc);
+                self.published = false;
+                self.query = Query::ModeSense { ten, page, dbd, pc };
+                Ok(())
+            }
+            READ_CAPACITY_10 => {
+                if self.inner.spc_profile().is_none() {
+                    return self.inner.prepare(permit, ctx, cdb);
+                }
+                check_direction(ctx, Direction::ToHost)?;
+                if cdb.len() < 10 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                if foreground_format(self.inner.long_info()) {
+                    return Err(Completion::Check(FORMAT_IN_PROGRESS));
+                }
+                // READ CAPACITY has no allocation length: the host must be
+                // able to receive the fixed 8-byte response.
+                if ctx.host_bytes < READ_CAPACITY_LEN as u64 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                let capacity = self.inner.spc_profile().and_then(|p| p.read_capacity());
+                let Some(capacity) = capacity else {
+                    return Err(Completion::Check(MEDIUM_NOT_PRESENT));
+                };
+                // SBC-3 5.16: PMI=0 requires LBA 0; PMI=1 requires the LBA to
+                // be addressable.
+                let pmi = cdb[8] & 0x01 != 0;
+                let lba = be32(&cdb[2..6]);
+                let valid = if pmi {
+                    lba <= capacity.last_lba
+                } else {
+                    lba == 0
+                };
+                if !valid {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                self.len = READ_CAPACITY_LEN;
+                self.published = false;
+                self.query = Query::ReadCapacity;
+                Ok(())
+            }
+            GET_CONFIGURATION => {
+                if self.inner.spc_profile().is_none() {
+                    return self.inner.prepare(permit, ctx, cdb);
+                }
+                check_direction(ctx, Direction::ToHost)?;
+                if cdb.len() < 10 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                let rt = cdb[1] & 0x03;
+                if rt == 3 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                let start = be16(&cdb[2..4]);
+                let alloc = be16(&cdb[7..9]) as usize;
+                let total = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.get_configuration(rt, start, None));
+                let Some(total) = total else {
+                    // Unsupported by the profile: the opcode stays with the
+                    // inner device (P2a delegation, e.g. Block).
+                    return self.inner.prepare(permit, ctx, cdb);
+                };
+                self.len = total.min(alloc);
+                self.published = false;
+                self.query = Query::GetConfiguration {
+                    rt,
+                    start_feature: start,
+                };
+                Ok(())
+            }
+            EVENT_STATUS_NOTIFICATION => {
+                if self.inner.spc_profile().is_none() {
+                    return self.inner.prepare(permit, ctx, cdb);
+                }
+                check_direction(ctx, Direction::ToHost)?;
+                if cdb.len() < 10 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                // P2b keeps the baseline rejection of non-polled GESN.
+                if cdb[1] & 0x01 == 0 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                let class = cdb[4];
+                let alloc = be16(&cdb[7..9]) as usize;
+                let total = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.event_status(class, None));
+                let Some(total) = total else {
+                    return self.inner.prepare(permit, ctx, cdb);
+                };
+                self.len = total.min(alloc);
+                self.published = false;
+                self.query = Query::EventStatus { class };
+                Ok(())
+            }
             PREVENT_ALLOW => {
                 check_direction(ctx, Direction::None)?;
                 if cdb.len() < 6 {
@@ -249,6 +441,15 @@ fn check_direction(ctx: CommandContext, expected: Direction) -> Result<(), Compl
     }
 }
 
+/// Whether a foreground FORMAT is running and holds the medium gate up.
+///
+/// MODE SENSE and READ CAPACITY are medium queries and must not report
+/// geometry/parameters while the medium is being formatted; GET
+/// CONFIGURATION and GESN stay admitted (`02-api-core.md` §4.12).
+fn foreground_format(info: LongInfo) -> bool {
+    info.phase == LongPhase::Foreground && info.progress.is_some()
+}
+
 /// Big-endian 16-bit CDB field.
 fn be16(bytes: &[u8]) -> u16 {
     (u16::from(bytes[0]) << 8) | u16::from(bytes[1])
@@ -297,7 +498,11 @@ fn fill_inquiry(info: InquiryData, data: &mut [u8], n: usize) {
 }
 
 /// Write a fixed-format sense response into `data`.
-fn fill_sense(sense: Sense, data: &mut [u8], n: usize) {
+///
+/// For a foreground FORMAT (`2/04/04`) with a known progress value, byte 15
+/// carries SKSV=1 and bytes 16–17 the Progress Indication
+/// (`value / 65536 × 100%`, SPC-3 4.5.2.4 / MMC-6 Table 252).
+fn fill_sense(sense: Sense, progress: Option<u32>, data: &mut [u8], n: usize) {
     for byte in &mut data[..n] {
         *byte = 0;
     }
@@ -315,6 +520,13 @@ fn fill_sense(sense: Sense, data: &mut [u8], n: usize) {
     }
     if n >= 14 {
         data[13] = sense.ascq;
+    }
+    if n >= 18 && sense.key == 0x02 && sense.asc == 0x04 && sense.ascq == 0x04 {
+        if let Some(progress) = progress {
+            data[15] = 0x80; // SKSV
+            let scaled = (progress.min(100) * 65_536 / 100).min(u32::from(u16::MAX));
+            data[16..18].copy_from_slice(&(scaled as u16).to_be_bytes());
+        }
     }
 }
 
@@ -431,6 +643,127 @@ impl<D: Device> Device for Spc<D> {
                 fill_report_luns(self.lun_count, data, self.len);
                 PollStep::Send(&data[..self.len])
             }
+            Query::ModeSense { ten, page, dbd, pc } => {
+                let len = self.len;
+                if len == 0 {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if !self.published {
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::ToHost,
+                        bytes: len as u64,
+                    });
+                }
+                if fb.kind() == FeedbackKind::HostSent {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if data.len() < len {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                // The profile writes directly into the caller's bank; header
+                // lengths describe the complete, untruncated response.
+                let filled = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.mode_sense(ten, page, dbd, pc, Some(&mut data[..len])));
+                if filled.is_none() {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                PollStep::Send(&data[..len])
+            }
+            Query::ReadCapacity => {
+                let len = self.len;
+                if !self.published {
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::ToHost,
+                        bytes: len as u64,
+                    });
+                }
+                if fb.kind() == FeedbackKind::HostSent {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if data.len() < len {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                let capacity = self.inner.spc_profile().and_then(|p| p.read_capacity());
+                let Some(capacity) = capacity else {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
+                };
+                data[..4].copy_from_slice(&capacity.last_lba.to_be_bytes());
+                data[4..8].copy_from_slice(&capacity.block_len.to_be_bytes());
+                PollStep::Send(&data[..len])
+            }
+            Query::GetConfiguration { rt, start_feature } => {
+                let len = self.len;
+                if len == 0 {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if !self.published {
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::ToHost,
+                        bytes: len as u64,
+                    });
+                }
+                if fb.kind() == FeedbackKind::HostSent {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if data.len() < len {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                let filled = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.get_configuration(rt, start_feature, Some(&mut data[..len])));
+                if filled.is_none() {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                PollStep::Send(&data[..len])
+            }
+            Query::EventStatus { class } => {
+                let len = self.len;
+                if len == 0 {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if !self.published {
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::ToHost,
+                        bytes: len as u64,
+                    });
+                }
+                if fb.kind() == FeedbackKind::HostSent {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Good);
+                }
+                if data.len() < len {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                let filled = self
+                    .inner
+                    .spc_profile()
+                    .and_then(|p| p.event_status(class, Some(&mut data[..len])));
+                if filled.is_none() {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                }
+                PollStep::Send(&data[..len])
+            }
             Query::Inquiry => {
                 if self.len == 0 {
                     self.query = Query::None;
@@ -491,7 +824,12 @@ impl<D: Device> Device for Spc<D> {
                 } else {
                     self.saved_sense.unwrap_or(Sense::new(0x00, 0x00, 0x00))
                 };
-                fill_sense(sense, data, self.len);
+                let progress = if info.phase == LongPhase::Foreground {
+                    info.progress
+                } else {
+                    None
+                };
+                fill_sense(sense, progress, data, self.len);
                 PollStep::Send(&data[..self.len])
             }
         }
@@ -555,7 +893,7 @@ mod tests {
     use super::*;
     use crate::block::{BlockAttrs, BlockDevice};
     use crate::core::storage::HostReceipt;
-    use crate::core::{NoMedium, TargetId};
+    use crate::core::{Capacity, NoMedium, SpcProfile, TargetId};
 
     fn permit() -> CommandPermit {
         CommandPermit::new(TargetId::UNBOUND)
@@ -1093,5 +1431,161 @@ mod tests {
             spc.prepare(&permit, ctx(Direction::ToHost, 36), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
+    }
+
+    struct Foreground(BlockDevice);
+
+    impl SpcProfile for Foreground {
+        fn mode_sense(
+            &self,
+            ten: bool,
+            page: u8,
+            dbd: bool,
+            pc: u8,
+            out: Option<&mut [u8]>,
+        ) -> Option<usize> {
+            self.0.mode_sense(ten, page, dbd, pc, out)
+        }
+
+        fn read_capacity(&self) -> Option<Capacity> {
+            self.0.read_capacity()
+        }
+
+        fn event_status(&self, _class: u8, out: Option<&mut [u8]>) -> Option<usize> {
+            if let Some(out) = out {
+                let n = 8.min(out.len());
+                out[..n].fill(0x5A);
+            }
+            Some(8)
+        }
+    }
+
+    impl Device for Foreground {
+        type Medium = NoMedium;
+
+        fn spc_profile(&self) -> Option<&dyn SpcProfile> {
+            Some(self)
+        }
+
+        fn prepare(
+            &mut self,
+            p: &CommandPermit,
+            c: CommandContext,
+            cdb: &[u8],
+        ) -> Result<(), Completion> {
+            self.0.prepare(p, c, cdb)
+        }
+
+        fn active(&self) -> bool {
+            self.0.active()
+        }
+
+        fn resume(&mut self, p: &CommandPermit) -> Result<(), Completion> {
+            self.0.resume(p)
+        }
+
+        fn poll<'a>(
+            &mut self,
+            p: &CommandPermit,
+            fb: Feedback,
+            data: &'a mut [u8],
+        ) -> PollStep<'a> {
+            self.0.poll(p, fb, data)
+        }
+
+        fn poll_long<'a>(
+            &mut self,
+            p: &CommandPermit,
+            fb: Feedback,
+            data: &'a mut [u8],
+        ) -> PollStep<'a> {
+            self.0.poll_long(p, fb, data)
+        }
+
+        fn long_info(&self) -> LongInfo {
+            LongInfo {
+                phase: LongPhase::Foreground,
+                write_accessible: false,
+                progress: Some(64),
+                error: None,
+            }
+        }
+
+        fn interrupt(
+            &mut self,
+            p: &CommandPermit,
+            r: InterruptReason,
+            k: KnownEffects,
+        ) -> Result<(), Fault> {
+            self.0.interrupt(p, r, k)
+        }
+
+        fn finish_delivery(&mut self, p: &CommandPermit, d: Delivery) {
+            self.0.finish_delivery(p, d)
+        }
+
+        fn take_medium(&mut self, p: &BoundaryPermit) -> Option<NoMedium> {
+            self.0.take_medium(p)
+        }
+
+        fn install_medium(
+            &mut self,
+            p: &BoundaryPermit,
+            m: NoMedium,
+        ) -> Result<(), (NoMedium, Fault)> {
+            self.0.install_medium(p, m)
+        }
+    }
+
+    #[test]
+    fn foreground_format_gates_the_medium_queries_only() {
+        let mut spc = Spc::new(Foreground(BlockDevice::new(BlockAttrs::new(16, 512))));
+        let permit = permit();
+        let mut cdb = [0u8; 6];
+        cdb[0] = 0x1A;
+        cdb[2] = 0x08;
+        cdb[4] = 24;
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 24), &cdb),
+            Err(Completion::Check(FORMAT_IN_PROGRESS))
+        );
+        assert_eq!(spc.saved_sense(), Some(FORMAT_IN_PROGRESS));
+
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x25;
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 8), &cdb),
+            Err(Completion::Check(FORMAT_IN_PROGRESS))
+        );
+
+        // GESN stays admitted while the foreground FORMAT holds the gate.
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x4A;
+        cdb[1] = 0x01;
+        cdb[8] = 8;
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 8), &cdb),
+            Ok(())
+        );
+        let mut data = [0u8; 8];
+        match spc.poll(&permit, Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => {
+                assert_eq!(plan.direction, Direction::ToHost);
+                assert_eq!(plan.bytes, 8);
+            }
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
+            PollStep::Send(bytes) => assert_eq!(bytes, &[0x5A; 8]),
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(8, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
     }
 }

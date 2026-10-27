@@ -9,6 +9,8 @@
 //!   table and `commit_fault` (§4.17);
 //! - [`device`] — the [`Device`] lifecycle trait, [`NoMedium`]/[`Pair`] and the
 //!   static [`InquiryData`]/[`RemovalEncoding`] descriptors (§4.1/§4.2);
+//! - [`profile`] — the defaulted [`SpcProfile`] capability seam for the public
+//!   query commands (§4.19 extension clause);
 //! - [`permit`] — privately minted permits and [`ExecutionGuard`] (§4.8/§4.11);
 //! - [`long`], [`management`], [`ua`], [`eject`] — long-operation, management,
 //!   unit-attention and eject values (§4.7/§4.12–§4.14);
@@ -35,6 +37,7 @@ pub mod long;
 pub mod lu;
 pub mod management;
 pub mod permit;
+pub mod profile;
 pub mod runner;
 pub mod spc;
 pub mod storage;
@@ -57,6 +60,7 @@ pub use self::long::{LongInfo, LongPhase};
 pub use self::lu::{Lu, LuImpl};
 pub use self::management::{BoundaryReject, Change, ChangeResult, LuInfo};
 pub use self::permit::{BoundaryPermit, CommandPermit, ExecutionGuard, OwnerBindPermit};
+pub use self::profile::{Capacity, SpcProfile};
 pub use self::runner::{DriveStep, RunEnd, RunOutcome, Runner};
 pub use self::spc::Spc;
 pub use self::target::{StaticTarget, Target};

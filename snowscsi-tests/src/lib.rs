@@ -37,5 +37,8 @@ mod store_plane;
 #[cfg(test)]
 mod core_p2a;
 
+#[cfg(test)]
+mod core_p2b;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;

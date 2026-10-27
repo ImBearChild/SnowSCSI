@@ -7,8 +7,8 @@
 //! # Workspace map
 //!
 //! - **this crate** — SPC/SBC/MMC command layers, `BlockDevice` /
-//!   [`CdromDrive`](cdrom::CdromDrive), iSCSI target (`iscsi`),
-//!   USB BOT core (`usb`).
+//!   [`CdromDrive`](cdrom::CdromDrive), the P2 MMC profile ([`mmc::MmcDrive`])
+//!   with its flat CD medium, iSCSI target (`iscsi`), USB BOT core (`usb`).
 //! - [`snowscsi_common`] — the storage seams everything is written
 //!   against: the capability ladder
 //!   [`common::seekable_storage::FlatData`] →
@@ -39,6 +39,8 @@ pub mod block;
 /// Core contract layer (`no_std`, no-alloc, no `unsafe`): errors, device
 /// lifecycle, permits and management values.
 pub mod core;
+/// MMC profile (`MmcDrive` + `MmcMedium`) and the flat CD medium.
+pub mod mmc;
 
 pub mod scsi;
 

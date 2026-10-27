@@ -20,11 +20,11 @@
 use crate::block::BlockAttrs;
 use crate::core::storage::StorageOp;
 use crate::core::{
-    storage_fault_sense, BoundaryPermit, CommandContext, CommandPermit, Completion, DataPlan,
-    Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
+    storage_fault_sense, BoundaryPermit, Capacity, CommandContext, CommandPermit, Completion,
+    DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, NoMedium, PollStep, RemovalEncoding,
-    COMMAND_ABORTED, ILLEGAL_REQUEST, INTERNAL_FAILURE, INVALID_FIELD, LBA_OUT_OF_RANGE,
-    MEDIUM_ERROR, NEEDS_RECOVERY, WRITE_ERROR, WRITE_PROTECTED,
+    SpcProfile, COMMAND_ABORTED, ILLEGAL_REQUEST, INTERNAL_FAILURE, INVALID_FIELD,
+    LBA_OUT_OF_RANGE, MEDIUM_ERROR, NEEDS_RECOVERY, WRITE_ERROR, WRITE_PROTECTED,
 };
 
 /// Opcode TEST UNIT READY (SPC-3 6.33). Owned by the Block profile so the
@@ -38,6 +38,30 @@ const WRITE_10: u8 = 0x2A;
 const SYNC_CACHE_10: u8 = 0x35;
 /// Opcode FORMAT UNIT (SBC-3 §5.3).
 const FORMAT_UNIT: u8 = 0x04;
+
+/// Largest MODE SENSE(10) response this profile encodes: 8-byte header plus
+/// every supported mode page (24 bytes).
+const MODE_SENSE_MAX: usize = 32;
+
+/// Mode pages for the block device (SPC-4 §7.4): caching page 0x08
+/// (PS=0, WCE=0, RCD=0, DRA=1) followed by the vendor-specific page 0x00.
+///
+/// The bytes are copied verbatim from the legacy baseline encoder
+/// (`scsi::spc::ALL_MODE_PAGES`); core must not depend on the `scsi` module.
+const BLOCK_MODE_PAGES: [u8; 24] = [
+    0x08, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, /* caching PS=0 */
+    0x00, 2, 0x00, 0x08, /* vendor page 0x00 */
+];
+
+/// Mode pages selected by a MODE SENSE page code (`0x3F` = all pages).
+fn block_mode_pages(page: u8) -> Option<&'static [u8]> {
+    match page {
+        0x08 => Some(&BLOCK_MODE_PAGES[..20]),
+        0x00 => Some(&BLOCK_MODE_PAGES[20..]),
+        0x3F => Some(&BLOCK_MODE_PAGES),
+        _ => None,
+    }
+}
 
 /// CDB byte 1 bits that this profile does not implement: RDPROTECT/WRPROTECT
 /// (bits 7–5), DPO, RARC and the reserved low bits. FUA (bit 3) is accepted:
@@ -350,6 +374,10 @@ impl Device for BlockDevice {
         RemovalEncoding::Scsi
     }
 
+    fn spc_profile(&self) -> Option<&dyn SpcProfile> {
+        Some(self)
+    }
+
     fn prepare(
         &mut self,
         _permit: &CommandPermit,
@@ -625,6 +653,81 @@ impl Device for BlockDevice {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Public query profile for the block device: MODE SENSE (pages 0x00, 0x08
+/// and 0x3F) and READ CAPACITY(10). GET CONFIGURATION and GESN keep the
+/// default `None`, so `Spc` delegates those opcodes to the inner device.
+impl SpcProfile for BlockDevice {
+    fn medium_type(&self) -> u8 {
+        0
+    }
+
+    fn write_protected(&self) -> bool {
+        // A statically read-only backing or the runtime latch both set WP.
+        self.attrs.rejects_writes()
+    }
+
+    fn mode_sense(
+        &self,
+        ten: bool,
+        page: u8,
+        _dbd: bool,
+        pc: u8,
+        out: Option<&mut [u8]>,
+    ) -> Option<usize> {
+        let pages = block_mode_pages(page)?;
+        if pc == 3 {
+            // Saved pages are unsupported; `Spc` rejects PC=11b before this.
+            return None;
+        }
+        let header = if ten { 8 } else { 4 };
+        let total = header + pages.len();
+        let mut buf = [0u8; MODE_SENSE_MAX];
+        if ten {
+            let mode_len = (total - 2) as u16;
+            buf[..2].copy_from_slice(&mode_len.to_be_bytes());
+            buf[2] = self.medium_type();
+            buf[3] = if self.write_protected() { 0x80 } else { 0x00 };
+            // Bytes 4..6 are reserved and the block descriptor length (6..8)
+            // stays zero: no block descriptor is ever returned.
+        } else {
+            buf[0] = (total - 1) as u8;
+            buf[1] = self.medium_type();
+            buf[2] = if self.write_protected() { 0x80 } else { 0x00 };
+            // Byte 3 (block descriptor length) stays zero.
+        }
+        if pc == 1 {
+            // Changeable mask: the pages have no changeable fields, so keep
+            // the page code/length bytes and zero the payload (same choice as
+            // the baseline encoder).
+            let mut at = 0usize;
+            while at + 2 <= pages.len() {
+                let payload = pages[at + 1] as usize;
+                buf[header + at] = pages[at];
+                buf[header + at + 1] = pages[at + 1];
+                at += 2 + payload;
+            }
+        } else {
+            // PC=00b (current) and PC=10b (default) share the same bytes.
+            buf[header..total].copy_from_slice(pages);
+        }
+        if let Some(out) = out {
+            // The declared header length always describes `total`, even when
+            // the host allocation truncates the response.
+            let n = total.min(out.len());
+            out[..n].copy_from_slice(&buf[..n]);
+        }
+        Some(total)
+    }
+
+    fn read_capacity(&self) -> Option<Capacity> {
+        // Zero blocks is not a valid geometry; clamping keeps the wire value
+        // representable (`last_lba` is 32 bits).
+        let last = self.attrs.capacity_blocks.saturating_sub(1);
+        let last_lba = last.min(u64::from(u32::MAX)) as u32;
+        Some(Capacity::new(last_lba, self.attrs.block_len))
     }
 }
 
