@@ -13,20 +13,21 @@
 
 use snowscsi::block::{BlockAttrs, BlockDevice};
 use snowscsi::core::storage::{
-    BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, IoBuf, IoReq, StorageReceipt,
-    SyncHost, SyncStorage,
+    BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, IoBuf,
+    IoReq, IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt, SyncHost, SyncStorage,
 };
 use snowscsi::core::{
     cons, decide_eject, At, BoundaryPermit, BoundaryReject, Change, CommandContext, CommandPermit,
     Completion, Cons, Control, DataPlan, Delivery, Device, Direction, DriveStep, Effect,
     EjectOrigin, Fault, Feedback, Here, InterruptReason, KnownEffects, LongInfo, LongPhase, Lu,
-    LuImpl, Nil, NoMedium, Pair, PollStep, RemovalLocks, RunEnd, RunOutcome, SlotSet, Spc,
+    LuImpl, Nil, NoMedium, Pair, PollStep, RemovalLocks, RunEnd, RunOutcome, Sense, SlotSet, Spc,
     StaticTarget, Target, ABORTED_COMMAND, INTERNAL_FAILURE, MEDIUM_NOT_PRESENT,
     MEDIUM_REMOVAL_PREVENTED, WRITE_ERROR,
 };
 use snowscsi::mmc::{DvdRamMedium, FlatCdMedium, MmcDrive};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::task::Poll;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
@@ -2028,4 +2029,2503 @@ fn operator_eject_policy_reads_live_latches_and_detaches_nothing() {
         Some(BoundaryReject::NothingToTake)
     );
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Abnormal settlement: Stop drains, every other end cancels
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Authority: `03-lifecycles.md` §3.3 (phase × interruption matrix),
+// §3.4 (issue/poll/feedback) and `02-api-core.md` §4.10/§4.11/§4.17.
+//
+// Every fixture drives the public `Target` entries over a scripted device and
+// scripted adapter pair that append to **one** shared call log, so the design's
+// order is asserted on the real sequence: `cancel`/the drained receipt returns
+// before `interrupt`, `interrupt` before `finish_delivery(Failed)`, a token is
+// re-polled and never re-issued (no replay), and no settlement path detaches or
+// installs a medium.
+//
+// Rows that cannot be modelled in core (written reason, §3.3):
+//
+// - "partial header" / "complete header not admitted": core receives an
+//   already-complete CDB slice (`Target::drive_start_*`); BHS/CBW framing and
+//   the input barrier are transport facts, covered by the transport card. This
+//   slice must not fake a header the runner never sees.
+// - "sending frame" segment prefixes: the exact wire framing belongs to
+//   `HostTransport`; core only observes the returned receipt, which the
+//   fixtures do cover (full-status-sent hook, in-flight send, short send).
+// - "retained input 未清": the runner's `retained_input` hold is crate-private
+//   and not wired to any `Target` entry, so the window is pinned by the runner
+//   unit test (`boundary_counts_the_execution_borrow_and_retained_input`) and by
+//   the unconsumed-completion window below, not by a transport fixture.
+
+/// One observed call, in real call order across the device and both adapters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ev {
+    /// `Storage::begin_exec` saw this metadata (never a buffer).
+    Begin { dir: Direction, len: u32 },
+    /// `Storage::poll_exec` re-borrowed a buffer of this shape.
+    Poll {
+        dir: Direction,
+        len: u32,
+        none_buf: bool,
+    },
+    /// `Storage::cancel` returned.
+    Cancel,
+    /// `Device::interrupt` was entered with these facts.
+    Interrupt {
+        reason: InterruptReason,
+        known: KnownEffects,
+    },
+    /// `Device::finish_delivery` was entered.
+    Delivery(Delivery),
+    /// `Device::take_medium` ran (a detach).
+    Take,
+    /// `Device::install_medium` ran (a new medium).
+    Install,
+    /// The device observed a storage receipt.
+    IoSeen {
+        confirmed: usize,
+        error: Option<Fault>,
+    },
+    /// `HostTransport::poll_host` was entered.
+    HostPoll { dir: Direction, len: u32 },
+    /// `HostTransport::cancel` returned.
+    HostCancel,
+}
+
+type Log = Rc<RefCell<Vec<Ev>>>;
+
+/// Copy of the shared call log.
+fn events(log: &Log) -> Vec<Ev> {
+    log.borrow().clone()
+}
+
+/// Position of the first event matching `pred`.
+fn at(log: &Log, pred: impl Fn(&Ev) -> bool) -> usize {
+    log.borrow()
+        .iter()
+        .position(pred)
+        .expect("the expected call was observed")
+}
+
+/// One scripted device step (`PollStep` without the borrow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Publish(DataPlan),
+    Write(usize),
+    Read(usize),
+    Prefetch(usize),
+    Sync,
+    Receive(usize),
+    Send(usize),
+    Complete(Completion),
+}
+
+const SETTLE_SCRIPT: usize = 8;
+
+/// Scripted device that replays [`Step`]s and records every settlement hook in
+/// the shared log. It never issues storage IO itself (`commit` is the default
+/// no-op).
+struct SettleDevice {
+    steps: [Option<Step>; SETTLE_SCRIPT],
+    cursor: usize,
+    active: bool,
+    medium: Option<NoMedium>,
+    interrupt_fault: Option<Fault>,
+    log: Log,
+    interrupts: u32,
+    /// How many times the device was polled (proof that a settle did not poll
+    /// again after a returned receipt).
+    polls: u32,
+    deliveries: Vec<Delivery>,
+    last_known: Option<KnownEffects>,
+    takes: u32,
+    installs: u32,
+    /// Receipts handed to `poll`, in order: `(confirmed, error)`.
+    seen: Vec<(usize, Option<Fault>)>,
+}
+
+impl SettleDevice {
+    fn new(log: Log, steps: [Option<Step>; SETTLE_SCRIPT]) -> Self {
+        Self {
+            steps,
+            cursor: 0,
+            active: false,
+            medium: Some(NoMedium),
+            interrupt_fault: None,
+            log,
+            interrupts: 0,
+            polls: 0,
+            deliveries: Vec::new(),
+            last_known: None,
+            takes: 0,
+            installs: 0,
+            seen: Vec::new(),
+        }
+    }
+
+    /// A device whose `interrupt` settlement fails with `fault`.
+    fn failing_settle(log: Log, steps: [Option<Step>; SETTLE_SCRIPT], fault: Fault) -> Self {
+        Self {
+            interrupt_fault: Some(fault),
+            ..Self::new(log, steps)
+        }
+    }
+}
+
+impl Device for SettleDevice {
+    type Medium = NoMedium;
+
+    fn prepare(
+        &mut self,
+        _permit: &CommandPermit,
+        _ctx: CommandContext,
+        _cdb: &[u8],
+    ) -> Result<(), Completion> {
+        self.active = true;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn active(&self) -> bool {
+        self.active
+    }
+
+    fn resume(&mut self, _permit: &CommandPermit) -> Result<(), Completion> {
+        Ok(())
+    }
+
+    fn poll<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        feedback: Feedback,
+        data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        self.polls = self.polls.saturating_add(1);
+        if let Some(io) = feedback.io() {
+            self.seen.push((io.confirmed(), io.error()));
+            self.log.borrow_mut().push(Ev::IoSeen {
+                confirmed: io.confirmed(),
+                error: io.error(),
+            });
+        }
+        let step = match self.steps.get(self.cursor).copied().flatten() {
+            Some(step) => step,
+            None => return PollStep::Idle,
+        };
+        self.cursor += 1;
+        match step {
+            Step::Publish(plan) => PollStep::Publish(plan),
+            Step::Write(len) => PollStep::Io(StorageOp::Write {
+                resource: 1,
+                offset: 0,
+                buf: &data[..len],
+            }),
+            Step::Read(len) => PollStep::Io(StorageOp::Read {
+                resource: 1,
+                offset: 0,
+                buf: &mut data[..len],
+            }),
+            Step::Prefetch(len) => PollStep::Prefetch(PrefetchOp::Read {
+                resource: 1,
+                offset: 0,
+                buf: &mut data[..len],
+            }),
+            Step::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
+            Step::Receive(len) => PollStep::Receive(&mut data[..len]),
+            Step::Send(len) => PollStep::Send(&data[..len]),
+            Step::Complete(completion) => {
+                self.active = false;
+                PollStep::Complete(completion)
+            }
+        }
+    }
+
+    fn poll_long<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        _feedback: Feedback,
+        _data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        PollStep::Idle
+    }
+
+    fn long_info(&self) -> LongInfo {
+        LongInfo::IDLE
+    }
+
+    fn interrupt(
+        &mut self,
+        _permit: &CommandPermit,
+        reason: InterruptReason,
+        known: KnownEffects,
+    ) -> Result<(), Fault> {
+        self.interrupts = self.interrupts.saturating_add(1);
+        self.last_known = Some(known);
+        self.active = false;
+        self.log.borrow_mut().push(Ev::Interrupt { reason, known });
+        match self.interrupt_fault {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_delivery(&mut self, _permit: &CommandPermit, delivery: Delivery) {
+        self.deliveries.push(delivery);
+        self.log.borrow_mut().push(Ev::Delivery(delivery));
+    }
+
+    fn take_medium(&mut self, _permit: &BoundaryPermit) -> Option<NoMedium> {
+        self.takes = self.takes.saturating_add(1);
+        self.log.borrow_mut().push(Ev::Take);
+        self.medium.take()
+    }
+
+    fn install_medium(
+        &mut self,
+        _permit: &BoundaryPermit,
+        medium: NoMedium,
+    ) -> Result<(), (NoMedium, Fault)> {
+        self.installs = self.installs.saturating_add(1);
+        self.log.borrow_mut().push(Ev::Install);
+        self.medium = Some(medium);
+        Ok(())
+    }
+}
+
+/// Scripted storage adapter: `pending` consecutive `Pending` answers, then the
+/// programmed receipt. `exhausted` mints the pool-exhausted token instead.
+struct SettleStorage {
+    log: Log,
+    pending: u32,
+    receipt: StorageReceipt,
+    exhausted: bool,
+    begins: u32,
+    polls: u32,
+    cancels: u32,
+    /// Buffer shape per `poll_exec`: `(direction, len, was IoBuf::None)`.
+    bufs: Vec<(Direction, u32, bool)>,
+}
+
+impl SettleStorage {
+    fn ready(log: Log, receipt: StorageReceipt) -> Self {
+        Self {
+            log,
+            pending: 0,
+            receipt,
+            exhausted: false,
+            begins: 0,
+            polls: 0,
+            cancels: 0,
+            bufs: Vec::new(),
+        }
+    }
+
+    fn pending_then(log: Log, pending: u32, receipt: StorageReceipt) -> Self {
+        Self {
+            pending,
+            ..Self::ready(log, receipt)
+        }
+    }
+
+    fn stalled(log: Log) -> Self {
+        Self::pending_then(log, u32::MAX, StorageReceipt::ok(0))
+    }
+
+    fn exhausted(log: Log) -> Self {
+        Self {
+            exhausted: true,
+            ..Self::ready(log, StorageReceipt::ok(0))
+        }
+    }
+}
+
+impl Storage for SettleStorage {
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.begins = self.begins.saturating_add(1);
+        self.log.borrow_mut().push(Ev::Begin {
+            dir: req.dir,
+            len: req.len,
+        });
+        if self.exhausted {
+            // The pool-exhausted token shape (`IoToken::invalid` is crate-only).
+            return IoToken::new(u8::MAX, 0);
+        }
+        IoToken::new(0, self.begins)
+    }
+
+    fn poll_exec(&mut self, _token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        let (dir, len, none_buf) = match &buf {
+            IoBuf::None => (Direction::None, 0, true),
+            IoBuf::Read(b) => (Direction::ToHost, b.len(), false),
+            IoBuf::Write(b) => (Direction::FromHost, b.len(), false),
+        };
+        self.polls = self.polls.saturating_add(1);
+        self.bufs.push((dir, len as u32, none_buf));
+        self.log.borrow_mut().push(Ev::Poll {
+            dir,
+            len: len as u32,
+            none_buf,
+        });
+        if self.pending > 0 {
+            self.pending -= 1;
+            return Poll::Pending;
+        }
+        Poll::Ready(self.receipt)
+    }
+
+    fn cancel(&mut self, _token: IoToken) {
+        self.cancels = self.cancels.saturating_add(1);
+        self.log.borrow_mut().push(Ev::Cancel);
+    }
+}
+
+/// Scripted transport: `pending` consecutive `Pending` answers, then a receipt
+/// with the programmed accepted prefix/error.
+struct SettleHost {
+    log: Log,
+    pending: u32,
+    accepted: Option<usize>,
+    error: Option<Fault>,
+    delivery: Delivery,
+    publish_fault: Option<Fault>,
+    publishes: u32,
+    plans: Vec<DataPlan>,
+    begins: u32,
+    polls: u32,
+    cancels: u32,
+}
+
+impl SettleHost {
+    fn ready(log: Log) -> Self {
+        Self {
+            log,
+            pending: 0,
+            accepted: None,
+            error: None,
+            delivery: Delivery::Complete,
+            publish_fault: None,
+            publishes: 0,
+            plans: Vec::new(),
+            begins: 0,
+            polls: 0,
+            cancels: 0,
+        }
+    }
+
+    fn pending_then(log: Log, pending: u32) -> Self {
+        Self {
+            pending,
+            ..Self::ready(log)
+        }
+    }
+}
+
+impl HostTransport for SettleHost {
+    fn publish(&mut self, plan: DataPlan) -> Result<(), Fault> {
+        self.publishes = self.publishes.saturating_add(1);
+        self.plans.push(plan);
+        match self.publish_fault {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
+    fn begin_recv(&mut self, _req: HostReq) -> HostToken {
+        self.begins = self.begins.saturating_add(1);
+        HostToken::new(0, self.begins)
+    }
+
+    fn begin_send(&mut self, _req: HostReq) -> HostToken {
+        self.begins = self.begins.saturating_add(1);
+        HostToken::new(0, self.begins)
+    }
+
+    fn poll_host(&mut self, _token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
+        let (dir, len) = match &buf {
+            HostBuf::Recv(b) => (Direction::FromHost, b.len()),
+            HostBuf::Send(b) => (Direction::ToHost, b.len()),
+        };
+        self.polls = self.polls.saturating_add(1);
+        self.log.borrow_mut().push(Ev::HostPoll {
+            dir,
+            len: len as u32,
+        });
+        if self.pending > 0 {
+            self.pending -= 1;
+            return Poll::Pending;
+        }
+        let accepted = self.accepted.unwrap_or(len);
+        Poll::Ready(HostReceipt::from_adapter(accepted, self.error))
+    }
+
+    fn cancel(&mut self, _token: HostToken) {
+        self.cancels = self.cancels.saturating_add(1);
+        self.log.borrow_mut().push(Ev::HostCancel);
+    }
+
+    fn delivery(&self) -> Delivery {
+        self.delivery
+    }
+}
+
+/// Resident long-operation device: one scripted `PollStep` per `poll_long` entry.
+struct LongDevice {
+    steps: [Option<Step>; 4],
+    cursor: usize,
+}
+
+impl Device for LongDevice {
+    type Medium = NoMedium;
+
+    fn prepare(
+        &mut self,
+        _permit: &CommandPermit,
+        _ctx: CommandContext,
+        _cdb: &[u8],
+    ) -> Result<(), Completion> {
+        Ok(())
+    }
+
+    fn active(&self) -> bool {
+        false
+    }
+
+    fn resume(&mut self, _permit: &CommandPermit) -> Result<(), Completion> {
+        Ok(())
+    }
+
+    fn poll<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        _feedback: Feedback,
+        _data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        PollStep::Idle
+    }
+
+    fn poll_long<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        _feedback: Feedback,
+        data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let step = match self.steps.get(self.cursor).copied().flatten() {
+            Some(step) => step,
+            None => return PollStep::Idle,
+        };
+        self.cursor += 1;
+        match step {
+            Step::Read(len) => PollStep::Io(StorageOp::Read {
+                resource: 1,
+                offset: 0,
+                buf: &mut data[..len],
+            }),
+            Step::Write(len) => PollStep::Io(StorageOp::Write {
+                resource: 1,
+                offset: 0,
+                buf: &data[..len],
+            }),
+            Step::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
+            Step::Complete(completion) => PollStep::Complete(completion),
+            // A long operation has no host phase and no second publish.
+            Step::Publish(_) | Step::Prefetch(_) | Step::Receive(_) | Step::Send(_) => {
+                PollStep::Idle
+            }
+        }
+    }
+
+    fn long_info(&self) -> LongInfo {
+        LongInfo::IDLE
+    }
+
+    fn interrupt(
+        &mut self,
+        _permit: &CommandPermit,
+        _reason: InterruptReason,
+        _known: KnownEffects,
+    ) -> Result<(), Fault> {
+        Ok(())
+    }
+
+    fn finish_delivery(&mut self, _permit: &CommandPermit, _delivery: Delivery) {}
+
+    fn take_medium(&mut self, _permit: &BoundaryPermit) -> Option<NoMedium> {
+        None
+    }
+
+    fn install_medium(
+        &mut self,
+        _permit: &BoundaryPermit,
+        _medium: NoMedium,
+    ) -> Result<(), (NoMedium, Fault)> {
+        Ok(())
+    }
+}
+
+type SettleTarget = Target<Cons<LuImpl<SettleDevice, u8>, Nil>>;
+type LongTarget = Target<Cons<LuImpl<LongDevice, u8>, Nil>>;
+
+fn settle_target(device: SettleDevice, backing: u8) -> SettleTarget {
+    Target::new(cons(LuImpl::new(device, backing), Nil))
+}
+
+/// `CommandContext` with a declared host data phase.
+fn ctx_data(direction: Direction, bytes: u64) -> CommandContext {
+    CommandContext {
+        lun: 0,
+        lun_count: 1,
+        host_bytes: bytes,
+        host_direction: direction,
+    }
+}
+
+/// A 512-byte Data-Out command (`WRITE(6)`), the standard pending-write script.
+fn write_steps() -> [Option<Step>; SETTLE_SCRIPT] {
+    [
+        Some(Step::Publish(DataPlan {
+            direction: Direction::FromHost,
+            bytes: 512,
+        })),
+        Some(Step::Write(512)),
+        Some(Step::Complete(Completion::Good)),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+}
+
+fn plan_512(direction: Direction) -> DataPlan {
+    DataPlan {
+        direction,
+        bytes: 512,
+    }
+}
+
+// ── Row 1: Stop is a drain (`03 §3.3`) ─────────────────────────────────────
+
+/// `stop` closes submission and **drains** a pending write. The drain
+/// polls the same token, merges the confirmed prefix into `known`, and only then
+/// settles (`interrupt` → `finish_delivery(Failed)`). Nothing is cancelled, the
+/// command is not replayed, and the pair is neither detached nor replaced.
+#[test]
+fn stop_drains_a_pending_write_and_merges_the_confirmed_prefix() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A]),
+        Ok(())
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 1, 0));
+
+    target.stop();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "a drain still in flight must not be reported as `Ended`"
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(
+        storage.cancels, 0,
+        "Stop drains a healthy token, never cancels"
+    );
+    assert_eq!(
+        storage.begins, 1,
+        "the same token is polled again, not re-issued"
+    );
+    assert_eq!(storage.polls, 2);
+
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1);
+    assert_eq!(
+        device.polls, 2,
+        "the device produced `Publish` and `Write`; the drain does not poll it again"
+    );
+    assert!(
+        device.seen.is_empty(),
+        "the drained receipt is merged into `known`, never fed back (no replay)"
+    );
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 512,
+            ..KnownEffects::NONE
+        }),
+        "the drained receipt's confirmed prefix reaches the device"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert_eq!(
+        (device.takes, device.installs),
+        (0, 0),
+        "Stop never detaches"
+    );
+    assert!(!device.active);
+    assert!(
+        at(&log, |e| matches!(e, Ev::Poll { .. }))
+            < at(&log, |e| matches!(e, Ev::Interrupt { .. })),
+        "the drained receipt is merged before `interrupt`"
+    );
+    assert!(
+        at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+            < at(&log, |e| matches!(e, Ev::Delivery(_))),
+        "`finish_delivery` books an already fixed completion"
+    );
+
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }
+    );
+    assert_eq!(
+        slot0(&target).backing_ref(),
+        Some(&9),
+        "no detach and no new medium after a Stop"
+    );
+    assert!(target.snapshot_static::<Here>().ready);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake),
+        "Stop produces no management result"
+    );
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A]),
+        Err(Fault::Boundary),
+        "new submission stays closed"
+    );
+}
+
+/// `03:60/83/118`: an errored receipt is still a **returned** fact. The drain
+/// keeps its confirmed prefix, cancels the token for slot hygiene, and the
+/// receipt's own `Effect` decides the remainder — no fabricated unknown.
+#[test]
+fn stop_drains_a_failing_write_and_keeps_the_confirmed_prefix() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Io, 128, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(
+        storage.cancels, 1,
+        "the errored token is cancelled for slot hygiene"
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 128,
+            ..KnownEffects::NONE
+        }),
+        "the returned prefix survives and `Effect::Known` keeps the remainder known"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. })),
+        "`cancel` returns before the settle"
+    );
+}
+
+/// `03:60/83/118`: a Stop drain whose write receipt is `Fault::Contract` with
+/// `Effect::Known` keeps the prefix, marks no unknown remainder, cancels once
+/// for slot hygiene, and still returns `Control(Ended { Stopped })`.
+#[test]
+fn stop_drains_a_contract_write_receipt_without_fabricating_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Contract, 128, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        })),
+        "the Ended shape holds even for a `Contract` receipt"
+    );
+
+    assert_eq!(storage.cancels, 1);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 128,
+            ..KnownEffects::NONE
+        }),
+        "the contract receipt's prefix is returned fact, not an unknown remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+}
+
+/// `03:60/83/118/138-139`: a drained Sync whose receipt is `Fault::Contract`
+/// with `Effect::Known` claims neither durability nor an unknown write
+/// remainder; the token is still cancelled once.
+#[test]
+fn stop_drains_a_contract_sync_receipt_without_durability_or_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(DataPlan {
+                    direction: Direction::None,
+                    bytes: 0,
+                })),
+                Some(Step::Sync),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        4,
+    );
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Contract, 0, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects::NONE),
+        "an errored Sync is not durable and is not an unknown write remainder"
+    );
+}
+
+/// `03:60/83/118`: a drained write receipt that reports
+/// `Effect::UnknownRemainder` keeps both its confirmed prefix and the unknown
+/// flag; the effect field, not the byte count, decides (`03:138-139`).
+#[test]
+fn stop_drains_a_write_receipt_that_reports_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Io, 64, Effect::UnknownRemainder),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects {
+            confirmed_write: 64,
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        })
+    );
+}
+
+/// `03:60/83`: a Stop drain of an errored host receive keeps the accepted
+/// prefix it already returned, does not fabricate a write remainder, and
+/// cancels the token for slot hygiene.
+#[test]
+fn stop_drains_an_errored_host_receive_keeping_the_host_prefix() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::FromHost))),
+                Some(Step::Receive(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost {
+        pending: 1,
+        accepted: Some(256),
+        error: Some(Fault::Io),
+        ..SettleHost::ready(log.clone())
+    };
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(host.cancels, 1, "the errored host token is cancelled");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            host_prefix: 256,
+            ..KnownEffects::NONE
+        }),
+        "the returned accepted prefix survives; the remainder is not unknown"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::HostCancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+}
+
+/// `03:60/83/118` + §3.4: a Stop drain of a pending **read** whose receipt is
+/// `failed(Io, 0, Known)` keeps `NONE` (a read never fabricates a write/sync
+/// remainder). The errored token is still cancelled for slot hygiene, which is
+/// the widened drain handling this fixture pins.
+#[test]
+fn stop_drains_an_errored_read_without_fabricating_a_write_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Read(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Io, 0, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(
+        storage.cancels, 1,
+        "the errored token is cancelled for slot hygiene (any direction)"
+    );
+    assert_eq!(storage.begins, 1, "no replay");
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects::NONE),
+        "an errored read has no write effect and no unknown remainder"
+    );
+    assert_eq!(
+        slot0(&target).device_ref().deliveries,
+        vec![Delivery::Failed]
+    );
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+}
+
+/// §3.4: a Sync is issued with `IoBuf::None` (`dir == None`, `len == 0`)
+/// and a successful drain of it becomes `known.sync_durable`.
+#[test]
+fn stop_drains_a_pending_sync_into_a_durable_effect() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(DataPlan {
+                    direction: Direction::None,
+                    bytes: 0,
+                })),
+                Some(Step::Sync),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        4,
+    );
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(0));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(
+        storage.bufs,
+        vec![(Direction::None, 0, true), (Direction::None, 0, true)],
+        "a Sync is polled with `IoBuf::None`, never a zero-length read/write"
+    );
+    assert_eq!(storage.cancels, 0);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            sync_durable: true,
+            ..KnownEffects::NONE
+        }),
+        "the drained Sync proves durability and nothing else"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// A pending host **receive** drains across two steps; `tick` stays
+/// `ServiceReady` until the drain settles, and the accepted prefix becomes
+/// `known.host_prefix` without a cancel.
+#[test]
+fn stop_drains_a_pending_host_receive_across_two_steps() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::FromHost))),
+                Some(Step::Receive(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::pending_then(log.clone(), 2);
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!((host.begins, host.polls, host.cancels), (1, 1, 0));
+
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending),
+        "the drain keeps the same host token"
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(host.polls, 3, "one host token, polled three times");
+    assert_eq!(host.begins, 1, "never re-issued");
+    assert_eq!(
+        host.cancels, 0,
+        "a healthy host phase is drained, not cancelled"
+    );
+    assert_eq!(
+        storage.begins, 0,
+        "no storage operation for a host-only phase"
+    );
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects {
+            host_prefix: 512,
+            ..KnownEffects::NONE
+        })
+    );
+}
+
+/// Same drain for a pending host **send** (Data-In). A send leaves no
+/// unknown write remainder.
+#[test]
+fn stop_drains_a_pending_host_send() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Send(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        6,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::pending_then(log.clone(), 1);
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(host.cancels, 0);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            host_prefix: 512,
+            ..KnownEffects::NONE
+        }),
+        "a Data-In send has no write effect to call unknown"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.3 (preparing, IO not yet issued): Stop settles with the honest empty
+/// `KnownEffects` — nothing was issued, so nothing is claimed or marked
+/// unknown — and does not invent IO.
+#[test]
+fn stop_with_no_io_in_flight_settles_with_no_effects() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), [None; SETTLE_SCRIPT]), 3);
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!((storage.begins, host.begins), (0, 0), "nothing is issued");
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1);
+    assert_eq!(
+        events(&log)
+            .into_iter()
+            .find(|e| matches!(e, Ev::Interrupt { .. })),
+        Some(Ev::Interrupt {
+            reason: InterruptReason::Stop,
+            known: KnownEffects::NONE,
+        })
+    );
+    assert_eq!(device.last_known, Some(KnownEffects::NONE));
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.4: a drained speculative prefetch never manufactures a write `Unknown`.
+/// Stop ends the command, so no completion is expected or asserted here — only
+/// the absence of a write remainder (and the lack of a cancel) is pinned.
+#[test]
+fn stop_drains_a_speculative_prefetch_without_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Prefetch(64)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        7,
+    );
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(64));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+
+    assert_eq!(storage.cancels, 0);
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects::NONE),
+        "a read leaves no write effect and no unknown remainder"
+    );
+}
+
+/// §4.3 (work-bank identity): a step that passes a different work bank cannot
+/// re-borrow the retained window. The step entry cancels the token once and
+/// settles; it must not spin, re-issue, or reinterpret the token against the
+/// wrong bytes.
+#[test]
+fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 2);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+    let mut other = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    // A different work bank cannot re-borrow the retained window (`§4.3`).
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut other, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(storage.cancels, 1, "the token is cancelled before settling");
+    assert_eq!(storage.begins, 1, "no re-issue");
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1, "exactly one bounded settle");
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+}
+
+// ── Row 2: `transport_ended` / `fatal` / `Abort` cancel ─────────────────────
+
+/// §3.3 (transport_ended): the pending token is cancelled **before**
+/// `interrupt`; a write remainder becomes unknown; the service ends only after
+/// the settlement.
+#[test]
+fn transport_end_cancels_the_pending_write_before_the_interrupt() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.transport_ended();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "the settle is still owed, so the end is not reported yet"
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::TransportEnded,
+            error: None,
+        }))
+    );
+
+    assert_eq!(storage.cancels, 1, "transport end cancels exactly once");
+    assert_eq!(
+        storage.polls, 1,
+        "the token is cancelled, not polled to Ready"
+    );
+    assert_eq!(storage.begins, 1, "no replay");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        }),
+        "an unobserved pending write keeps an unknown remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert_eq!((device.takes, device.installs), (0, 0));
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. })),
+        "`cancel` returns before `interrupt`"
+    );
+    assert!(
+        at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+            < at(&log, |e| matches!(e, Ev::Delivery(_)))
+    );
+
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::TransportEnded,
+            error: None,
+        }
+    );
+    // A late event cannot act on a settled command or a new medium.
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(storage.begins, 1);
+    assert_eq!(slot0(&target).device_ref().interrupts, 1);
+}
+
+/// §3.4 ("读取取消不凭空制造写入 Unknown"): an immediate cancel of a pending
+/// *read* settles with no write/sync remainder and no confirmed write prefix,
+/// even though the cancelled token is reported exactly once.
+#[test]
+fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Read(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.transport_ended();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::TransportEnded,
+            error: None,
+        }))
+    );
+
+    assert_eq!(
+        (storage.begins, storage.polls),
+        (1, 1),
+        "cancelled, not polled"
+    );
+    assert_eq!(storage.cancels, 1);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects::NONE),
+        "a cancelled read has no write effect and no unknown remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.3 (fatal): a pending host token is cancelled first, the settle carries the
+/// host prefix/unknown facts, and `tick` reports the first fault once settled.
+#[test]
+fn fatal_cancels_a_pending_host_token_before_the_interrupt() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::FromHost))),
+                Some(Step::Receive(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::pending_then(log.clone(), 2);
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.fatal(Fault::NeedsRecovery);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::NeedsRecovery),
+        }))
+    );
+
+    assert_eq!(host.cancels, 1, "the pending host token is cancelled");
+    assert_eq!(host.polls, 1, "no further poll of a cancelled token");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            host_prefix: 0,
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        }),
+        "a dropped receive is an unknown write remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::HostCancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::NeedsRecovery),
+        }
+    );
+}
+
+/// `03:120-125`: `fatal` cancels a pending storage **write** before `interrupt`,
+/// marks the unobserved remainder unknown, and the service ends only after the
+/// settlement.
+#[test]
+fn fatal_cancels_a_pending_storage_write_before_the_interrupt() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    target.fatal(Fault::Io);
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "the settle is still owed, so the end is not reported yet"
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::Io),
+        }))
+    );
+
+    assert_eq!(storage.cancels, 1, "fatal cancels exactly once");
+    assert_eq!(storage.polls, 1, "the token is cancelled, not drained");
+    assert_eq!(storage.begins, 1, "no replay");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        }),
+        "a cancelled pending write keeps an unknown remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(
+        at(&log, |e| matches!(e, Ev::Cancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::Io),
+        }
+    );
+}
+
+/// §4.10: `Control::Abort` cancels the pending send, settles once, and returns
+/// `0B/45/00` without detaching the medium or ending the target.
+#[test]
+fn abort_of_a_pending_send_returns_aborted_command_without_detaching() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Send(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        6,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::pending_then(log.clone(), 2);
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    assert_eq!(target.request_control(Control::Abort), Ok(()));
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Check(Sense::new(
+            0x0B, 0x45, 0x00
+        ))))
+    );
+
+    assert_eq!(host.cancels, 1);
+    assert_eq!(host.polls, 1, "the cancelled token is not polled again");
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1);
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects::NONE),
+        "a cancelled send has no write effect"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert_eq!(
+        (device.takes, device.installs),
+        (0, 0),
+        "Abort never detaches"
+    );
+    assert!(device.medium.is_some());
+    assert_eq!(slot0(&target).backing_ref(), Some(&6));
+    assert!(!slot0(&target).has_result());
+    assert!(
+        at(&log, |e| matches!(e, Ev::HostCancel)) < at(&log, |e| matches!(e, Ev::Interrupt { .. }))
+    );
+    // Abort ends the command only: the target keeps serving.
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::NothingToTake)
+    );
+    // The abort was consumed; a late step has nothing to settle.
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(slot0(&target).device_ref().interrupts, 1);
+}
+
+/// §4.10: an Abort of a pending write reports the unknown remainder instead of a
+/// fabricated clean state.
+#[test]
+fn abort_of_a_pending_write_reports_the_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.request_control(Control::Abort), Ok(()));
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Check(Sense::new(
+            0x0B, 0x45, 0x00
+        ))))
+    );
+
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(
+        slot0(&target).device_ref().last_known,
+        Some(KnownEffects {
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        })
+    );
+}
+
+// ── Row 3: injection points ────────────────────────────────────────────────
+
+/// §3.4 (`begin_exec` before issue): a pool-exhausted (invalid) token means no
+/// operation exists, so the settle carries no fabricated effect and nothing is
+/// polled.
+#[test]
+fn a_pool_exhausted_token_settles_without_an_adapter_operation() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::exhausted(log.clone());
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 0, 0));
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects::NONE),
+        "nothing was issued, so nothing can be unknown"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(!device.active);
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "a runner-side contract fault settles the command, not the service"
+    );
+}
+
+/// §3.4 (`Ready(Err(n))`): the receipt error reaches the device exactly once;
+/// the operation is never replayed, and a command that completed normally is
+/// never interrupted afterwards — a late transport end does not roll back an
+/// already booked status.
+#[test]
+fn a_receipt_error_is_fed_back_once_and_never_replayed() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::FromHost))),
+                Some(Step::Write(512)),
+                Some(Step::Complete(Completion::Check(WRITE_ERROR))),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        9,
+    );
+    let mut storage = SettleStorage::pending_then(
+        log.clone(),
+        1,
+        StorageReceipt::failed(Fault::Io, 128, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Check(WRITE_ERROR)))
+    );
+
+    assert_eq!(storage.begins, 1, "one operation, never replayed");
+    assert_eq!(storage.polls, 2, "the same token: Pending, then Ready");
+    assert_eq!(storage.cancels, 0);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.seen,
+        vec![(128, Some(Fault::Io))],
+        "the trustworthy prefix and the error reach the device once"
+    );
+    assert_eq!(
+        device.interrupts, 0,
+        "a completed command is not interrupted"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Complete]);
+
+    // The full-status-sent hook already ran; a later transport failure must not
+    // re-book delivery or interrupt the device again.
+    target.transport_ended();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::TransportEnded,
+            error: None,
+        }
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.deliveries, vec![Delivery::Complete]);
+    assert_eq!(device.interrupts, 0);
+    assert_eq!(storage.begins, 1);
+}
+
+/// §3.3 ("receipt 已返回") + §3.4: a returned receipt is authoritative for its
+/// own facts. An adapter receipt that breaks the contract settles the command
+/// before the device is polled again, the confirmed write prefix it reports is
+/// preserved, and `unknown_remainder` follows the receipt's `Effect` — a
+/// `Fault::Contract` alone never fabricates uncertainty.
+#[test]
+fn a_contract_receipt_settles_before_the_next_poll() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::ready(
+        log.clone(),
+        StorageReceipt::failed(Fault::Contract, 128, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+
+    assert_eq!(
+        (storage.begins, storage.polls),
+        (1, 1),
+        "one operation, one poll"
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.polls, 2,
+        "the device produced `Publish` and `Write`; the contract receipt is not polled back"
+    );
+    assert_eq!(
+        device.seen,
+        Vec::new(),
+        "a contract receipt is never mapped into device facts"
+    );
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 128,
+            ..KnownEffects::NONE
+        }),
+        "the returned confirmed prefix survives the contract settle"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert_eq!(device.interrupts, 1, "exactly one bounded settle");
+    // The command is gone: another step cannot replay the write.
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!((storage.begins, storage.polls), (1, 1), "no replay");
+}
+
+/// §3.4 (`Ready(n > requested)` / `Effect::UnknownRemainder`): the effect on the
+/// returned receipt stays authoritative. A write receipt that reports both a
+/// confirmed prefix and an unknown remainder reaches the device with both,
+/// instead of being flattened to a clean or a fabricated state.
+#[test]
+fn a_contract_receipt_with_an_unknown_effect_keeps_the_remainder_unknown() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::ready(
+        log.clone(),
+        StorageReceipt::failed(Fault::Contract, 32, Effect::UnknownRemainder),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 32,
+            unknown_remainder: true,
+            ..KnownEffects::NONE
+        }),
+        "the receipt's `Effect::UnknownRemainder` is honoured, not guessed"
+    );
+    assert_eq!(device.seen, Vec::new());
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.4 ("读取取消不凭空制造写入 Unknown"): a read never carries a write/sync
+/// remainder. Even a contract-violating read receipt that claims
+/// `Effect::UnknownRemainder` cannot make the runner report one.
+#[test]
+fn a_contract_receipt_from_a_read_never_fabricates_an_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Read(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::ready(
+        log.clone(),
+        StorageReceipt::failed(Fault::Contract, 0, Effect::UnknownRemainder),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+
+    assert_eq!((storage.begins, storage.polls), (1, 1));
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.polls, 2, "no device poll after the returned receipt");
+    assert_eq!(device.seen, Vec::new());
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects::NONE),
+        "a read leaves no write/sync remainder, whatever the receipt claims"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// `03:60`: a returned host receipt is authoritative even when it carries
+/// `Fault::Contract`. A pending send whose receipt reports 256 accepted bytes
+/// settles with that `host_prefix` and never fabricates a write remainder.
+#[test]
+fn a_contract_host_send_receipt_keeps_the_accepted_prefix() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Send(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        6,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost {
+        pending: 1,
+        accepted: Some(256),
+        error: Some(Fault::Contract),
+        ..SettleHost::ready(log.clone())
+    };
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+
+    assert_eq!(host.begins, 1, "one host token, never replayed");
+    assert_eq!(host.polls, 2, "Pending, then the returned contract receipt");
+    assert_eq!(host.cancels, 0, "a returned receipt is not a dropped token");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            host_prefix: 256,
+            ..KnownEffects::NONE
+        }),
+        "the accepted prefix is a returned fact; a send has no write remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.4 (`Ready(n > requested)` on the **inline** host path): a receive whose
+/// first poll returns `accepted > req.len` with `Fault::Contract` settles with
+/// the prefix clamped to the request and no fabricated unknown remainder. The
+/// inline contract branch does not cancel (the receipt already returned).
+#[test]
+fn an_inline_contract_host_receive_clamps_the_accepted_prefix() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::FromHost))),
+                Some(Step::Receive(512)),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        5,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    // `pending == 0`: the first `poll_host` returns `Ready`, i.e. the inline
+    // `PollStep::Receive` branch (not the retained `resume_host` path).
+    let mut host = SettleHost {
+        accepted: Some(1024),
+        error: Some(Fault::Contract),
+        ..SettleHost::ready(log.clone())
+    };
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+
+    assert_eq!(host.begins, 1, "one inline host token");
+    assert_eq!(
+        host.polls, 1,
+        "the inline receipt arrives on the first poll"
+    );
+    assert_eq!(
+        host.cancels, 0,
+        "the inline contract branch settles a returned receipt without cancelling"
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            host_prefix: 512,
+            ..KnownEffects::NONE
+        }),
+        "1024 > 512 is clamped to the request, and a receive is never an unknown remainder"
+    );
+    assert_eq!(device.interrupts, 1, "exactly one bounded settle");
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    // The command is settled: another step cannot replay the receive.
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(host.begins, 1, "no replay");
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+/// §3.4 (`IoBuf::None`): a *Sync* is polled with `IoBuf::None`, and a storage
+/// that returns a contract violation for it is settled without claiming
+/// durability, without inventing an unknown write remainder, and without polling
+/// the device again after the returned receipt.
+#[test]
+fn a_sync_contract_violation_reports_no_durability() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(DataPlan {
+                    direction: Direction::None,
+                    bytes: 0,
+                })),
+                Some(Step::Sync),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        4,
+    );
+    let mut storage = SettleStorage::ready(
+        log.clone(),
+        StorageReceipt::failed(Fault::Contract, 0, Effect::Known),
+    );
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(
+        storage.bufs,
+        vec![(Direction::None, 0, true)],
+        "the Sync was handed `IoBuf::None`, never a zero-length read/write"
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.polls, 2, "no device poll after the returned receipt");
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects::NONE),
+        "a failed Sync is `sync_durable = false`, not an unknown write remainder"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+}
+
+/// §3.3 (cleanup failure): a settle that cannot be proven safe is terminal, is
+/// attempted exactly once (no recursion), and the next `tick` reports the fault.
+#[test]
+fn a_failed_interrupt_settles_once_and_ends_the_service() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::failing_settle(log.clone(), write_steps(), Fault::NeedsRecovery),
+        9,
+    );
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+    target.stop();
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::NeedsRecovery)
+    );
+
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.interrupts, 1,
+        "one bounded settle, never a retry loop"
+    );
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::NeedsRecovery),
+        }
+    );
+    assert_eq!(slot0(&target).device_ref().interrupts, 1);
+}
+
+/// §3.3 (cleanup failure) + first-fault precedence: a settle failure must not
+/// overwrite an already-recorded fatal root cause (`set_fatal` keeps the first
+/// fault). The step still reports the settle fault; `tick` keeps the root one.
+#[test]
+fn a_failed_settle_does_not_overwrite_the_first_fatal_fault() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::failing_settle(log.clone(), write_steps(), Fault::NeedsRecovery),
+        9,
+    );
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending)
+    );
+
+    // The root fault is recorded first, then the settle also fails.
+    target.fatal(Fault::Io);
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::NeedsRecovery),
+        "the step reports the settle fault it just observed"
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Fatal,
+            error: Some(Fault::Io),
+        },
+        "the first fault stays authoritative"
+    );
+}
+
+/// §4.3/§4.4: a rejected data plan moves no data and starts no storage IO.
+#[test]
+fn a_rejected_data_plan_starts_no_io() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(512));
+    let mut host = SettleHost {
+        publish_fault: Some(Fault::Io),
+        ..SettleHost::ready(log.clone())
+    };
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Io)
+    );
+    assert_eq!(host.publishes, 1);
+    assert_eq!(storage.begins, 0, "no storage IO for a refused plan");
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.last_known, Some(KnownEffects::NONE));
+    assert_eq!(device.deliveries, vec![Delivery::Failed]);
+    assert!(!device.active);
+}
+
+/// §3.3 (local settled before send): a completion fixed while the host data
+/// phase has not started is reported without inventing a send.
+#[test]
+fn a_completion_fixed_before_the_send_starts_no_host_phase() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(
+        SettleDevice::new(
+            log.clone(),
+            [
+                Some(Step::Publish(plan_512(Direction::ToHost))),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        ),
+        6,
+    );
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Good))
+    );
+    assert_eq!(host.publishes, 1);
+    assert_eq!(
+        host.begins, 0,
+        "no send token is minted for a settled command"
+    );
+    assert_eq!(storage.begins, 0);
+    assert_eq!(
+        slot0(&target).device_ref().deliveries,
+        vec![Delivery::Complete]
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+// ── Row 4: idle / empty / drop windows ─────────────────────────────────────
+
+/// §3.3: `stop` with no command settles nothing — no `interrupt`, no delivery,
+/// no IO — and the next `tick` reports the end.
+#[test]
+fn stop_with_no_command_reports_ended_without_an_interrupt() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target.stop();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.interrupts, 0,
+        "no command, so nothing is interrupted"
+    );
+    assert!(device.deliveries.is_empty());
+    assert_eq!((storage.begins, host.begins), (0, 0));
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Err(Fault::Contract),
+        "there is no active command to step"
+    );
+    assert_eq!(events(&log), Vec::new(), "no adapter or device call at all");
+}
+
+/// §4.10: an idle `Abort` is accepted as a no-op; nothing is settled and service
+/// continues.
+#[test]
+fn abort_with_no_active_command_is_a_no_op() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    assert_eq!(target.request_control(Control::Abort), Ok(()));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 0);
+    assert!(device.deliveries.is_empty());
+    // Service continues: a command still starts and runs.
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A]),
+        Ok(())
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Good))
+    );
+}
+
+/// §3.3 (retained input / unconsumed completion): an admission rejection is a
+/// completion the shell still owes; until it is reported the boundary stays
+/// incomplete, so neither a new command nor a management transaction may start.
+#[test]
+fn an_unconsumed_completion_blocks_the_next_command_until_it_is_reported() {
+    let mut target = block_target();
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(QuietHost);
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    assert_eq!(target.propose_static::<Here>(Change::Remove), Ok(()));
+    assert_eq!(target.advance_static::<Here>(), Ok(()));
+    assert!(target
+        .take_static_at::<Here>(0)
+        .expect("removed pair")
+        .pair
+        .is_some());
+
+    // A media command on the empty slot is rejected at admission: the rejection
+    // is already a fixed completion, but the shell has not been given it.
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx(), &[0x00, 0, 0, 0, 0, 0]),
+        Ok(())
+    );
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx(), &[0x12, 0, 0, 0, 0, 0]),
+        Err(Fault::Boundary),
+        "an unconsumed completion keeps the boundary incomplete"
+    );
+    assert!(matches!(
+        target.propose_static::<Here>(Change::Install(pair_none(2))),
+        Err((Change::Install(_), Fault::Boundary))
+    ));
+
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Done(Completion::Check(MEDIUM_NOT_PRESENT)))
+    );
+    // The completion was reported exactly once: management is admissible again.
+    assert_eq!(
+        target.propose_static::<Here>(Change::Install(pair_none(2))),
+        Ok(())
+    );
+}
+
+// ── Row 5: the long-operation entry is synchronous and bounded ─────────────
+
+/// §3.4/§3.5: a long-operation entry issues one operation and re-polls the same
+/// token. A synchronous adapter may answer `Pending` a bounded number of times
+/// before it settles; the entry must not re-issue or lose the token.
+#[test]
+fn a_long_entry_polls_a_bounded_pending_then_completes() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target: LongTarget = Target::new(cons(
+        LuImpl::new(
+            LongDevice {
+                steps: [
+                    Some(Step::Sync),
+                    Some(Step::Complete(Completion::Good)),
+                    None,
+                    None,
+                ],
+                cursor: 0,
+            },
+            3u8,
+        ),
+        Nil,
+    ));
+    let mut storage = SettleStorage::pending_then(log.clone(), 2, StorageReceipt::ok(0));
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Ok(LongInfo::IDLE)
+    );
+    assert_eq!(storage.begins, 1, "one operation for this entry");
+    assert_eq!(
+        storage.polls, 3,
+        "Pending, Pending, Ready on the same token"
+    );
+    assert_eq!(storage.cancels, 0);
+    assert_eq!(storage.bufs, vec![(Direction::None, 0, true); 3]);
+}
+
+/// §3.4/§3.5: an adapter that never progresses must not spin forever. The entry
+/// cancels the stalled token and reports a runner-side contract fault; a true
+/// non-blocking path is the async-wrapper slice's job, not a hidden busy loop.
+#[test]
+fn a_long_entry_that_never_progresses_is_bounded() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target: LongTarget = Target::new(cons(
+        LuImpl::new(
+            LongDevice {
+                steps: [Some(Step::Sync), None, None, None],
+                cursor: 0,
+            },
+            3u8,
+        ),
+        Nil,
+    ));
+    let mut storage = SettleStorage::stalled(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Err(Fault::Contract)
+    );
+    assert_eq!(storage.begins, 1);
+    assert!(
+        storage.polls <= 64,
+        "the pending budget is bounded ({} polls)",
+        storage.polls
+    );
+    assert_eq!(
+        storage.cancels, 1,
+        "the stalled token is cancelled before settling"
+    );
 }

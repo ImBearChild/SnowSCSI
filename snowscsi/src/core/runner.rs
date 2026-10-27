@@ -148,7 +148,11 @@ enum IoAbsorb {
     /// Contract violation with no external effect (nothing was issued).
     Unissued,
     /// Contract violation reported for an operation that did reach the adapter.
-    Contract,
+    ///
+    /// The receipt was **returned**, so its own facts (confirmed prefix,
+    /// [`Effect`]) are carried instead of an unreported-cancel guess
+    /// (`03 §3.3` "receipt 已返回").
+    Contract(KnownEffects),
 }
 
 /// Authoritative runner state.
@@ -607,8 +611,20 @@ impl Runner {
         }
     }
 
-    /// Facts confirmed by a storage receipt that arrived while a Stop drained.
+    /// Facts confirmed by a storage receipt that was **returned** by the
+    /// adapter.
+    ///
+    /// A returned receipt is authoritative for its own facts (`03 §3.3`
+    /// "receipt 已返回" = consume the receipt first, a later cancel must not
+    /// overwrite it): the confirmed write prefix is kept exactly as reported and
+    /// `unknown_remainder` follows the receipt's [`Effect`]. An error on the
+    /// receipt — including [`Fault::Contract`] — does not by itself fabricate an
+    /// unknown remainder; only a write/sync whose end was never observed does
+    /// (see [`Self::known_unobserved`]). A read never produces a write/sync
+    /// remainder (`03 §3.4`: cancelling a read must not invent a write
+    /// `Unknown`), so an impossible read-side `UnknownRemainder` is masked.
     fn known_from_storage_receipt(req: IoReq, receipt: StorageReceipt) -> KnownEffects {
+        let write_or_sync = matches!(req.dir, Direction::FromHost | Direction::None);
         let mut known = KnownEffects::NONE;
         if req.dir == Direction::FromHost {
             known.confirmed_write = receipt.confirmed as u64;
@@ -617,11 +633,13 @@ impl Runner {
         {
             known.sync_durable = true;
         }
-        known.unknown_remainder = receipt.effect == Effect::UnknownRemainder;
+        known.unknown_remainder = write_or_sync && receipt.effect == Effect::UnknownRemainder;
         known
     }
 
-    /// Facts confirmed by a host receipt that arrived while a Stop drained.
+    /// Facts confirmed by a host receipt that was **returned** by the
+    /// adapter: the accepted/sent prefix is a returned fact and is never
+    /// replaced by a fabricated unknown remainder (`03 §3.3`).
     fn known_from_host_receipt(receipt: HostReceipt) -> KnownEffects {
         KnownEffects {
             host_prefix: receipt.accepted() as u64,
@@ -667,14 +685,13 @@ impl Runner {
                             self.note_required_io(false);
                         }
                         let receipt = sanitize_storage_receipt(req, raw);
-                        let mut known = Self::known_from_storage_receipt(req, receipt);
-                        if raw.error.is_some()
-                            && matches!(req.dir, Direction::FromHost | Direction::None)
-                        {
-                            // The adapter reported a failure: cancel the token
-                            // and keep the remainder unknown.
+                        let known = Self::known_from_storage_receipt(req, receipt);
+                        if raw.error.is_some() {
+                            // An errored token is cancelled for slot
+                            // hygiene. `cancel` returning does not rewrite the
+                            // facts the returned receipt already established
+                            // (`03 §3.3` "receipt 已返回").
                             storage.cancel(token);
-                            known.unknown_remainder = true;
                         }
                         known
                     }
@@ -712,14 +729,14 @@ impl Runner {
                         return Ok(Some(DriveStep::Pending));
                     }
                     Some(Poll::Ready(raw)) => {
-                        let mut known = Self::known_from_host_receipt(raw);
+                        // A returned host receipt is authoritative: keep its
+                        // (clamped) accepted prefix and do not fabricate an
+                        // unknown write remainder. The token is still cancelled
+                        // for slot hygiene when the adapter reported an error.
                         if raw.error().is_some() {
                             host.cancel(token);
-                            if is_recv {
-                                known.unknown_remainder = true;
-                            }
                         }
-                        known
+                        Self::known_from_host_receipt(sanitize_host_receipt(req, raw, self.owner))
                     }
                     None => {
                         host.cancel(token);
@@ -736,8 +753,9 @@ impl Runner {
         self.drive_state.set(None);
         if let Err(fault) = interrupted {
             // A failed settle is terminal: the slot can no longer prove a safe
-            // state (`03 §3.3`).
-            self.fatal = Some(fault);
+            // state (`03 §3.3`). The first fault wins; a settle failure must not
+            // mask an already-recorded root cause.
+            self.set_fatal(fault);
             return Err(fault);
         }
         Ok(None)
@@ -774,7 +792,9 @@ impl Runner {
         self.note_command_finished();
         self.drive_state.set(None);
         if let Err(fault) = interrupted {
-            self.fatal = Some(fault);
+            // The first fault is authoritative; a settle failure must not mask
+            // the root cause of an already-ending service.
+            self.set_fatal(fault);
             return Err(fault);
         }
         Ok(())
@@ -903,12 +923,19 @@ impl Runner {
                                 self.note_required_io(false);
                             }
                             state.pending = None;
-                            if !matches!(
-                                self.absorb_io(&mut state, req, IoSettlement::Ready(receipt)),
-                                IoAbsorb::Retained
-                            ) {
-                                self.settle_contract(lu, Self::known_unobserved(req.dir));
-                                return Err(Fault::Contract);
+                            match self.absorb_io(&mut state, req, IoSettlement::Ready(receipt)) {
+                                IoAbsorb::Retained => {}
+                                IoAbsorb::Contract(known) => {
+                                    self.settle_contract(lu, known);
+                                    return Err(Fault::Contract);
+                                }
+                                // A returned `Ready` receipt is never `Pending`
+                                // or `Unissued`; keep the match future-proof
+                                // without inventing an unknown remainder.
+                                IoAbsorb::Pending | IoAbsorb::Unissued => {
+                                    self.settle_contract(lu, KnownEffects::NONE);
+                                    return Err(Fault::Contract);
+                                }
                             }
                         }
                         None => {
@@ -935,7 +962,9 @@ impl Runner {
                     HostResume::Retained(raw) => {
                         state.pending = None;
                         if raw.error() == Some(Fault::Contract) {
-                            self.settle_contract(lu, Self::known_unobserved(Direction::FromHost));
+                            // The receipt was returned: keep its accepted prefix
+                            // and never invent an unknown remainder.
+                            self.settle_contract(lu, Self::known_from_host_receipt(raw));
                             return Err(Fault::Contract);
                         }
                         if raw.error().is_some() {
@@ -958,7 +987,9 @@ impl Runner {
                     HostResume::Retained(raw) => {
                         state.pending = None;
                         if raw.error() == Some(Fault::Contract) {
-                            self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
+                            // The receipt was returned: keep its accepted prefix
+                            // and never invent an unknown remainder.
+                            self.settle_contract(lu, Self::known_from_host_receipt(raw));
                             return Err(Fault::Contract);
                         }
                         if raw.error().is_some() {
@@ -1125,18 +1156,21 @@ impl Runner {
                             }
                         },
                         Poll::Ready(raw) if raw.error() == Some(Fault::Contract) => {
-                            self.settle_contract(lu, Self::known_unobserved(Direction::FromHost));
+                            // A returned receipt keeps its (clamped) accepted
+                            // prefix; a contract error alone is not an unknown
+                            // write.
+                            let known = Self::known_from_host_receipt(sanitize_host_receipt(
+                                req, raw, self.owner,
+                            ));
+                            self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
                         Poll::Ready(raw) => {
-                            let accepted = raw.accepted().min(req.len as usize);
-                            let error = raw.error();
-                            if error.is_some() {
+                            let receipt = sanitize_host_receipt(req, raw, self.owner);
+                            if receipt.error().is_some() {
                                 state.host_failed = true;
                             }
-                            state.feedback = Feedback::host_received(HostReceipt::new(
-                                accepted, error, self.owner,
-                            ));
+                            state.feedback = Feedback::host_received(receipt);
                         }
                     }
                 }
@@ -1175,17 +1209,21 @@ impl Runner {
                             }
                         },
                         Poll::Ready(raw) if raw.error() == Some(Fault::Contract) => {
-                            self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
+                            // A returned receipt keeps its (clamped) accepted
+                            // prefix; a contract error alone is not an unknown
+                            // write.
+                            let known = Self::known_from_host_receipt(sanitize_host_receipt(
+                                req, raw, self.owner,
+                            ));
+                            self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
                         Poll::Ready(raw) => {
-                            let accepted = raw.accepted().min(req.len as usize);
-                            let error = raw.error();
-                            if error.is_some() {
+                            let receipt = sanitize_host_receipt(req, raw, self.owner);
+                            if receipt.error().is_some() {
                                 state.host_failed = true;
                             }
-                            state.feedback =
-                                Feedback::host_sent(HostReceipt::new(accepted, error, self.owner));
+                            state.feedback = Feedback::host_sent(receipt);
                         }
                     }
                 }
@@ -1283,7 +1321,13 @@ impl Runner {
                 IoAbsorb::Pending
             }
             IoSettlement::Unissued => IoAbsorb::Unissued,
-            IoSettlement::Ready(raw) if raw.error == Some(Fault::Contract) => IoAbsorb::Contract,
+            IoSettlement::Ready(raw) if raw.error == Some(Fault::Contract) => {
+                // The adapter answered (the receipt is a returned fact): keep
+                // its confirmed prefix and effect instead of treating the
+                // operation as an unreported cancel (`03 §3.3`).
+                let receipt = sanitize_storage_receipt(req, raw);
+                IoAbsorb::Contract(Self::known_from_storage_receipt(req, receipt))
+            }
             IoSettlement::Ready(raw) => {
                 // A receipt-level contract violation is never mapped to SCSI
                 // sense; only real facts reach the device.
@@ -1310,8 +1354,8 @@ impl Runner {
                 self.settle_contract(lu, KnownEffects::NONE);
                 Err(Fault::Contract)
             }
-            IoAbsorb::Contract => {
-                self.settle_contract(lu, Self::known_unobserved(req.dir));
+            IoAbsorb::Contract(known) => {
+                self.settle_contract(lu, known);
                 Err(Fault::Contract)
             }
         }
@@ -1355,8 +1399,7 @@ impl Runner {
             Poll::Ready(raw) => {
                 // A short or failed phase keeps exactly the prefix the adapter
                 // reported; it is never rounded up to the request.
-                let accepted = raw.accepted().min(req.len as usize);
-                HostResume::Retained(HostReceipt::new(accepted, raw.error(), self.owner))
+                HostResume::Retained(sanitize_host_receipt(req, raw, self.owner))
             }
         }
     }
@@ -1836,11 +1879,34 @@ fn sanitize_storage_receipt(req: IoReq, receipt: StorageReceipt) -> StorageRecei
     receipt
 }
 
+/// Clamp a returned host receipt to the request it answers (`03 §3.4`).
+///
+/// The accepted/sent prefix can never exceed the request (a larger number is a
+/// contract violation and must not be over-reported). The runner stamps its own
+/// identity so an adapter cannot forge ownership.
+fn sanitize_host_receipt(req: HostReq, receipt: HostReceipt, owner: TargetId) -> HostReceipt {
+    HostReceipt::new(
+        receipt.accepted().min(req.len as usize),
+        receipt.error(),
+        owner,
+    )
+}
+
+/// Consecutive `Pending` answers a synchronous adapter may give before the
+/// long-operation entry cancels it.
+///
+/// Core has no executor or waker, so [`exec_storage`] busy-polls. The budget
+/// stops a stalled adapter from spinning forever (a stalled token would
+/// otherwise grow its own log unbounded). Yielding `Pending` back to the runner
+/// is the async wrapper's job; this is only the bounded synchronous fallback.
+const PENDING_BUDGET: u32 = 64;
+
 /// Busy-execute one storage operation for the long-operation entry.
 ///
 /// Core has no executor or waker, so a long-operation entry completes its
-/// single operation synchronously; an invalid token or a contract receipt is
-/// returned instead of spinning.
+/// single operation synchronously. An invalid token is reported as a contract
+/// failure, and a stalled token is cancelled after [`PENDING_BUDGET`]
+/// consecutive `Pending` answers instead of spinning.
 fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt {
     match op {
         StorageOp::Read {
@@ -1858,12 +1924,7 @@ fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt 
             if !token.is_valid() {
                 return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
             }
-            loop {
-                match storage.poll_exec(token, IoBuf::Read(&mut *buf)) {
-                    Poll::Pending => {}
-                    Poll::Ready(receipt) => return sanitize_storage_receipt(req, receipt),
-                }
-            }
+            drive_exec(storage, token, req, ExecBuf::Read(buf))
         }
         StorageOp::Write {
             resource,
@@ -1880,12 +1941,7 @@ fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt 
             if !token.is_valid() {
                 return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
             }
-            loop {
-                match storage.poll_exec(token, IoBuf::Write(buf)) {
-                    Poll::Pending => {}
-                    Poll::Ready(receipt) => return sanitize_storage_receipt(req, receipt),
-                }
-            }
+            drive_exec(storage, token, req, ExecBuf::Write(buf))
         }
         StorageOp::Sync { resource } => {
             let req = IoReq {
@@ -1898,10 +1954,56 @@ fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt 
             if !token.is_valid() {
                 return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
             }
-            loop {
-                match storage.poll_exec(token, IoBuf::None) {
-                    Poll::Pending => {}
-                    Poll::Ready(receipt) => return sanitize_storage_receipt(req, receipt),
+            drive_exec(storage, token, req, ExecBuf::None)
+        }
+    }
+}
+
+/// Buffer shape for [`drive_exec`], re-derived on every poll so a `Pending`
+/// answer can borrow the same window again.
+enum ExecBuf<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+    None,
+}
+
+impl ExecBuf<'_> {
+    fn reborrow(&mut self) -> IoBuf<'_> {
+        match self {
+            ExecBuf::Read(buf) => IoBuf::Read(buf),
+            ExecBuf::Write(buf) => IoBuf::Write(buf),
+            ExecBuf::None => IoBuf::None,
+        }
+    }
+}
+
+/// Poll one begun storage token until `Ready` or the pending budget runs out.
+///
+/// On exhaustion the token is cancelled before returning, so the adapter's
+/// slot is freed and the operation is never resumed as if it were still live.
+/// The operation's end was **not observed**, so a write/sync reports
+/// [`Effect::UnknownRemainder`] (its remainder is unknown); a read has no
+/// write effect and reports [`Effect::Known`] (`03 §3.4`).
+fn drive_exec(
+    storage: &mut dyn Storage,
+    token: IoToken,
+    req: IoReq,
+    mut work: ExecBuf<'_>,
+) -> StorageReceipt {
+    let mut pending = 0u32;
+    loop {
+        match storage.poll_exec(token, work.reborrow()) {
+            Poll::Ready(receipt) => return sanitize_storage_receipt(req, receipt),
+            Poll::Pending => {
+                pending += 1;
+                if pending >= PENDING_BUDGET {
+                    storage.cancel(token);
+                    let effect = if matches!(req.dir, Direction::FromHost | Direction::None) {
+                        Effect::UnknownRemainder
+                    } else {
+                        Effect::Known
+                    };
+                    return StorageReceipt::failed(Fault::Contract, 0, effect);
                 }
             }
         }
@@ -2719,6 +2821,54 @@ mod tests {
                 error: Some(Fault::NeedsRecovery),
             }
         );
+    }
+
+    #[test]
+    fn drive_exec_budget_exhaustion_marks_a_write_remainder_unknown() {
+        let mut buf = [0u8; 32];
+
+        // A stalled write: the end was never observed, so the remainder is
+        // unknown and the token is cancelled before reporting the fault.
+        let mut write_storage = HoldStorage::new(usize::MAX);
+        let write_req = IoReq {
+            resource: 1,
+            offset: 0,
+            len: 32,
+            dir: Direction::FromHost,
+        };
+        let write_token = write_storage.begin_exec(write_req);
+        assert!(write_token.is_valid());
+        let write = drive_exec(
+            &mut write_storage,
+            write_token,
+            write_req,
+            ExecBuf::Write(&buf),
+        );
+        assert_eq!(write.error, Some(Fault::Contract));
+        assert_eq!(write.confirmed, 0);
+        assert_eq!(write.effect, Effect::UnknownRemainder);
+        assert_eq!(write_storage.begins, 1);
+        assert_eq!(write_storage.cancels, 1);
+
+        // A stalled read has no write effect: no fabricated unknown remainder.
+        let mut read_storage = HoldStorage::new(usize::MAX);
+        let read_req = IoReq {
+            resource: 1,
+            offset: 0,
+            len: 32,
+            dir: Direction::ToHost,
+        };
+        let read_token = read_storage.begin_exec(read_req);
+        assert!(read_token.is_valid());
+        let read = drive_exec(
+            &mut read_storage,
+            read_token,
+            read_req,
+            ExecBuf::Read(&mut buf),
+        );
+        assert_eq!(read.error, Some(Fault::Contract));
+        assert_eq!(read.effect, Effect::Known);
+        assert_eq!(read_storage.cancels, 1);
     }
 
     #[test]
