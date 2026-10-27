@@ -3,9 +3,12 @@
 //! Authority: `__ARCH__/design/02-api-core.md` §4.12.
 //!
 //! The long-operation state lives in the Device; `poll_long` rebuilds the
-//! execution context on every call and persists only this state. A Target has
-//! at most one active long operation, and management is rejected while
-//! `phase != Settled`.
+//! execution context on every call and persists only this state. The runner
+//! keeps the *one* retained adapter token (and the caller's `data` bank
+//! identity) beside this projection, keyed to the LUN: `Pending` yields across
+//! entries without polling the device, `Ready` is consumed on the next entry.
+//! A Target has at most one active long operation, and management is rejected
+//! while `phase != Settled`.
 
 use super::errors::Fault;
 

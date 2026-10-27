@@ -401,9 +401,12 @@ impl<S: RuntimeSet> Target<S> {
     /// Advance a resident long operation on a runtime LUN.
     ///
     /// `work` serves the current command (it is left untouched here); `scratch`
-    /// is the resident long operation's data bank. The single storage IO issued
-    /// by one entry borrows `scratch` only, never `work` or the device, so a
-    /// query command may use `work` while a long IO is in flight (`03 §3.7`).
+    /// is the resident long operation's data bank. One entry polls the adapter
+    /// **at most once**: a long operation may span several entries with one
+    /// retained token, and the bank stays borrowed until it settles
+    /// (`Ready`/`cancel`). A query command may use `work` while a long IO is in
+    /// flight (`03 §3.7`). A foreign LUN (another LUN's long operation owns the
+    /// slot) fails closed with `Fault::Boundary`.
     pub fn poll_long_entry_rt(
         &mut self,
         lun: usize,
@@ -614,9 +617,11 @@ pub trait StaticTarget<S: SlotSet> {
     /// Advance a resident long operation on the static slot.
     ///
     /// `work` serves the current command; `scratch` is the resident long
-    /// operation's data bank. A query command may use `work` while a long IO is
-    /// in flight because the returned operation borrows only `scratch`
-    /// (`03 §3.7`).
+    /// operation's data bank. One entry polls the adapter at most once, so a
+    /// long operation may span several entries with one retained token; the
+    /// bank stays borrowed until it settles. A query command may use `work`
+    /// while a long IO is in flight because the returned operation borrows only
+    /// `scratch` (`03 §3.7`).
     fn poll_long_entry_static<I>(
         &mut self,
         storage: &mut dyn super::storage::Storage,

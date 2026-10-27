@@ -19,8 +19,8 @@
 //! `MmcDrive` in `snowscsi/src/mmc/drive.rs` so it can name the profile type.
 
 use snowscsi::core::storage::{
-    BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, IoBuf, IoReq, StorageReceipt,
-    SyncHost, SyncStorage,
+    BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, IoBuf, IoReq, IoToken, Storage,
+    StorageReceipt, SyncHost, SyncStorage,
 };
 use snowscsi::core::{
     cons, At, BoundaryReject, Change, CommandContext, Completion, Cons, Control, DataPlan,
@@ -409,7 +409,7 @@ macro_rules! two_lun_target {
 fn start_immed_format_rt(
     target: &mut TwoTarget<'_>,
     lun: usize,
-    storage: &mut BlockingStorage<Plane>,
+    storage: &mut dyn Storage,
     host: &mut BlockingHost<TestHost>,
     work: &mut [u8],
     scratch: &mut [u8],
@@ -429,10 +429,63 @@ fn start_immed_format_rt(
         .expect("FORMAT start")
 }
 
+/// Start IMMED FORMAT through any [`Storage`] adapter (the parity fixture needs
+/// both a `BlockingStorage` and a `Pending`-first double).
+fn start_format_any(
+    target: &mut MmcTarget,
+    storage: &mut dyn Storage,
+    host: &mut BlockingHost<TestHost>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+) -> Completion {
+    let params = format_params(0xA2, 0);
+    *host = BlockingHost::new(TestHost::params(params));
+    target
+        .drive_static_host::<Here>(
+            storage,
+            host,
+            ctx(Direction::FromHost, 12),
+            &[0x04, 0x11, 0, 0, 0, 0],
+            work,
+            scratch,
+        )
+        .expect("FORMAT start")
+}
+
+/// Start IMMED FORMAT and advance the resident fill until it settles.
+///
+/// Returns the number of long entries used and the final projection; the
+/// entry count is the only thing the sync/async parity fixture allows to
+/// differ.
+fn run_format_fill(
+    target: &mut MmcTarget,
+    storage: &mut dyn Storage,
+    host: &mut BlockingHost<TestHost>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+) -> (u32, LongInfo) {
+    assert_eq!(
+        start_format_any(target, storage, host, work, scratch),
+        Completion::Good
+    );
+    let mut entries = 0u32;
+    loop {
+        entries += 1;
+        assert!(entries < 64, "the long operation did not settle");
+        let info = target
+            .poll_long_entry_static::<Here>(storage, work, scratch)
+            .expect("poll_long");
+        if info.phase == LongPhase::Settled {
+            return (entries, info);
+        }
+        assert_eq!(info.phase, LongPhase::Foreground);
+    }
+}
+
 fn poll_long_rt(
     target: &mut TwoTarget<'_>,
     lun: usize,
-    storage: &mut BlockingStorage<Plane>,
+    storage: &mut dyn Storage,
     work: &mut [u8],
     scratch: &mut [u8],
 ) -> Result<LongInfo, Fault> {
@@ -857,6 +910,157 @@ fn a_failing_final_sync_settles_with_an_error_without_replay() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Sync/async adapter parity
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Storage double that answers `Pending` a fixed number of times per operation
+/// before delegating to a real [`BlockingStorage`] over the same [`Plane`].
+///
+/// It records every `begin_exec` request (the storage-op trace) and the
+/// poll/cancel counts, so a `Pending` run can be compared with a fully
+/// synchronous run byte for byte.
+struct PendingStorage {
+    inner: BlockingStorage<Plane>,
+    pendings_per_op: usize,
+    remaining: usize,
+    begins: Vec<IoReq>,
+    polls: u32,
+    cancels: u32,
+}
+
+impl PendingStorage {
+    fn new(plane: Plane, pendings_per_op: usize) -> Self {
+        Self {
+            inner: BlockingStorage::new(plane),
+            pendings_per_op,
+            remaining: 0,
+            begins: Vec::new(),
+            polls: 0,
+            cancels: 0,
+        }
+    }
+}
+
+impl Storage for PendingStorage {
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.begins.push(req);
+        self.remaining = self.pendings_per_op;
+        self.inner.begin_exec(req)
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> std::task::Poll<StorageReceipt> {
+        self.polls = self.polls.saturating_add(1);
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            return std::task::Poll::Pending;
+        }
+        self.inner.poll_exec(token, buf)
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        self.cancels = self.cancels.saturating_add(1);
+        self.inner.cancel(token);
+    }
+}
+
+/// §3.4/§3.5: the same MMC FORMAT script driven through a synchronous adapter
+/// and through one that yields `Pending` K times per operation must produce the
+/// same device trace (`Publish`/`Io` sequence with offsets and lengths), the
+/// same storage op trace (direction/offset/len order), the same final contents,
+/// completion and [`LongInfo`], and one `begin_exec` per operation.
+///
+/// Only the **entry count** may differ: the async run spends extra entries on
+/// `Pending`, and a long-operation receipt is always consumed by the device on
+/// the entry *after* it was stored (the documented one-step lag).
+#[test]
+fn sync_and_async_adapters_produce_the_same_long_operation_trace() {
+    const K: usize = 2;
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // 1. BlockingStorage over a SyncStorage: every poll is Ready.
+    let mut sync_target = target(4);
+    let mut sync_storage = BlockingStorage::new(Plane::new(16 * 1024));
+    let mut sync_host = BlockingHost::new(TestHost::data());
+    let (sync_entries, sync_info) = run_format_fill(
+        &mut sync_target,
+        &mut sync_storage,
+        &mut sync_host,
+        &mut work,
+        &mut scratch,
+    );
+    let sync_log = sync_storage.inner().log.clone();
+    let sync_events = sync_host.inner().events.clone();
+
+    // 2. The same script behind a Storage double that yields Pending K times.
+    let mut async_target = target(4);
+    let mut async_storage = PendingStorage::new(Plane::new(16 * 1024), K);
+    let mut async_host = BlockingHost::new(TestHost::data());
+    let (async_entries, async_info) = run_format_fill(
+        &mut async_target,
+        &mut async_storage,
+        &mut async_host,
+        &mut work,
+        &mut scratch,
+    );
+    let async_log = async_storage.inner.inner().log.clone();
+    let async_events = async_host.inner().events.clone();
+
+    // Identical device trace: publish/receive order plus storage op family,
+    // offset and length, in order.
+    assert_eq!(
+        async_events, sync_events,
+        "the host trace must be identical"
+    );
+    assert_eq!(
+        async_log, sync_log,
+        "the device/storage op trace (direction/offset/len order) must be identical"
+    );
+    assert_eq!(
+        async_storage.inner.inner().mem,
+        sync_storage.inner().mem,
+        "the final backing contents must be identical"
+    );
+
+    // Identical completion and projection.
+    assert_eq!(async_info, sync_info);
+    assert_eq!(sync_info.phase, LongPhase::Settled);
+    assert_eq!(sync_info.progress, Some(100));
+    assert_eq!(sync_info.error, None);
+
+    // One `begin_exec` per operation in both runs: 2 zero-fill writes + 1 Sync
+    // for the 4-sector medium.
+    assert_eq!(async_log.len(), 3, "writes then one durability Sync");
+    assert_eq!(
+        async_storage.begins.len(),
+        async_log.len(),
+        "the async run begins every operation exactly once"
+    );
+    for (req, ev) in async_storage.begins.iter().zip(&async_log) {
+        let expected = match ev {
+            Ev::Read(offset, len) => (Direction::ToHost, *offset, *len as u32),
+            Ev::Write(offset, len) => (Direction::FromHost, *offset, *len as u32),
+            Ev::Sync => (Direction::None, 0, 0),
+        };
+        assert_eq!(
+            (req.dir, req.offset, req.len),
+            expected,
+            "the async storage op trace matches the synchronous one"
+        );
+    }
+    assert_eq!(async_storage.cancels, 0, "no token is cancelled");
+    assert_eq!(
+        async_storage.polls,
+        (async_storage.begins.len() as u32) * (K as u32 + 1),
+        "each operation is polled K times as Pending, then Ready"
+    );
+    assert!(
+        async_entries > sync_entries,
+        "Pending spans entries ({async_entries} vs {sync_entries}); the trace does not change"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // D4 — explicit no-medium GC/GESN through Spc
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1106,6 +1310,673 @@ fn queries_use_work_while_the_foreground_fill_advances_from_scratch() {
     }
     assert_eq!(storage.inner().syncs(), 1);
     assert!(storage.inner().zeroed(8192));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Queries while a long IO token is actually Pending
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `03 §3.7`: a long-entry token is **not** a command-owned
+/// `required_io` obligation. With the token still `Pending`, INQUIRY /
+/// REQUEST SENSE / REPORT LUNS start and complete from `work`, READ/WRITE/TUR
+/// stay device-gated with zero medium/backing calls, and the long entry then
+/// resumes the *same* token (one poll per entry, no second `begin_exec`).
+/// Management still refuses to cross the live long IO.
+#[test]
+fn queries_are_served_while_a_long_token_is_pending() {
+    let (mut target, counters) = target_counted(4);
+    // Two Pending answers: the first write token survives several entries.
+    let mut storage = PendingStorage::new(Plane::new(16 * 1024), 2);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_format_any(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    // Entry 1 issues the first zero-fill write and yields Pending.
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!(storage.begins.len(), 1);
+    assert_eq!(storage.polls, 1);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    // Management must not cross the live long IO.
+    assert!(matches!(
+        target.propose_static::<Here>(Change::Remove),
+        Err((Change::Remove, Fault::Boundary))
+    ));
+
+    let medium_before = counters.snap();
+    let mut queries = BlockingHost::new(TestHost::data());
+
+    // INQUIRY is served from `work` while the token is pending.
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut queries,
+            ctx(Direction::ToHost, 96),
+            &inquiry(),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(work[0], 0x05, "MMC inquiry PDT is CD-ROM");
+
+    // REQUEST SENSE reports FORMAT IN PROGRESS with SKSV and progress.
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut queries,
+            ctx(Direction::ToHost, 18),
+            &request_sense(),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(work[2] & 0x0F, 0x02, "NOT READY");
+    assert_eq!(work[12], 0x04, "ASC = LOGICAL UNIT NOT READY");
+    assert_eq!(work[13], 0x04, "ASCQ = FORMAT IN PROGRESS");
+    assert_eq!(work[15] & 0x80, 0x80, "SKSV set");
+
+    // REPORT LUNS is a live admitted command during the foreground fill.
+    let mut report_luns = [0u8; 10];
+    report_luns[0] = 0xA0;
+    report_luns[9] = 8;
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut queries,
+            ctx(Direction::ToHost, 8),
+            &report_luns,
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(
+        u32::from_be_bytes([work[0], work[1], work[2], work[3]]),
+        8,
+        "one LUN in the REPORT LUNS list"
+    );
+
+    // READ/WRITE/TUR still get the device foreground gate, zero medium IO.
+    for cdb in [&tur_cdb()[..], &read10(0, 1)[..], &write10(0, 1)[..]] {
+        let direction = match cdb[0] {
+            0x28 => Direction::ToHost,
+            0x2A => Direction::FromHost,
+            _ => Direction::None,
+        };
+        assert_eq!(
+            target.drive_static::<Here>(
+                &mut storage,
+                ctx(direction, 0),
+                cdb,
+                &mut work,
+                &mut scratch,
+            ),
+            Ok(Completion::Check(FORMAT_IN_PROGRESS)),
+            "opcode {:#04x} must be gated",
+            cdb[0]
+        );
+    }
+    assert_eq!(
+        counters.snap(),
+        medium_before,
+        "gated commands touched the medium"
+    );
+
+    // The queries never issued or polled the long token.
+    assert_eq!(storage.begins.len(), 1, "no second operation was begun");
+    assert_eq!(storage.polls, 1, "the pending token was not polled");
+
+    // The long entry resumes the same token: one poll per entry, then Ready.
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((storage.begins.len(), storage.polls), (1, 2));
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((storage.begins.len(), storage.polls), (1, 3));
+
+    // ... and the fill finishes normally from `scratch`.
+    loop {
+        let info = target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("poll_long");
+        if info.phase == LongPhase::Settled {
+            assert_eq!(info.error, None);
+            break;
+        }
+    }
+    assert_eq!(storage.cancels, 0);
+    assert_eq!(storage.inner.inner().syncs(), 1);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Terminal flags with a live long token
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Stop = drain: a retained long token keeps `tick` at `ServiceReady`, the
+/// next entry polls the **same** token once to `Ready`, and only then does the
+/// service report `Ended`. Nothing is cancelled and the resident fill may stay
+/// `Foreground` (a terminal target never issues new IO).
+#[test]
+fn stop_drains_a_pending_long_token_before_reporting_ended() {
+    let mut target = target(2);
+    let mut storage = PendingStorage::new(Plane::new(8 * 1024), 1);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_format_any(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!(storage.polls, 1);
+
+    target.stop();
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "a live token keeps the service up"
+    );
+
+    // Drain entry: the same token answers Ready; the receipt is fed once.
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("drain entry");
+    assert_eq!(info.phase, LongPhase::Foreground);
+    assert_eq!(storage.polls, 2, "one more poll of the same token");
+    assert_eq!(storage.cancels, 0, "Stop drains, it never cancels");
+    assert_eq!(storage.begins.len(), 1, "the operation is never re-issued");
+
+    // Token is gone: the service can now end, and no further IO is issued.
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: snowscsi::core::RunEnd::Stopped,
+            error: None,
+        }
+    );
+    let polls = storage.polls;
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Err(Fault::Boundary),
+        "no new long entry after a terminal flag"
+    );
+    assert_eq!(storage.polls, polls, "the token is never polled again");
+}
+
+/// Transport end = cancel: one `storage.cancel`, a synthesized cancelled
+/// receipt fed to the device (`LongInfo.error` records it), then `Ended`.
+#[test]
+fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
+    let mut target = target(2);
+    // Never leaves Pending: only a terminal cancel can end this token.
+    let mut storage = PendingStorage::new(Plane::new(8 * 1024), usize::MAX);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_format_any(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("long entry");
+    assert_eq!(storage.polls, 1);
+
+    target.transport_ended();
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("cancel entry");
+    assert_eq!(storage.cancels, 1, "cancelled exactly once");
+    assert_eq!(storage.polls, 1, "the cancelled token is never polled");
+    assert_eq!(info.phase, LongPhase::Settled);
+    assert_eq!(
+        info.error,
+        Some(Fault::Contract),
+        "the device settles from the synthesized cancelled receipt"
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: snowscsi::core::RunEnd::TransportEnded,
+            error: None,
+        }
+    );
+    let polls = storage.polls;
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Err(Fault::Boundary)
+    );
+    assert_eq!(storage.polls, polls);
+    assert_eq!(storage.cancels, 1);
+}
+
+/// Fatal = cancel: same shape as transport end, but the fatal fault is
+/// what `Ended` reports; the long op records its own cancelled receipt.
+#[test]
+fn fatal_cancels_a_pending_long_write_and_records_the_fault() {
+    let mut target = target(2);
+    let mut storage = PendingStorage::new(Plane::new(8 * 1024), usize::MAX);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_format_any(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("long entry");
+
+    target.fatal(Fault::NeedsRecovery);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("cancel entry");
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(storage.polls, 1);
+    assert_eq!(info.error, Some(Fault::Contract));
+    assert_eq!(
+        target.tick(),
+        RunOutcome::Ended {
+            reason: snowscsi::core::RunEnd::Fatal,
+            error: Some(Fault::NeedsRecovery),
+        }
+    );
+    let polls = storage.polls;
+    let cancels = storage.cancels;
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Err(Fault::Boundary)
+    );
+    assert_eq!((storage.polls, storage.cancels), (polls, cancels));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Forced-long latch: a force-cancelled long op must still be takeable
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The exact dead-end repro: `Replace → advance` leaves a resident result, a
+/// fill holds a `Pending` write token, `force_remove_rt` cancels the token but
+/// defers on the resident result. The forced-long latch must let the take
+/// deliver the old pair and the deferred force detach the current one (with the
+/// force's unknown write remainder), ending in an installable empty slot.
+#[test]
+fn a_force_cancelled_long_operation_still_hands_back_and_detaches() {
+    let mut target = target(4);
+    let mut storage = PendingStorage::new(Plane::new(16 * 1024), usize::MAX);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // Replace: the old pair becomes a resident result while a fresh medium runs.
+    let replacement = Pair {
+        medium: SpyMedium::with_counters(4, Counters::default()),
+        backing: 2u8,
+    };
+    assert!(target
+        .propose_static::<Here>(Change::Replace(replacement))
+        .is_ok());
+    target.advance_static::<Here>().expect("advance replace");
+    assert!(target.snapshot_static::<Here>().ready);
+
+    // The fresh medium starts a fill whose first write token stalls.
+    assert_eq!(
+        start_format_any(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((storage.begins.len(), storage.polls), (1, 1));
+
+    // The force cancels the token, books the unknown write remainder and defers
+    // on the resident result.
+    target
+        .force_remove_static::<Here>(&mut storage, &mut host)
+        .expect("force accepts");
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(storage.polls, 1);
+    assert!(target.snapshot_static::<Here>().ready, "force deferred");
+
+    // NEW-2: a latched LUN refuses long entries without touching the adapter
+    // or the projection.
+    let before = (
+        storage.begins.len(),
+        storage.polls,
+        storage.cancels,
+        target.snapshot_static::<Here>().long,
+    );
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
+        Err(Fault::Boundary),
+        "a pair committed for removal issues no new IO"
+    );
+    assert_eq!(
+        (
+            storage.begins.len(),
+            storage.polls,
+            storage.cancels,
+            target.snapshot_static::<Here>().long,
+        ),
+        before,
+        "neither the adapter nor the projection was touched"
+    );
+
+    // The latch lets the take cross only the long-phase check: the old pair is
+    // handed back, and the deferred force detaches the current (unsettled) pair.
+    let old = target.take_static_at::<Here>(0).expect("old pair takeable");
+    assert_eq!(
+        old.pair.map(|p| p.backing),
+        Some(1u8),
+        "the replaced old pair is handed back"
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ResourcesReady { lun: 0 },
+        "the deferred force detached the current pair"
+    );
+    assert!(!target.snapshot_static::<Here>().ready);
+
+    let forced = target
+        .take_static_at::<Here>(0)
+        .expect("forced pair takeable");
+    assert_eq!(forced.pair.map(|p| p.backing), Some(2u8));
+    assert!(
+        forced.effects.unknown_remainder,
+        "the force handback carries the cancelled write remainder"
+    );
+    assert_eq!(forced.effects.confirmed_write, 0);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    // Nothing wedges: the now-empty slot accepts a fresh pair.
+    let pair = Pair {
+        medium: SpyMedium::with_counters(4, Counters::default()),
+        backing: 3u8,
+    };
+    assert!(target.install_static::<Here>(pair).is_ok());
+    assert!(target.snapshot_static::<Here>().ready);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+}
+
+/// A force on a `Foreground` long op with **no** token (IMMED start, no entry
+/// yet) also arms the latch and detaches immediately; the take is not blocked
+/// by `LongOperationActive`.
+#[test]
+fn a_force_on_a_tokenless_foreground_long_operation_still_detaches() {
+    let mut target = target(2);
+    let mut storage = BlockingStorage::new(Plane::new(8 * 1024));
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_immed_format(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        target.snapshot_static::<Here>().long.phase,
+        LongPhase::Foreground
+    );
+    // No long entry has run: no adapter token is retained.
+
+    target
+        .force_remove_static::<Here>(&mut storage, &mut host)
+        .expect("force detaches");
+    assert!(!target.snapshot_static::<Here>().ready);
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+
+    let taken = target
+        .take_static_at::<Here>(0)
+        .expect("the forced pair is takeable");
+    assert_eq!(taken.pair.map(|p| p.backing), Some(1u8));
+    assert!(
+        !taken.effects.unknown_remainder,
+        "nothing was issued, so there is no unknown remainder"
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.snapshot_static::<Here>().long.phase,
+        LongPhase::Idle,
+        "the detach discarded the resident long operation"
+    );
+}
+
+/// A normal (non-force) take during a `Foreground` fill still gets the
+/// long-operation rejection: the latch is only armed by a force.
+#[test]
+fn a_normal_take_during_foreground_still_rejects() {
+    let mut target = target(2);
+    let mut storage = BlockingStorage::new(Plane::new(8 * 1024));
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_immed_format(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    // One entry completes the first chunk synchronously: no token is retained,
+    // so only the long phase can reject the take.
+    assert_eq!(
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert!(matches!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::LongOperationActive)
+    ));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deferred force with a live long token
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Force row: a force deferred behind a **slot-resident result** still
+/// cancels the live long token exactly once (no leaked adapter slot) and the
+/// target keeps serving (`ServiceReady`, never `Ended`). The deferred detach is
+/// left armed because the resident long operation is not settled.
+#[test]
+fn a_deferred_force_cancels_a_live_long_token_once() {
+    two_lun_target!(target, 4, _c0, _c1);
+    // LUN 1's fill token never leaves Pending.
+    let mut s1 = PendingStorage::new(Plane::new(16 * 1024), usize::MAX);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // Replace on LUN 1: the old pair is resident (force must defer on it) while
+    // a fresh medium is installed and can run a long op.
+    let replacement = Pair {
+        medium: SpyMedium::with_counters(4, Counters::default()),
+        backing: 2u8,
+    };
+    assert!(target.propose_rt(1, Change::Replace(replacement)).is_ok());
+    target.advance_rt(1).expect("advance replace");
+    assert!(target.snapshot_rt(1).expect("slot 1").ready);
+
+    assert_eq!(
+        start_immed_format_rt(&mut target, 1, &mut s1, &mut host, &mut work, &mut scratch),
+        Completion::Good
+    );
+    assert_eq!(
+        poll_long_rt(&mut target, 1, &mut s1, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((s1.begins.len(), s1.polls), (1, 1));
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    // The force is deferred on LUN 1's resident result, but the live token is
+    // still cancelled exactly once.
+    assert_eq!(target.force_remove_rt(1, &mut s1, &mut host), Ok(()));
+    assert_eq!(s1.cancels, 1, "the deferred force still cancels the token");
+    assert_eq!(s1.polls, 1, "the cancelled token is never polled again");
+    assert_eq!(s1.begins.len(), 1, "the write is never re-issued");
+    assert!(
+        target.snapshot_rt(1).expect("slot 1").ready,
+        "deferred: LUN 1 stays installed"
+    );
+    assert_eq!(
+        target.snapshot_rt(1).expect("slot 1").long.phase,
+        LongPhase::Foreground,
+        "the resident operation is not settled by the cancel"
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "a deferred force with a cancelled token keeps serving"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Foreign LUN fail-closed with a live token
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The owner of a `Pending` long token is serialized: a foreign LUN entry is
+/// `Boundary` without touching either adapter or either projection, and the
+/// owner then resumes the same token.
+#[test]
+fn a_foreign_long_entry_is_boundary_without_touching_a_pending_token() {
+    two_lun_target!(target, 4, _c0, _c1);
+    let mut s0 = PendingStorage::new(Plane::new(16 * 1024), 2);
+    let mut s1 = PendingStorage::new(Plane::new(16 * 1024), 2);
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        start_immed_format_rt(&mut target, 1, &mut s1, &mut host, &mut work, &mut scratch),
+        Completion::Good
+    );
+    assert_eq!(
+        poll_long_rt(&mut target, 1, &mut s1, &mut work, &mut scratch)
+            .expect("LUN 1 entry")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((s1.begins.len(), s1.polls), (1, 1));
+
+    let luns = (
+        target.snapshot_rt(0).unwrap().long,
+        target.snapshot_rt(1).unwrap().long,
+    );
+    assert_eq!(
+        poll_long_rt(&mut target, 0, &mut s0, &mut work, &mut scratch),
+        Err(Fault::Boundary),
+        "the non-owner LUN fails closed"
+    );
+    assert_eq!(
+        (s0.begins.len(), s0.polls),
+        (0, 0),
+        "LUN 0 adapter untouched"
+    );
+    assert_eq!(
+        (s1.begins.len(), s1.polls),
+        (1, 1),
+        "the owner's token was not consumed"
+    );
+    assert_eq!(
+        (
+            target.snapshot_rt(0).unwrap().long,
+            target.snapshot_rt(1).unwrap().long
+        ),
+        luns,
+        "neither projection changed"
+    );
+
+    // The owner still advances the same token.
+    assert_eq!(
+        poll_long_rt(&mut target, 1, &mut s1, &mut work, &mut scratch)
+            .expect("owner advances")
+            .phase,
+        LongPhase::Foreground
+    );
+    assert_eq!((s1.begins.len(), s1.polls), (1, 2));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

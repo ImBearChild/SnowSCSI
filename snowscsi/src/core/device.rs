@@ -302,6 +302,13 @@ impl Feedback {
 ///
 /// Slices are valid only for this poll step; the runner re-borrows a caller
 /// bank on every pending poll and core never stores `&mut [u8]`.
+///
+/// A **long operation** may span several entries with one retained adapter
+/// token: `Io`/`Prefetch` is issued once and polls at most once per entry
+/// (`Pending` keeps the token, `Ready` delivers one `FeedbackKind::IoDone` on a
+/// later entry). The runner's `data` bank (`scratch`) stays owned by the caller
+/// until the operation settles, while `work` remains free for query commands
+/// (`03 §3.7`).
 #[derive(Debug)]
 pub enum PollStep<'a> {
     /// Publish the one data plan; accepted once, then frozen.
@@ -378,6 +385,13 @@ pub trait Device {
     ) -> PollStep<'a>;
 
     /// One step of the resident long operation (if any).
+    ///
+    /// `data` is the caller's long-operation bank (`scratch`). The runner
+    /// issues the returned `Io`/`Prefetch` once and polls it at most once per
+    /// entry, retaining the token across `Pending`; the receipt comes back as a
+    /// [`FeedbackKind::IoDone`] on a later entry. The bank stays owned by the
+    /// caller until the operation settles; a concurrent query command uses
+    /// `work`, never this bank (`03 §3.7`).
     fn poll_long<'a>(
         &mut self,
         permit: &CommandPermit,

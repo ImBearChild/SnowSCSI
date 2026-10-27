@@ -2474,6 +2474,33 @@ impl HostTransport for SettleHost {
 struct LongDevice {
     steps: [Option<Step>; 4],
     cursor: usize,
+    /// Projection reported by `long_info`; `Complete` settles it.
+    long: LongInfo,
+    medium: Option<NoMedium>,
+    interrupts: u32,
+    last_known: KnownEffects,
+}
+
+impl LongDevice {
+    fn foreground() -> LongInfo {
+        LongInfo {
+            phase: LongPhase::Foreground,
+            write_accessible: false,
+            progress: Some(0),
+            error: None,
+        }
+    }
+
+    fn staged(steps: [Option<Step>; 4]) -> Self {
+        Self {
+            steps,
+            cursor: 0,
+            long: Self::foreground(),
+            medium: Some(NoMedium),
+            interrupts: 0,
+            last_known: KnownEffects::NONE,
+        }
+    }
 }
 
 impl Device for LongDevice {
@@ -2528,7 +2555,15 @@ impl Device for LongDevice {
                 buf: &data[..len],
             }),
             Step::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
-            Step::Complete(completion) => PollStep::Complete(completion),
+            Step::Complete(completion) => {
+                self.long = LongInfo {
+                    phase: LongPhase::Settled,
+                    write_accessible: true,
+                    progress: Some(100),
+                    error: None,
+                };
+                PollStep::Complete(completion)
+            }
             // A long operation has no host phase and no second publish.
             Step::Publish(_) | Step::Prefetch(_) | Step::Receive(_) | Step::Send(_) => {
                 PollStep::Idle
@@ -2537,29 +2572,39 @@ impl Device for LongDevice {
     }
 
     fn long_info(&self) -> LongInfo {
-        LongInfo::IDLE
+        self.long
     }
 
     fn interrupt(
         &mut self,
         _permit: &CommandPermit,
         _reason: InterruptReason,
-        _known: KnownEffects,
+        known: KnownEffects,
     ) -> Result<(), Fault> {
+        self.interrupts = self.interrupts.saturating_add(1);
+        self.last_known = known;
         Ok(())
     }
 
     fn finish_delivery(&mut self, _permit: &CommandPermit, _delivery: Delivery) {}
 
     fn take_medium(&mut self, _permit: &BoundaryPermit) -> Option<NoMedium> {
-        None
+        let medium = self.medium.take();
+        if medium.is_some() {
+            // Detaching the medium discards the resident operation, like a real
+            // drive (`MmcDrive::take_medium`).
+            self.long = LongInfo::IDLE;
+            self.cursor = self.steps.len();
+        }
+        medium
     }
 
     fn install_medium(
         &mut self,
         _permit: &BoundaryPermit,
-        _medium: NoMedium,
+        medium: NoMedium,
     ) -> Result<(), (NoMedium, Fault)> {
+        self.medium = Some(medium);
         Ok(())
     }
 }
@@ -4454,25 +4499,23 @@ fn an_unconsumed_completion_blocks_the_next_command_until_it_is_reported() {
     );
 }
 
-// ── Row 5: the long-operation entry is synchronous and bounded ─────────────
+// ── Row 5: the long-operation entry polls the adapter once per entry ───────
 
-/// §3.4/§3.5: a long-operation entry issues one operation and re-polls the same
-/// token. A synchronous adapter may answer `Pending` a bounded number of times
-/// before it settles; the entry must not re-issue or lose the token.
+/// §3.4/§3.5: a long operation may span entries with **one retained token**.
+/// Each entry polls the adapter at most once: `Pending` returns the unchanged
+/// projection (the device is not polled again), `Ready` is stored for the next
+/// entry. The operation is begun once, never re-issued and never cancelled.
 #[test]
 fn a_long_entry_polls_a_bounded_pending_then_completes() {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let mut target: LongTarget = Target::new(cons(
         LuImpl::new(
-            LongDevice {
-                steps: [
-                    Some(Step::Sync),
-                    Some(Step::Complete(Completion::Good)),
-                    None,
-                    None,
-                ],
-                cursor: 0,
-            },
+            LongDevice::staged([
+                Some(Step::Sync),
+                Some(Step::Complete(Completion::Good)),
+                None,
+                None,
+            ]),
             3u8,
         ),
         Nil,
@@ -4481,51 +4524,203 @@ fn a_long_entry_polls_a_bounded_pending_then_completes() {
     let mut work = [0u8; 64];
     let mut scratch = [0u8; 64];
 
-    assert_eq!(
-        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
-        Ok(LongInfo::IDLE)
-    );
-    assert_eq!(storage.begins, 1, "one operation for this entry");
-    assert_eq!(
-        storage.polls, 3,
-        "Pending, Pending, Ready on the same token"
-    );
+    // Entry 1: the device asks for the Sync; the adapter answers Pending.
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("first entry");
+    assert_eq!(info.phase, LongPhase::Foreground);
+    assert_eq!(storage.begins, 1, "one operation for the whole entry run");
+    assert_eq!(storage.polls, 1);
     assert_eq!(storage.cancels, 0);
-    assert_eq!(storage.bufs, vec![(Direction::None, 0, true); 3]);
+
+    // Entry 2: the same token answers Pending again; the device is not polled.
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("second entry");
+    assert_eq!(info.phase, LongPhase::Foreground);
+    assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 2, 0));
+
+    // Entry 3: Ready is stored keyed to the LUN; the device consumes it next.
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("third entry");
+    assert_eq!(info.phase, LongPhase::Foreground);
+    assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 3, 0));
+    assert_eq!(
+        storage.bufs,
+        vec![(Direction::None, 0, true); 3],
+        "every poll re-borrows the same Sync window"
+    );
+
+    // Entry 4: the device consumes the receipt and settles.
+    let info = target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("settle entry");
+    assert_eq!(info.phase, LongPhase::Settled);
+    assert_eq!(info.progress, Some(100));
+    assert_eq!(
+        (storage.begins, storage.polls, storage.cancels),
+        (1, 3, 0),
+        "settling neither re-issues nor polls the adapter again"
+    );
 }
 
-/// §3.4/§3.5: an adapter that never progresses must not spin forever. The entry
-/// cancels the stalled token and reports a runner-side contract fault; a true
-/// non-blocking path is the async-wrapper slice's job, not a hidden busy loop.
+/// `poll_long_gate` does not need the command `required_io`/`speculative_io`
+/// flags: they are only set while a command is active, and `command_active`
+/// alone rejects the long entry before the long adapter is touched.
 #[test]
-fn a_long_entry_that_never_progresses_is_bounded() {
+fn a_live_command_blocks_the_long_entry_without_polling_its_adapter() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut long_storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(0));
+    let mut work = [0u8; 1024];
+    let mut scratch = [0u8; 1024];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
+        .expect("start the write");
+    assert_eq!(
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        Ok(DriveStep::Pending),
+        "the command owns a Pending storage token"
+    );
+
+    assert_eq!(
+        target.poll_long_entry_static::<Here>(&mut long_storage, &mut work, &mut scratch),
+        Err(Fault::Boundary),
+        "a live command rejects the long entry"
+    );
+    assert_eq!(long_storage.begins, 0, "the long adapter was never begun");
+    assert_eq!(long_storage.polls, 0, "the long adapter was never polled");
+    assert_eq!(long_storage.cancels, 0);
+}
+
+/// §3.4/§3.5/§3.7: an adapter that never leaves `Pending` cannot grow work or
+/// memory — the entry polls it exactly once and yields `Ok(Foreground)`; there
+/// is **no** runner-side budget, busy loop or contract fault. The escape is
+/// `force_remove_*`, which cancels the retained token exactly once before it
+/// detaches the pair.
+#[test]
+fn a_stalled_long_entry_yields_and_force_cancels_the_token_once() {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let mut target: LongTarget = Target::new(cons(
         LuImpl::new(
-            LongDevice {
-                steps: [Some(Step::Sync), None, None, None],
-                cursor: 0,
-            },
+            LongDevice::staged([Some(Step::Sync), None, None, None]),
             3u8,
         ),
         Nil,
     ));
     let mut storage = SettleStorage::stalled(log.clone());
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 64];
+    let mut scratch = [0u8; 64];
+
+    // Eight entries, one adapter poll each: no growth, no cancel, no fault.
+    for entry in 1..=8 {
+        let info = target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("a stalled adapter yields, it is not a fault");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        assert_eq!(storage.begins, 1, "the operation is begun exactly once");
+        assert_eq!(storage.polls, entry, "exactly one poll per entry");
+        assert_eq!(
+            storage.cancels, 0,
+            "a live token is never cancelled by a yield"
+        );
+    }
+
+    // A live long IO is a boundary obligation and is checked before the long
+    // phase. This device also reports `Foreground`, but the IO reason fires
+    // first; the Idle-projection variant is pinned by the runner unit test
+    // `resume_pending_force_refuses_a_live_long_token_even_when_the_device_is_idle`.
+    assert!(matches!(
+        target.take_static_at::<Here>(0),
+        Err(BoundaryReject::RequiredIoInFlight)
+    ));
+    assert_eq!(storage.polls, 8, "a rejected take never polls the token");
+
+    // Force is the escape: cancel the retained token once, then detach.
+    target
+        .force_remove_static::<Here>(&mut storage, &mut host)
+        .expect("force detach");
+    assert_eq!(storage.cancels, 1, "the retained token is cancelled once");
+    assert_eq!(storage.begins, 1, "the operation is never re-issued");
+    assert!(
+        !target.snapshot_static::<Here>().ready,
+        "force detached the pair"
+    );
+    assert_eq!(
+        target.snapshot_static::<Here>().long.phase,
+        LongPhase::Idle,
+        "a detached medium discards the resident projection"
+    );
+    let pair = target.take_static_at::<Here>(0).expect("forced pair").pair;
+    assert_eq!(pair, Some(pair_none(3)));
+
+    // No adapter slot is retained: an entry now only polls the device again.
+    let polls = storage.polls;
+    target
+        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+        .expect("a detached slot still answers the entry");
+    assert_eq!(storage.polls, polls, "no token to poll after the cancel");
+}
+
+/// `03 §3.3` force row: force cancels a stalled long **write** token. Its
+/// end was never observed, so the handback must carry
+/// `unknown_remainder = true` (confirmed prefix 0) instead of `NONE`.
+#[test]
+fn force_cancels_a_stalled_long_write_and_reports_the_unknown_remainder() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target: LongTarget = Target::new(cons(
+        LuImpl::new(
+            LongDevice::staged([Some(Step::Write(8)), None, None, None]),
+            3u8,
+        ),
+        Nil,
+    ));
+    let mut storage = SettleStorage::stalled(log.clone());
+    let mut host = SettleHost::ready(log.clone());
     let mut work = [0u8; 64];
     let mut scratch = [0u8; 64];
 
     assert_eq!(
-        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
-        Err(Fault::Contract)
+        target
+            .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
+            .expect("long entry")
+            .phase,
+        LongPhase::Foreground
     );
     assert_eq!(storage.begins, 1);
-    assert!(
-        storage.polls <= 64,
-        "the pending budget is bounded ({} polls)",
-        storage.polls
-    );
+    assert_eq!(storage.polls, 1);
+
+    target
+        .force_remove_static::<Here>(&mut storage, &mut host)
+        .expect("force detach");
+    assert_eq!(storage.cancels, 1, "the retained token is cancelled once");
     assert_eq!(
-        storage.cancels, 1,
-        "the stalled token is cancelled before settling"
+        storage.polls, 1,
+        "the cancelled write is never polled again"
     );
+    assert_eq!(storage.begins, 1, "the write is never re-issued");
+    let device = target.slots().slot().device_ref();
+    assert_eq!(
+        device.interrupts, 1,
+        "force books the long-cancel facts once"
+    );
+    assert!(
+        device.last_known.unknown_remainder,
+        "a cancelled long write keeps an unknown remainder"
+    );
+    assert_eq!(device.last_known.confirmed_write, 0);
+
+    let taken = target.take_static_at::<Here>(0).expect("take the pair");
+    assert_eq!(taken.pair, Some(pair_none(3)));
+    assert!(
+        taken.effects.unknown_remainder,
+        "the force handback reports the unknown write remainder"
+    );
+    assert_eq!(taken.effects.confirmed_write, 0);
+    assert!(!taken.effects.sync_durable, "force claims no durability");
 }

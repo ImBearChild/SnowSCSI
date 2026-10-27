@@ -12,7 +12,8 @@
 //!   long-operation settled check (`§4.11`);
 //! - the current [`Feedback`] and one pending adapter token with metadata only —
 //!   core never stores a `&mut [u8]`, the shell re-supplies `work` on every
-//!   step;
+//!   step. A resident long operation may additionally retain **one** adapter
+//!   token across entries, re-borrowed from the caller's `data` bank;
 //! - lifecycle settlement: **Stop is a drain, everything else cancels**
 //!   (`03 §3.3`).
 //!
@@ -111,6 +112,20 @@ enum PendingOp {
     },
 }
 
+/// One retained adapter operation of the resident long operation.
+///
+/// Same metadata-only shape as [`PendingOp::Storage`] and the same buffer rule:
+/// the window is re-borrowed from the caller's `data` bank on every entry, so
+/// `buf_offset` is relative to that bank. At most one exists per Target
+/// (one resident long operation), keyed to its LUN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LongPending {
+    token: IoToken,
+    req: IoReq,
+    buf_offset: usize,
+    prefetch: bool,
+}
+
 /// Per-command step state. Every field is `Copy`: no buffer lifetime is stored.
 #[derive(Clone, Copy, Debug)]
 struct DriveState {
@@ -155,6 +170,20 @@ enum IoAbsorb {
     Contract(KnownEffects),
 }
 
+/// Outcome of issuing one long-operation storage request (`Io`/`Prefetch`).
+enum LongIo {
+    /// The adapter answered `Pending`; the token is retained keyed to the LUN.
+    Pending,
+    /// The adapter answered `Ready`; the receipt is already sanitized.
+    Ready(StorageReceipt),
+    /// The adapter pool is exhausted; no operation was issued.
+    Unissued,
+    /// The adapter answered `Pending` for a window that cannot be re-borrowed
+    /// from the caller's bank; the token was cancelled and the operation's end
+    /// was never observed (write/sync remainder unknown).
+    Unaddressable(Direction),
+}
+
 /// Authoritative runner state.
 ///
 /// The `Cell` counters let a step mutate bookkeeping while the runner is
@@ -185,6 +214,18 @@ pub struct Runner {
     /// the owning LUN. A different LUN's entry fails closed with
     /// `Fault::Boundary` without consuming this receipt.
     long_feedback: Option<(usize, Feedback)>,
+    /// Retained adapter token of the resident long operation, keyed to its LUN.
+    ///
+    /// One adapter poll per entry: the token is polled at most once, `Pending`
+    /// returns the unchanged projection, `Ready` turns into `long_feedback`
+    /// (the device consumes it on the next entry). Never re-borrowed from a
+    /// different bank than the one it was issued against.
+    long_pending: Option<(usize, LongPending)>,
+    /// Data-bank identity captured when `long_pending` was stored: the caller
+    /// must pass the same bank (address and length) while the token is live.
+    /// Same rule as [`DriveState::work_addr`]/[`DriveState::work_len`].
+    long_data_addr: usize,
+    long_data_len: usize,
     drive_state: Cell<Option<DriveState>>,
     /// Deferred emergency removals, one bit per LUN.
     ///
@@ -196,6 +237,18 @@ pub struct Runner {
     /// LUN. The mask stays allocation-free (`no_std`); LUNs >= 64 are rejected
     /// with `Fault::Contract` (documented bound).
     force_pending: u64,
+    /// LUNs whose resident long operation was cancelled by a force while its
+    /// phase stayed `Foreground`/`Background`.
+    ///
+    /// The device is not restarted by a force (only a detach discards it), so
+    /// `long_settled` would otherwise reject the `take` that must deliver the
+    /// R-C effects and the deferred force that must detach the pair. This
+    /// runner-side latch is the only bypass: it lets a take cross **only** the
+    /// long-phase check for that LUN, never a live token, a command, retained
+    /// input, an unconsumed completion or a result barrier. Same allocation-free
+    /// 64-LUN bound as [`Self::force_pending`] (`force_bit` → `Fault::Contract`
+    /// above it).
+    force_long_cancelled: u64,
     /// Consumed control events (probe counter, not a business API).
     #[doc(hidden)]
     pub control_events: u32,
@@ -235,8 +288,12 @@ impl Runner {
             await_take: None,
             eject_pending: None,
             long_feedback: None,
+            long_pending: None,
+            long_data_addr: 0,
+            long_data_len: 0,
             drive_state: Cell::new(None),
             force_pending: 0,
+            force_long_cancelled: 0,
             control_events: 0,
             take_events: 0,
             eject_events: 0,
@@ -282,8 +339,11 @@ impl Runner {
     }
 
     /// Boundary over any slot reference (also used by the generic entries).
+    ///
+    /// Rejects while the resident long operation holds a retained IO token
+    /// (`RequiredIoInFlight`) in addition to the long-phase check.
     fn boundary_of<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
-        self.boundary_checks(slot, true)
+        self.boundary_checks(slot, true, true)
     }
 
     /// Boundary for starting a command.
@@ -291,15 +351,19 @@ impl Runner {
     /// A resident foreground long operation (MMC FORMAT/BLANK) must **not**
     /// reject the command at the runner: the medium gate belongs to the device
     /// (`Lu::admit` returns `2/04/04` and the profile refuses before any IO).
-    /// Management entries keep the stricter [`Self::boundary_of`].
+    /// The same holds for the long operation's retained IO token: queries stay
+    /// serviceable while a long IO is pending (`03 §3.7`), so this path
+    /// ignores both the long phase and the long IO obligation. Management
+    /// entries keep the stricter [`Self::boundary_of`].
     fn command_boundary_of<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
-        self.boundary_checks(slot, false)
+        self.boundary_checks(slot, false, false)
     }
 
     fn boundary_checks<L: Lu + ?Sized>(
         &self,
         slot: &L,
         require_long_settled: bool,
+        reject_long_io: bool,
     ) -> Result<(), BoundaryReject> {
         if self.command_active.get() || slot.active() {
             return Err(BoundaryReject::CommandActive);
@@ -309,6 +373,14 @@ impl Runner {
         }
         if self.speculative_io.get() {
             return Err(BoundaryReject::SpeculativeIoInFlight);
+        }
+        // The resident long operation's retained token is an IO obligation too,
+        // but it is **not** the command-owned `required_io` flag: queries must
+        // still start while it is live (`03 §3.7`), while management/take must
+        // not cross it. `RequiredIoInFlight` is the boundary-row reason for a
+        // live IO obligation (`02-api-core §4.11`).
+        if reject_long_io && self.long_io_in_flight() {
+            return Err(BoundaryReject::RequiredIoInFlight);
         }
         if self.retained_input.get() > 0 {
             return Err(BoundaryReject::RetainedInput);
@@ -340,10 +412,12 @@ impl Runner {
     /// Gate for a resident long-operation entry.
     ///
     /// It applies the lifecycle/control checks of `service_gate` but does not
-    /// reject the long operation's own non-settled phase (that is what this
-    /// entry is there to advance). Everything else — ended, control, result
-    /// barrier, command, in-flight IO, retained input, unconsumed completion,
-    /// live borrow — still blocks.
+    /// reject the long operation's own non-settled phase or its retained token
+    /// (that is what this entry is there to advance). Everything else — ended,
+    /// control, result barrier, command, retained input, unconsumed completion,
+    /// live borrow — still blocks. `required_io`/`speculative_io` are not
+    /// checked here: those flags belong to a command-owned IO, and a command
+    /// cannot be live (`command_active`/`slot.active()` already reject it).
     fn poll_long_gate<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
         if self.terminal_outcome().is_some() {
             return Err(BoundaryReject::Ended);
@@ -357,12 +431,6 @@ impl Runner {
         self.result_barrier()?;
         if self.command_active.get() || slot.active() {
             return Err(BoundaryReject::CommandActive);
-        }
-        if self.required_io.get() {
-            return Err(BoundaryReject::RequiredIoInFlight);
-        }
-        if self.speculative_io.get() {
-            return Err(BoundaryReject::SpeculativeIoInFlight);
         }
         if self.retained_input.get() > 0 {
             return Err(BoundaryReject::RetainedInput);
@@ -453,13 +521,29 @@ impl Runner {
     }
 
     /// Terminal outcome only once nothing still has to settle: `tick` must not
-    /// report `Ended` while a command or its in-flight IO is live.
+    /// report `Ended` while a command or its in-flight IO is live, nor while
+    /// the resident long operation holds a retained token (a terminal flag
+    /// with in-flight IO keeps `ServiceReady` so the token can drain/cancel).
     fn settled_terminal_outcome(&self) -> Option<RunOutcome> {
-        if self.command_active.get() || self.drive_state.get().is_some() {
+        if self.command_active.get()
+            || self.drive_state.get().is_some()
+            || self.long_pending.is_some()
+        {
             None
         } else {
             self.terminal_outcome()
         }
+    }
+
+    /// Whether the resident long operation holds a retained adapter token.
+    ///
+    /// This is the long-entry analogue of `required_io`: an in-flight IO
+    /// obligation that management/take must not cross. It is deliberately **not**
+    /// the command-owned [`Runner`] flag, because queries must stay serviceable
+    /// while a long IO is pending (`03 §3.7`); see
+    /// [`Self::command_boundary_of`].
+    const fn long_io_in_flight(&self) -> bool {
+        self.long_pending.is_some()
     }
 
     // ── bookkeeping ────────────────────────────────────────────────────
@@ -606,6 +690,49 @@ impl Runner {
             unknown_remainder: matches!(dir, Direction::FromHost | Direction::None),
             ..KnownEffects::NONE
         }
+    }
+
+    /// Adapter receipt for an operation the runner had to cancel **without**
+    /// observing its end (long-entry bank mismatch / unaddressable window).
+    ///
+    /// The shape mirrors [`Self::known_unobserved`]: a write/sync reports
+    /// [`Effect::UnknownRemainder`], a read never invents one (`03 §3.4`).
+    fn cancelled_receipt(dir: Direction) -> StorageReceipt {
+        let effect = if matches!(dir, Direction::FromHost | Direction::None) {
+            Effect::UnknownRemainder
+        } else {
+            Effect::Known
+        };
+        StorageReceipt::failed(Fault::Contract, 0, effect)
+    }
+
+    /// Drop the workflow flags of one long-operation adapter request.
+    fn clear_long_token(&mut self) {
+        self.long_pending = None;
+        self.long_data_addr = 0;
+        self.long_data_len = 0;
+    }
+
+    /// Cancel the resident long operation's retained adapter token for `lun`.
+    ///
+    /// Only `force_remove_*` can reach this: it is the one immediate-cancel path
+    /// that carries a `Storage` adapter. Returns the cancelled request so the
+    /// caller can book its unobserved effects (`03 §3.3` force row); the device
+    /// keeps its `Foreground`/`Background` projection because the operation's
+    /// end was never observed, so [`Self::resume_pending_force`] still refuses
+    /// to treat it as settled.
+    fn cancel_long_pending(
+        &mut self,
+        lun: usize,
+        storage: &mut dyn Storage,
+    ) -> Option<LongPending> {
+        let (owner, pending) = self.long_pending?;
+        if owner != lun {
+            return None;
+        }
+        storage.cancel(pending.token);
+        self.clear_long_token();
+        Some(pending)
     }
 
     /// Facts already known for a dropped pending operation.
@@ -1417,6 +1544,19 @@ impl Runner {
     /// already contains `long_settled`); it deliberately excludes ended,
     /// control-pending and await-take so a fixed result stays claimable.
     ///
+    /// A retained long-entry adapter token is the runner's `long_io`
+    /// obligation, so the gate rejects the take with
+    /// [`BoundaryReject::RequiredIoInFlight`] before the long-phase check (a
+    /// device could report `Idle` while the token is live). This entry never
+    /// cancels or re-borrows that token; only `force_remove_*` (which has a
+    /// `Storage` adapter) cancels one.
+    ///
+    /// [`Self::take_boundary_of`] relaxes **only** the long-phase rejection,
+    /// and only for a LUN whose long operation a force already cancelled
+    /// ([`Self::force_long_cancelled`]); the handback booked by that force must
+    /// stay deliverable even though the device keeps `Foreground` until the
+    /// detach.
+    ///
     /// A successful take that clears the global handback barrier also releases
     /// the deferred force for **this** LUN (see [`Self::resume_pending_force`]);
     /// forces deferred on other LUNs are released by `Target::take_rt`, which
@@ -1427,7 +1567,7 @@ impl Runner {
         lun: usize,
         lu: &mut L,
     ) -> Result<ChangeResult<L::Pair>, BoundaryReject> {
-        self.boundary_of(lu)?;
+        self.take_boundary_of(lun, lu)?;
         let permit = self.permit();
         if !lu.accepts_permit(&permit) {
             return Err(BoundaryReject::ForeignBoundary);
@@ -1438,8 +1578,27 @@ impl Runner {
             self.await_take = None;
             self.take_events = self.take_events.saturating_add(1);
         }
+        // The deferred force (if any) may detach the current pair, which clears
+        // the latch itself. If no force remains armed, the take completes the
+        // bypass: a fresh medium must not inherit it.
         self.resume_pending_force(lun, lu);
+        if !self.force_pending(lun) {
+            self.clear_force_long_cancelled(lun);
+        }
         Ok(result)
+    }
+
+    /// Gate for [`Self::take_rt`].
+    ///
+    /// The authoritative boundary, with **only** the long-phase rejection
+    /// relaxed for a LUN whose long operation a force already cancelled
+    /// ([`Self::force_long_cancelled`]): the device keeps its `Foreground`
+    /// projection until the pair is detached, so the handback booked by the
+    /// force (including `unknown_remainder`) must stay deliverable. A live
+    /// token, command, retained input, unconsumed completion, result barrier or
+    /// live borrow still blocks.
+    fn take_boundary_of<L: Lu + ?Sized>(&self, lun: usize, slot: &L) -> Result<(), BoundaryReject> {
+        self.boundary_checks(slot, !self.force_long_cancelled(lun), true)
     }
 
     /// Bit for `lun` in the deferred-force mask, or `Fault::Contract` for a
@@ -1455,6 +1614,26 @@ impl Runner {
     /// Whether a force is deferred for `lun`.
     pub(crate) const fn force_pending(&self, lun: usize) -> bool {
         lun < u64::BITS as usize && self.force_pending & (1u64 << lun) != 0
+    }
+
+    /// Whether a force cancelled `lun`'s resident long operation while its
+    /// phase stayed `Foreground`/`Background` (the take bypass latch).
+    pub(crate) const fn force_long_cancelled(&self, lun: usize) -> bool {
+        lun < u64::BITS as usize && self.force_long_cancelled & (1u64 << lun) != 0
+    }
+
+    /// Arm the take bypass for `lun` (see [`Self::force_long_cancelled`]).
+    fn set_force_long_cancelled(&mut self, lun: usize) -> Result<(), Fault> {
+        let bit = Self::force_bit(lun)?;
+        self.force_long_cancelled |= bit;
+        Ok(())
+    }
+
+    /// Drop the take bypass for `lun`; out-of-range LUNs never had it set.
+    fn clear_force_long_cancelled(&mut self, lun: usize) {
+        if lun < u64::BITS as usize {
+            self.force_long_cancelled &= !(1u64 << lun);
+        }
     }
 
     /// Finish a force that was deferred behind a resident result or the global
@@ -1481,11 +1660,22 @@ impl Runner {
         };
         // Still blocked: the result/handback must be taken first. A busy
         // device is never detached here (`Lu::active()`); its command needs the
-        // adapters to settle, so the force stays armed.
+        // adapters to settle, so the force stays armed. A non-settled resident
+        // long operation has the same problem: this entry has **no** storage
+        // adapter, so it cannot cancel the retained long-entry token. It stays
+        // armed until the application calls `force_remove_*` with the adapters.
+        // The token itself is checked as well: a device may report `Idle`
+        // while a long IO is still retained by the runner. A force-cancelled
+        // long op (`force_long_cancelled`) does not block the detach: its token
+        // is already gone and the pair is committed for removal.
+        let forced_long = self.force_long_cancelled(lun);
         if lu.has_result()
             || lu.active()
             || self.await_take.is_some()
             || self.eject_pending.is_some()
+            || self.long_pending.is_some_and(|(owner, _)| owner == lun)
+            || (!forced_long
+                && !matches!(lu.long_info().phase, LongPhase::Idle | LongPhase::Settled))
         {
             return;
         }
@@ -1502,6 +1692,7 @@ impl Runner {
         match lu.force_remove_rt(&permit) {
             Ok(()) if lu.has_result() => {
                 self.clear_long_feedback(lun);
+                self.clear_force_long_cancelled(lun);
                 if let Err(reject) = self.host_eject_succeeded(lun) {
                     let fault = match reject {
                         BoundaryReject::EjectPending => Fault::Contract,
@@ -1510,7 +1701,10 @@ impl Runner {
                     self.set_fatal(fault);
                 }
             }
-            Ok(()) => self.clear_long_feedback(lun),
+            Ok(()) => {
+                self.clear_long_feedback(lun);
+                self.clear_force_long_cancelled(lun);
+            }
             Err(fault) => self.set_fatal(fault),
         }
     }
@@ -1548,8 +1742,10 @@ impl Runner {
         }
         lu.advance_rt(&permit)?;
         // `advance` detaches the old pair; its resident long result cannot
-        // follow the new medium.
+        // follow the new medium, and a fresh medium never inherits the
+        // force-cancelled long-phase bypass.
         self.clear_long_feedback(lun);
+        self.clear_force_long_cancelled(lun);
         Ok(())
     }
 
@@ -1570,6 +1766,7 @@ impl Runner {
         }
         lu.install_rt(&permit, pair)?;
         self.clear_long_feedback(lun);
+        self.clear_force_long_cancelled(lun);
         Ok(())
     }
 
@@ -1592,6 +1789,16 @@ impl Runner {
     /// see [`Self::force_bit`]). Repeating the force for an already-deferred
     /// LUN is still allowed and re-settles any command that started after the
     /// first request — but only if that LUN owns the command.
+    ///
+    /// **Forced-long latch.** If the LUN still reports a resident
+    /// `Foreground`/`Background` operation after the cancel, the force arms
+    /// [`Self::force_long_cancelled`]. The device is only discarded by the
+    /// detach, so without the latch `long_settled` would reject both the take
+    /// that delivers the force effects and the deferred detach — a permanent
+    /// dead end. The latch relaxes only the long-phase check in `take`, never a
+    /// live token/command/barrier, and is cleared by any pair change
+    /// (`take` completion without an armed force, `advance`, `install`, host
+    /// eject, force detach).
     #[allow(dead_code)] // `Target::force_remove_rt` (C2); driven by tests here
     pub(crate) fn force_remove_rt<L: Lu + ?Sized>(
         &mut self,
@@ -1613,9 +1820,38 @@ impl Runner {
             _ if lu.active() => return Err(Fault::Contract),
             _ => {}
         }
+        // A resident long operation may hold one retained adapter token for
+        // this LUN. Force is an immediate-cancel path (`03 §3.3`): cancel the
+        // token before any detach, including before a deferral, so the adapter
+        // slot is freed even if the detach happens later. A write/sync whose
+        // end was never observed must leave `unknown_remainder` in the force
+        // handback (`ChangeResult.effects`); a read has no write effect. The
+        // device's own long-op state is discarded by the detach, so no
+        // synthetic receipt is fed to it.
+        if let Some(pending) = self.cancel_long_pending(lun, storage) {
+            let known = Self::known_unobserved(pending.req.dir);
+            if known != KnownEffects::NONE {
+                // `Lu::interrupt` records the facts in the slot before the
+                // device hook, so a failing hook cannot lose the remainder. A
+                // read settles with `NONE`, which would only overwrite facts.
+                let permit = self.command_permit();
+                let _ = lu.interrupt(&permit, InterruptReason::Stop, known);
+            }
+        }
+        // The force cancelled the resident long operation (token and/or its
+        // phase). The device keeps `Foreground`/`Background` until the detach,
+        // so arm the take-only latch that lets the handback (with the R-C
+        // effects) and the deferred force complete. A force on a LUN with no
+        // resident long op must not arm it.
         let permit = self.permit();
         if !lu.accepts_permit(&permit) {
             return Err(Fault::ForeignBoundary);
+        }
+        match lu.long_info().phase {
+            LongPhase::Foreground | LongPhase::Background => {
+                self.set_force_long_cancelled(lun)?;
+            }
+            LongPhase::Idle | LongPhase::Settled => {}
         }
         if lu.has_result() || self.await_take.is_some() {
             // Never overwrite a resident result; finish after the take.
@@ -1627,7 +1863,10 @@ impl Runner {
         lu.force_remove_rt(&permit).inspect_err(|fault| {
             self.set_fatal(*fault);
         })?;
+        // A force that detached immediately completes the pair change: a fresh
+        // medium must not inherit the long-phase bypass.
         self.clear_long_feedback(lun);
+        self.clear_force_long_cancelled(lun);
         if lu.has_result() {
             if let Err(reject) = self.host_eject_succeeded(lun) {
                 let fault = match reject {
@@ -1658,8 +1897,10 @@ impl Runner {
             return Err(BoundaryReject::EjectPending);
         }
         // The host eject detached this LUN's pair; its resident long result
-        // must not leak into a later fill.
+        // must not leak into a later fill and the force-cancelled bypass must
+        // not follow a fresh medium.
         self.clear_long_feedback(lun);
+        self.clear_force_long_cancelled(lun);
         self.await_take = Some(lun);
         self.eject_events = self.eject_events.saturating_add(1);
         Ok(())
@@ -1785,12 +2026,45 @@ impl Runner {
 
     /// Advance a resident long operation by exactly one entry.
     ///
-    /// A Target has at most one active resident long operation. The pending
-    /// receipt is keyed to its LUN: an entry for a different LUN fails closed
-    /// with `Fault::Boundary` before the device is polled, while an `Idle`
-    /// answer from the owning device drops the receipt (the operation is gone).
-    /// Arming a second long operation is an application error; it can only
-    /// advance after the owner settles (or its pair is detached/taken).
+    /// A Target has at most one active resident long operation. Both the
+    /// pending adapter token and the pending receipt are keyed to its LUN: an
+    /// entry for a different LUN fails closed with `Fault::Boundary` before the
+    /// device or the adapter is touched, while an `Idle` answer from the owning
+    /// device drops the receipt (the operation is gone). Arming a second long
+    /// operation is an application error; it can only advance after the owner
+    /// settles (or its pair is detached/taken).
+    ///
+    /// **One adapter poll per entry.** A long operation may span several
+    /// entries with one retained [`IoToken`]:
+    ///
+    /// - a retained token for this LUN is re-borrowed from `data` and polled
+    ///   **once**; `Pending` returns the unchanged [`LongInfo`] without polling
+    ///   the device, `Ready` clears the token and stores the receipt as the
+    ///   keyed feedback (the device consumes it on the next entry — the same
+    ///   one-step lag as before);
+    /// - with no retained token the device is polled once and a request is
+    ///   issued and polled once; `Pending` retains the token, `Ready` stores
+    ///   the feedback. There is **no** loop over `Poll::Pending` and therefore
+    ///   no runner-side pending budget: a stalled adapter costs one poll per
+    ///   entry and cannot grow work or memory.
+    /// - a `data` bank that no longer matches the token's bank (address and
+    ///   length, including an empty bank) is never re-borrowed: the token is
+    ///   cancelled, the operation is settled through the bounded contract path
+    ///   and `Fault::Contract` is returned.
+    /// - a LUN whose long operation a force already cancelled
+    ///   ([`Self::force_long_cancelled`]) is committed for removal: every entry
+    ///   returns `Fault::Boundary` without issuing IO or reading the device.
+    ///
+    /// **Terminal flags and a live token.** `tick` stays `ServiceReady` while
+    /// the token is pending. This entry then runs *before* the normal
+    /// gate, keyed to the owning LUN: `stop` **drains** the token (one poll per
+    /// entry, then one bounded device poll with the receipt);
+    /// `transport_ended`/`fatal` **cancel** it (one `storage.cancel`, then a
+    /// synthesized cancelled receipt fed to the device so it settles/records
+    /// the fault). With no token, the normal gate rejects new entries — a
+    /// terminal target never issues new IO. `Stop` neither detaches nor ejects;
+    /// the fill may stay `Foreground` afterwards because only `force_remove_*`
+    /// can escape it.
     ///
     /// A `Fault::Contract` receipt is delivered back to the device in the same
     /// entry (one bounded settle step, never a loop) so an `MmcDrive` is
@@ -1803,28 +2077,88 @@ impl Runner {
         storage: &mut dyn Storage,
         data: &mut [u8],
     ) -> Result<LongInfo, Fault> {
+        if matches!(self.long_pending, Some((owner, _)) if owner != lun) {
+            return Err(Fault::Boundary);
+        }
         if matches!(self.long_feedback, Some((owner, _)) if owner != lun) {
             return Err(Fault::Boundary);
         }
+        // A force already cancelled this LUN's long operation and committed the
+        // pair for removal. No new IO, and the device projection is not even
+        // read: the handback happens through `take`/the deferred force.
+        if self.force_long_cancelled(lun) {
+            return Err(Fault::Boundary);
+        }
+        let permit = self.command_permit();
+
+        // 0. A terminal flag with a retained token: drain (Stop) or cancel
+        //    (transport end / fatal) before the normal gate. With no token the
+        //    gate below rejects the entry.
+        if self.long_pending.is_some() {
+            if let Some(outcome) = self.terminal_outcome() {
+                let stopped = matches!(
+                    outcome,
+                    RunOutcome::Ended {
+                        reason: RunEnd::Stopped,
+                        ..
+                    }
+                );
+                return self.settle_long_terminal(lun, lu, storage, &permit, data, stopped);
+            }
+        }
         self.poll_long_gate(lu).map_err(|_| Fault::Boundary)?;
+
+        // 1. Resume the retained adapter token for this LUN. One poll, never
+        //    the device: the receipt is consumed by the device on the next
+        //    entry.
+        if let Some((_, pending)) = self.long_pending {
+            let data_addr = data.as_ptr() as usize;
+            let data_len = data.len();
+            // An empty bank is a mismatch too: the retained window can never
+            // be re-borrowed from it.
+            let same_bank = self.long_data_addr == data_addr && self.long_data_len == data_len;
+            let buf = same_bank
+                .then(|| pending_io_buf(data, pending.req, pending.buf_offset))
+                .flatten();
+            if let Some(buf) = buf {
+                match storage.poll_exec(pending.token, buf) {
+                    Poll::Pending => return Ok(lu.long_info()),
+                    Poll::Ready(raw) => {
+                        self.clear_long_token();
+                        let receipt = sanitize_storage_receipt(pending.req, raw);
+                        return self.absorb_long_receipt(lun, lu, &permit, receipt, data);
+                    }
+                }
+            }
+            // The caller's bank is no longer the one the token was issued
+            // against (or the window is no longer addressable inside it):
+            // never re-borrow a different bank. Cancel, then settle the
+            // abandoned operation through the bounded contract path.
+            storage.cancel(pending.token);
+            self.clear_long_token();
+            let feedback = Feedback::io_done(IoReceipt::from_storage(
+                Self::cancelled_receipt(pending.req.dir),
+                self.owner,
+            ));
+            self.long_feedback = Some((lun, feedback));
+            return self.settle_contract_long(lun, lu, &permit, feedback, data);
+        }
+
+        // 2. No retained token: poll the device once, issue at most one
+        //    storage operation and poll it once.
         let feedback = match self.long_feedback.take() {
             Some((owner, feedback)) if owner == lun => feedback,
             _ => Feedback::begin(),
         };
-        let permit = self.command_permit();
+        let data_addr = data.as_ptr() as usize;
+        let data_len = data.len();
         let step = lu.poll_long(&permit, feedback, data);
-        match step {
+        let outcome = match step {
             PollStep::Io(op) => {
-                let receipt = exec_storage(storage, op);
-                // A returned receipt is authoritative even for `Contract`
-                // (`03 §3.3`): feed it back before surfacing the fault, so the
-                // device settles from the confirmed prefix/effect and a later
-                // entry cannot re-issue the cancelled operation.
-                let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
-                self.long_feedback = Some((lun, feedback));
-                if receipt.error == Some(Fault::Contract) {
-                    return self.settle_contract_long(lun, lu, &permit, feedback, data);
-                }
+                let (req, buf, buf_offset) = split_long_op(op, data_addr, data_len);
+                self.long_io(
+                    lun, storage, req, buf, buf_offset, false, data_addr, data_len,
+                )
             }
             PollStep::Prefetch(PrefetchOp::Read {
                 resource,
@@ -1833,23 +2167,27 @@ impl Runner {
             }) => {
                 // Speculative reads never change the long-operation outcome; a
                 // failure is reported to the device, which falls back to `Io`.
-                // As above, a `Contract` receipt is still fed back first.
-                let receipt = exec_storage(
+                let req = IoReq {
+                    resource,
+                    offset,
+                    len: buf.len() as u32,
+                    dir: Direction::ToHost,
+                };
+                let buf_offset = slice_offset(data_addr, data_len, buf);
+                self.long_io(
+                    lun,
                     storage,
-                    StorageOp::Read {
-                        resource,
-                        offset,
-                        buf,
-                    },
-                );
-                let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
-                self.long_feedback = Some((lun, feedback));
-                if receipt.error == Some(Fault::Contract) {
-                    return self.settle_contract_long(lun, lu, &permit, feedback, data);
-                }
+                    req,
+                    IoBuf::Read(buf),
+                    buf_offset,
+                    true,
+                    data_addr,
+                    data_len,
+                )
             }
             PollStep::Complete(_) => {
                 self.clear_long_feedback(lun);
+                return Ok(lu.long_info());
             }
             PollStep::Idle => {
                 // `Idle` only means "no work ready in this step". Keep the
@@ -1864,10 +2202,182 @@ impl Runner {
                 } else {
                     self.clear_long_feedback(lun);
                 }
+                return Ok(lu.long_info());
             }
             PollStep::Publish(_) | PollStep::Receive(_) | PollStep::Send(_) => {
-                return Err(Fault::Contract)
+                // The device broke the long-operation contract but did not
+                // consume the receipt: restore it instead of dropping facts.
+                self.long_feedback = Some((lun, feedback));
+                return Err(Fault::Contract);
             }
+        };
+        let receipt = match outcome {
+            // Token retained; the device is not polled again in this entry.
+            LongIo::Pending => return Ok(lu.long_info()),
+            LongIo::Ready(receipt) => receipt,
+            // Pool exhausted: nothing was issued, so no effect and no token.
+            LongIo::Unissued => StorageReceipt::failed(Fault::Contract, 0, Effect::Known),
+            // The adapter answered `Pending` for a window outside `data`; the
+            // token was already cancelled and its end was never observed.
+            LongIo::Unaddressable(dir) => Self::cancelled_receipt(dir),
+        };
+        self.absorb_long_receipt(lun, lu, &permit, receipt, data)
+    }
+
+    /// Terminal-flag settlement for a retained long-operation token.
+    ///
+    /// `Stop` drains (`03 §3.3`): one adapter poll per entry until `Ready`,
+    /// then one bounded device poll with the returned receipt. A bank mismatch
+    /// cannot advance the drain, so it cancels and books the unobserved effect
+    /// instead. `transport_ended`/`fatal` cancel immediately: one
+    /// `storage.cancel`, then a synthesized cancelled receipt
+    /// ([`Self::cancelled_receipt`]) fed to the device so it settles/records the
+    /// fault. Neither path issues new IO.
+    fn settle_long_terminal<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+        storage: &mut dyn Storage,
+        permit: &CommandPermit,
+        data: &mut [u8],
+        stopped: bool,
+    ) -> Result<LongInfo, Fault> {
+        let Some((_, pending)) = self.long_pending else {
+            return Err(Fault::Boundary);
+        };
+        let receipt = if stopped {
+            let data_addr = data.as_ptr() as usize;
+            let data_len = data.len();
+            let same_bank = self.long_data_addr == data_addr && self.long_data_len == data_len;
+            let buf = same_bank
+                .then(|| pending_io_buf(data, pending.req, pending.buf_offset))
+                .flatten();
+            let Some(buf) = buf else {
+                // The drain cannot re-borrow its window: cancel and report the
+                // unobserved effect (same rule as the normal mismatch path).
+                storage.cancel(pending.token);
+                self.clear_long_token();
+                let receipt = Self::cancelled_receipt(pending.req.dir);
+                let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
+                return self.feed_long_terminal(lun, lu, permit, feedback, data, false);
+            };
+            match storage.poll_exec(pending.token, buf) {
+                Poll::Pending => return Ok(lu.long_info()),
+                Poll::Ready(raw) => {
+                    self.clear_long_token();
+                    sanitize_storage_receipt(pending.req, raw)
+                }
+            }
+        } else {
+            storage.cancel(pending.token);
+            self.clear_long_token();
+            Self::cancelled_receipt(pending.req.dir)
+        };
+        let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
+        self.feed_long_terminal(lun, lu, permit, feedback, data, stopped)
+    }
+
+    /// Feed one terminal receipt to the device with a single bounded
+    /// `poll_long`, never issuing new IO.
+    ///
+    /// On `Stop` the resident fill may stay `Foreground` (a terminal target
+    /// issues no more IO; `force_remove_*` remains the escape). On transport
+    /// end/fatal a device that still asks for IO is stopped with one bounded
+    /// `interrupt(Stop, NONE)` so it cannot keep a phantom in-flight operation.
+    fn feed_long_terminal<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &mut [u8],
+        stopped: bool,
+    ) -> Result<LongInfo, Fault> {
+        self.long_feedback = Some((lun, feedback));
+        match lu.poll_long(permit, feedback, data) {
+            PollStep::Io(_) | PollStep::Prefetch(_) => {
+                if !stopped {
+                    let _ = lu.interrupt(permit, InterruptReason::Stop, KnownEffects::NONE);
+                }
+            }
+            PollStep::Complete(_)
+            | PollStep::Idle
+            | PollStep::Publish(_)
+            | PollStep::Receive(_)
+            | PollStep::Send(_) => {}
+        }
+        self.clear_long_feedback(lun);
+        Ok(lu.long_info())
+    }
+
+    /// Issue one long-operation storage request and poll it exactly once.
+    ///
+    /// `Pending` retains the token together with the caller's bank identity;
+    /// `Ready` returns the sanitized receipt. Nothing loops, and **no**
+    /// `required_io`/`speculative_io` flag is set: those are command-owned
+    /// obligations, while a long IO must leave queries serviceable
+    /// (`03 §3.7`). The obligation is [`Self::long_io_in_flight`] instead.
+    #[allow(clippy::too_many_arguments)]
+    fn long_io(
+        &mut self,
+        lun: usize,
+        storage: &mut dyn Storage,
+        req: IoReq,
+        buf: IoBuf<'_>,
+        buf_offset: Option<usize>,
+        prefetch: bool,
+        data_addr: usize,
+        data_len: usize,
+    ) -> LongIo {
+        let token = storage.begin_exec(req);
+        if !token.is_valid() {
+            return LongIo::Unissued;
+        }
+        match storage.poll_exec(token, buf) {
+            Poll::Ready(raw) => LongIo::Ready(sanitize_storage_receipt(req, raw)),
+            Poll::Pending => match buf_offset {
+                Some(offset) => {
+                    self.long_pending = Some((
+                        lun,
+                        LongPending {
+                            token,
+                            req,
+                            buf_offset: offset,
+                            prefetch,
+                        },
+                    ));
+                    self.long_data_addr = data_addr;
+                    self.long_data_len = data_len;
+                    LongIo::Pending
+                }
+                None => {
+                    // The window is not addressable inside `data`; the next
+                    // entry could not re-borrow it, so cancel now.
+                    storage.cancel(token);
+                    LongIo::Unaddressable(req.dir)
+                }
+            },
+        }
+    }
+
+    /// Store one returned long-operation receipt as the keyed feedback and
+    /// settle a `Fault::Contract` one bounded step before surfacing it.
+    fn absorb_long_receipt<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+        permit: &CommandPermit,
+        receipt: StorageReceipt,
+        data: &mut [u8],
+    ) -> Result<LongInfo, Fault> {
+        // A returned receipt is authoritative even for `Contract`
+        // (`03 §3.3`): feed it back before surfacing the fault, so the device
+        // settles from the confirmed prefix/effect and a later entry cannot
+        // re-issue the cancelled operation.
+        let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
+        self.long_feedback = Some((lun, feedback));
+        if receipt.error == Some(Fault::Contract) {
+            return self.settle_contract_long(lun, lu, permit, feedback, data);
         }
         Ok(lu.long_info())
     }
@@ -1947,6 +2457,55 @@ fn slice_offset(work_start: usize, work_len: usize, buf: &[u8]) -> Option<usize>
     }
 }
 
+/// Split one long-operation [`StorageOp`] into its metadata request, buffer and
+/// offset inside the caller's `data` bank.
+fn split_long_op<'a>(
+    op: StorageOp<'a>,
+    data_addr: usize,
+    data_len: usize,
+) -> (IoReq, IoBuf<'a>, Option<usize>) {
+    match op {
+        StorageOp::Read {
+            resource,
+            offset,
+            buf,
+        } => {
+            let req = IoReq {
+                resource,
+                offset,
+                len: buf.len() as u32,
+                dir: Direction::ToHost,
+            };
+            let buf_offset = slice_offset(data_addr, data_len, buf);
+            (req, IoBuf::Read(buf), buf_offset)
+        }
+        StorageOp::Write {
+            resource,
+            offset,
+            buf,
+        } => {
+            let req = IoReq {
+                resource,
+                offset,
+                len: buf.len() as u32,
+                dir: Direction::FromHost,
+            };
+            let buf_offset = slice_offset(data_addr, data_len, buf);
+            (req, IoBuf::Write(buf), buf_offset)
+        }
+        StorageOp::Sync { resource } => (
+            IoReq {
+                resource,
+                offset: 0,
+                len: 0,
+                dir: Direction::None,
+            },
+            IoBuf::None,
+            Some(0),
+        ),
+    }
+}
+
 /// Rebuild the storage buffer from metadata; `None` means the retained window
 /// is no longer addressable in `work`.
 fn pending_io_buf<'a>(work: &'a mut [u8], req: IoReq, offset: usize) -> Option<IoBuf<'a>> {
@@ -2007,124 +2566,6 @@ fn sanitize_host_receipt(req: HostReq, receipt: HostReceipt, owner: TargetId) ->
         receipt.error(),
         owner,
     )
-}
-
-/// Consecutive `Pending` answers a synchronous adapter may give before the
-/// long-operation entry cancels it.
-///
-/// Core has no executor or waker, so [`exec_storage`] busy-polls. The budget
-/// stops a stalled adapter from spinning forever (a stalled token would
-/// otherwise grow its own log unbounded). Yielding `Pending` back to the runner
-/// is the async wrapper's job; this is only the bounded synchronous fallback.
-const PENDING_BUDGET: u32 = 64;
-
-/// Busy-execute one storage operation for the long-operation entry.
-///
-/// Core has no executor or waker, so a long-operation entry completes its
-/// single operation synchronously. An invalid token is reported as a contract
-/// failure, and a stalled token is cancelled after [`PENDING_BUDGET`]
-/// consecutive `Pending` answers instead of spinning.
-fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt {
-    match op {
-        StorageOp::Read {
-            resource,
-            offset,
-            buf,
-        } => {
-            let req = IoReq {
-                resource,
-                offset,
-                len: buf.len() as u32,
-                dir: Direction::ToHost,
-            };
-            let token = storage.begin_exec(req);
-            if !token.is_valid() {
-                return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
-            }
-            drive_exec(storage, token, req, ExecBuf::Read(buf))
-        }
-        StorageOp::Write {
-            resource,
-            offset,
-            buf,
-        } => {
-            let req = IoReq {
-                resource,
-                offset,
-                len: buf.len() as u32,
-                dir: Direction::FromHost,
-            };
-            let token = storage.begin_exec(req);
-            if !token.is_valid() {
-                return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
-            }
-            drive_exec(storage, token, req, ExecBuf::Write(buf))
-        }
-        StorageOp::Sync { resource } => {
-            let req = IoReq {
-                resource,
-                offset: 0,
-                len: 0,
-                dir: Direction::None,
-            };
-            let token = storage.begin_exec(req);
-            if !token.is_valid() {
-                return StorageReceipt::failed(Fault::Contract, 0, Effect::Known);
-            }
-            drive_exec(storage, token, req, ExecBuf::None)
-        }
-    }
-}
-
-/// Buffer shape for [`drive_exec`], re-derived on every poll so a `Pending`
-/// answer can borrow the same window again.
-enum ExecBuf<'a> {
-    Read(&'a mut [u8]),
-    Write(&'a [u8]),
-    None,
-}
-
-impl ExecBuf<'_> {
-    fn reborrow(&mut self) -> IoBuf<'_> {
-        match self {
-            ExecBuf::Read(buf) => IoBuf::Read(buf),
-            ExecBuf::Write(buf) => IoBuf::Write(buf),
-            ExecBuf::None => IoBuf::None,
-        }
-    }
-}
-
-/// Poll one begun storage token until `Ready` or the pending budget runs out.
-///
-/// On exhaustion the token is cancelled before returning, so the adapter's
-/// slot is freed and the operation is never resumed as if it were still live.
-/// The operation's end was **not observed**, so a write/sync reports
-/// [`Effect::UnknownRemainder`] (its remainder is unknown); a read has no
-/// write effect and reports [`Effect::Known`] (`03 §3.4`).
-fn drive_exec(
-    storage: &mut dyn Storage,
-    token: IoToken,
-    req: IoReq,
-    mut work: ExecBuf<'_>,
-) -> StorageReceipt {
-    let mut pending = 0u32;
-    loop {
-        match storage.poll_exec(token, work.reborrow()) {
-            Poll::Ready(receipt) => return sanitize_storage_receipt(req, receipt),
-            Poll::Pending => {
-                pending += 1;
-                if pending >= PENDING_BUDGET {
-                    storage.cancel(token);
-                    let effect = if matches!(req.dir, Direction::FromHost | Direction::None) {
-                        Effect::UnknownRemainder
-                    } else {
-                        Effect::Known
-                    };
-                    return StorageReceipt::failed(Fault::Contract, 0, effect);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2312,6 +2753,7 @@ mod tests {
         interrupts: u32,
         last_reason: Option<InterruptReason>,
         last_known: KnownEffects,
+        last_effect: Option<Effect>,
     }
 
     impl ProbeLong {
@@ -2324,6 +2766,7 @@ mod tests {
                 interrupts: 0,
                 last_reason: None,
                 last_known: KnownEffects::NONE,
+                last_effect: None,
             }
         }
 
@@ -2371,8 +2814,9 @@ mod tests {
             feedback: Feedback,
             data: &'a mut [u8],
         ) -> PollStep<'a> {
-            if feedback.io().is_some() {
+            if let Some(io) = feedback.io() {
                 self.ios = self.ios.saturating_add(1);
+                self.last_effect = Some(io.effect());
             }
             match self.mode {
                 ProbeMode::SettleIo => {
@@ -3009,6 +3453,40 @@ mod tests {
     }
 
     #[test]
+    fn resume_pending_force_refuses_a_live_long_token_even_when_the_device_is_idle() {
+        // Unit test of the guard, not a public-path scenario: it sets
+        // `long_pending` directly because a realistic `Lu` cannot issue long IO
+        // from a slot that already holds a resident result (the medium is gone).
+        let mut bench = Bench::new([None; SCRIPT_LEN], 0);
+        // A force is armed for LUN 0 while the runner still retains a long
+        // token, even though the device projects `Idle` (the token is the only
+        // record of the live IO).
+        bench.runner.force_pending = 1;
+        bench.runner.long_pending = Some((
+            0,
+            LongPending {
+                token: IoToken::invalid(),
+                req: IoReq {
+                    resource: 0,
+                    offset: 0,
+                    len: 8,
+                    dir: Direction::FromHost,
+                },
+                buf_offset: 0,
+                prefetch: false,
+            },
+        ));
+        bench.runner.resume_pending_force(0, &mut bench.slot);
+        assert_eq!(bench.slot.long_info().phase, LongPhase::Idle);
+        assert!(
+            !bench.slot.has_result(),
+            "a bare take must not detach a slot with a live runner token"
+        );
+        assert!(bench.slot.snapshot().ready, "the pair stays installed");
+        assert!(bench.runner.force_pending(0), "the force stays armed");
+    }
+
+    #[test]
     fn a_resident_result_blocks_new_management_until_taken() {
         let mut bench = Bench::new([None; SCRIPT_LEN], 0);
         let permit = BoundaryPermit::new(TargetId::UNBOUND);
@@ -3166,51 +3644,44 @@ mod tests {
     }
 
     #[test]
-    fn drive_exec_budget_exhaustion_marks_a_write_remainder_unknown() {
-        let mut buf = [0u8; 32];
+    fn a_long_entry_that_loses_its_bank_cancels_once_and_keeps_the_write_remainder_unknown() {
+        // The former `drive_exec` budget test pinned the receipt shape of a
+        // write whose end was never observed. That fact is still observable on
+        // the real long-entry path: a retained token is cancelled when the
+        // caller's bank changes, and the device is told
+        // `Fault::Contract`/`UnknownRemainder` for the abandoned write.
+        let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 1u8);
+        let mut runner = Runner::new();
+        let mut storage = HoldStorage::new(usize::MAX);
+        let mut bank = [0u8; 64];
+        let mut other = [0u8; 64];
 
-        // A stalled write: the end was never observed, so the remainder is
-        // unknown and the token is cancelled before reporting the fault.
-        let mut write_storage = HoldStorage::new(usize::MAX);
-        let write_req = IoReq {
-            resource: 1,
-            offset: 0,
-            len: 32,
-            dir: Direction::FromHost,
-        };
-        let write_token = write_storage.begin_exec(write_req);
-        assert!(write_token.is_valid());
-        let write = drive_exec(
-            &mut write_storage,
-            write_token,
-            write_req,
-            ExecBuf::Write(&buf),
-        );
-        assert_eq!(write.error, Some(Fault::Contract));
-        assert_eq!(write.confirmed, 0);
-        assert_eq!(write.effect, Effect::UnknownRemainder);
-        assert_eq!(write_storage.begins, 1);
-        assert_eq!(write_storage.cancels, 1);
+        // Entry 1 issues the write and retains the stalled token.
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut bank)
+            .expect("first entry");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        assert_eq!(storage.begins, 1);
+        assert_eq!(storage.cancels, 0);
+        assert!(runner.long_pending.is_some());
 
-        // A stalled read has no write effect: no fabricated unknown remainder.
-        let mut read_storage = HoldStorage::new(usize::MAX);
-        let read_req = IoReq {
-            resource: 1,
-            offset: 0,
-            len: 32,
-            dir: Direction::ToHost,
-        };
-        let read_token = read_storage.begin_exec(read_req);
-        assert!(read_token.is_valid());
-        let read = drive_exec(
-            &mut read_storage,
-            read_token,
-            read_req,
-            ExecBuf::Read(&mut buf),
+        // Entry 2 must not re-borrow a different bank: cancel once, then settle
+        // the abandoned write through the bounded contract path.
+        assert_eq!(
+            runner.poll_long_entry(0, &mut slot, &mut storage, &mut other),
+            Err(Fault::Contract)
         );
-        assert_eq!(read.error, Some(Fault::Contract));
-        assert_eq!(read.effect, Effect::Known);
-        assert_eq!(read_storage.cancels, 1);
+        assert_eq!(storage.begins, 1, "the operation is never re-issued");
+        assert_eq!(storage.cancels, 1, "the retained token is cancelled once");
+        assert!(runner.long_pending.is_none(), "no adapter slot is retained");
+        let probe = slot.device_ref();
+        assert_eq!(probe.ios, 1, "one write receipt reached the device");
+        assert_eq!(
+            probe.last_effect,
+            Some(Effect::UnknownRemainder),
+            "a cancelled write keeps an unknown remainder"
+        );
+        assert_eq!(probe.interrupts, 1, "exactly one bounded cleanup");
     }
 
     #[test]
