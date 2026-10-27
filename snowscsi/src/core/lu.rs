@@ -133,6 +133,15 @@ pub trait Lu {
     fn force_remove_rt(&mut self, permit: &BoundaryPermit) -> Result<(), Fault>;
 
     /// Install a pair handed back by the application; returns it on failure.
+    ///
+    /// This is the second documented recovery path out of `needs_recovery`
+    /// (`02-api-core.md` §4.10, `03-lifecycles.md` §3.6). The AwaitTake barrier
+    /// is enforced one level up: `Runner::service_gate` refuses this entry (and
+    /// `propose`/`advance`) while a management result is still resident, so a
+    /// reinstall requires the application to `take` the candidate first. This
+    /// seam only checks its own device/boundary state, and a refused install
+    /// returns `pair` unchanged. Pinning fixture:
+    /// `core_p3::replace_install_and_restore_failure_needs_recovery_and_blocks_reinstall_before_take`.
     fn install_rt(
         &mut self,
         permit: &BoundaryPermit,

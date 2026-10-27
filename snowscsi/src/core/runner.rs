@@ -357,8 +357,26 @@ impl Runner {
         Ok(())
     }
 
-    /// Service gate for commands and management (`§4.11`): ended,
-    /// control-pending, result barrier, boundary.
+    /// Service gate for management (`§4.11`): ended, control-pending, result
+    /// barrier, boundary.
+    ///
+    /// `awaiting_resource_take` has two sources: the runner's global
+    /// `await_take` (host-eject `ResourcesReady` not claimed yet) and a result
+    /// the slot itself still holds from `advance`/`force`. Both are the same
+    /// design term — "a result has been produced and awaits `take`" — so a new
+    /// transaction cannot start before the one-shot result is claimed
+    /// (`03 §3.6` AwaitTake row). `take` deliberately does not use this gate; it
+    /// is what clears the barrier.
+    ///
+    /// **Barrier scope (deliberate, documented drift).** `03 §3.6` and
+    /// `02-api-core §4.11` name `service_gate` the gate for commands, long
+    /// operations *and* management. The production scope is narrower: this
+    /// gate (with `slot.has_result()`) blocks only `propose`/`advance`/`install`.
+    /// `command_gate` and `poll_long_gate` consult the global `result_barrier`
+    /// but **not** a slot-resident result, because the slot would otherwise
+    /// deadlock: a command is how the application inspects the medium it has to
+    /// hand back, and nothing else can clear the barrier but `take`. Pinning
+    /// fixture: `core_p3::a_resident_result_blocks_management_but_not_commands`.
     fn service_gate<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
         if self.terminal_outcome().is_some() {
             return Err(BoundaryReject::Ended);
@@ -370,6 +388,9 @@ impl Runner {
             return Err(BoundaryReject::EjectPending);
         }
         self.result_barrier()?;
+        if slot.has_result() {
+            return Err(BoundaryReject::AwaitingResourceTake);
+        }
         self.boundary_of(slot)
     }
 
@@ -1800,7 +1821,7 @@ fn exec_storage(storage: &mut dyn Storage, op: StorageOp<'_>) -> StorageReceipt 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::device::{Device, NoMedium};
+    use crate::core::device::{Device, NoMedium, Pair};
     use crate::core::lu::LuImpl;
     use crate::core::storage::{BlockingHost, BlockingStorage, SyncHost, SyncStorage};
 
@@ -2510,6 +2531,48 @@ mod tests {
             Ok(())
         );
         assert!(bench.slot.has_candidate());
+    }
+
+    #[test]
+    fn a_resident_result_blocks_new_management_until_taken() {
+        let mut bench = Bench::new([None; SCRIPT_LEN], 0);
+        let permit = BoundaryPermit::new(TargetId::UNBOUND);
+        bench.slot.force_remove_rt(&permit).expect("force detaches");
+        assert!(bench.slot.has_result());
+
+        // A produced result is `awaiting_resource_take`: no new transaction may
+        // start before it is claimed (`§4.11` service_gate, `§3.6` AwaitTake).
+        assert_eq!(
+            bench.runner.service_gate(&bench.slot),
+            Err(BoundaryReject::AwaitingResourceTake)
+        );
+        assert_eq!(
+            bench.runner.propose_rt(&mut bench.slot, Change::Remove),
+            Err((Change::Remove, Fault::Boundary))
+        );
+        let pair = Pair {
+            medium: NoMedium,
+            backing: 4,
+        };
+        assert_eq!(
+            bench.runner.install_rt(&mut bench.slot, pair),
+            Err((
+                Pair {
+                    medium: NoMedium,
+                    backing: 4,
+                },
+                Fault::Boundary
+            ))
+        );
+        assert_eq!(
+            bench.runner.advance_rt(&mut bench.slot),
+            Err(Fault::Boundary)
+        );
+
+        // `take` is the one entry allowed through, and it clears the barrier.
+        assert!(bench.runner.take_rt(0, &mut bench.slot).is_ok());
+        assert!(!bench.slot.has_result());
+        assert_eq!(bench.runner.service_gate(&bench.slot), Ok(()));
     }
 
     #[test]
