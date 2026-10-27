@@ -43,5 +43,8 @@ mod core_p2b;
 #[cfg(test)]
 mod core_p3;
 
+#[cfg(test)]
+mod core_p4;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;

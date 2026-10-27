@@ -18,6 +18,11 @@ pub enum LongPhase {
     /// REPORT LUNS are admitted).
     Foreground,
     /// Running but the medium is write accessible; media commands may run.
+    ///
+    /// Reserved: the current implementation has **only** the foreground
+    /// format/blank path. DVD+RW background format is deliberately not
+    /// implemented; no production path produces this
+    /// variant.
     Background,
     /// Finished; the result is resident until management takes it.
     Settled,
@@ -31,6 +36,11 @@ pub struct LongInfo {
     /// Whether the foreground gate has been lifted.
     pub write_accessible: bool,
     /// Meaningful progress only; `None` when not applicable.
+    ///
+    /// `Some(100)` is observable only when `phase == Settled && error.is_none()`.
+    /// A foreground fill whose final durability sync is still pending reports
+    /// `Some(99)`; a failed settle carries the real progress reached at the
+    /// failure (`< 100`, or `None` when no progress is meaningful).
     pub progress: Option<u32>,
     /// Terminal error, if the operation settled abnormally.
     pub error: Option<Fault>,

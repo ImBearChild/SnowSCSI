@@ -186,6 +186,9 @@ impl<S: RuntimeSet> Target<S> {
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
         let result = runner.step_command(slot, storage, host, work, scratch)?;
+        if matches!(result, DriveStep::Done(_)) {
+            runner.claim_long_feedback(lun, slot.long_info());
+        }
         if matches!(result, DriveStep::Done(_) | DriveStep::Control(_)) {
             self.active_lun = None;
         }
@@ -342,7 +345,7 @@ impl<S: RuntimeSet> Target<S> {
     pub fn advance_rt(&mut self, lun: usize) -> Result<(), Fault> {
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
-        runner.advance_rt(slot)
+        runner.advance_rt(lun, slot)
     }
 
     /// Install an application-returned pair into a runtime LUN.
@@ -352,7 +355,7 @@ impl<S: RuntimeSet> Target<S> {
             Some(slot) => slot,
             None => return Err((pair, Fault::LunNotFound)),
         };
-        runner.install_rt(slot, pair)
+        runner.install_rt(lun, slot, pair)
     }
 
     /// Emergency removal on a runtime LUN.
@@ -396,16 +399,24 @@ impl<S: RuntimeSet> Target<S> {
     }
 
     /// Advance a resident long operation on a runtime LUN.
+    ///
+    /// `work` serves the current command (it is left untouched here); `scratch`
+    /// is the resident long operation's data bank. The single storage IO issued
+    /// by one entry borrows `scratch` only, never `work` or the device, so a
+    /// query command may use `work` while a long IO is in flight (`03 §3.7`).
     pub fn poll_long_entry_rt(
         &mut self,
         lun: usize,
         storage: &mut dyn super::storage::Storage,
         work: &mut [u8],
-        _scratch: &mut [u8],
+        scratch: &mut [u8],
     ) -> Result<LongInfo, Fault> {
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
-        runner.poll_long_entry(slot, storage, work)
+        // `work` is intentionally unused: a long entry must not consume the
+        // bank a concurrent query command is using.
+        let _ = work;
+        runner.poll_long_entry(lun, slot, storage, scratch)
     }
 }
 
@@ -601,6 +612,11 @@ pub trait StaticTarget<S: SlotSet> {
         <S as At<I>>::Slot: Lu;
 
     /// Advance a resident long operation on the static slot.
+    ///
+    /// `work` serves the current command; `scratch` is the resident long
+    /// operation's data bank. A query command may use `work` while a long IO is
+    /// in flight because the returned operation borrows only `scratch`
+    /// (`03 §3.7`).
     fn poll_long_entry_static<I>(
         &mut self,
         storage: &mut dyn super::storage::Storage,
@@ -672,6 +688,9 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         }
         let Self { runner, slots, .. } = self;
         let result = runner.step_command(slots.slot_mut(), storage, host, work, scratch)?;
+        if matches!(result, DriveStep::Done(_)) {
+            runner.claim_long_feedback(I::INDEX, slots.slot_mut().long_info());
+        }
         if matches!(result, DriveStep::Done(_) | DriveStep::Control(_)) {
             self.active_lun = None;
         }
@@ -844,7 +863,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         <S as At<I>>::Slot: Lu,
     {
         let Self { runner, slots, .. } = self;
-        runner.advance_rt(slots.slot_mut())
+        runner.advance_rt(I::INDEX, slots.slot_mut())
     }
 
     fn install_static<I>(
@@ -857,7 +876,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         <S as At<I>>::Slot: Lu,
     {
         let Self { runner, slots, .. } = self;
-        runner.install_rt(slots.slot_mut(), pair)
+        runner.install_rt(I::INDEX, slots.slot_mut(), pair)
     }
 
     fn force_remove_static<I>(
@@ -878,7 +897,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         &mut self,
         storage: &mut dyn super::storage::Storage,
         work: &mut [u8],
-        _scratch: &mut [u8],
+        scratch: &mut [u8],
     ) -> Result<LongInfo, Fault>
     where
         I: Index,
@@ -886,7 +905,10 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         <S as At<I>>::Slot: Lu,
     {
         let Self { runner, slots, .. } = self;
-        runner.poll_long_entry(slots.slot_mut(), storage, work)
+        // `work` belongs to the current command; the resident long operation
+        // uses `scratch` only (`03 §3.7`).
+        let _ = work;
+        runner.poll_long_entry(I::INDEX, slots.slot_mut(), storage, scratch)
     }
 }
 

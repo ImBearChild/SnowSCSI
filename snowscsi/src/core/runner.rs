@@ -177,7 +177,14 @@ pub struct Runner {
     /// Host-eject transaction in flight (AwaitDelivery): commit/detach may be
     /// under way but no result is resident yet (`§4.11`).
     eject_pending: Option<usize>,
-    long_feedback: Option<Feedback>,
+    /// Pending long-operation receipt, keyed to the LUN that owns it.
+    ///
+    /// A Target runs at most one resident long operation at a time
+    /// (`02-api-core.md:350`, `03 §3.7`): a fixed per-LUN array is not
+    /// possible without allocation, so the runner serializes long entries on
+    /// the owning LUN. A different LUN's entry fails closed with
+    /// `Fault::Boundary` without consuming this receipt.
+    long_feedback: Option<(usize, Feedback)>,
     drive_state: Cell<Option<DriveState>>,
     /// Deferred emergency removals, one bit per LUN.
     ///
@@ -1426,6 +1433,7 @@ impl Runner {
             return Err(BoundaryReject::ForeignBoundary);
         }
         let result = lu.take_rt(&permit).ok_or(BoundaryReject::NothingToTake)?;
+        self.clear_long_feedback(lun);
         if self.await_take == Some(lun) {
             self.await_take = None;
             self.take_events = self.take_events.saturating_add(1);
@@ -1493,6 +1501,7 @@ impl Runner {
         }
         match lu.force_remove_rt(&permit) {
             Ok(()) if lu.has_result() => {
+                self.clear_long_feedback(lun);
                 if let Err(reject) = self.host_eject_succeeded(lun) {
                     let fault = match reject {
                         BoundaryReject::EjectPending => Fault::Contract,
@@ -1501,7 +1510,7 @@ impl Runner {
                     self.set_fatal(fault);
                 }
             }
-            Ok(()) => {}
+            Ok(()) => self.clear_long_feedback(lun),
             Err(fault) => self.set_fatal(fault),
         }
     }
@@ -1527,19 +1536,28 @@ impl Runner {
     /// `propose → advance → take`. The commit is the device's local hook, never
     /// an injected runner `Sync`.
     #[allow(dead_code)] // `Target::advance_rt` (C2); driven by tests here
-    pub(crate) fn advance_rt<L: Lu + ?Sized>(&mut self, lu: &mut L) -> Result<(), Fault> {
+    pub(crate) fn advance_rt<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+    ) -> Result<(), Fault> {
         self.service_gate(lu).map_err(|_| Fault::Boundary)?;
         let permit = self.permit();
         if !lu.accepts_permit(&permit) {
             return Err(Fault::ForeignBoundary);
         }
-        lu.advance_rt(&permit)
+        lu.advance_rt(&permit)?;
+        // `advance` detaches the old pair; its resident long result cannot
+        // follow the new medium.
+        self.clear_long_feedback(lun);
+        Ok(())
     }
 
     /// Install an application-returned pair.
     #[allow(dead_code)] // `Target::install_rt` (C2); driven by tests here
     pub(crate) fn install_rt<L: Lu + ?Sized>(
         &mut self,
+        lun: usize,
         lu: &mut L,
         pair: L::Pair,
     ) -> Result<(), (L::Pair, Fault)> {
@@ -1550,7 +1568,9 @@ impl Runner {
         if !lu.accepts_permit(&permit) {
             return Err((pair, Fault::ForeignBoundary));
         }
-        lu.install_rt(&permit, pair)
+        lu.install_rt(&permit, pair)?;
+        self.clear_long_feedback(lun);
+        Ok(())
     }
 
     /// Emergency removal. Any pending token is cancelled first; an already
@@ -1607,6 +1627,7 @@ impl Runner {
         lu.force_remove_rt(&permit).inspect_err(|fault| {
             self.set_fatal(*fault);
         })?;
+        self.clear_long_feedback(lun);
         if lu.has_result() {
             if let Err(reject) = self.host_eject_succeeded(lun) {
                 let fault = match reject {
@@ -1636,6 +1657,9 @@ impl Runner {
         if self.await_take.is_some() {
             return Err(BoundaryReject::EjectPending);
         }
+        // The host eject detached this LUN's pair; its resident long result
+        // must not leak into a later fill.
+        self.clear_long_feedback(lun);
         self.await_take = Some(lun);
         self.eject_events = self.eject_events.saturating_add(1);
         Ok(())
@@ -1675,7 +1699,12 @@ impl Runner {
                 self.pending_control = Some(Control::Nop);
             }
             Control::Abort => {
-                if self.drive_state.get().is_some() {
+                // Only a command that is actually active owns an Abort. A
+                // fixed-completion command (admission reject / prepare error)
+                // has `command_active == false` while `drive_state.done` is
+                // still owed; queueing there would never be consumed and would
+                // wedge every later entry in `ControlPending`.
+                if self.command_active.get() {
                     self.pending_control = Some(Control::Abort);
                 } else {
                     // An idle Abort has no task; consume it immediately.
@@ -1734,27 +1763,68 @@ impl Runner {
         }
     }
 
+    /// Claim the single long-operation slot when a command leaves a resident
+    /// foreground/background operation on `lun`.
+    ///
+    /// Once claimed, an entry for any other LUN fails closed with
+    /// `Fault::Boundary` until this owner settles or its pair is detached.
+    pub(crate) fn claim_long_feedback(&mut self, lun: usize, info: LongInfo) {
+        if self.long_feedback.is_none()
+            && matches!(info.phase, LongPhase::Foreground | LongPhase::Background)
+        {
+            self.long_feedback = Some((lun, Feedback::begin()));
+        }
+    }
+
+    /// Drop a pending long-operation receipt only when `lun` owns it.
+    fn clear_long_feedback(&mut self, lun: usize) {
+        if matches!(self.long_feedback, Some((owner, _)) if owner == lun) {
+            self.long_feedback = None;
+        }
+    }
+
     /// Advance a resident long operation by exactly one entry.
+    ///
+    /// A Target has at most one active resident long operation. The pending
+    /// receipt is keyed to its LUN: an entry for a different LUN fails closed
+    /// with `Fault::Boundary` before the device is polled, while an `Idle`
+    /// answer from the owning device drops the receipt (the operation is gone).
+    /// Arming a second long operation is an application error; it can only
+    /// advance after the owner settles (or its pair is detached/taken).
+    ///
+    /// A `Fault::Contract` receipt is delivered back to the device in the same
+    /// entry (one bounded settle step, never a loop) so an `MmcDrive` is
+    /// already `Settled` before `Err(Fault::Contract)` is surfaced.
     #[allow(dead_code)] // `Target::poll_long_entry_*` (C2)
     pub(crate) fn poll_long_entry<L: Lu + ?Sized>(
         &mut self,
+        lun: usize,
         lu: &mut L,
         storage: &mut dyn Storage,
         data: &mut [u8],
     ) -> Result<LongInfo, Fault> {
+        if matches!(self.long_feedback, Some((owner, _)) if owner != lun) {
+            return Err(Fault::Boundary);
+        }
         self.poll_long_gate(lu).map_err(|_| Fault::Boundary)?;
-        let feedback = self.long_feedback.take().unwrap_or_else(Feedback::begin);
+        let feedback = match self.long_feedback.take() {
+            Some((owner, feedback)) if owner == lun => feedback,
+            _ => Feedback::begin(),
+        };
         let permit = self.command_permit();
         let step = lu.poll_long(&permit, feedback, data);
         match step {
             PollStep::Io(op) => {
                 let receipt = exec_storage(storage, op);
+                // A returned receipt is authoritative even for `Contract`
+                // (`03 §3.3`): feed it back before surfacing the fault, so the
+                // device settles from the confirmed prefix/effect and a later
+                // entry cannot re-issue the cancelled operation.
+                let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
+                self.long_feedback = Some((lun, feedback));
                 if receipt.error == Some(Fault::Contract) {
-                    return Err(Fault::Contract);
+                    return self.settle_contract_long(lun, lu, &permit, feedback, data);
                 }
-                self.long_feedback = Some(Feedback::io_done(IoReceipt::from_storage(
-                    receipt, self.owner,
-                )));
             }
             PollStep::Prefetch(PrefetchOp::Read {
                 resource,
@@ -1763,6 +1833,7 @@ impl Runner {
             }) => {
                 // Speculative reads never change the long-operation outcome; a
                 // failure is reported to the device, which falls back to `Io`.
+                // As above, a `Contract` receipt is still fed back first.
                 let receipt = exec_storage(
                     storage,
                     StorageOp::Read {
@@ -1771,22 +1842,68 @@ impl Runner {
                         buf,
                     },
                 );
+                let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
+                self.long_feedback = Some((lun, feedback));
                 if receipt.error == Some(Fault::Contract) {
-                    return Err(Fault::Contract);
+                    return self.settle_contract_long(lun, lu, &permit, feedback, data);
                 }
-                self.long_feedback = Some(Feedback::io_done(IoReceipt::from_storage(
-                    receipt, self.owner,
-                )));
             }
             PollStep::Complete(_) => {
-                self.long_feedback = None;
+                self.clear_long_feedback(lun);
             }
-            PollStep::Idle => {}
+            PollStep::Idle => {
+                // `Idle` only means "no work ready in this step". Keep the
+                // receipt only while the device still owns a live long
+                // operation (a foreground `Begin` guard also answers `Idle`);
+                // a settled/idle projection means the operation is gone.
+                if matches!(
+                    lu.long_info().phase,
+                    LongPhase::Foreground | LongPhase::Background
+                ) {
+                    self.long_feedback = Some((lun, feedback));
+                } else {
+                    self.clear_long_feedback(lun);
+                }
+            }
             PollStep::Publish(_) | PollStep::Receive(_) | PollStep::Send(_) => {
                 return Err(Fault::Contract)
             }
         }
         Ok(lu.long_info())
+    }
+
+    /// One bounded settle step after a `Fault::Contract` long receipt.
+    ///
+    /// The receipt is already stored keyed to `lun`. Polling the device once
+    /// more is exactly what the next entry would do; it lets an `MmcDrive`
+    /// reach `Settled` before the error surfaces. A second `Io`/`Prefetch` is
+    /// **not** executed and the already-consumed receipt is never re-fed: the
+    /// device is told to stop with a bounded `interrupt(Stop, NONE)` (no IO is
+    /// in flight), the slot is cleared, and the entry returns the contract
+    /// fault. This is a one-step cleanup, not an IO loop.
+    fn settle_contract_long<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &mut [u8],
+    ) -> Result<LongInfo, Fault> {
+        match lu.poll_long(permit, feedback, data) {
+            PollStep::Io(_) | PollStep::Prefetch(_) => {
+                // The device consumed the receipt and asked for another IO.
+                // Never re-feed it (the receipt is spent) and never execute the
+                // requested IO; one bounded cleanup settles the device.
+                let _ = lu.interrupt(permit, InterruptReason::Stop, KnownEffects::NONE);
+                self.clear_long_feedback(lun);
+            }
+            PollStep::Complete(_)
+            | PollStep::Idle
+            | PollStep::Publish(_)
+            | PollStep::Receive(_)
+            | PollStep::Send(_) => self.clear_long_feedback(lun),
+        }
+        Err(Fault::Contract)
     }
 }
 
@@ -2016,6 +2133,7 @@ mod tests {
     use crate::core::device::{Device, NoMedium, Pair};
     use crate::core::lu::LuImpl;
     use crate::core::storage::{BlockingHost, BlockingStorage, SyncHost, SyncStorage};
+    use crate::core::FeedbackKind;
 
     const SCRIPT_LEN: usize = 8;
     const BANK: usize = 1024;
@@ -2173,6 +2291,171 @@ mod tests {
         ) -> Result<(), (NoMedium, Fault)> {
             self.medium = Some(medium);
             Ok(())
+        }
+    }
+
+    /// Purpose-built long-operation device for the receipt hand-off tests.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProbeMode {
+        /// Consume the receipt, then ask for another IO (R1).
+        SettleIo,
+        /// First entry issues IO; the next returns `Idle` while still
+        /// `Foreground`, then the third consumes the same receipt (R2).
+        IdleOnce,
+    }
+
+    struct ProbeLong {
+        mode: ProbeMode,
+        long: LongInfo,
+        step: u32,
+        ios: u32,
+        interrupts: u32,
+        last_reason: Option<InterruptReason>,
+        last_known: KnownEffects,
+    }
+
+    impl ProbeLong {
+        fn new(mode: ProbeMode) -> Self {
+            Self {
+                mode,
+                long: LongInfo::IDLE,
+                step: 0,
+                ios: 0,
+                interrupts: 0,
+                last_reason: None,
+                last_known: KnownEffects::NONE,
+            }
+        }
+
+        fn io<'a>(data: &'a mut [u8]) -> PollStep<'a> {
+            PollStep::Io(StorageOp::Write {
+                resource: 1,
+                offset: 0,
+                buf: &data[..8],
+            })
+        }
+    }
+
+    impl Device for ProbeLong {
+        type Medium = NoMedium;
+
+        fn prepare(
+            &mut self,
+            _permit: &CommandPermit,
+            _ctx: CommandContext,
+            _cdb: &[u8],
+        ) -> Result<(), Completion> {
+            Ok(())
+        }
+
+        fn active(&self) -> bool {
+            false
+        }
+
+        fn resume(&mut self, _permit: &CommandPermit) -> Result<(), Completion> {
+            Ok(())
+        }
+
+        fn poll<'a>(
+            &mut self,
+            _permit: &CommandPermit,
+            _feedback: Feedback,
+            _data: &'a mut [u8],
+        ) -> PollStep<'a> {
+            PollStep::Idle
+        }
+
+        fn poll_long<'a>(
+            &mut self,
+            _permit: &CommandPermit,
+            feedback: Feedback,
+            data: &'a mut [u8],
+        ) -> PollStep<'a> {
+            if feedback.io().is_some() {
+                self.ios = self.ios.saturating_add(1);
+            }
+            match self.mode {
+                ProbeMode::SettleIo => {
+                    self.long = LongInfo {
+                        phase: LongPhase::Foreground,
+                        write_accessible: false,
+                        progress: Some(0),
+                        error: None,
+                    };
+                    match feedback.kind() {
+                        FeedbackKind::Begin | FeedbackKind::IoDone => ProbeLong::io(data),
+                        _ => PollStep::Idle,
+                    }
+                }
+                ProbeMode::IdleOnce => {
+                    self.step = self.step.saturating_add(1);
+                    match self.step {
+                        1 => {
+                            self.long = LongInfo {
+                                phase: LongPhase::Foreground,
+                                write_accessible: false,
+                                progress: Some(0),
+                                error: None,
+                            };
+                            ProbeLong::io(data)
+                        }
+                        2 => PollStep::Idle,
+                        _ => {
+                            self.long = LongInfo {
+                                phase: LongPhase::Settled,
+                                write_accessible: true,
+                                progress: Some(100),
+                                error: None,
+                            };
+                            PollStep::Complete(Completion::Good)
+                        }
+                    }
+                }
+            }
+        }
+
+        fn long_info(&self) -> LongInfo {
+            self.long
+        }
+
+        fn interrupt(
+            &mut self,
+            _permit: &CommandPermit,
+            reason: InterruptReason,
+            known: KnownEffects,
+        ) -> Result<(), Fault> {
+            self.interrupts = self.interrupts.saturating_add(1);
+            self.last_reason = Some(reason);
+            self.last_known = known;
+            Ok(())
+        }
+
+        fn finish_delivery(&mut self, _permit: &CommandPermit, _delivery: Delivery) {}
+
+        fn take_medium(&mut self, _permit: &BoundaryPermit) -> Option<NoMedium> {
+            None
+        }
+
+        fn install_medium(
+            &mut self,
+            _permit: &BoundaryPermit,
+            medium: NoMedium,
+        ) -> Result<(), (NoMedium, Fault)> {
+            Err((medium, Fault::Contract))
+        }
+    }
+
+    /// Storage double for the receipt hand-off tests (contract or success).
+    struct ProbePlane {
+        fault: Option<Fault>,
+    }
+
+    impl SyncStorage for ProbePlane {
+        fn exec(&mut self, _req: IoReq, _buf: IoBuf<'_>) -> StorageReceipt {
+            match self.fault {
+                Some(fault) => StorageReceipt::failed(fault, 0, Effect::Known),
+                None => StorageReceipt::ok(0),
+            }
         }
     }
 
@@ -2747,7 +3030,7 @@ mod tests {
             backing: 4,
         };
         assert_eq!(
-            bench.runner.install_rt(&mut bench.slot, pair),
+            bench.runner.install_rt(0, &mut bench.slot, pair),
             Err((
                 Pair {
                     medium: NoMedium,
@@ -2757,7 +3040,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            bench.runner.advance_rt(&mut bench.slot),
+            bench.runner.advance_rt(0, &mut bench.slot),
             Err(Fault::Boundary)
         );
 
@@ -2792,12 +3075,71 @@ mod tests {
     }
 
     #[test]
+    fn settle_contract_long_never_refeeds_a_consumed_receipt() {
+        let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 1u8);
+        let mut runner = Runner::new();
+        let mut storage = BlockingStorage::new(ProbePlane {
+            fault: Some(Fault::Contract),
+        });
+        let mut data = [0u8; 64];
+
+        assert_eq!(
+            runner.poll_long_entry(0, &mut slot, &mut storage, &mut data),
+            Err(Fault::Contract)
+        );
+        let probe = slot.device_ref();
+        assert_eq!(probe.ios, 1, "the receipt was delivered exactly once");
+        assert_eq!(probe.interrupts, 1, "one bounded cleanup");
+        assert_eq!(probe.last_reason, Some(InterruptReason::Stop));
+        assert_eq!(probe.last_known, KnownEffects::NONE);
+        assert!(
+            runner.long_feedback.is_none(),
+            "a spent receipt must not be restored"
+        );
+    }
+
+    #[test]
+    fn an_idle_answer_while_foreground_keeps_the_receipt() {
+        let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::IdleOnce), 1u8);
+        let mut runner = Runner::new();
+        let mut storage = BlockingStorage::new(ProbePlane { fault: None });
+        let mut data = [0u8; 64];
+
+        // Entry 1 issues the IO and stores the receipt.
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut data)
+            .expect("first entry");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        assert_eq!(slot.device_ref().ios, 0);
+
+        // Entry 2 consumes the receipt but answers `Idle` while Foreground:
+        // the receipt must be restored, not dropped.
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut data)
+            .expect("idle entry");
+        assert_eq!(info.phase, LongPhase::Foreground, "not reported as gone");
+        assert_eq!(slot.device_ref().ios, 1);
+        assert!(
+            runner.long_feedback.is_some(),
+            "the receipt survived an Idle-with-work-pending answer"
+        );
+
+        // Entry 3 consumes it again and settles.
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut data)
+            .expect("settle entry");
+        assert_eq!(info.phase, LongPhase::Settled);
+        assert_eq!(slot.device_ref().ios, 2);
+        assert!(runner.long_feedback.is_none());
+    }
+
+    #[test]
     fn long_entry_projects_the_device_state() {
         let mut bench = Bench::new([None; SCRIPT_LEN], 0);
         let mut bank = [0u8; 64];
         let info = bench
             .runner
-            .poll_long_entry(&mut bench.slot, &mut bench.storage, &mut bank)
+            .poll_long_entry(0, &mut bench.slot, &mut bench.storage, &mut bank)
             .expect("long entry");
         assert_eq!(info, LongInfo::IDLE);
 
@@ -2805,7 +3147,7 @@ mod tests {
         assert_eq!(
             bench
                 .runner
-                .poll_long_entry(&mut bench.slot, &mut bench.storage, &mut bank),
+                .poll_long_entry(0, &mut bench.slot, &mut bench.storage, &mut bank),
             Err(Fault::Boundary)
         );
     }

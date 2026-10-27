@@ -1438,6 +1438,31 @@ mod tests {
     }
 
     #[test]
+    fn progress_indication_scaling_is_non_zero_and_clamped() {
+        // MMC-6 Table 252: value / 65536 x 100%. Any non-zero progress must
+        // produce a non-zero 16-bit field; 99 and 100 stay in range and the
+        // existing 65535 clamp is respected.
+        let mut data = [0u8; 18];
+        let mut field = |progress| {
+            fill_sense(FORMAT_IN_PROGRESS, Some(progress), &mut data, 18);
+            assert_eq!(data[15], 0x80, "SKSV");
+            u16::from_be_bytes([data[16], data[17]])
+        };
+        assert_eq!(field(0), 0);
+        assert!(field(1) > 0, "non-zero progress must not encode as zero");
+        let at_99 = field(99);
+        let at_100 = field(100);
+        assert!(at_99 > 0 && at_99 < at_100);
+        assert_eq!(at_100, u16::MAX, "100% is the clamped maximum");
+        assert_eq!(field(101), u16::MAX, "the clamp still holds");
+        assert_eq!(field(200), u16::MAX, "the clamp still holds");
+
+        fill_sense(FORMAT_IN_PROGRESS, None, &mut data, 18);
+        assert_eq!(data[15], 0, "no progress => no SKSV");
+        assert_eq!(u16::from_be_bytes([data[16], data[17]]), 0);
+    }
+
+    #[test]
     fn request_sense_returns_a_prepare_level_check() {
         use crate::core::LBA_OUT_OF_RANGE;
         let mut spc = device();

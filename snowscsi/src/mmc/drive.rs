@@ -82,7 +82,24 @@ const FORMAT_CHUNK_MAX: usize = 1024 * 1024;
 /// constant for it because only the MMC FORMAT UNIT decoder needs it.
 const INVALID_FIELD_IN_PARAMETER_LIST: Sense = Sense::new(0x05, 0x26, 0x00);
 
+/// Facts projected when no medium is installed (`take_medium`).
+///
+/// GET CONFIGURATION and GESN must answer explicitly instead of delegating:
+/// their response for an absent medium is identical to a zero-sector medium.
+const NO_MEDIUM_ATTRS: MmcAttrs = MmcAttrs {
+    write_mode: MmcWriteMode::ReadOnly,
+    block_len: 2048,
+    sectors: 0,
+    tracks: 0,
+    sessions: 0,
+    write_protected: false,
+    needs_recovery: false,
+};
+
 /// Resident zero-fill state (MMC-internal; only projected through `LongInfo`).
+///
+/// Only the **foreground** FORMAT/BLANK fill exists. `LongPhase::Background`
+/// (DVD+RW background format) is reserved and never produced here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LongOp {
     /// No resident operation.
@@ -95,9 +112,22 @@ enum LongOp {
         done: u64,
         /// Bytes of the single in-flight write (`0` when none).
         in_flight: u64,
+        /// The final durability `Sync` was issued for the completed write set.
+        ///
+        /// The drive owns these writes and reports completion before the host
+        /// can issue SYNCHRONIZE CACHE, so it establishes durability itself
+        /// with exactly one `Sync` after the last confirmed chunk
+        /// A repeated `Begin` while this is set
+        /// must not reissue that sync.
+        sync: bool,
     },
     /// Finished; the result is resident until management takes it.
-    Settled { error: Option<Fault> },
+    Settled {
+        /// Terminal error, if the operation settled abnormally.
+        error: Option<Fault>,
+        /// Real progress at settle time: `Some(100)` only on success.
+        progress: Option<u32>,
+    },
 }
 
 /// FORMAT UNIT / BLANK command state machine fields.
@@ -570,12 +600,16 @@ impl<M: MmcMedium> MmcDrive<M> {
             .checked_mul(u64::from(block_len))
             .ok_or(Completion::Check(INVALID_FIELD))?;
         self.long = if bytes == 0 {
-            LongOp::Settled { error: None }
+            LongOp::Settled {
+                error: None,
+                progress: Some(100),
+            }
         } else {
             LongOp::Foreground {
                 total: bytes,
                 done: 0,
                 in_flight: 0,
+                sync: false,
             }
         };
         Ok(())
@@ -584,13 +618,19 @@ impl<M: MmcMedium> MmcDrive<M> {
     /// One step of the drive-owned zero-fill. The medium supplies geometry, but
     /// the fill is issued directly as `StorageOp::Write` on resource 0 at byte
     /// offset `done`, so no `MmcOp::Format` reaches the medium. Only one IO is
-    /// in flight at a time; a repeated `Begin` while `in_flight != 0` does not
-    /// reissue the same write (only the matching `IoDone` advances).
+    /// in flight at a time; a repeated `Begin` while an operation is in flight
+    /// does not reissue it (only the matching `IoDone` advances).
+    ///
+    /// After the last confirmed chunk the drive issues exactly one
+    /// `StorageOp::Sync { resource: 0 }` before settling GOOD: it owns those
+    /// writes and reports completion before the host's SYNCHRONIZE CACHE can
+    /// run, so durability is established here.
     fn fill_step<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
         let LongOp::Foreground {
             total,
             done,
             in_flight,
+            sync,
         } = self.long
         else {
             return PollStep::Idle;
@@ -602,33 +642,79 @@ impl<M: MmcMedium> MmcDrive<M> {
                 let Some(receipt) = fb.io() else {
                     self.long = LongOp::Settled {
                         error: Some(Fault::Contract),
+                        progress: failure_progress(done, total),
                     };
                     return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
                 };
+                if sync && in_flight == 0 {
+                    // Final durability sync receipt. Success needs a known,
+                    // error-free, zero-confirmed sync; anything else settles
+                    // abnormally but never revokes an already-sent GOOD.
+                    let fault = receipt.error().or_else(|| {
+                        (receipt.effect() != Effect::Known || receipt.confirmed() != 0)
+                            .then_some(Fault::Io)
+                    });
+                    return match fault {
+                        None => {
+                            self.long = LongOp::Settled {
+                                error: None,
+                                progress: Some(100),
+                            };
+                            PollStep::Complete(Completion::Good)
+                        }
+                        Some(fault) => {
+                            self.long = LongOp::Settled {
+                                error: Some(fault),
+                                progress: failure_progress(done, total),
+                            };
+                            PollStep::Complete(Completion::Check(
+                                storage_fault_sense(fault, IoContext::Format)
+                                    .unwrap_or(MEDIUM_ERROR),
+                            ))
+                        }
+                    };
+                }
                 if let Some(fault) = receipt.error() {
-                    self.long = LongOp::Settled { error: Some(fault) };
+                    self.long = LongOp::Settled {
+                        error: Some(fault),
+                        progress: failure_progress(done, total),
+                    };
                     return PollStep::Complete(Completion::Check(
-                        storage_fault_sense(fault, IoContext::Format).unwrap_or(INTERNAL_FAILURE),
+                        storage_fault_sense(fault, IoContext::Format).unwrap_or(MEDIUM_ERROR),
                     ));
                 }
                 if in_flight == 0 || receipt.confirmed() as u64 != in_flight {
                     // A short write leaves an unknown tail; do not replay it.
                     self.long = LongOp::Settled {
                         error: Some(Fault::Io),
+                        progress: failure_progress(done, total),
                     };
                     return PollStep::Complete(Completion::Check(MEDIUM_ERROR));
                 }
                 done += in_flight;
                 in_flight = 0;
+                if done == total {
+                    // The whole medium is zeroed; establish durability before
+                    // the long operation settles.
+                    self.long = LongOp::Foreground {
+                        total,
+                        done,
+                        in_flight: 0,
+                        sync: true,
+                    };
+                    return PollStep::Io(StorageOp::Sync { resource: 0 });
+                }
                 self.long = LongOp::Foreground {
                     total,
                     done,
                     in_flight,
+                    sync,
                 };
             }
             FeedbackKind::Begin => {
-                if in_flight != 0 {
-                    // A retried `Begin` must not reissue the in-flight write.
+                if in_flight != 0 || sync {
+                    // A retried `Begin` must not reissue the in-flight write or
+                    // the final sync.
                     return PollStep::Idle;
                 }
             }
@@ -639,7 +725,12 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         let remaining = total.saturating_sub(done);
         if remaining == 0 {
-            self.long = LongOp::Settled { error: None };
+            // Only reachable when the final sync is no longer in flight, which
+            // the `Begin` arm above already handles; keep a defensive settle.
+            self.long = LongOp::Settled {
+                error: None,
+                progress: Some(100),
+            };
             return PollStep::Complete(Completion::Good);
         }
         let chunk = remaining
@@ -648,6 +739,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         if chunk == 0 {
             self.long = LongOp::Settled {
                 error: Some(Fault::Contract),
+                progress: failure_progress(done, total),
             };
             return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
         }
@@ -656,6 +748,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             total,
             done,
             in_flight: chunk as u64,
+            sync,
         };
         PollStep::Io(StorageOp::Write {
             resource: 0,
@@ -1007,6 +1100,10 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         }
     }
 
+    /// Advance the resident long operation.
+    ///
+    /// Only the foreground FORMAT/BLANK zero-fill exists; DVD+RW background
+    /// format is not implemented (`LongPhase::Background` is reserved).
     fn poll_long<'a>(
         &mut self,
         _permit: &CommandPermit,
@@ -1025,18 +1122,26 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
     fn long_info(&self) -> LongInfo {
         match self.long {
             LongOp::Idle => LongInfo::IDLE,
-            LongOp::Foreground { total, done, .. } => LongInfo {
+            LongOp::Foreground {
+                total, done, sync, ..
+            } => LongInfo {
                 phase: LongPhase::Foreground,
                 write_accessible: false,
-                progress: Some(format_progress(done, total)),
+                // 100 is reserved for a successful settle; while the final
+                // durability Sync is pending the fill is at 99.
+                progress: Some(if sync {
+                    99
+                } else {
+                    format_progress(done, total)
+                }),
                 error: None,
             },
-            LongOp::Settled { error } => LongInfo {
+            LongOp::Settled { error, progress } => LongInfo {
                 phase: LongPhase::Settled,
                 // The foreground gate is down once the fill settled; a failed
                 // settle is carried in `error`, not in this projection.
                 write_accessible: true,
-                progress: Some(100),
+                progress,
                 error,
             },
         }
@@ -1191,7 +1296,9 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         if rt == 3 {
             return None;
         }
-        let attrs = self.attrs()?;
+        // An absent medium answers explicitly with the zero-sector view rather
+        // than delegating (`Spc` would turn `None` into an unrelated reject).
+        let attrs = self.attrs().unwrap_or(NO_MEDIUM_ATTRS);
         let present = attrs.sectors != 0;
         let rewritable = matches!(
             attrs.write_mode,
@@ -1312,7 +1419,9 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
     }
 
     fn event_status(&self, class: u8, out: Option<&mut [u8]>) -> Option<usize> {
-        let attrs = self.attrs()?;
+        // As with GET CONFIGURATION, an absent medium gets the explicit
+        // zero-sector view instead of `None` (which would delegate/reject).
+        let attrs = self.attrs().unwrap_or(NO_MEDIUM_ATTRS);
         let mut buf = [0u8; 8];
         let len = if class & 0x10 != 0 {
             // Media class: Event Header + 4-byte Media Event Descriptor.
@@ -1589,6 +1698,11 @@ fn format_progress(done: u64, total: u64) -> u32 {
         return 100;
     }
     (done.saturating_mul(100) / total).min(100) as u32
+}
+
+/// Progress carried by a failed settle: never 100.
+fn failure_progress(done: u64, total: u64) -> Option<u32> {
+    Some(format_progress(done, total).min(99))
 }
 
 /// Validate `lba + blocks` against the medium's sector count.
@@ -2216,13 +2330,15 @@ mod tests {
     }
 
     /// Drive a resident long operation to completion and record its write
-    /// offsets/lengths. Every passed buffer must be zeroed by the drive.
+    /// offsets/lengths. Every passed buffer must be zeroed by the drive and the
+    /// operation must end with exactly one durability `Sync`.
     fn drive_long(
         dev: &mut MmcDrive<SpyMedium>,
         permit: &CommandPermit,
         data: &mut [u8],
     ) -> Vec<(u64, usize)> {
         let mut ios = Vec::new();
+        let mut syncs = 0usize;
         let mut fb = Feedback::begin();
         for _ in 0..64 {
             match dev.poll_long(permit, fb, data) {
@@ -2231,7 +2347,14 @@ mod tests {
                     ios.push((offset, buf.len()));
                     fb = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
                 }
-                PollStep::Complete(Completion::Good) => return ios,
+                PollStep::Io(StorageOp::Sync { resource: 0 }) => {
+                    syncs += 1;
+                    fb = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                }
+                PollStep::Complete(Completion::Good) => {
+                    assert_eq!(syncs, 1, "the fill must end with exactly one Sync");
+                    return ios;
+                }
                 other => panic!("unexpected long step: {other:?}"),
             }
         }
@@ -2308,8 +2431,23 @@ mod tests {
             Feedback::io_done(IoReceipt::test(4096, None, Effect::Known)),
             &mut data,
         ) {
+            PollStep::Io(StorageOp::Sync { resource: 0 }) => {}
+            other => panic!("expected the final durability sync, got {other:?}"),
+        }
+        // The final durability sync is pending: progress is 99, never 100.
+        assert_eq!(dev.long_info().progress, Some(99));
+        // A repeated Begin while the sync is in flight must not reissue it.
+        assert!(matches!(
+            dev.poll_long(&permit, Feedback::begin(), &mut data),
+            PollStep::Idle
+        ));
+        match dev.poll(
+            &permit,
+            Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
+            &mut data,
+        ) {
             PollStep::Complete(Completion::Good) => {}
-            other => panic!("expected GOOD, got {other:?}"),
+            other => panic!("expected GOOD after the sync, got {other:?}"),
         }
         assert!(!dev.active());
         let info = dev.long_info();
@@ -2361,6 +2499,125 @@ mod tests {
             dev.poll_long(&permit, Feedback::begin(), &mut data),
             PollStep::Idle
         ));
+    }
+
+    #[test]
+    fn poll_long_io_borrows_the_caller_bank_not_the_device() {
+        // D6 borrow-domain proof: the returned `PollStep::Io` may be held while
+        // the device is read (`long_info`/`medium`), so a concurrent query is
+        // possible. The IO buffer points into the caller's bank.
+        let permit = permit();
+        let mut dev = MmcDrive::new(SpyMedium::rewritable(4));
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[FORMAT_UNIT, 0, 0, 0, 0, 0]
+            ),
+            Ok(())
+        );
+        let mut bank = [0xA5u8; 8192];
+        let base = bank.as_ptr();
+        let op = dev.poll_long(&permit, Feedback::begin(), &mut bank);
+        let info = dev.long_info();
+        let medium = dev.medium().expect("medium");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        assert_eq!(medium.attrs().sectors, 4);
+        match op {
+            PollStep::Io(StorageOp::Write { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(buf.as_ptr(), base, "IO must point into the caller bank");
+                assert!(buf.iter().all(|b| *b == 0), "the bank is zeroed in place");
+            }
+            other => panic!("expected a write into the caller bank, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn final_fill_sync_failure_settles_without_good_or_replay() {
+        let permit = permit();
+        let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[FORMAT_UNIT, 0, 0, 0, 0, 0]
+            ),
+            Ok(())
+        );
+        let mut data = [0u8; 4096];
+        assert!(matches!(
+            dev.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Io(StorageOp::Write { .. })
+        ));
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::io_done(IoReceipt::test(4096, None, Effect::Known)),
+                &mut data
+            ),
+            PollStep::Io(StorageOp::Sync { resource: 0 })
+        ));
+        // Pressing Begin again while the sync is in flight must not reissue it.
+        assert!(matches!(
+            dev.poll_long(&permit, Feedback::begin(), &mut data),
+            PollStep::Idle
+        ));
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::io_done(IoReceipt::test(0, Some(Fault::Io), Effect::Known)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Check(MEDIUM_ERROR))
+        ));
+        let info = dev.long_info();
+        assert_eq!(info.phase, LongPhase::Settled);
+        assert_eq!(info.error, Some(Fault::Io));
+        assert_eq!(info.progress, Some(99), "a failed settle never reports 100");
+        // The settled operation never replays the sync or a write.
+        assert!(matches!(
+            dev.poll_long(&permit, Feedback::begin(), &mut data),
+            PollStep::Idle
+        ));
+    }
+
+    #[test]
+    fn final_fill_sync_with_unknown_effect_is_an_io_fault() {
+        let permit = permit();
+        for receipt in [
+            IoReceipt::test(0, None, Effect::UnknownRemainder),
+            IoReceipt::test(1, None, Effect::Known),
+        ] {
+            let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
+            assert_eq!(
+                dev.prepare(
+                    &permit,
+                    ctx(Direction::None, 0),
+                    &[FORMAT_UNIT, 0, 0, 0, 0, 0]
+                ),
+                Ok(())
+            );
+            let mut data = [0u8; 4096];
+            assert!(matches!(
+                dev.poll(&permit, Feedback::begin(), &mut data),
+                PollStep::Io(StorageOp::Write { .. })
+            ));
+            assert!(matches!(
+                dev.poll(
+                    &permit,
+                    Feedback::io_done(IoReceipt::test(4096, None, Effect::Known)),
+                    &mut data
+                ),
+                PollStep::Io(StorageOp::Sync { resource: 0 })
+            ));
+            assert!(matches!(
+                dev.poll(&permit, Feedback::io_done(receipt), &mut data),
+                PollStep::Complete(Completion::Check(MEDIUM_ERROR))
+            ));
+            assert_eq!(dev.long_info().error, Some(Fault::Io));
+            assert_eq!(dev.long_info().progress, Some(99));
+        }
     }
 
     #[test]
@@ -2551,6 +2808,14 @@ mod tests {
             dev.poll(
                 &permit,
                 Feedback::io_done(IoReceipt::test(4096, None, Effect::Known)),
+                &mut data
+            ),
+            PollStep::Io(StorageOp::Sync { resource: 0 })
+        ));
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
                 &mut data
             ),
             PollStep::Complete(Completion::Good)
@@ -2846,6 +3111,62 @@ mod tests {
     }
 
     #[test]
+    fn no_medium_get_configuration_matches_a_zero_sector_medium() {
+        // D4: after `take_medium` the profile answers instead of delegating.
+        let mut dev = drive(100);
+        let removed = dev.take_medium(&boundary()).expect("medium");
+        assert_eq!(removed.attrs().sectors, 100);
+        let profile = dev.spc_profile().expect("profile");
+
+        let mut absent = [0u8; 128];
+        let len = profile
+            .get_configuration(0, 0, Some(&mut absent))
+            .expect("GC must answer without a medium");
+        let mut zero = [0u8; 128];
+        let zero_len = MmcDrive::new(FlatCdMedium::read_only(0))
+            .spc_profile()
+            .expect("profile")
+            .get_configuration(0, 0, Some(&mut zero))
+            .expect("GC must answer for a zero-sector medium");
+        assert_eq!((len, &absent), (zero_len, &zero));
+        assert_eq!(
+            &absent[6..8],
+            &0x0000u16.to_be_bytes(),
+            "no current profile"
+        );
+        assert_eq!(absent[11], 4, "one CD-ROM profile entry");
+        // RT=10b and RT=01b also answer from the absent default.
+        assert!(profile.get_configuration(2, 0x0050, None).is_some());
+        assert!(profile.get_configuration(1, 0x0010, None).is_some());
+        assert_eq!(profile.get_configuration(3, 0, None), None);
+    }
+
+    #[test]
+    fn no_medium_event_status_matches_a_zero_sector_medium() {
+        let mut dev = drive(100);
+        assert!(dev.take_medium(&boundary()).is_some());
+        let profile = dev.spc_profile().expect("profile");
+
+        let mut absent = [0u8; 8];
+        let len = profile
+            .event_status(0x10, Some(&mut absent))
+            .expect("GESN must answer without a medium");
+        let mut zero = [0u8; 8];
+        let zero_len = MmcDrive::new(FlatCdMedium::read_only(0))
+            .spc_profile()
+            .expect("profile")
+            .event_status(0x10, Some(&mut zero))
+            .expect("GESN must answer for a zero-sector medium");
+        assert_eq!((len, &absent), (zero_len, &zero));
+        assert_eq!(&absent[0..2], &6u16.to_be_bytes());
+        assert_eq!(absent[3], 0x10, "Media class advertised");
+        assert_eq!(absent[4], 0x00, "NoChg");
+        assert_eq!(absent[5], 0x00, "no media present");
+        // No class requested: header-only, same advertised class.
+        assert_eq!(profile.event_status(0x00, None), Some(4));
+    }
+
+    #[test]
     fn no_medium_rejects_media_queries_and_install_is_exclusive() {
         let mut dev = drive(100);
         let boundary = boundary();
@@ -2861,8 +3182,10 @@ mod tests {
         let profile = dev.spc_profile().expect("profile");
         assert_eq!(profile.read_capacity(), None);
         assert_eq!(profile.mode_sense(false, 0x08, false, 0, None), None);
-        assert_eq!(profile.get_configuration(0, 0, None), None);
-        assert_eq!(profile.event_status(0x10, None), None);
+        // GC/GESN answer explicitly with the zero-sector view instead of
+        // delegating to `Spc` (which would reject for an unrelated reason).
+        assert_eq!(profile.get_configuration(0, 0, None), Some(60));
+        assert_eq!(profile.event_status(0x10, None), Some(8));
 
         let mut cdb = [0u8; 10];
         cdb[0] = READ_TOC;

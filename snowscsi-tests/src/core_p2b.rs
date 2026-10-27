@@ -993,7 +993,9 @@ fn mmc_format_immed_one_gates_media_commands_and_settles() {
     let mut storage = BlockingStorage::new(Plane::new(16 * 1024));
     let mut host = BlockingHost::new(ParamHost::new(format_params(0xA2, 0)));
     let mut work = vec![0u8; 4096];
-    let mut scratch = vec![0u8; 64];
+    // The resident long operation uses `scratch`, so it must be large enough
+    // for the fixture's expected 4096-byte chunks.
+    let mut scratch = vec![0u8; 4096];
     let cdb = [0x04u8, 0x11, 0, 0, 0, 0];
 
     assert_eq!(
@@ -1060,15 +1062,11 @@ fn mmc_format_immed_one_gates_media_commands_and_settles() {
     assert!(storage.inner().writes.is_empty());
     assert!(storage.inner().reads.is_empty());
 
-    // The runner's lifecycle gate (`Runner::boundary_of`) refuses to start any
-    // command while the resident long operation is unsettled, so the live
-    // `Target` path cannot reach the `2/04/04` gate at all. `core/` is outside
-    // this slice; the check above pins the `Lu` admission seam and
-    // `drive.rs`'s `foreground_gate_rejects_every_opcode_before_medium_access`
-    // pins `MmcDrive::prepare`. Record the boundary fact here so the gap is
-    // not mistaken for a passing T14 live case.
-    // The runner must let the command reach the device gate: the host sees
-    // CHECK 2/04/04 (not a boundary fault) with zero medium/backing access.
+    // The runner does not reject a command merely because a resident long
+    // operation is unsettled: the command reaches the device gate and the host
+    // sees CHECK 2/04/04 (not a boundary fault) with zero medium/backing
+    // access. `core_p4` covers the same live path with the `work`/`scratch`
+    // split and the query set.
     let rejected: [&[u8]; 3] = [&tur_cdb(), &read10(0, 1), &write10(0, 1)];
     for cdb in rejected {
         assert_eq!(
@@ -1131,6 +1129,11 @@ fn mmc_format_immed_one_gates_media_commands_and_settles() {
         storage.inner().writes,
         vec![(0, 4096), (4096, 4096)],
         "the whole 4-sector medium is zero-filled once, in order"
+    );
+    assert_eq!(
+        storage.inner().syncs,
+        1,
+        "the drive establishes durability with exactly one final Sync"
     );
     assert!(storage.inner().zeroed(8192));
 
@@ -1251,6 +1254,7 @@ fn mmc_format_immed_zero_zero_fills_in_poll() {
     );
     assert_eq!(storage.inner().writes, vec![(0, 4096), (4096, 4096)]);
     assert_eq!(storage.inner().write_zero, vec![true, true]);
+    assert_eq!(storage.inner().syncs, 1, "one final durability sync");
     assert!(storage.inner().zeroed(8192));
     assert_eq!(slot0(&target).long_info().phase, LongPhase::Settled);
 
@@ -1270,6 +1274,7 @@ fn mmc_format_immed_zero_zero_fills_in_poll() {
     );
     assert_eq!(storage.inner().writes, vec![(0, 4096)]);
     assert_eq!(storage.inner().write_zero, vec![true]);
+    assert_eq!(storage.inner().syncs, 1, "one final durability sync");
     assert!(storage.inner().zeroed(4096));
     assert_eq!(slot0(&target).long_info().phase, LongPhase::Settled);
 }
@@ -1421,6 +1426,7 @@ fn mmc_blank_zero_fills_only_writable_media() {
     );
     assert_eq!(storage.inner().writes, vec![(0, 4096)]);
     assert_eq!(storage.inner().write_zero, vec![true]);
+    assert_eq!(storage.inner().syncs, 1, "one final durability sync");
     assert!(storage.inner().zeroed(4096));
     assert_eq!(slot0(&target).long_info().phase, LongPhase::Settled);
 
