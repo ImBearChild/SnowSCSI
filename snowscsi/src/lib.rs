@@ -34,6 +34,12 @@
 pub use snowscsi_common as common;
 pub use snowscsi_common::{debug, error, info, trace, warn};
 
+/// Direct-access block device profile.
+pub mod block;
+/// Core contract layer (`no_std`, no-alloc, no `unsafe`): errors, device
+/// lifecycle, permits and management values.
+pub mod core;
+
 pub mod scsi;
 
 #[cfg(feature = "cdrom")]

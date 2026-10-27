@@ -34,5 +34,8 @@ pub mod async_golden;
 #[cfg(test)]
 mod store_plane;
 
+#[cfg(test)]
+mod core_p2a;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;
