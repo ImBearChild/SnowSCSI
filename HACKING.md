@@ -12,10 +12,10 @@ the `snowscsi` binary lives in `snowscsi-cli`.
 | **Disc** | `snowscsi-iso9660` | ISO9660 + Joliet live-generation algorithms (`live.rs`) |
 | **SCSI core** | `snowscsi` | SCSI core, block/CD-ROM devices (SBC/SPC/MMC), iSCSI target, USB MSC (BOT) core, blank (host-formatted) DVD-RAM media |
 | — storage seams | `snowscsi::common` (= `snowscsi-common`) | Re-exported `SeekableStorage`/`FsStorage` + logging macros |
-| — SCSI | `snowscsi::scsi` | One `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, trait-driven LUNs (`ScsiDevice`) |
+| — SCSI | `snowscsi::scsi` | Legacy `BlockDevice` (disk/cdrom profiles), SPC/SBC layers, file/fs backends, `ScsiDevice` LUN trait (kept for the profile path; the transports no longer use it) |
 | — CD-ROM | `snowscsi::cdrom` | `CdromDrive` + media (`FlatMedia` / `LiveData` / `DvdRamMedia`), full MMC |
-| — iSCSI | `snowscsi::iscsi` | iSCSI PDU codec, connection, target state machine, TCP transport |
-| — USB MSC | `snowscsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, non-blocking `BotSession` state machine |
+| — iSCSI | `snowscsi::iscsi` | iSCSI PDU codec, connection, target state machine driving `core::Target`, TCP transport |
+| — USB MSC | `snowscsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, `BotSession` driving `core::Target` |
 | — DVD-RAM | `snowscsi::dvdram` (feature `dvdram`) | Blank, host-formatted random-writable DVD-RAM media (`cdrom::dvdram::DvdRamMedia`) |
 | **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory |
 | **Tests** | `snowscsi-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
@@ -317,9 +317,9 @@ breaking; we still keep changes reviewable:
   compiler-enforced migration for every downstream driver.
 - Error domains (`MediaError`, `StorageError`, …) may gain variants in
   a minor release; consider `#[non_exhaustive]` when stabilizing toward 1.0.
-- Trait additions (new required or default methods on `ScsiDevice`,
-  `SpcDevice`, `FlatData`, …) are breaking while `0.x`; batch them and
-  document them under a `BREAKING CHANGE:` footer.
+- Trait additions (new required or default methods on `Lu`, `Device`,
+  `Storage`, `HostTransport`, `ScsiDevice`, `FlatData`, …) are breaking while
+  `0.x`; batch them and document them under a `BREAKING CHANGE:` footer.
 
 ## Legacy C Code
 

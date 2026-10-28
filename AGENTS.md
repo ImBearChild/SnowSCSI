@@ -61,8 +61,8 @@ making changes. Crate names at a glance:
 | `snowscsi-iso9660` | Done — ISO9660/Joliet live-generation (`live.rs`), moved out of the old `iso9660` module. `LiveData`/`LiveDataBuilder`/`compute_layout`. |
 | `snowscsi::scsi` | Done — seam-first rewrite: one `BlockDevice<D: FlatData>` with two profiles (`disk()` writable PDT 0x00 / `cdrom()` read-only PDT 0x05, the former `CDBlockDevice`, over ANY plane incl. user backends); transports are generic over `D: ScsiDevice` (+ blanket for `&mut T`) so users implement their own LUNs; the closed `Device` enum is removed. |
 | `snowscsi::cdrom` | Done — `CdromDrive` dispatches all MMC commands; media types `FlatMedia` (full MMC), `LiveData`/`LiveDataBuilder` (livefs), `DvdRamMedia` (DVD-RAM, `dvdram`). Full MMC surface: READ TOC, GET CONFIGURATION, READ DISC INFORMATION, READ BUFFER CAPACITY, READ CAPACITY, DVD physical format, prevent/allow removal, tray exchange, pending Unit Attention. Legacy `CdromDevice`/`CdLiveFsDevice`/`DvdRamDevice` removed. |
-| `snowscsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine, BSD `TcpStream` transport behind `std`. Recent fixes: StatSN/DataSN/BufferOffset sequencing and the R2T/Data-In state machine. |
-| `snowscsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (non-blocking `BotSession::poll`). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowscsi-cli` under `cfg(target_os = "linux")`. |
+| `snowscsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine driving `core::Target` through the host data seam, BSD `TcpStream` transport behind `std`. Data phase, R2T/Data-Out, task management, unit-attention reporting and transport-loss settlement are covered by mock, golden and libiscsi suites. |
+| `snowscsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (`BotSession` driving `core::Target` through the host data seam, all BOT data-phase cases). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowscsi-cli` under `cfg(target_os = "linux")`. |
 | `snowscsi::dvdram` | Done (feature `dvdram`) — `cdrom::dvdram::DvdRamMedia`, a **blank** random-writable DVD-RAM over any `WritableFlatData`: FORMAT UNIT (zero-fill) + byte-plane read/write; the **host** formats it (the device never writes UDF structures). Exposed via CLI `--cdrom dvdram=`. |
 | `snowscsi-cli` | Done — `serve` (`--block`/`--cdrom` planes + `--iscsi`/`--usb` transports, mutually exclusive; `--iscsi auto` open-iscsi loopback auto-config) and `mkisofs` (directory → ISO image). |
 | `snowscsi-tests` | Done — mock + libiscsi whitebox (`has_libiscsi` gated) + ISO cross-validation. |
@@ -104,13 +104,15 @@ git checkout legacy
   and `snowscsi`; `snowscsi-cli` uses `#![forbid(unsafe_code)]`.
   `snowscsi-tests` is the only crate that allows `unsafe` (libiscsi FFI).
   RFC 3720 only, no RFC 7143. `__*` files never committed.
-- **LUN model**: both transports drive any `D: ScsiDevice` via
-  `poll<…, D>(devs: &mut [D])`. Homogeneous arrays use concrete types
-  (`&mut [BlockDevice<B>]`); heterogeneous mixing uses
-  `[&mut dyn ScsiDevice]`. Users implement `ScsiDevice` directly or wrap
-  built-ins (see `ScsiDevice` doc for the canonical wrapper pattern).
-  The CLI owns typed vectors (`disks`/`drives`/`backends`/`lives`) and
-  builds a `Vec<&mut dyn ScsiDevice>`; shutdown flushes via
-  `ScsiDevice::sync()`. See `__SEAM_REWRITE.md` (agent memory) for the
-  full design. Dual-mount of the same path
-  across planes is warned but permitted (each LUN is an independent SCSI device).
+- **LUN model**: both transports drive a `core::Target<S>` where
+  `S: RuntimeSet`, i.e. a homogeneous-pair slot table. A transport's `poll`
+  takes `work`/`scratch` banks plus `&mut Target<S>` and `&mut dyn Storage`,
+  and implements `HostTransport` itself; storage IO runs inside the runner.
+  Applications wrap a device in `LuImpl<D, B>` (optionally `Spc<D>`) or
+  implement `Lu` directly; heterogeneous LUN kinds need one pair type (the CLI
+  uses `CliLu`/`CliPair` in `snowscsi-cli/src/stack.rs`). Per-LUN storage
+  routing goes through `Storage::select_lun`. The legacy `scsi::ScsiDevice`
+  path still exists for the `snowscsi::scsi` profiles but no longer drives the
+  transports. See `__SEAM_REWRITE.md` (agent memory) for the full design.
+  Dual-mount of the same path across planes is warned but permitted (each LUN
+  is an independent SCSI device).
