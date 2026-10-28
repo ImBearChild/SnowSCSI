@@ -122,6 +122,13 @@ impl TestLu {
         ))
     }
 
+    /// Write-protected block slot with the given geometry.
+    pub fn block_read_only(blocks: u64, block_len: u32, backing: TestBacking) -> Self {
+        let mut attrs = BlockAttrs::new(blocks, block_len);
+        attrs.write_mode = snowscsi::core::Writability::ReadOnly;
+        Self::Block(LuImpl::new(Spc::new(BlockDevice::new(attrs)), backing))
+    }
+
     /// Read-only flat CD slot with `sectors` 2048-byte blocks.
     pub fn cdrom(sectors: u64, backing: TestBacking) -> Self {
         Self::Mmc(LuImpl::new(
@@ -417,6 +424,11 @@ pub struct PlaneSet<'a> {
     lun: usize,
     token: Option<(IoReq, u32)>,
     tag: u32,
+    /// Number of plane operations actually executed (test observability).
+    pub execs: usize,
+    /// When non-zero, the next poll(s) answer `Pending` before touching the
+    /// plane (used to observe the core's storage-only steps).
+    pub pending_polls: usize,
 }
 
 impl<'a> PlaneSet<'a> {
@@ -427,7 +439,16 @@ impl<'a> PlaneSet<'a> {
             lun: 0,
             token: None,
             tag: 1,
+            execs: 0,
+            pending_polls: 0,
         }
+    }
+
+    /// Answer the next `polls` storage executions as `Pending` (a
+    /// storage-only step the shell must drive again).
+    pub fn with_pending(mut self, polls: usize) -> Self {
+        self.pending_polls = polls;
+        self
     }
 
     /// Execute one raw store operation on the selected LUN.
@@ -462,6 +483,10 @@ impl Storage for PlaneSet<'_> {
             Some((req, tag)) if token == IoToken::new(0, tag) => (req, tag),
             _ => return Poll::Ready(StorageReceipt::failed(Fault::Contract, 0, Effect::Known)),
         };
+        if self.pending_polls > 0 {
+            self.pending_polls -= 1;
+            return Poll::Pending;
+        }
         let _ = tag;
         self.token = None;
         let ok = match (req.dir, &buf) {
@@ -492,6 +517,7 @@ impl Storage for PlaneSet<'_> {
                 buf: b,
             },
         };
+        self.execs += 1;
         match plane.do_op(op) {
             Ok(()) => Poll::Ready(StorageReceipt::ok(confirmed)),
             Err(e) => Poll::Ready(StorageReceipt::failed(

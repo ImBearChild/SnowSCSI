@@ -113,9 +113,16 @@ pub struct CommandContext {
     /// [`Self::UNBOUNDED_HOST_BYTES`] means the transport declared **no
     /// bound**: the exact-length rules for `FromHost`/`None` are skipped and
     /// the transport's own `HostTransport::publish` gate enforces the protocol
-    /// limit. `ToHost` still treats it as an unlimited receive capacity.
+    /// limit and direction. `ToHost` still treats it as an unlimited receive
+    /// capacity.
     pub host_bytes: u64,
     /// Direction of the host data phase.
+    ///
+    /// Must equal [`DataPlan::direction`] unless [`Self::host_bytes`] is
+    /// [`Self::UNBOUNDED_HOST_BYTES`], in which case the transport's publish
+    /// gate owns the direction check (a wire convention can legitimately
+    /// declare a phase the command does not use, which is the transport's
+    /// phase-error case, not a contract violation).
     pub host_direction: Direction,
 }
 

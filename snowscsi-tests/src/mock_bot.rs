@@ -27,6 +27,8 @@ pub struct MockBotIo {
     pub stall_in_count: u32,
     /// Whether `stall_in` reports success (default: yes).
     pub stall_in_available: bool,
+    /// Number of zero-length bulk-IN sends (ZLPs) observed.
+    pub zero_in_count: u32,
 }
 
 impl MockBotIo {
@@ -76,6 +78,9 @@ impl BotIo for MockBotIo {
     }
 
     fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+        if buf.is_empty() {
+            self.zero_in_count += 1;
+        }
         self.in_.extend_from_slice(buf);
         Ok(())
     }

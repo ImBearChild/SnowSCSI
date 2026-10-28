@@ -1,46 +1,29 @@
-//! Integration tests for the USB MSC Bulk-Only Transport session core
-//! Command sequences, CSW validation, phase/invalid-CBW/invalid-LUN
-//! error paths, the usb-storage probe script, control-request ordering,
-//! reset-during-data-phase, and cross-platform data-phase regressions.
+//! Integration tests for the USB MSC Bulk-Only Transport session core.
+//!
+//! Command sequences, CSW validation, phase/invalid-CBW/invalid-LUN error
+//! paths, the usb-storage probe script, control-request ordering,
+//! reset-during-data-phase, and the Data-In shortfall policy.
 //!
 //! All tests are deterministic, single-threaded and need no root: the host
 //! side is a scripted `MockBotIo` + `MockGadget` driving the same
-//! non-blocking `BotSession` `poll` core the PC driver uses.
-//!
-//! The core is converged on `Action`/`Event` (`__STEP1_USB.md`): the driver
-//! holds the pending [`Action`] and feeds back one [`Event`] per I/O
-//! completion. There is no `Done` boundary — a completed transaction simply
-//! returns the next command-boundary `Action::HostRecv { len: 31, .. }` — so
-//! the local helpers below track "a CSW was sent" to end one transaction.
+//! non-blocking `BotSession` `poll` core the PC driver uses, over a real core
+//! `Target` and a synchronous storage plane.
 
+use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowscsi::common::store::{StoreOp, StorePlane};
-use snowscsi::scsi::backend::{RamBackend, StorageError};
-use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::ScsiDevice;
+use snowscsi::core::{Lu, RuntimeSet, Target};
+use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
     Action, BotIo, BotIoErr, BotSession, CtrlAck, CtrlReply, CtrlReq, Event, Gadget,
-    ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN,
+    ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN, MAX_PAD,
 };
 use std::sync::atomic::Ordering;
 
-/// A 64 KiB block device over a caller-owned RAM backend.
-///
-/// The constructor borrows the backend once for geometry and releases it; the
-/// data phase hands the driver a `Store` op to execute against a
-/// [`StorePlane`].
-pub(crate) fn block_device(backend: &mut RamBackend<'_>) -> BlockDevice {
-    BlockDevice::disk(backend, 512).unwrap()
-}
-
-/// Read `buf.len()` bytes at `off` through LUN 0's storage plane (the test
+/// Read `buf.len()` bytes at `off` through the storage plane (the test
 /// stand-in for the driver reading the backing store).
-fn plane_read(planes: &mut [Option<StorePlane<'_>>], off: u64, buf: &mut [u8]) {
-    planes[0]
-        .as_mut()
-        .unwrap()
-        .do_op(StoreOp::Read { off, buf })
-        .unwrap();
+fn plane_read(storage: &mut PlaneSet<'_>, off: u64, buf: &mut [u8]) {
+    storage.exec_raw(StoreOp::Read { off, buf }).unwrap();
 }
 
 /// Build a raw 31-byte CBW from its logical fields (little endian).
@@ -90,42 +73,37 @@ enum Drive {
 /// The pending [`Action`], with every borrow dropped so the driver can touch
 /// `work` again before the next `poll`.
 enum Step {
-    Recv {
-        len: usize,
-        probe: bool,
-    },
-    Sent {
-        is_csw: bool,
-    },
-    /// A storage op was executed; the driver feeds `Event::StoreDone`.
-    Stored(Result<(), StorageError>),
+    Recv { len: usize, probe: bool },
+    Sent { is_csw: bool },
     StallBoth,
     StallIn,
 }
 
+/// Build the slot table: a heterogeneous runtime LUN set.
+fn table<L: Lu<Pair = TestPair>>(slots: &mut [L]) -> Vec<&mut dyn Lu<Pair = TestPair>> {
+    slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect()
+}
+
 /// Poll the core once with `ev` and classify its `Action`. A `HostSend` is
-/// executed here (bulk IN); a `HostRecv` is returned for the driver to fill;
-/// an `Action::Store` is executed against the LUN's plane.
-fn next_step<D: ScsiDevice>(
+/// executed here (bulk IN); a `HostRecv` is returned for the driver to fill.
+fn next_step<S: RuntimeSet>(
     session: &mut BotSession,
     ev: Event,
     work: &mut [u8],
-    devs: &mut [D],
-    planes: &mut [Option<StorePlane<'_>>],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
     io: &mut MockBotIo,
 ) -> Step {
-    match session.poll(ev, work, devs) {
+    match session.poll(ev, work, scratch, target, storage) {
         Action::HostRecv { len, probe } => Step::Recv { len, probe },
-        Action::HostSend { bytes, .. } => {
+        Action::HostSend { bytes } => {
             let is_csw = bytes.len() == CSW_LEN;
             io.send_in(bytes).unwrap();
             Step::Sent { is_csw }
-        }
-        Action::Store { lun, op, .. } => {
-            // Execute the device-produced op on the LUN's plane, exactly like
-            // `usb::serve`; the completion is fed back on the next poll.
-            let result = planes[lun].as_mut().unwrap().do_op(op);
-            Step::Stored(result)
         }
         Action::StallBoth => Step::StallBoth,
         Action::StallIn => Step::StallIn,
@@ -135,20 +113,20 @@ fn next_step<D: ScsiDevice>(
 
 /// Drive the poll loop until one transaction ends (a CSW was sent and the
 /// session is back at the command boundary) or an invalid CBW STALLed both
-/// pipes and the script ran dry. Mirrors `usb::serve`'s bulk arm; the control
-/// plane is serviced by [`serve_ctrl_once`] between transactions.
-fn drive_until_done<D: ScsiDevice>(
+/// pipes and the script ran dry.
+fn drive_until_done<S: RuntimeSet>(
     session: &mut BotSession,
     io: &mut MockBotIo,
     work: &mut [u8],
-    devs: &mut [D],
-    planes: &mut [Option<StorePlane<'_>>],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
 ) -> Drive {
     let mut ev = Event::Tick;
     let mut csw_sent = false;
     let mut stalled = false;
     loop {
-        match next_step(session, ev, work, devs, planes, io) {
+        match next_step(session, ev, work, scratch, target, storage, io) {
             Step::Recv { len, probe } => {
                 if csw_sent && len == CBW_LEN && !probe {
                     return Drive::Processed;
@@ -173,9 +151,6 @@ fn drive_until_done<D: ScsiDevice>(
                 }
                 ev = Event::HostSent;
             }
-            Step::Stored(result) => {
-                ev = Event::StoreDone { result };
-            }
             Step::StallBoth => {
                 if io.stall_both().is_ok() {
                     stalled = true;
@@ -191,36 +166,39 @@ fn drive_until_done<D: ScsiDevice>(
 }
 
 /// Feed one CBW and drive the transaction to completion.
-fn run_command<D: ScsiDevice>(
+fn run_command<S: RuntimeSet>(
     session: &mut BotSession,
     io: &mut MockBotIo,
     work: &mut [u8],
-    devs: &mut [D],
-    planes: &mut [Option<StorePlane<'_>>],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
     cbw: &[u8; CBW_LEN],
 ) -> Drive {
     io.feed_out(cbw);
-    drive_until_done(session, io, work, devs, planes)
+    drive_until_done(session, io, work, scratch, target, storage)
 }
 
 /// Handle one queued control request the way `usb::serve` does.
-fn serve_ctrl_once<D: ScsiDevice>(
+fn serve_ctrl_once<S: RuntimeSet>(
     session: &mut BotSession,
     gadget: &mut MockGadget,
     work: &mut [u8],
-    devs: &mut [D],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
 ) -> bool {
     if let Some(req) = gadget.try_next_ctrl() {
         match req {
             CtrlReq::BotReset { ack } => {
-                let _ = session.poll(Event::Reset, work, devs);
+                let _ = session.poll(Event::Reset, work, scratch, target, storage);
                 ack.ack();
             }
             CtrlReq::GetMaxLun { mut reply } => {
                 reply.send(&[session.max_lun()]).unwrap();
             }
             CtrlReq::LinkReset => {
-                let _ = session.poll(Event::Reset, work, devs);
+                let _ = session.poll(Event::Reset, work, scratch, target, storage);
             }
         }
         true
@@ -230,12 +208,14 @@ fn serve_ctrl_once<D: ScsiDevice>(
 }
 
 /// Assert the session is at the command boundary (`HostRecv { len: 31 }`).
-fn assert_command_boundary<D: ScsiDevice>(
+fn assert_command_boundary<S: RuntimeSet>(
     session: &mut BotSession,
     work: &mut [u8],
-    devs: &mut [D],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
 ) {
-    match session.poll(Event::Tick, work, devs) {
+    match session.poll(Event::Tick, work, scratch, target, storage) {
         Action::HostRecv {
             len: CBW_LEN,
             probe: false,
@@ -250,11 +230,13 @@ fn assert_command_boundary<D: ScsiDevice>(
 fn command_sequence_inquiry_read_capacity_tur() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // INQUIRY, alloc 36 → 36-byte response, PDT 0 (direct-access block).
@@ -263,8 +245,9 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 36, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -279,8 +262,9 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 8, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -297,8 +281,9 @@ fn command_sequence_inquiry_read_capacity_tur() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(3, 0, 0, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -314,28 +299,31 @@ fn command_sequence_read_and_write_verify_backend() {
         *b = (i % 251) as u8;
     }
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
-    // READ(10) LBA 0, 8 blocks → 4096 bytes (within one 8K chunk).
+    // READ(10) LBA 0, 8 blocks → 4096 bytes.
     let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 8, 0];
     let r = run_command(
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(4, 4096, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(sent.len(), 4096 + CSW_LEN);
     let mut check = [0u8; 4096];
-    plane_read(&mut planes, 0, &mut check);
+    plane_read(&mut storage, 0, &mut check);
     assert_eq!(&sent[..4096], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 
@@ -345,13 +333,20 @@ fn command_sequence_read_and_write_verify_backend() {
     let cbw = raw_cbw(5, 512, 0x00, 0, &cdb);
     io.feed_out(&cbw);
     io.feed_out(&payload);
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(sent.len(), CSW_LEN);
     assert_eq!(csw_fields(&sent), (5, 0, 0x00));
     let mut check = [0u8; 512];
-    plane_read(&mut planes, 512, &mut check);
+    plane_read(&mut storage, 512, &mut check);
     assert_eq!(&check[..], payload.as_slice());
 
     // READ(10) back LBA 1 → the written payload.
@@ -360,8 +355,9 @@ fn command_sequence_read_and_write_verify_backend() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(6, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -373,11 +369,13 @@ fn command_sequence_read_and_write_verify_backend() {
 fn command_sequence_mode_sense_and_request_sense_clear() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // MODE SENSE(6) 0x3F, alloc 192 → 4-byte header + 24 bytes of pages.
@@ -386,8 +384,9 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(7, 192, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -402,8 +401,9 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(8, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -416,8 +416,9 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(9, 18, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -434,8 +435,9 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(10, 18, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -449,29 +451,31 @@ fn command_sequence_mode_sense_and_request_sense_clear() {
 fn csw_host_asks_for_more_gets_short_packet_and_residue() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
-    // INQUIRY alloc 95 truncates the 96-byte response; host declared 192 → a
-    // short packet + residue (no pad, no STALL; see the core's "Data-In
-    // shortfall policy").
+    // INQUIRY alloc 95 is capped by the core's 36-byte page; host declared
+    // 192 → a short packet + residue (no pad, no STALL).
     let cdb = [0x12, 0, 0, 0, 95, 0];
     let r = run_command(
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 192, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 95 + CSW_LEN);
-    assert_eq!(csw_fields(&sent), (1, 192 - 95, 0x00));
+    assert_eq!(sent.len(), 36 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (1, 192 - 36, 0x00));
     assert_eq!(io.stall_count, 0, "short packet must not STALL");
 }
 
@@ -481,11 +485,13 @@ fn csw_host_asks_for_more_gets_short_packet_and_residue() {
 fn phase_error_on_direction_mismatch() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // READ(10) declared with Data-Out direction → the host's 512 data-out
@@ -494,7 +500,14 @@ fn phase_error_on_direction_mismatch() {
     let cbw = raw_cbw(1, 512, 0x00, 0, &cdb);
     io.feed_out(&cbw);
     io.feed_out(&vec![0x00; 512]);
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (1, 512, 0x02)); // Phase Error
@@ -504,11 +517,13 @@ fn phase_error_on_direction_mismatch() {
 fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // TUR to LUN 3 (only LUN 0 exists) → Failed, NOT Phase Error.
@@ -517,8 +532,9 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 0, 0, 3, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -531,8 +547,9 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 18, 0x80, 3, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -547,11 +564,13 @@ fn invalid_lun_is_failed_csw_with_sense_not_phase_error() {
 fn invalid_cbw_stalls_both_then_new_cbw_recovers() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // Bad signature → STALL both pipes once, no CSW; the session returns to
@@ -559,7 +578,14 @@ fn invalid_cbw_stalls_both_then_new_cbw_recovers() {
     let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
     bad[0] = b'X';
     io.feed_out(&bad);
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Stalled);
     assert_eq!(io.stall_count, 1, "both pipes STALLed once");
     assert!(io.in_.is_empty(), "no CSW for an invalid CBW");
@@ -572,8 +598,9 @@ fn invalid_cbw_stalls_both_then_new_cbw_recovers() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -586,11 +613,13 @@ fn invalid_cbw_stalls_both_then_new_cbw_recovers() {
 fn invalid_cbw_without_stall_falls_back_to_command() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     io.stall_available = false;
 
@@ -601,7 +630,14 @@ fn invalid_cbw_without_stall_falls_back_to_command() {
     io.feed_out(&bad);
     let cdb = [0x12, 0, 0, 0, 36, 0];
     io.feed_out(&raw_cbw(2, 36, 0x80, 0, &cdb));
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
     assert_eq!(io.stall_count, 0, "STALL unavailable → fallback reset");
     let sent = io.take_sent();
@@ -617,11 +653,13 @@ fn host_probe_script_drives_serve_bot() {
         *b = (i * 13 % 256) as u8;
     }
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut gadget = MockGadget::new();
 
@@ -630,7 +668,14 @@ fn host_probe_script_drives_serve_bot() {
     gadget.inject(CtrlReq::GetMaxLun {
         reply: reply.clone(),
     });
-    assert!(serve_ctrl_once(&mut s, &mut gadget, &mut work, &mut devs));
+    assert!(serve_ctrl_once(
+        &mut s,
+        &mut gadget,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage
+    ));
     assert_eq!(reply.sent.lock().unwrap().as_slice(), &[0u8]);
 
     // 2) TUR.
@@ -639,8 +684,9 @@ fn host_probe_script_drives_serve_bot() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 0, 0, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -652,8 +698,9 @@ fn host_probe_script_drives_serve_bot() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -666,8 +713,9 @@ fn host_probe_script_drives_serve_bot() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(3, 8, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -680,14 +728,15 @@ fn host_probe_script_drives_serve_bot() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(4, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     let mut check = [0u8; 512];
-    plane_read(&mut planes, 5 * 512, &mut check);
+    plane_read(&mut storage, 5 * 512, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (4, 0, 0x00));
 }
@@ -698,14 +747,22 @@ fn host_probe_script_drives_serve_bot() {
 fn reset_injects_unit_attention() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
-    let _ = s.poll(Event::Reset, &mut work, &mut devs);
+    let _ = s.poll(
+        Event::Reset,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     // First TUR → CHECK CONDITION (UA), Failed CSW.
     let cdb = [0x00, 0, 0, 0, 0, 0];
@@ -713,8 +770,9 @@ fn reset_injects_unit_attention() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 0, 0, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -727,15 +785,16 @@ fn reset_injects_unit_attention() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 18, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(sent[2], 0x06); // UNIT ATTENTION
     assert_eq!(sent[12], 0x29);
-    assert_eq!(sent[13], 0x00);
+    assert_eq!(sent[13], 0x02); // SCSI BUS RESET OCCURRED
 
     // Subsequent TUR → GOOD.
     let cdb = [0x00, 0, 0, 0, 0, 0];
@@ -743,8 +802,9 @@ fn reset_injects_unit_attention() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(3, 0, 0, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -756,10 +816,14 @@ fn reset_injects_unit_attention() {
 
 #[test]
 fn control_requests_get_max_lun_and_bot_reset() {
+    let mut slots: [TestLu; 0] = [];
+    let mut storage = PlaneSet::new(vec![]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
     let mut gadget = MockGadget::new();
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
-    let mut no_devs: [&mut dyn ScsiDevice; 0] = [];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
 
     // Get Max LUN → [max_lun]; never STALLs, never errors.
     let reply = MockReply::new();
@@ -770,10 +834,12 @@ fn control_requests_get_max_lun_and_bot_reset() {
         &mut s,
         &mut gadget,
         &mut work,
-        &mut no_devs
+        &mut scratch,
+        &mut target,
+        &mut storage
     ));
     assert_eq!(reply.sent.lock().unwrap().as_slice(), &[0u8]);
-    assert_command_boundary(&mut s, &mut work, &mut no_devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
 
     // Bot Reset → reset before ack; back to Command.
     let acked = MockAck::new();
@@ -782,10 +848,12 @@ fn control_requests_get_max_lun_and_bot_reset() {
         &mut s,
         &mut gadget,
         &mut work,
-        &mut no_devs
+        &mut scratch,
+        &mut target,
+        &mut storage
     ));
     assert!(acked.acked.load(Ordering::SeqCst), "ack called after reset");
-    assert_command_boundary(&mut s, &mut work, &mut no_devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
 
     // LinkReset → same as a reset.
     gadget.inject(CtrlReq::LinkReset);
@@ -793,9 +861,11 @@ fn control_requests_get_max_lun_and_bot_reset() {
         &mut s,
         &mut gadget,
         &mut work,
-        &mut no_devs
+        &mut scratch,
+        &mut target,
+        &mut storage
     ));
-    assert_command_boundary(&mut s, &mut work, &mut no_devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
 }
 
 // ── 8. Reset during a data phase ────────────────────────────────────
@@ -804,25 +874,39 @@ fn control_requests_get_max_lun_and_bot_reset() {
 fn bot_reset_interrupts_data_phase() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
     let mut gadget = MockGadget::new();
 
     // WRITE CBW → data phase.
     let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
     io.feed_out(&raw_cbw(1, 512, 0x00, 0, &cdb));
-    let len = match s.poll(Event::Tick, &mut work, &mut devs) {
+    let len = match s.poll(
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
         Action::HostRecv { len, probe: false } => len,
         _ => panic!("expected a CBW receive"),
     };
     assert_eq!(len, CBW_LEN);
     let n = io.try_recv_out(&mut work[..len]).unwrap();
     assert_eq!(n, CBW_LEN);
-    match s.poll(Event::HostRecv { len: n }, &mut work, &mut devs) {
+    match s.poll(
+        Event::HostRecv { len: n },
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
         Action::HostRecv {
             len: 512,
             probe: false,
@@ -830,16 +914,17 @@ fn bot_reset_interrupts_data_phase() {
         _ => panic!("expected a 512-byte Data-Out need"),
     }
 
-    // Partial data received: the session hands the 128 received bytes to the
-    // device as a Store(Write); once executed it asks for the remaining 384.
+    // Partial data received: the session moves it and asks for the rest.
     io.feed_out(&[0xAA; 128]);
     let n = io.try_recv_out(&mut work[..512]).unwrap();
     assert_eq!(n, 128);
-    let result = match s.poll(Event::HostRecv { len: n }, &mut work, &mut devs) {
-        Action::Store { lun, op, .. } => planes[lun].as_mut().unwrap().do_op(op),
-        _ => panic!("expected a Store for the partial write"),
-    };
-    match s.poll(Event::StoreDone { result }, &mut work, &mut devs) {
+    match s.poll(
+        Event::HostRecv { len: n },
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
         Action::HostRecv {
             len: 384,
             probe: false,
@@ -851,9 +936,16 @@ fn bot_reset_interrupts_data_phase() {
     // follows the reset.
     let acked = MockAck::new();
     gadget.inject(CtrlReq::BotReset { ack: acked.clone() });
-    assert!(serve_ctrl_once(&mut s, &mut gadget, &mut work, &mut devs));
+    assert!(serve_ctrl_once(
+        &mut s,
+        &mut gadget,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage
+    ));
     assert!(acked.acked.load(Ordering::SeqCst));
-    assert_command_boundary(&mut s, &mut work, &mut devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
 
     // A new valid CBW is processed.
     let cdb = [0x12, 0, 0, 0, 36, 0];
@@ -861,8 +953,9 @@ fn bot_reset_interrupts_data_phase() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 36, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -876,11 +969,13 @@ fn bot_reset_interrupts_data_phase() {
 fn mode_sense_10_and_prevent_allow() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // MODE SENSE(10) 0x3F alloc 192 → 8-byte header + 24 pages.
@@ -889,8 +984,9 @@ fn mode_sense_10_and_prevent_allow() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 192, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -905,8 +1001,9 @@ fn mode_sense_10_and_prevent_allow() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 0, 0, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -919,11 +1016,13 @@ fn mode_sense_10_and_prevent_allow() {
 fn request_sense_with_large_allocation_is_short_packet() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // Cause a CC first.
@@ -932,8 +1031,9 @@ fn request_sense_with_large_allocation_is_short_packet() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -945,8 +1045,9 @@ fn request_sense_with_large_allocation_is_short_packet() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(2, 64, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -963,11 +1064,13 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
         *b = (i % 97) as u8;
     }
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // READ(10) 1 block = 512 bytes = one MPS multiple. The data phase must
@@ -977,30 +1080,33 @@ fn data_in_exact_mps_boundary_sends_no_zlp() {
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 512, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(sent.len(), 512 + CSW_LEN);
     let mut check = [0u8; 512];
-    plane_read(&mut planes, 0, &mut check);
+    plane_read(&mut storage, 0, &mut check);
     assert_eq!(&sent[..512], &check[..]);
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));
     // Back in Command, ready for the next CBW.
-    assert_command_boundary(&mut s, &mut work, &mut devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
 }
 
 #[test]
 fn data_out_host_overrun_is_drained() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
     // WRITE(10) 512 bytes, but the host transmits 512 + 100 extra bytes.
@@ -1008,15 +1114,22 @@ fn data_out_host_overrun_is_drained() {
     io.feed_out(&raw_cbw(1, 512, 0x00, 0, &cdb));
     io.feed_out(&[0x5A; 512]);
     io.feed_out(&[0x6B; 100]);
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
 
     // Only the declared 512 bytes were written; the excess was discarded.
     let mut check = [0u8; 512];
-    plane_read(&mut planes, 0, &mut check);
+    plane_read(&mut storage, 0, &mut check);
     assert!(check.iter().all(|&b| b == 0x5A));
     let mut tail = [0u8; 128];
-    plane_read(&mut planes, 512, &mut tail);
+    plane_read(&mut storage, 512, &mut tail);
     assert!(tail.iter().all(|&b| b == 0));
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (1, 0, 0x00));
@@ -1026,20 +1139,23 @@ fn data_out_host_overrun_is_drained() {
 fn opcode_report_luns_synthesized() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
 
-    let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16];
+    let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 16];
     let r = run_command(
         &mut s,
         &mut io,
         &mut work,
-        &mut devs,
-        &mut planes,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &raw_cbw(1, 16, 0x80, 0, &cdb),
     );
     assert_eq!(r, Drive::Processed);
@@ -1056,18 +1172,19 @@ fn opcode_report_luns_synthesized() {
 /// on `Action::StallIn` and then releasing the stall (`Event::StallApplied`;
 /// the host's CLEAR_FEATURE is handled by the USB core). Returns `None` when
 /// `stall_in` failed and the transaction was aborted via `Event::Reset`.
-fn drive_short<D: ScsiDevice>(
+fn drive_short<S: RuntimeSet>(
     session: &mut BotSession,
     io: &mut MockBotIo,
     work: &mut [u8],
-    devs: &mut [D],
-    planes: &mut [Option<StorePlane<'_>>],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
 ) -> Option<Drive> {
     let mut ev = Event::Tick;
     let mut csw_sent = false;
     let mut stalled_once = false;
     loop {
-        match next_step(session, ev, work, devs, planes, io) {
+        match next_step(session, ev, work, scratch, target, storage, io) {
             Step::Recv { len, probe } => {
                 if csw_sent && len == CBW_LEN && !probe {
                     return Some(Drive::Processed);
@@ -1091,15 +1208,12 @@ fn drive_short<D: ScsiDevice>(
                 }
                 ev = Event::HostSent;
             }
-            Step::Stored(result) => {
-                ev = Event::StoreDone { result };
-            }
             Step::StallIn => {
                 assert!(!stalled_once, "stall was not released");
                 stalled_once = true;
                 if io.stall_in().is_err() {
                     // Abort deterministically (the withheld CSW is dropped).
-                    let _ = session.poll(Event::Reset, work, devs);
+                    let _ = session.poll(Event::Reset, work, scratch, target, storage);
                     return None;
                 }
                 // Release the stall; the withheld CSW follows.
@@ -1114,22 +1228,31 @@ fn drive_short<D: ScsiDevice>(
 fn short_policy_stalls_then_applied_releases_csw() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
 
     // READ(10) 1 block (512, an MPS multiple) vs declared 1024.
     let cdb = rw10(0x28, 0, 1);
     io.feed_out(&raw_cbw(1, 1024, 0x80, 0, &cdb));
     assert_eq!(
-        drive_short(&mut s, &mut io, &mut work, &mut devs, &mut planes),
+        drive_short(
+            &mut s,
+            &mut io,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
         Some(Drive::Processed)
     );
 
-    // 512 relevant + a ZLP (empty → adds nothing) + CSW; no padding, no stall_both.
+    // 512 relevant + a ZLP (empty → adds nothing) + CSW.
     let sent = io.take_sent();
     assert_eq!(sent.len(), 512 + CSW_LEN, "no pad, no stray bytes");
     assert_eq!(csw_fields(&sent), (1, 1024 - 512, 0x00));
@@ -1141,23 +1264,33 @@ fn short_policy_stalls_then_applied_releases_csw() {
 fn short_policy_non_mps_shortfall_stalls_without_zlp() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
 
-    // INQUIRY alloc 95 vs declared 192: the short packet ends the read.
+    // INQUIRY alloc 95 (36-byte core page) vs declared 192: the short
+    // packet ends the read.
     let cdb = [0x12, 0, 0, 0, 95, 0];
     io.feed_out(&raw_cbw(2, 192, 0x80, 0, &cdb));
     assert_eq!(
-        drive_short(&mut s, &mut io, &mut work, &mut devs, &mut planes),
+        drive_short(
+            &mut s,
+            &mut io,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
         Some(Drive::Processed)
     );
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 95 + CSW_LEN);
-    assert_eq!(csw_fields(&sent), (2, 192 - 95, 0x00));
+    assert_eq!(sent.len(), 36 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (2, 192 - 36, 0x00));
     assert_eq!(io.stall_in_count, 1);
 }
 
@@ -1165,21 +1298,30 @@ fn short_policy_non_mps_shortfall_stalls_without_zlp() {
 fn short_policy_stall_failure_resets_transaction() {
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new().set_stall_in(false);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
 
     let cdb = rw10(0x28, 0, 1);
     io.feed_out(&raw_cbw(3, 1024, 0x80, 0, &cdb));
     // `stall_in` unavailable → the driver aborts via reset.
     assert_eq!(
-        drive_short(&mut s, &mut io, &mut work, &mut devs, &mut planes),
+        drive_short(
+            &mut s,
+            &mut io,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
         None
     );
-    assert_command_boundary(&mut s, &mut work, &mut devs);
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
     // Only the 512 relevant bytes went out; the withheld CSW was dropped.
     assert_eq!(io.in_.len(), 512, "no CSW emitted on the abort");
 }
@@ -1192,44 +1334,49 @@ fn default_policy_is_short_no_stall() {
     // The default ending is the plain short packet (no STALL, no pad).
     let mut ram = vec![0u8; 64 * 1024];
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new(); // no selector: exercise the default
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
     let mut io = MockBotIo::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
 
-    // INQUIRY alloc 95 vs declared 192.
+    // INQUIRY alloc 95 (36-byte core page) vs declared 192.
     let cdb = [0x12, 0, 0, 0, 95, 0];
     io.feed_out(&raw_cbw(5, 192, 0x80, 0, &cdb));
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
-    assert_eq!(sent.len(), 95 + CSW_LEN);
-    assert_eq!(csw_fields(&sent), (5, 192 - 95, 0x00));
+    assert_eq!(sent.len(), 36 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (5, 192 - 36, 0x00));
     assert_eq!(io.stall_count, 0);
     assert_eq!(io.stall_in_count, 0);
 }
 
-/// FORMAT UNIT's whole-disc `Fill` must run through the **session** agenda
-/// (never inline in the device). Pre-fill the plane with a pattern so a no-op
-/// FORMAT is detectable, drive FORMAT through the session, and assert the
-/// plane is zero afterwards. (Golden scenario ⑬ cannot discriminate this: its
-/// RAM starts zeroed, so the post-FORMAT read is zero either way.)
+/// FORMAT UNIT's whole-disc zero-fill must run through the resident long
+/// operation. Pre-fill the plane with a pattern so a no-op FORMAT is
+/// detectable, drive FORMAT through the session, advance the long operation on
+/// idle entries, and assert the plane is zero afterwards.
 #[test]
-fn format_unit_zeroes_the_plane_via_the_session_agenda() {
-    use snowscsi::cdrom::dvdram::DvdRamMedia;
-    use snowscsi::cdrom::{CdMedia, CdromDrive, HYPER_MULTI_CAPS};
-
+fn format_unit_zeroes_the_plane_via_the_long_operation() {
     let mut ram = vec![0x5Au8; 1 << 20];
     let mut backend = RamBackend::new(&mut ram);
-    let mut drive = CdromDrive::builder().capabilities(HYPER_MULTI_CAPS).build();
-    let _ = drive.load_quiet(CdMedia::Rw(DvdRamMedia::open(&mut backend)));
-
+    let mut slots = [TestLu::dvdram(512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
     let mut s = BotSession::new();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
     let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = vec![0u8; 64 * 1024];
     let mut io = MockBotIo::new();
 
     // FORMAT UNIT (0x04) followed by its 12-byte format parameter list.
@@ -1243,13 +1390,594 @@ fn format_unit_zeroes_the_plane_via_the_session_agenda() {
     io.feed_out(&[
         0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
     ]);
-    let r = drive_until_done(&mut s, &mut io, &mut work, &mut devs, &mut planes);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
     assert_eq!(r, Drive::Processed);
 
+    // Advance the resident zero-fill on idle entries.
+    for _ in 0..32 {
+        let _ = s.poll(
+            Event::Tick,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
+    }
+
     let mut check = vec![0u8; 1 << 20];
-    plane_read(&mut planes, 0, &mut check);
+    plane_read(&mut storage, 0, &mut check);
     assert!(
         check.iter().all(|&b| b == 0),
-        "FORMAT must zero-fill the whole plane through the session agenda"
+        "FORMAT must zero-fill the whole plane through the long operation"
     );
+}
+
+// ── 11. Data-Out residue (BOT §6.6.2) ──────────────────────────────
+
+/// A failed storage write must not report that the host's bytes were
+/// processed: the conservative residue is the whole declared length.
+#[test]
+fn failed_data_out_write_reports_full_residue() {
+    // The plane holds one 512-byte block while the device geometry and the
+    // CDB address LBA 1, so the storage step fails with OutOfBounds.
+    let mut ram = vec![0u8; 512];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    let cdb = rw10(0x2A, 1, 1);
+    io.feed_out(&raw_cbw(1, 512, 0x00, 0, &cdb));
+    io.feed_out(&[0x5A; 512]);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(
+        csw_fields(&sent),
+        (1, 512, 0x01),
+        "no byte reached the medium, so the whole declared length is residue"
+    );
+}
+
+/// A successful Data-Out reports zero residue.
+#[test]
+fn successful_data_out_reports_zero_residue() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    let cdb = rw10(0x2A, 0, 1);
+    io.feed_out(&raw_cbw(1, 512, 0x00, 0, &cdb));
+    io.feed_out(&[0x5A; 512]);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (1, 0, 0x00));
+}
+
+// ── 12. Host/device transfer matrix (BOT §6.7) ─────────────────────
+
+/// Run one CBW against a fresh 64 KiB block LUN, optionally followed by host
+/// data, and return `(CSW fields, plane ops, ZLP count)`.
+fn run_phase_case(cbw: [u8; CBW_LEN], host_data: Option<&[u8]>) -> ((u32, u32, u8), usize, u32) {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    io.feed_out(&cbw);
+    if let Some(data) = host_data {
+        io.feed_out(data);
+    }
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    (csw_fields(&sent), storage.execs, io.zero_in_count)
+}
+
+/// Case (2) Hn < Di: the host declared no data but the device wants to send.
+#[test]
+fn case_02_host_none_device_in_is_phase_error_without_medium_io() {
+    let cdb = rw10(0x28, 0, 1);
+    let (csw, execs, _) = run_phase_case(raw_cbw(1, 0, 0x80, 0, &cdb), None);
+    assert_eq!(csw, (1, 0, 0x02));
+    assert_eq!(execs, 0, "the device must not be touched");
+}
+
+/// Case (3) Hn < Do: the host declared no data but the device wants to
+/// receive.
+#[test]
+fn case_03_host_none_device_out_is_phase_error_without_medium_io() {
+    let cdb = rw10(0x2A, 0, 1);
+    let (csw, execs, _) = run_phase_case(raw_cbw(1, 0, 0x00, 0, &cdb), None);
+    assert_eq!(csw, (1, 0, 0x02));
+    assert_eq!(execs, 0, "the device must not be touched");
+}
+
+/// Case (7) Hi < Di: the host expects fewer Data-In bytes than the device
+/// intends to send. INQUIRY keeps the case off the medium.
+#[test]
+fn case_07_host_in_shorter_than_device_in_is_phase_error() {
+    let cdb = [0x12, 0, 0, 0, 36, 0];
+    let (csw, execs, zlp) = run_phase_case(raw_cbw(1, 18, 0x80, 0, &cdb), None);
+    // The host's 18 declared bytes are all relevant data, so residue 0.
+    assert_eq!(csw, (1, 0, 0x02));
+    assert_eq!(execs, 0, "INQUIRY must not read the medium");
+    assert_eq!(zlp, 0, "18 bytes is a short packet on its own");
+}
+
+/// Case (8) Hi <> Do: the host expects data-in while the device wants the
+/// host to send.
+#[test]
+fn case_08_host_in_device_out_is_phase_error_without_medium_io() {
+    let cdb = rw10(0x2A, 0, 1);
+    let (csw, execs, zlp) = run_phase_case(raw_cbw(1, 512, 0x80, 0, &cdb), None);
+    assert_eq!(csw, (1, 512, 0x02));
+    assert_eq!(execs, 0, "the device must not be touched");
+    assert_eq!(zlp, 1, "zero relevant bytes need a ZLP to end the IN phase");
+}
+
+/// Case (10) Ho <> Di: the host expects to send while the device wants to
+/// send data.
+#[test]
+fn case_10_host_out_device_in_is_phase_error_without_medium_io() {
+    let cdb = rw10(0x28, 0, 1);
+    let (csw, execs, _) = run_phase_case(raw_cbw(1, 512, 0x00, 0, &cdb), Some(&[0u8; 512]));
+    assert_eq!(csw, (1, 512, 0x02));
+    assert_eq!(execs, 0, "the device must not be touched");
+}
+
+/// Case (13) Ho < Do: the host will send fewer bytes than the device's format
+/// parameter list, so the device aborts before touching the medium.
+#[test]
+fn case_13_host_out_shorter_than_device_out_is_phase_error() {
+    let mut ram = vec![0u8; 1 << 20];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::dvdram(512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // FORMAT UNIT with a 12-byte parameter list, but the CBW declares 8.
+    let cdb = [0x04, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    io.feed_out(&raw_cbw(1, 8, 0x00, 0, &cdb));
+    io.feed_out(&[0u8; 8]);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (1, 8, 0x02));
+    assert_eq!(storage.execs, 0, "no medium IO may run for a phase error");
+}
+
+// ── 13. Restored protocol coverage ─────────────────────────────────
+
+/// A zero-byte Data-In failure terminates the phase with a ZLP before the
+/// Failed CSW.
+#[test]
+fn failed_zero_byte_data_in_sends_zlp_before_csw() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // READ beyond the 128-block geometry: CHECK CONDITION with no relevant
+    // data, while the CBW declares a 512-byte Data-In phase.
+    let cdb = [0x28, 0, 0, 0x1F, 0x40, 0, 0, 0, 1, 0];
+    io.feed_out(&raw_cbw(1, 512, 0x80, 0, &cdb));
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    assert_eq!(io.zero_in_count, 1, "one ZLP closes the empty data phase");
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), CSW_LEN, "ZLP adds no bytes");
+    assert_eq!(csw_fields(&sent), (1, 512, 0x01));
+}
+
+/// `MAX_PAD` bounds the zero fill: exactly the cap goes out, then a ZLP (the
+/// wire length is an MPS multiple), then the CSW with the relevant residue.
+#[test]
+fn pad_cap_exhaustion_fills_to_max_pad_then_zlp() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    let cdb = rw10(0x28, 0, 1);
+    let declared = 512 + MAX_PAD as u32 + 512;
+    io.feed_out(&raw_cbw(1, declared, 0x80, 0, &cdb));
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(
+        sent.len(),
+        512 + MAX_PAD as usize + CSW_LEN,
+        "exactly one cap of fill, then the CSW"
+    );
+    assert_eq!(csw_fields(&sent), (1, declared - 512, 0x00));
+    assert_eq!(io.zero_in_count, 1, "MPS-aligned cap needs a ZLP");
+}
+
+/// The 31-byte CBW accumulates across partial bulk-OUT receives.
+#[test]
+fn cbw_accumulates_across_partial_receives() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    let cdb = [0x12, 0, 0, 0, 36, 0];
+    let raw = raw_cbw(1, 36, 0x80, 0, &cdb);
+    io.feed_out(&raw[..20]);
+    let n = io.try_recv_out(&mut work[..20]).unwrap();
+    assert_eq!(n, 20);
+    match s.poll(
+        Event::HostRecv { len: n },
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostRecv {
+            len: 11,
+            probe: false,
+        } => {}
+        other => panic!("expected 11 more CBW bytes, got {other:?}"),
+    }
+    // The pending action is re-emitted without state change.
+    match s.poll(
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostRecv {
+            len: 11,
+            probe: false,
+        } => {}
+        other => panic!("expected the re-emitted 11-byte need, got {other:?}"),
+    }
+
+    io.feed_out(&raw[20..]);
+    let n = io.try_recv_out(&mut work[..11]).unwrap();
+    assert_eq!(n, 11);
+    match s.poll(
+        Event::HostRecv { len: n },
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostSend { bytes } => assert_eq!(bytes.len(), 36),
+        other => panic!("expected the INQUIRY data, got {other:?}"),
+    }
+}
+
+/// REPORT LUNS is target-level: any addressed LUN is served by slot 0, and a
+/// reserved select value fails with INVALID FIELD IN CDB after a ZLP.
+#[test]
+fn report_luns_any_lun_and_reserved_select() {
+    let mut ram0 = vec![0u8; 64 * 1024];
+    let mut ram1 = vec![0u8; 64 * 1024];
+    let mut backend0 = RamBackend::new(&mut ram0);
+    let mut backend1 = RamBackend::new(&mut ram1);
+    let mut slots = [TestLu::block(128, 512, 0), TestLu::block(128, 512, 1)];
+    let mut storage = PlaneSet::new(vec![
+        Some(StorePlane::BlockRw(&mut backend0)),
+        Some(StorePlane::BlockRw(&mut backend1)),
+    ]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::with_luns(2);
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // REPORT LUNS addressed to LUN 1 still lists the whole inventory.
+    let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 24];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(1, 24, 0x80, 1, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 24 + CSW_LEN);
+    assert_eq!(u32::from_be_bytes([sent[0], sent[1], sent[2], sent[3]]), 16);
+    assert_eq!(sent[9], 0, "first LUN id");
+    assert_eq!(sent[17], 1, "second LUN id");
+    assert_eq!(csw_fields(&sent), (1, 0, 0x00));
+
+    // Reserved select 03h → Failed + ZLP.
+    let cdb = [0xA0, 0, 3, 0, 0, 0, 0, 0, 0, 24];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(2, 24, 0x80, 1, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    assert_eq!(io.zero_in_count, 1);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), CSW_LEN);
+    assert_eq!(csw_fields(&sent), (2, 24, 0x01));
+
+    // REQUEST SENSE carries the saved INVALID FIELD IN CDB (05/24/00).
+    let cdb = [0x03, 0, 0, 0, 18, 0];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(3, 18, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent[2], 0x05);
+    assert_eq!(sent[12], 0x24);
+    assert_eq!(sent[13], 0x00);
+    assert_eq!(storage.execs, 0, "REPORT LUNS never touches a plane");
+}
+
+/// Bulk MPS override and LUN-count clamping.
+#[test]
+fn session_bulk_mps_and_lun_limits() {
+    assert_eq!(BotSession::new().bulk_mps(), 512);
+    assert_eq!(BotSession::new().with_bulk_mps(64).bulk_mps(), 64);
+
+    let mut s = BotSession::new();
+    s.set_bulk_mps(64);
+    assert_eq!(s.bulk_mps(), 64);
+    s.set_bulk_mps(512);
+    assert_eq!(s.bulk_mps(), 512);
+    // 0 is rejected: keep the documented default.
+    s.set_bulk_mps(0);
+    assert_eq!(s.bulk_mps(), 512);
+    assert_eq!(BotSession::new().with_bulk_mps(0).bulk_mps(), 512);
+
+    assert_eq!(BotSession::with_luns(1).max_lun(), 0);
+    assert_eq!(BotSession::with_luns(3).max_lun(), 2);
+    assert_eq!(BotSession::with_luns(17).max_lun(), 15);
+    assert_eq!(BotSession::with_luns(0).max_lun(), 0);
+}
+
+/// A flat CD-ROM LUN answers the `--usb --cdrom` path over BOT.
+#[test]
+fn flat_cdrom_lun_serves_over_bot() {
+    let mut ram = vec![0u8; 64 * 2048];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::cdrom(64, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // INQUIRY: optical memory device (PDT 5).
+    let cdb = [0x12, 0, 0, 0, 36, 0];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(1, 36, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent[0] & 0x1F, 0x05, "PDT = CD-ROM");
+
+    // READ CAPACITY(10): 64 sectors of 2048 bytes.
+    let cdb = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(2, 8, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(u32::from_be_bytes([sent[0], sent[1], sent[2], sent[3]]), 63);
+    assert_eq!(
+        u32::from_be_bytes([sent[4], sent[5], sent[6], sent[7]]),
+        2048
+    );
+
+    // READ(10) one sector.
+    let cdb = rw10(0x28, 0, 1);
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(3, 2048, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 2048 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (3, 0, 0x00));
+}
+
+// ── 14. Stray host byte while the core is storage-only ─────────────
+
+/// A byte arriving while the core drives a storage-only step cannot be a CBW
+/// continuation: it is an invalid CBW (STALL both) and the session continues.
+#[test]
+fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]).with_pending(1);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // SYNCHRONIZE CACHE has no host data phase but needs a storage step.
+    let cdb = [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    io.feed_out(&raw_cbw(1, 0, 0x00, 0, &cdb));
+
+    let mut ev = Event::Tick;
+    loop {
+        match next_step(
+            &mut s,
+            ev,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &mut io,
+        ) {
+            Step::Recv { len, probe: false } => {
+                let n = io.try_recv_out(&mut work[..len]).unwrap();
+                ev = Event::HostRecv { len: n };
+            }
+            Step::Recv { len, probe: true } => {
+                // The core is in the storage-only step; a stray host byte
+                // arrives where only a one-byte probe was expected.
+                io.feed_out(&[0xEE]);
+                let n = io.try_recv_out(&mut work[..len]).unwrap();
+                assert_eq!(n, 1);
+                match s.poll(
+                    Event::HostRecv { len: n },
+                    &mut work,
+                    &mut scratch,
+                    &mut target,
+                    &mut storage,
+                ) {
+                    Action::StallBoth => {}
+                    other => panic!("expected StallBoth, got {other:?}"),
+                }
+                break;
+            }
+            Step::Sent { .. } => ev = Event::HostSent,
+            Step::StallBoth => panic!("unexpected STALL before the stray byte"),
+            Step::StallIn => panic!("unexpected Bulk-In STALL"),
+        }
+    }
+
+    assert!(io.in_.is_empty(), "no CSW for the abandoned command");
+    assert_command_boundary(&mut s, &mut work, &mut scratch, &mut target, &mut storage);
+
+    // The loop is still usable: a fresh command completes normally.
+    let cdb = [0x12, 0, 0, 0, 36, 0];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(2, 36, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (2, 0, 0x00));
 }

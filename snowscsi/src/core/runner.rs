@@ -2485,7 +2485,13 @@ enum HostResume {
 /// match exactly unless the transport declared no bound at all
 /// ([`CommandContext::UNBOUNDED_HOST_BYTES`]).
 fn plan_contract(ctx: CommandContext, plan: DataPlan) -> bool {
-    if plan.direction != ctx.host_direction {
+    // A transport that declares no host bound owns the direction gate too:
+    // only it knows the wire's data-phase convention (BOT's CBW direction
+    // bit, iSCSI's W bit) and enforces it in `HostTransport::publish`. With a
+    // declared bound the direction must match exactly.
+    if plan.direction != ctx.host_direction
+        && ctx.host_bytes != CommandContext::UNBOUNDED_HOST_BYTES
+    {
         return true;
     }
     match plan.direction {
@@ -3075,6 +3081,7 @@ mod tests {
         plans: [Option<DataPlan>; 4],
         recvs: usize,
         sends: usize,
+        publish_fault: Option<Fault>,
     }
 
     impl HostRec {
@@ -3084,6 +3091,7 @@ mod tests {
                 plans: [None; 4],
                 recvs: 0,
                 sends: 0,
+                publish_fault: None,
             }
         }
     }
@@ -3094,7 +3102,10 @@ mod tests {
                 self.plans[self.publishes] = Some(plan);
             }
             self.publishes += 1;
-            Ok(())
+            match self.publish_fault {
+                Some(fault) => Err(fault),
+                None => Ok(()),
+            }
         }
 
         fn receive(&mut self, req: HostReq, _buf: HostBuf<'_>) -> HostReceipt {
@@ -3198,6 +3209,11 @@ mod tests {
                 &mut self.scratch,
             )
         }
+
+        /// Make the host's `publish` reject with `fault`.
+        fn set_publish_fault(&mut self, fault: Fault) {
+            self.host.inner.inner_mut().publish_fault = Some(fault);
+        }
     }
 
     fn ctx(direction: Direction, bytes: u64) -> CommandContext {
@@ -3223,6 +3239,80 @@ mod tests {
             None,
             None,
         ]
+    }
+
+    /// With no declared bound the transport owns the direction gate: a
+    /// mismatched plan reaches `HostTransport::publish` and its error is
+    /// surfaced unchanged.
+    #[test]
+    fn unbounded_host_bytes_delegates_the_direction_gate_to_publish() {
+        let script = [
+            Some(Script::Publish(DataPlan {
+                direction: Direction::FromHost,
+                bytes: 512,
+            })),
+            Some(Script::Write { len: 512 }),
+            Some(Script::Complete(Completion::Good)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut bench = Bench::new(script, 0);
+        bench.set_publish_fault(Fault::Io);
+        bench
+            .start(ctx(Direction::ToHost, CommandContext::UNBOUNDED_HOST_BYTES))
+            .expect("start");
+        assert_eq!(
+            bench.step(),
+            Err(Fault::Io),
+            "the transport's publish error is surfaced"
+        );
+        assert_eq!(
+            bench.host.recorder().publishes,
+            1,
+            "the sentinel direction mismatch must reach publish"
+        );
+        assert_eq!(bench.storage.begins, 0, "no storage token may be issued");
+        assert_eq!(bench.storage.recorder().execs, 0, "backing untouched");
+        assert_eq!(
+            bench.slot.device_ref().last_delivery,
+            Some(Delivery::Failed),
+            "a rejected plan never claims delivery"
+        );
+    }
+
+    /// With a declared bound, a direction mismatch is rejected before the
+    /// transport sees the plan.
+    #[test]
+    fn declared_host_bytes_rejects_a_direction_mismatch_before_publish() {
+        let script = [
+            Some(Script::Publish(DataPlan {
+                direction: Direction::FromHost,
+                bytes: 512,
+            })),
+            Some(Script::Write { len: 512 }),
+            Some(Script::Complete(Completion::Good)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut bench = Bench::new(script, 0);
+        bench.start(ctx(Direction::ToHost, 512)).expect("start");
+        assert_eq!(bench.step(), Err(Fault::Contract));
+        assert_eq!(
+            bench.host.recorder().publishes,
+            0,
+            "a bounded direction mismatch never reaches publish"
+        );
+        assert_eq!(bench.storage.recorder().execs, 0, "backing untouched");
+        assert_eq!(
+            bench.slot.device_ref().last_delivery,
+            Some(Delivery::Failed)
+        );
     }
 
     #[test]

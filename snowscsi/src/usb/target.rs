@@ -1,37 +1,43 @@
-//! USB MSC Bulk-Only Transport session state machine (target.rs).
+//! USB MSC Bulk-Only Transport session state machine.
 //!
 //! [`BotSession`] is a pure, non-blocking protocol state machine: it never
 //! blocks and never touches platform I/O. A shell feeds one [`Event`] (an I/O
 //! completion or a control-plane notification) per [`BotSession::poll`] call
-//! and learns the next [`Action`] (receive, send, stall, or — from Step 2 on —
-//! a storage op). The library shell [`crate::usb::serve()`] owns the platform
-//! loop; the PC FunctionFS driver and embedded `select!` drivers implement the
-//! same `Event`/`Action` contract.
+//! and learns the next [`Action`]. The library shell [`crate::usb::serve()`]
+//! owns the platform loop; the PC FunctionFS driver and embedded `select!`
+//! drivers implement the same `Event`/`Action` contract.
+//!
+//! SCSI command execution is delegated to the core [`Target`]: the session
+//! builds the [`CommandContext`] from the CBW, starts the command and drives it
+//! one step per entry. Host data phases are implemented by this type as
+//! [`HostTransport`]: the data-in stream is chunked onto the bulk-IN endpoint,
+//! the data-out stream is received into the caller's bank, and the BOT
+//! H-versus-D contract is enforced in [`HostTransport::publish`].
 //!
 //! Out-of-band control enters the core as events: Bulk-Only Reset and
 //! LinkReset arrive as [`Event::Reset`], Get Max LUN is a pure getter
 //! ([`BotSession::max_lun`]). There is no out-of-band state mutation.
 //!
-//! Design invariants (/ /):
-//! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled
-//!   in an internal buffer; the caller's `work` area holds only SCSI data.
+//! Response framing:
+//! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled in
+//!   an internal buffer; the caller's `work` area holds only SCSI data.
 //! - STALL is used for invalid CBWs (both pipes, [`Action::StallBoth`]) and,
 //!   under [`ShortfallPolicy::Short`], for a Data-In shortfall (Bulk-In only,
 //!   [`Action::StallIn`]).
 //! - Data-Out host overrun is drained to a short packet so leftover bytes
 //!   never corrupt the next CBW.
-//! - After a reset the session injects a UNIT ATTENTION: delivered on the
-//!   next TEST UNIT READY (Failed CSW), cleared by REQUEST SENSE.
+//! - A reset raises a BUS RESET unit attention on every LUN of the target.
 //!
-//! ## Single-buffer model
+//! # Work-buffer contract
 //!
-//! `poll` takes one time-multiplexed `work` buffer. A receive always lands at
-//! `work[0..len]`; Data-In and synthesized responses are written into `work`.
-//! A parameter-list Data-Out accumulates at the **tail** of `work` (the
-//! `received` bytes sit at `work[work.len() - received..]`) so a front-landing
-//! receive never clobbers earlier chunks.
+//! `work` is the transport's data bank: it must hold the whole transfer the
+//! device stages (the core slices its I/O to `work.len()`; a larger transfer is
+//! finished with `RESOURCE FAILURE`). The data-in wire stream is chunked at
+//! [`WIRE_CHUNK`] bytes independently of the bank size. `scratch` is the
+//! resident long-operation bank and must hold at least [`crate::MIN_DATA_LEN`]
+//! bytes.
 //!
-//! ## Data-In shortfall policy ([`ShortfallPolicy`])
+//! # Data-In shortfall policy ([`ShortfallPolicy`])
 //!
 //! BOT §6.7.2 (cases (4)/(5): the host's `dCBWDataTransferLength` exceeding
 //! the data the device intends to send) lets the device either pad fill data up
@@ -73,10 +79,14 @@
 //! `Pad` fill bytes are not relevant, so a fully padded phase still reports a
 //! non-zero residue.
 
-use crate::common::seekable_storage::StorageError;
-use crate::common::store::StoreOp;
-use crate::scsi::device::{sense_for_storage_error, CommandOutcome, ScsiDevice, Xfer, XferOutcome};
-use crate::scsi::scsi::{asc, op as scsi_op, Sense, SenseKey};
+use core::task::Poll;
+
+use crate::core::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage};
+use crate::core::{
+    CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
+    RunOutcome, RuntimeSet, Target, UaClass,
+};
+use crate::scsi::scsi::{op as scsi_op, opcode_from_cdb};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
 use crate::usb::{CBW_LEN, CSW_LEN};
 
@@ -89,6 +99,13 @@ use crate::usb::{CBW_LEN, CSW_LEN};
 /// shortfall whose length is a multiple of the MPS — including zero bytes —
 /// must be closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)).
 const BOT_BULK_MPS: u64 = 512;
+
+/// Wire chunk size for a Data-In phase. Independent of the caller's bank so a
+/// large transfer is still split into bounded bulk packets.
+const WIRE_CHUNK: usize = 8192;
+
+/// Upper bound on a Data-Out drain chunk.
+const DRAIN_CHUNK: usize = 8192;
 
 /// Maximum number of fill bytes a single `ShortfallPolicy::Pad` data phase
 /// will send. A `dCBWDataTransferLength` far beyond the produced data
@@ -119,48 +136,31 @@ const ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
 ///
 /// - `ShortNoStall` — default. Runs unaided on any transport (no halt
 ///   capability, no clear observability required); the deliberate deviation
-///   for all shortfall sizes, S3-validated. For devices whose shortfalls are
-///   almost all large Data-phase errors, this is the semantically honest
-///   choice.
+///   for all shortfall sizes. For devices whose shortfalls are almost all
+///   large Data-phase errors, this is the semantically honest choice.
 /// - `Short` — opt-in for stall-capable transports *with* clear observability
 ///   (both legs). Any shortfall size; enters the host's halt/clear recovery
-///   flow (per-host software path, verified benign on Linux/EDK2/FreeBSD/
-///   U-Boot).
+///   flow.
 /// - `Pad` — opt-in for stall-less transports. Near-free for the structural
 ///   small shortfalls that occur routinely (INQUIRY/REQUEST SENSE/MODE SENSE:
 ///   tens to ~200 bytes ≈ one FS packet), and avoids the halt/clear/recovery
-///   path entirely (`-EBADMSG`-flavoured quirk risk included). Large
-///   shortfalls are capped by [`MAX_PAD`] and degrade to the `ShortNoStall`
-///   ending, so a garbage `dCBWDataTransferLength` cannot turn into an
-///   unbounded zero pour. The policy is "pad small, never flood" — conformant
-///   precisely where it matters most.
+///   path entirely. Large shortfalls are capped by [`MAX_PAD`] and degrade to
+///   the `ShortNoStall` ending, so a garbage `dCBWDataTransferLength` cannot
+///   turn into an unbounded zero pour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShortfallPolicy {
     /// Conformant below the fill cap: pad fill zeros up to
     /// `dCBWDataTransferLength`, sending at most [`MAX_PAD`] fill bytes (the
     /// fill is not "relevant" data — residue stays `declared − produced`).
-    /// Pure bulk state machine (no control plane) — unconditionally: a
-    /// shortfall that exhausts the cap ends like `ShortNoStall` (short packet
-    /// plus CSW), so `Pad` is explicitly non-conformant above the cap and never
-    /// touches the stall path.
-    ///
-    /// The fill is delivered without a premature short packet: the final
-    /// relevant chunk is zero-extended in-buffer to the next bulk-MPS boundary
-    /// before it is sent, so a shortfall whose relevant length is not a
-    /// multiple of the MPS (e.g. a 95-byte INQUIRY against a declared 192) is
-    /// still filled to `dCBWDataTransferLength` conformantly, rather than
-    /// leaking a short packet that would terminate the host's bulk-IN before
-    /// the fill.
+    /// A shortfall that exhausts the cap ends like `ShortNoStall`.
     Pad,
     /// Conformant: short packet then STALL Bulk-In ([`Action::StallIn`]); the
     /// withheld CSW is queued immediately and delivered once the host clears
-    /// the halt. Requires a driver that implements `BotIo::stall_in` (retrying
-    /// transient `-EAGAIN`) and then feeds [`Event::StallApplied`]; a real
-    /// `stall_in` failure aborts via [`Event::Reset`].
+    /// the halt. Requires a driver that implements `BotIo::stall_in` and then
+    /// feeds [`Event::StallApplied`].
     Short,
     /// Non-conformant, default: plain short packet, no STALL. Runs unaided on
-    /// any transport (no stall capability, no clear observability required);
-    /// the S3-validated behaviour.
+    /// any transport.
     #[default]
     ShortNoStall,
 }
@@ -178,27 +178,8 @@ pub enum Action<'a> {
     /// WouldBlock result ends the data phase and should be fed back as
     /// [`Event::HostIdle`].
     HostRecv { len: usize, probe: bool },
-    /// Send `bytes` on the bulk-IN pipe. `prefetch` is the next read-ahead
-    /// coordinate `(lun, off, len)` for read-phase overlap: after `bytes` is on
-    /// the wire the core's next read starts at `off` for `len` bytes. `None`
-    /// when there is no further Data-In chunk to read.
-    HostSend {
-        bytes: &'a [u8],
-        prefetch: Option<(usize, u64, usize)>,
-    },
-    /// Hand a storage op to the platform: the device's `xfer_out`/`xfer_in`
-    /// returned [`Xfer::Store`] for the current data-phase chunk. The shell
-    /// executes the op and feeds the result back as [`Event::StoreDone`];
-    /// the Store is invisible on the wire.
-    Store {
-        lun: usize,
-        op: StoreOp<'a>,
-        /// Write-ahead receive budget: once this op completes the core will
-        /// accept at most `next_recv` further Data-Out bytes (fed as
-        /// `min(got, n)`). `None` is a latch (final chunk / not a Data-Out write
-        /// phase): the shell must not pre-receive.
-        next_recv: Option<usize>,
-    },
+    /// Send `bytes` on the bulk-IN pipe.
+    HostSend { bytes: &'a [u8] },
     /// Invalid CBW (BOT §6.6.1): STALL both bulk endpoints. The core has
     /// already returned to the Command phase; a new CBW arriving clears the
     /// halt (the host's CLEAR_FEATURE is handled by the USB core).
@@ -223,22 +204,20 @@ pub enum Event {
     HostIdle,
     /// The pending bulk-IN packet has been sent.
     HostSent,
-    /// A storage op finished: `result` is the plane's outcome. Fed by the
-    /// shell after it executed an [`Action::Store`]; the session maps it
-    /// through [`ScsiDevice::store_done`] and continues the data phase.
-    StoreDone { result: Result<(), StorageError> },
     /// The `Short` shortfall's Bulk-In STALL has been applied; release the
     /// withheld CSW.
     StallApplied,
     /// Bulk-Only Reset / LinkReset: abort any in-flight transaction, return to
-    /// the Command phase, and inject a UNIT ATTENTION (BOT §4.2, §5.2).
+    /// the Command phase, and raise a BUS RESET unit attention (BOT §4.2,
+    /// §5.2).
     Reset,
 }
 
 /// Core-level error (no_std).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotTargetError {
-    /// The caller's `work` buffer is smaller than [`crate::MIN_DATA_LEN`].
+    /// The caller's `work` buffer is smaller than [`crate::MIN_DATA_LEN`], or
+    /// the scratch bank is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// I/O failure (reported through the shell).
     Io,
@@ -260,151 +239,147 @@ impl core::error::Error for BotTargetError {}
 
 /// BOT phase machine state (all Copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BotState {
+enum Stage {
     /// Command phase: accumulate the 31-byte CBW.
     Command { got: usize },
-    /// Data-In phase: send chunks from the device until `sent == transfer_len`.
-    DataIn {
-        expected: u64,
-        transfer_len: u64,
-        sent: u64,
+    /// A core command is active; `phase` carries its host data phase.
+    Exec,
+    /// Synthesized Data-In (REPORT LUNS / invalid-LUN sense): send
+    /// `total` bytes already staged in `work`.
+    Synth {
+        total: u64,
+        wire: u64,
+        staged: Option<u32>,
         tag: u32,
-        lun: usize,
-        chunk: usize,
-    },
-    /// Data-Out phase: receive chunks and write to the backend.
-    DataOut {
         declared: u64,
-        to_write: u64,
-        received: u64,
-        written: u64,
-        tag: u32,
         lun: usize,
-        status: CswStatus,
-        chunk: usize,
     },
-    /// Data-In phase awaiting a storage op (`Xfer::Store`): the chunk is in
-    /// flight in the platform. `sent` is the relevant data already sent
-    /// (excluding this chunk); on [`Event::StoreDone`] the chunk is finalized
-    /// — including the `ShortfallPolicy::Pad` boundary merge — and the phase
-    /// continues exactly like the `Inline` path.
-    DataInStore {
-        expected: u64,
-        transfer_len: u64,
-        sent: u64,
-        tag: u32,
-        lun: usize,
-        chunk: usize,
-    },
-    /// Data-Out phase awaiting a storage op (`Xfer::Store`): the received
-    /// chunk `got` (of which `w` bytes were handed to `xfer_in`) is in flight.
-    /// On [`Event::StoreDone`] `written` advances by `w` (or `status` becomes
-    /// `Failed`) and the phase continues exactly like the `Inline` path.
-    DataOutStore {
+    /// Data-In fill after a `Pad` shortfall.
+    Pad {
+        target: u64,
+        wire: u64,
         declared: u64,
-        to_write: u64,
-        received: u64,
-        written: u64,
-        tag: u32,
-        lun: usize,
-        status: CswStatus,
-        got: usize,
-        w: usize,
+        chunk: u32,
+        csw: CswPending,
     },
-    /// Parameter-list Data-Out: receive `expected` bytes into the **tail** of
-    /// `work` then call `complete_param`.
-    ParamOut {
-        expected: u64,
-        received: u64,
-        tag: u32,
-        lun: usize,
-        cdb: [u8; 16],
-        cdb_len: usize,
-        chunk: usize,
-    },
-    /// Data-Out host overrun: read-and-discard until a short packet.
-    DataOutOverrun {
-        tag: u32,
-        residue: u64,
-        status: CswStatus,
-        lun: usize,
-        chunk: usize,
-    },
-    /// Terminal-status pending: the data phase (including any ZLP / STALL) is
-    /// done, but the device agenda (`ScsiDevice::next_store_op`) must be drained
-    /// before the CSW. Carries the CSW
-    /// payload; each `Some(op)` is yielded as [`Action::Store`] and awaited via
-    /// [`Event::StoreDone`], then `devs[lun].store_done(result)` maps a failure
-    /// to sense (the terminal status becomes `Failed`). `None` emits the CSW
-    /// exactly as before.
-    Agenda {
-        tag: u32,
-        residue: u64,
-        status: CswStatus,
-        lun: usize,
+    /// A zero-length packet terminates the data phase before the CSW.
+    Zlp { csw: CswPending, stall: bool },
+    /// The CSW is withheld until the shell STALLs Bulk-In.
+    Stall { csw: CswPending },
+    /// Data-Out drain: known remainder, then a non-blocking overrun probe.
+    Drain {
+        remaining: u64,
+        probe: bool,
+        csw: CswPending,
     },
     /// CSW pending in the internal buffer.
     Csw,
-    /// Data-In pad: send fill zeros to reach `declared` (BOT §6.7.2
-    /// alternative to STALL), capped at [`MAX_PAD`] fill bytes. `produced` is
-    /// the relevant data already sent (the residue basis, `declared −
-    /// produced`); `wire` is the total bytes actually sent so far (relevant +
-    /// fill, excluding the pending `chunk`); `chunk` is the next fill chunk
-    /// length, served from an internal zero source. A cap-exhausted pad ends
-    /// `ShortNoStall`-style (short packet + CSW, no STALL).
-    DataInPad {
-        tag: u32,
-        declared: u64,
-        produced: u64,
-        wire: u64,
-        status: CswStatus,
-        lun: usize,
-        chunk: usize,
-    },
-    /// CSW pending, but a zero-length packet must terminate the data phase
-    /// first (a shortfall whose length is a multiple of the bulk MPS,
-    /// including zero bytes — see [`finish_data_in`]). Carries the shortfall
-    /// payload so the terminating `HostSent` can enter [`BotState::DataInStall`]
-    /// under `ShortfallPolicy::Short`.
-    CswZlp {
-        tag: u32,
-        declared: u64,
-        actual: u64,
-        status: CswStatus,
-        lun: usize,
-    },
-    /// The CSW is pending, but the shell must first STALL Bulk-In
-    /// (`ShortfallPolicy::Short`): `pending()` returns [`Action::StallIn`].
-    /// Holds the CSW payload that [`Event::StallApplied`] turns into the CSW
-    /// once the shell has set the halt. The host's CLEAR_FEATURE is handled by
-    /// the USB core and is not observable here, so this state is released by
-    /// [`Event::StallApplied`], not by a bulk event.
-    DataInStall {
-        tag: u32,
-        declared: u64,
-        actual: u64,
-        status: CswStatus,
-        lun: usize,
-    },
+}
+
+/// CSW payload of a terminal status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CswPending {
+    tag: u32,
+    residue: u64,
+    status: CswStatus,
+    lun: usize,
+}
+
+/// Device host data phase of the active command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Send(SendPhase),
+    Recv(RecvPhase),
+}
+
+/// Data-In progress (the device's send stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendPhase {
+    token: HostToken,
+    /// Device plan D (relevant bytes).
+    plan: u32,
+    /// Relevant bytes to put on the wire: `min(D, H)`.
+    limit: u32,
+    /// Wire bytes staged so far (relevant + any merged pad fill).
+    wire: u32,
+    /// Wire target of this phase (`min(pad_target, work.len())`).
+    stage_limit: u32,
+    /// Total wire target including fill (`min(H, D + MAX_PAD)` for `Pad`).
+    pad_target: u32,
+    /// Chunk staged and awaiting `Event::HostSent`.
+    staged: Option<u32>,
+}
+
+/// Data-Out progress (the device's receive stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecvPhase {
+    token: HostToken,
+    /// Device plan D.
+    plan: u32,
+    /// Bytes the device accepts: `min(D, H)`.
+    limit: u32,
+    /// Wire bytes received into the bank.
+    received: u32,
+    /// Prefix the device confirmed to the host seam (the `HostReceipt` the
+    /// runner fed back), or 0 while no receipt exists yet.
+    accepted: u32,
+    /// Wire bytes this phase must receive before the device may consume them.
+    wire_target: u32,
+    /// The BOT layer finished the wire receive; `poll_host` may answer Ready.
+    wire_done: bool,
+}
+
+/// H-versus-D gate computed by [`HostTransport::publish`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gate {
+    /// A plan was published.
+    seen: bool,
+    /// The plan is a phase error (case 7 / case 13).
+    phase_error: bool,
+    /// The transport rejected the plan; the runner settles the command.
+    rejected: bool,
+}
+
+impl Gate {
+    const EMPTY: Gate = Gate {
+        seen: false,
+        phase_error: false,
+        rejected: false,
+    };
 }
 
 /// BOT session: a non-blocking protocol state machine over one bulk pipe
 /// pair (plus the driver-mediated control pipe).
 #[derive(Debug)]
 pub struct BotSession {
-    state: BotState,
+    stage: Stage,
+    phase: Phase,
     cbw: [u8; CBW_LEN],
     csw: [u8; CSW_LEN],
     num_luns: u8,
-    invalid_lun_sense: Option<Sense>,
-    pending_ua: Option<Sense>,
     /// Bulk endpoint max packet size in bytes used for the Data-In ZLP
     /// decision (`BOT_BULK_MPS` by default; 64 for Full-Speed, 512 for
-    /// High-Speed). Stored as `u64` to match the transfer counter domain.
+    /// High-Speed).
     bulk_mps: u64,
-    /// How a Data-In shortfall ends (default `ShortNoStall`; see
-    /// [`ShortfallPolicy`]).
+    /// How a Data-In shortfall ends (default `ShortNoStall`).
     shortfall: ShortfallPolicy,
+    /// CBW tag / declared host length / direction of the active transaction.
+    tag: u32,
+    declared: u64,
+    host_dir: BotDir,
+    /// Wire LUN of the active transaction.
+    lun: usize,
+    /// The core command is active (started, not yet settled).
+    cmd_active: bool,
+    /// Host-phase token generation; a token is dead after `Ready`/`cancel`.
+    host_gen: u32,
+    /// Delivery state of the current completion.
+    delivery: Delivery,
+    /// The plan gate of the active command.
+    gate: Gate,
+    /// LUN whose resident long operation the idle entries advance.
+    long_lun: Option<usize>,
 }
 
 impl Default for BotSession {
@@ -420,19 +395,28 @@ impl BotSession {
     }
 
     /// A session serving `num_luns` logical units (1..=16), used by drivers
-    /// that must answer Get Max LUN before the first [`poll`] call.
+    /// that must answer Get Max LUN before the first [`poll`] call. The count
+    /// is refreshed from the target on every entry.
     ///
     /// [`poll`]: Self::poll
     pub fn with_luns(num_luns: usize) -> Self {
         Self {
-            state: BotState::Command { got: 0 },
+            stage: Stage::Command { got: 0 },
+            phase: Phase::Idle,
             cbw: [0u8; CBW_LEN],
             csw: [0u8; CSW_LEN],
             num_luns: num_luns.clamp(1, 16) as u8,
-            invalid_lun_sense: None,
-            pending_ua: None,
             bulk_mps: BOT_BULK_MPS,
             shortfall: ShortfallPolicy::default(),
+            tag: 0,
+            declared: 0,
+            host_dir: BotDir::DataOut,
+            lun: 0,
+            cmd_active: false,
+            host_gen: 1,
+            delivery: Delivery::NotApplicable,
+            gate: Gate::EMPTY,
+            long_lun: None,
         }
     }
 
@@ -481,294 +465,367 @@ impl BotSession {
     }
 
     /// Get Max LUN answer value (`num_luns - 1`, ≤ 15). The LUN count is
-    /// refreshed from the device slice on every command. Pure getter (no state
-    /// change).
+    /// refreshed from the target on every [`poll`](Self::poll) entry. Pure
+    /// getter (no state change).
     pub fn max_lun(&self) -> u8 {
         self.num_luns.saturating_sub(1)
     }
 
-    /// The action for the current state (the old `need()` + `out_slice()`
-    /// merged). Used to re-emit the pending [`Action`] on [`Event::Tick`] and
-    /// after an out-of-band control event.
-    fn pending<'a, D: ScsiDevice>(&'a mut self, work: &'a mut [u8], devs: &[D]) -> Action<'a> {
-        match self.state {
-            BotState::Command { got } => Action::HostRecv {
-                len: CBW_LEN - got,
-                probe: false,
-            },
-            BotState::DataIn {
-                chunk,
-                transfer_len,
-                sent,
-                lun,
-                ..
-            } => Action::HostSend {
-                bytes: &work[..chunk],
-                prefetch: data_in_prefetch(devs, lun, transfer_len, sent, work.len()),
-            },
-            BotState::DataOut { chunk, .. } => Action::HostRecv {
-                len: chunk,
-                probe: false,
-            },
-            // A storage op is in flight. The op itself borrows the platform
-            // buffer / device and cannot be rebuilt here; the shell executes
-            // the pending `Action::Store` immediately and feeds
-            // `Event::StoreDone`, so this is only reachable on a mis-fed
-            // `Tick` / out-of-band event.
-            BotState::DataInStore { .. } | BotState::DataOutStore { .. } => {
-                Action::Error(BotTargetError::Internal)
-            }
-            // An agenda op is in flight: same reasoning as the data-phase
-            // store states (the op cannot be rebuilt from state).
-            BotState::Agenda { .. } => Action::Error(BotTargetError::Internal),
-            BotState::ParamOut { chunk, .. } => Action::HostRecv {
-                len: chunk,
-                probe: false,
-            },
-            BotState::DataOutOverrun { chunk, .. } => Action::HostRecv {
-                len: chunk,
-                probe: true,
-            },
-            BotState::Csw => Action::HostSend {
-                bytes: &self.csw[..],
-                prefetch: None,
-            },
-            BotState::CswZlp { .. } => Action::HostSend {
-                bytes: &[],
-                prefetch: None,
-            },
-            BotState::DataInPad { chunk, .. } => Action::HostSend {
-                bytes: &ZERO_CHUNK[..chunk],
-                prefetch: None,
-            },
-            BotState::DataInStall { .. } => Action::StallIn,
-        }
-    }
+    // ── Poll interface (non-blocking state machine) ───────────────
 
-    /// Bulk-Only Reset / LinkReset body: abort any in-flight transaction,
-    /// return to the Command phase, and inject a UNIT ATTENTION for the next
-    /// TEST UNIT READY (BOT §4.2, §5.2).
+    /// Non-blocking state-machine step: consume one [`Event`] and return the
+    /// next [`Action`].
     ///
-    /// Unlike the pre-Step-1 core there is no persistent `Stalled` state: an
-    /// invalid CBW returns to the Command phase immediately (the host's
-    /// CLEAR_FEATURE is handled by the USB core), so a reset always lands in
-    /// `Command { got: 0 }`.
-    fn reset_state(&mut self) {
-        self.cbw = [0u8; CBW_LEN];
-        self.invalid_lun_sense = None;
-        self.pending_ua = Some(Sense::new(SenseKey::UnitAttention, asc::POWER_ON_RESET, 0));
-        self.state = BotState::Command { got: 0 };
-    }
-
-    /// Enter the terminal-status agenda: remember the pending CSW payload and
-    /// start draining the device agenda. Every terminal-status transition (CSW,
-    /// GOOD or CHECK CONDITION) funnels through here so the device's
-    /// maintenance/background ops (`next_store_op`) run **after** the data phase
-    /// (including any ZLP / STALL) and **before** the CSW.
-    ///
-    /// `lun` may be out of range (invalid-LUN / REPORT LUNS terminal statuses);
-    /// the drain then skips the device entirely and emits the CSW unchanged.
-    fn enter_agenda<'a, D: ScsiDevice>(
+    /// `work` is the transport's data bank (the CBW/CSW live in internal
+    /// buffers). `scratch` is the resident long-operation bank. `target` owns
+    /// the LUN slots and `storage` executes the device's storage operations;
+    /// the session itself implements the [`HostTransport`] data seam and
+    /// performs at most one command step per entry.
+    pub fn poll<'a, S: RuntimeSet>(
         &'a mut self,
-        tag: u32,
-        residue: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
+        ev: Event,
+        work: &'a mut [u8],
+        scratch: &'a mut [u8],
+        target: &'a mut Target<S>,
+        storage: &'a mut dyn Storage,
     ) -> Action<'a> {
-        self.state = BotState::Agenda {
-            tag,
-            residue,
-            status,
-            lun,
-        };
-        self.drain_agenda(devs)
+        if work.len() < crate::MIN_DATA_LEN || scratch.len() < crate::MIN_DATA_LEN {
+            return Action::Error(BotTargetError::WorkBufTooSmall);
+        }
+        self.num_luns = target.slot_count().clamp(1, 16) as u8;
+
+        // Every entry that starts at a command boundary advances the resident
+        // long operation once: one poll per entry.
+        if !self.cmd_active
+            && matches!(self.stage, Stage::Command { .. })
+            && self.idle_entry(work, scratch, target, storage)
+        {
+            return Action::Error(BotTargetError::Io);
+        }
+
+        match ev {
+            Event::Reset => {
+                self.reset(work, scratch, target, storage);
+                self.pending(work)
+            }
+            Event::StallApplied => {
+                if let Stage::Stall { csw } = self.stage {
+                    self.write_csw(csw);
+                }
+                self.pending(work)
+            }
+            Event::Tick => self.pending(work),
+            Event::HostSent => self.on_sent(work, scratch, target, storage),
+            Event::HostRecv { len } => self.on_recv(len, work, scratch, target, storage),
+            Event::HostIdle => self.on_idle(work, scratch, target, storage),
+        }
     }
 
-    /// Yield the next agenda op, or emit the terminal status once the agenda is
-    /// drained. The CSW is written into the internal buffer on emission (the
-    /// same bytes the pre-agenda code produced).
-    fn drain_agenda<'a, D: ScsiDevice>(&'a mut self, devs: &'a mut [D]) -> Action<'a> {
-        let BotState::Agenda {
-            tag,
-            residue,
-            status,
-            lun,
-        } = self.state
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        if lun < devs.len() {
-            if let Some(op) = devs[lun].next_store_op() {
-                // Re-state the pending payload (the op is in flight).
-                self.state = BotState::Agenda {
-                    tag,
-                    residue,
-                    status,
-                    lun,
-                };
-                return Action::Store {
-                    lun,
-                    op,
-                    next_recv: None,
-                };
+    /// Advance a resident long operation and the target lifecycle once per
+    /// idle entry. Returns `true` when the target reported its terminal
+    /// outcome.
+    fn idle_entry<S: RuntimeSet>(
+        &mut self,
+        work: &mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) -> bool {
+        if let Some(lun) = self.long_lun {
+            match target.poll_long_entry_rt(lun, storage, work, scratch) {
+                Ok(info) => {
+                    if !matches!(info.phase, LongPhase::Foreground | LongPhase::Background) {
+                        self.long_lun = None;
+                        if info.phase == LongPhase::Settled && info.error.is_none() {
+                            // The medium changed under the host: report it on
+                            // the next reporting command, like the device's
+                            // own post-format unit attention.
+                            let _ = target.raise_ua_rt(lun, UaClass::MediumChanged);
+                        }
+                    }
+                }
+                Err(fault) => {
+                    self.long_lun = None;
+                    target.fatal(fault);
+                }
             }
         }
-        self.store_csw(tag, residue, status);
-        self.state = BotState::Csw;
-        Action::HostSend {
-            bytes: &self.csw[..],
-            prefetch: None,
-        }
+        matches!(target.tick(), RunOutcome::Ended { .. })
     }
 
-    /// Agenda op completion: map the result through `devs[lun].store_done` (a
-    /// failure sets sense and turns the terminal status `Failed`) and continue
-    /// the drain. `residue`/`tag` semantics are unchanged.
-    fn poll_agenda<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
-        let BotState::Agenda {
-            tag,
-            residue,
-            status,
-            lun,
-        } = self.state
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::StoreDone { result } => {
-                let status = if lun < devs.len() && store_done_failed(devs, lun, result) {
-                    CswStatus::Failed
+    fn on_sent<'a, S: RuntimeSet>(
+        &'a mut self,
+        work: &'a mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) -> Action<'a> {
+        match self.stage {
+            Stage::Exec if matches!(self.phase, Phase::Send(_)) => {
+                self.step(work, scratch, target, storage);
+                self.pending(work)
+            }
+            Stage::Synth {
+                mut wire,
+                staged,
+                total,
+                tag,
+                declared,
+                lun,
+            } => {
+                let Some(chunk) = staged else {
+                    return Action::Error(BotTargetError::Internal);
+                };
+                wire = wire.saturating_add(u64::from(chunk));
+                if wire < total {
+                    self.stage = Stage::Synth {
+                        total,
+                        wire,
+                        staged: Some((total - wire).min(WIRE_CHUNK as u64).max(1) as u32),
+                        tag,
+                        declared,
+                        lun,
+                    };
                 } else {
-                    status
-                };
-                self.state = BotState::Agenda {
-                    tag,
-                    residue,
-                    status,
-                    lun,
-                };
-                self.drain_agenda(devs)
+                    self.finish_data_in(tag, declared, total, total, CswStatus::Passed, false, lun);
+                }
+                self.pending(work)
+            }
+            Stage::Pad {
+                target: pad_target,
+                wire,
+                declared,
+                chunk,
+                csw,
+            } => {
+                let wire = wire.saturating_add(u64::from(chunk));
+                if wire < pad_target {
+                    self.stage = Stage::Pad {
+                        target: pad_target,
+                        wire,
+                        declared,
+                        chunk: (pad_target - wire).min(ZERO_CHUNK.len() as u64) as u32,
+                        csw,
+                    };
+                } else if wire < declared && wire.is_multiple_of(self.bulk_mps) {
+                    // Cap exhausted on an MPS boundary: a short packet must
+                    // terminate the bulk-IN phase.
+                    self.stage = Stage::Zlp { csw, stall: false };
+                } else {
+                    self.write_csw(csw);
+                }
+                self.pending(work)
+            }
+            Stage::Zlp { csw, stall } => {
+                if stall {
+                    self.stage = Stage::Stall { csw };
+                } else {
+                    self.write_csw(csw);
+                }
+                self.pending(work)
+            }
+            Stage::Csw => {
+                self.stage = Stage::Command { got: 0 };
+                self.cmd_active = false;
+                self.delivery = Delivery::Complete;
+                self.phase = Phase::Idle;
+                self.pending(work)
             }
             _ => Action::Error(BotTargetError::Internal),
         }
     }
 
-    /// Non-blocking state-machine step: consume one event and return the next
-    /// action. `work` is the single time-multiplexed buffer; `devs` is the LUN
-    /// slice.
-    pub fn poll<'a, D: ScsiDevice>(
+    fn on_recv<'a, S: RuntimeSet>(
         &'a mut self,
-        ev: Event,
+        len: usize,
         work: &'a mut [u8],
-        devs: &'a mut [D],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
     ) -> Action<'a> {
-        // Out-of-band / no-I/O events first (they do not depend on the phase).
-        match ev {
-            Event::Reset => {
-                self.reset_state();
-                return self.pending(work, devs);
-            }
-            Event::StallApplied => {
-                // The `Short` shortfall's STALL is on the wire; the data phase
-                // is now complete, so drain the device agenda before the CSW.
-                if let BotState::DataInStall {
-                    tag,
-                    declared,
-                    actual,
-                    status,
-                    lun,
-                } = self.state
-                {
-                    return self.enter_agenda(tag, declared - actual, status, lun, devs);
+        match self.stage {
+            Stage::Command { got } => self.on_cbw(len, got, work, scratch, target, storage),
+            Stage::Exec if matches!(self.phase, Phase::Recv(_)) => {
+                let mut stray = false;
+                let done = {
+                    let Phase::Recv(p) = &mut self.phase else {
+                        return Action::Error(BotTargetError::Internal);
+                    };
+                    let cap = work.len() as u32;
+                    let wire_target = p.wire_target.min(cap);
+                    let remaining = wire_target.saturating_sub(p.received);
+                    if len as u32 > remaining {
+                        stray = true;
+                        false
+                    } else {
+                        if p.received > 0 && len > 0 {
+                            // The shell always lands a receive at `work[0..]`;
+                            // move the chunk to its final place in the bank.
+                            let start = p.received as usize;
+                            work.copy_within(0..len, start);
+                        }
+                        p.received = p.received.saturating_add(len as u32);
+                        let done = p.received >= wire_target;
+                        if done {
+                            p.wire_done = true;
+                        }
+                        done
+                    }
+                };
+                if stray {
+                    // No receive is outstanding (the wire phase already ended
+                    // and the device is in a storage-only step): the byte is
+                    // framing noise, so treat it as an invalid CBW.
+                    self.abort_active(work, scratch, target, storage);
+                    return Action::StallBoth;
                 }
-                return self.pending(work, devs);
+                if done {
+                    self.step(work, scratch, target, storage);
+                }
+                self.pending(work)
             }
-            Event::Tick => return self.pending(work, devs),
-            // `StoreDone` is consumed by the Data-In/Data-Out store states
-            // below; any other state treats it as a mis-fed event.
-            Event::StoreDone { .. }
-            | Event::HostRecv { .. }
-            | Event::HostIdle
-            | Event::HostSent => {}
+            Stage::Drain {
+                remaining,
+                probe,
+                csw,
+            } => {
+                if probe {
+                    if len < DRAIN_CHUNK {
+                        self.write_csw(csw);
+                    } else {
+                        self.stage = Stage::Drain {
+                            remaining,
+                            probe,
+                            csw,
+                        };
+                    }
+                } else {
+                    let done = (len as u64).min(remaining);
+                    let remaining = remaining - done;
+                    if remaining == 0 {
+                        self.stage = Stage::Drain {
+                            remaining: 0,
+                            probe: true,
+                            csw,
+                        };
+                    } else {
+                        self.stage = Stage::Drain {
+                            remaining,
+                            probe: false,
+                            csw,
+                        };
+                    }
+                }
+                self.pending(work)
+            }
+            _ => {
+                // A receive outside a command/data phase is framing noise, not
+                // an impossible transition: drop the transaction as an invalid
+                // CBW instead of ending the serve loop.
+                self.abort_active(work, scratch, target, storage);
+                Action::StallBoth
+            }
         }
-        match self.state {
-            BotState::Command { got } => self.poll_command(ev, work, devs, got),
-            BotState::DataIn { .. } => self.poll_data_in(ev, work, devs),
-            BotState::DataInStore { .. } => self.poll_data_in_store(ev, work, devs),
-            BotState::DataOut { .. } => self.poll_data_out(ev, work, devs),
-            BotState::DataOutStore { .. } => self.poll_data_out_store(ev, work, devs),
-            BotState::ParamOut { .. } => self.poll_param_out(ev, work, devs),
-            BotState::DataOutOverrun { .. } => self.poll_overrun(ev, devs),
-            BotState::Agenda { .. } => self.poll_agenda(ev, devs),
-            BotState::Csw => self.poll_csw(ev),
-            BotState::CswZlp { .. } => self.poll_csw_zlp(ev, devs),
-            BotState::DataInPad { .. } => self.poll_data_in_pad(ev, devs),
-            BotState::DataInStall { .. } => self.poll_data_in_stall(ev),
+    }
+
+    fn on_idle<'a, S: RuntimeSet>(
+        &'a mut self,
+        work: &'a mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) -> Action<'a> {
+        match self.stage {
+            // A storage-only step is in flight: drive it again.
+            Stage::Exec if matches!(self.phase, Phase::Idle) => {
+                self.step(work, scratch, target, storage);
+                self.pending(work)
+            }
+            // A host data phase paused: keep waiting for the same chunk.
+            Stage::Command { .. }
+            | Stage::Exec
+            | Stage::Synth { .. }
+            | Stage::Pad { .. }
+            | Stage::Csw
+            | Stage::Zlp { .. }
+            | Stage::Stall { .. } => self.pending(work),
+            // A non-blocking drain probe found nothing: the overrun is over.
+            Stage::Drain {
+                probe: true, csw, ..
+            } => {
+                self.write_csw(csw);
+                self.pending(work)
+            }
+            Stage::Drain { remaining, csw, .. } => {
+                self.stage = Stage::Drain {
+                    remaining,
+                    probe: false,
+                    csw,
+                };
+                self.pending(work)
+            }
         }
     }
 
     // ── Command phase ──────────────────────────────────────────────
 
-    fn poll_command<'a, D: ScsiDevice>(
+    fn on_cbw<'a, S: RuntimeSet>(
         &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
+        len: usize,
         got: usize,
+        work: &'a mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
     ) -> Action<'a> {
-        match ev {
-            Event::HostSent => Action::Error(BotTargetError::Internal),
-            Event::HostIdle => Action::HostRecv {
-                len: CBW_LEN - got,
-                probe: false,
-            },
-            Event::HostRecv { len } => {
-                // The shell guarantees `len <= work.len()`; clamp defensively.
-                let recv = &work[..len.min(work.len())];
-                if recv.len() > CBW_LEN - got {
-                    crate::warn!(
-                        "bot: CBW packet tail {} bytes discarded (single-packet CBW is 31B)",
-                        recv.len() - (CBW_LEN - got)
-                    );
-                }
-                let add = recv.len().min(CBW_LEN - got);
-                self.cbw[got..got + add].copy_from_slice(&recv[..add]);
-                let got = got + add;
-                if got < CBW_LEN {
-                    self.state = BotState::Command { got };
-                    return Action::HostRecv {
-                        len: CBW_LEN - got,
-                        probe: false,
-                    };
-                }
-                match Cbw::parse(&self.cbw) {
-                    None => {
-                        // Invalid CBW (BOT §6.6.1): STALL both endpoints and
-                        // return to the Command phase. The host's
-                        // CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB
-                        // core; the next CBW arriving means the halt is clear.
-                        self.state = BotState::Command { got: 0 };
-                        Action::StallBoth
-                    }
-                    Some(cbw) => self.dispatch_cbw(&cbw, work, devs),
-                }
+        // The shell guarantees `len <= work.len()`; clamp defensively.
+        let recv = &work[..len.min(work.len())];
+        if recv.len() > CBW_LEN - got {
+            crate::warn!(
+                "bot: CBW packet tail {} bytes discarded (single-packet CBW is 31B)",
+                recv.len() - (CBW_LEN - got)
+            );
+        }
+        let add = recv.len().min(CBW_LEN - got);
+        self.cbw[got..got + add].copy_from_slice(&recv[..add]);
+        let got = got + add;
+        if got < CBW_LEN {
+            self.stage = Stage::Command { got };
+            return self.pending(work);
+        }
+        match Cbw::parse(&self.cbw) {
+            None => {
+                // Invalid CBW (BOT §6.6.1): STALL both endpoints and return
+                // to the Command phase. The host's
+                // CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB core;
+                // the next CBW arriving means the halt is clear.
+                self.stage = Stage::Command { got: 0 };
+                Action::StallBoth
             }
-            _ => Action::Error(BotTargetError::Internal),
+            Some(cbw) => {
+                self.dispatch_cbw(&cbw, work, scratch, target, storage);
+                self.pending(work)
+            }
         }
     }
 
     // ── Command dispatch ───────────────────────────────────────────
 
-    fn dispatch_cbw<'a, D: ScsiDevice>(
-        &'a mut self,
+    fn dispatch_cbw<S: RuntimeSet>(
+        &mut self,
         cbw: &Cbw,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        self.num_luns = devs.len().clamp(1, 16) as u8;
+        work: &mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) {
         let cdb = cbw.cdb_slice();
         let declared = u64::from(cbw.data_len);
+        self.tag = cbw.tag;
+        self.declared = declared;
+        self.host_dir = cbw.dir;
+        self.lun = cbw.lun as usize;
+        self.gate = Gate::EMPTY;
         let mut hx = [0u8; 49];
         crate::debug!(
             "bot cbw lun={} dir={:?} len={} tag={} cdb={}",
@@ -779,2648 +836,823 @@ impl BotSession {
             core::str::from_utf8(crate::scsi::util::hex_of(&mut hx, cdb)).unwrap_or("?")
         );
 
-        // REPORT LUNS is served for any addressed LUN.
-        if cdb.first() == Some(&scsi_op::REPORT_LUNS) {
-            // SPC-3 Table 148: SELECT REPORT 00h/02h report the full
-            // inventory here (all LUNs are peripheral/flat); 01h reports
-            // well-known logical units only (none implemented → empty list);
-            // 03h-FFh are reserved → CHECK CONDITION / INVALID FIELD IN CDB.
-            let select = cdb.get(2).copied().unwrap_or(0);
-            if select > 0x02 {
-                if let Some(dev) = devs.get_mut(cbw.lun as usize) {
-                    dev.set_sense(Sense::new(SenseKey::IllegalRequest, asc::INVALID_FIELD, 0));
-                }
-                return self.finish_cmd(
-                    cbw,
-                    0,
-                    CswStatus::Failed,
-                    work.len(),
-                    cbw.lun as usize,
-                    devs,
-                );
-            }
-            let n = write_report_luns(work, if select == 0x01 { 0 } else { devs.len() });
-            return self.synthesize_data_in(cbw, work, n as u64, devs);
-        }
+        let opcode = opcode_from_cdb(cdb);
 
-        if cbw.lun as usize >= devs.len() {
-            // Invalid LUN: Failed CSW + REQUEST SENSE (ASC 0x25).
-            // SPC-3 §6.27: REQUEST SENSE to an unsupported LUN shall return
-            // GOOD with sense ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED,
-            // and shall do so on *every* REQUEST SENSE (not consume once).
-            if cdb.first() == Some(&scsi_op::REQUEST_SENSE) {
-                let sense = self.invalid_lun_sense.unwrap_or(Sense::new(
-                    SenseKey::IllegalRequest,
-                    asc::LOGICAL_UNIT_NOT_SUPPORTED,
-                    0,
-                ));
-                self.invalid_lun_sense = Some(sense);
-                let n = sense.write_fixed(work);
-                return self.synthesize_data_in(cbw, work, n as u64, devs);
-            }
-            self.invalid_lun_sense = Some(Sense::new(
-                SenseKey::IllegalRequest,
-                asc::LOGICAL_UNIT_NOT_SUPPORTED,
-                0,
-            ));
-            return self.finish_cmd(
-                cbw,
-                0,
-                CswStatus::Failed,
-                work.len(),
-                cbw.lun as usize,
-                devs,
-            );
-        }
-
-        // Valid LUN: unit-attention injection. The UA is delivered
-        // on the next TEST UNIT READY and cleared by REQUEST SENSE.
-        if self.pending_ua.is_some() {
-            match cdb.first() {
-                Some(&scsi_op::TEST_UNIT_READY) => {
-                    return self.finish_cmd(
-                        cbw,
-                        0,
-                        CswStatus::Failed,
-                        work.len(),
-                        cbw.lun as usize,
-                        devs,
-                    );
-                }
-                Some(&scsi_op::REQUEST_SENSE) => {
-                    // Defensive: no UA (driver raced a reset) — report an
-                    // empty fixed-sense (NO SENSE) instead of panicking.
-                    let sense = self.pending_ua.take().unwrap_or_else(Sense::clear);
-                    let n = sense.write_fixed(work);
-                    return self.synthesize_data_in(cbw, work, n as u64, devs);
-                }
-                _ => {}
+        // A declared host direction that contradicts the command family is a
+        // BOT phase error before the device is touched: never feed the medium
+        // a fabricated Data-Out, never send device data the host asked to
+        // write.
+        if declared > 0 {
+            let natural = if data_in_opcode(opcode) {
+                Some(BotDir::DataIn)
+            } else if data_out_opcode(opcode) {
+                Some(BotDir::DataOut)
+            } else {
+                None
+            };
+            if matches!(natural, Some(dir) if dir != cbw.dir) {
+                self.enter_phase_error(cbw.dir, declared);
+                return;
             }
         }
 
-        let lun = cbw.lun as usize;
-        let outcome = match devs[lun].do_cmd(cdb, work) {
-            Ok(o) => o,
-            Err(crate::scsi::device::Error::WorkBufTooSmall) => {
-                return Action::Error(BotTargetError::WorkBufTooSmall);
+        let slot_count = target.slot_count();
+        // REPORT LUNS is a target-level command: any addressed LUN is served by
+        // slot 0, whose response lists the whole inventory.
+        let lun = if opcode == scsi_op::REPORT_LUNS {
+            0
+        } else {
+            self.lun
+        };
+        if self.lun >= slot_count && opcode != scsi_op::REPORT_LUNS {
+            // Invalid LUN: Failed CSW + REQUEST SENSE (ASC 0x25). SPC-3 §6.27:
+            // REQUEST SENSE to an unsupported LUN returns GOOD with sense
+            // ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED on *every* call.
+            if opcode == scsi_op::REQUEST_SENSE {
+                let sense = crate::core::LUN_NOT_SUPPORTED;
+                let n = sense_write_fixed(sense, work);
+                self.synthesize_data_in(n, declared);
+            } else {
+                self.fail_command(CswStatus::Failed);
+            }
+            return;
+        }
+        self.lun = lun;
+
+        let direction = match cbw.dir {
+            BotDir::DataIn => Direction::ToHost,
+            BotDir::DataOut if declared > 0 => Direction::FromHost,
+            // Hn < Do: the host declared no data but the command family is
+            // Data-Out, so the device still sees the write intent and its
+            // publish gate rejects the plan as a phase error.
+            BotDir::DataOut if data_out_opcode(opcode) => Direction::FromHost,
+            BotDir::DataOut => {
+                if data_in_opcode(opcode) {
+                    Direction::ToHost
+                } else {
+                    Direction::None
+                }
+            }
+        };
+        let ctx = CommandContext {
+            lun: lun as u64,
+            lun_count: 0,
+            host_bytes: CommandContext::UNBOUNDED_HOST_BYTES,
+            host_direction: direction,
+        };
+        match target.drive_start_rt(lun, ctx, cdb) {
+            Ok(()) => {
+                self.cmd_active = true;
+                self.delivery = Delivery::Pending;
+                self.stage = Stage::Exec;
+                self.phase = Phase::Idle;
+                self.step(work, scratch, target, storage);
+            }
+            Err(Fault::LunNotFound) => {
+                if opcode == scsi_op::REQUEST_SENSE {
+                    let sense = crate::core::LUN_NOT_SUPPORTED;
+                    let n = sense_write_fixed(sense, work);
+                    self.synthesize_data_in(n, declared);
+                } else {
+                    self.fail_command(CswStatus::Failed);
+                }
             }
             Err(_) => {
-                return Action::Error(BotTargetError::Internal);
+                // A busy/lifecycle refusal is a SCSI CHECK CONDITION, never a
+                // phase error.
+                crate::debug!("lun {} refused the command", lun);
+                self.fail_command(CswStatus::Failed);
+            }
+        }
+    }
+
+    /// One step of the active command, then map its outcome to an ending.
+    fn step<S: RuntimeSet>(
+        &mut self,
+        work: &mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) {
+        let lun = self.lun;
+        let result = target.drive_step_rt(lun, storage, self, work, scratch);
+        match result {
+            Ok(crate::core::DriveStep::Pending) => {}
+            Ok(crate::core::DriveStep::Done(completion)) => self.finish(completion),
+            Ok(crate::core::DriveStep::Control(_)) => {
+                // A queued control settled the command without a SCSI status.
+                self.delivery = Delivery::Failed;
+                self.fail_command(CswStatus::Failed);
+            }
+            Err(fault) => {
+                crate::debug!("command step failed: fault={}", fault_state(fault));
+                self.delivery = Delivery::Failed;
+                if self.gate.rejected
+                    || (fault == Fault::Contract && !self.gate.seen && self.declared > 0)
+                {
+                    // The plan contradicted the wire's H/D declaration.
+                    self.enter_phase_error(self.host_dir, self.declared);
+                } else {
+                    self.fail_command(CswStatus::Failed);
+                }
+            }
+        }
+        // A command that left the medium busy keeps the long operation
+        // resident; the idle entries advance it.
+        if let Ok(info) = target.snapshot_rt(lun) {
+            if matches!(
+                info.long.phase,
+                LongPhase::Foreground | LongPhase::Background
+            ) {
+                self.long_lun = Some(lun);
+            }
+        }
+    }
+
+    /// Finish the active command from its fixed completion.
+    fn finish(&mut self, completion: Completion) {
+        let tag = self.tag;
+        let declared = self.declared;
+        let gate = self.gate;
+        let lun = self.lun;
+        let status = if gate.phase_error {
+            CswStatus::PhaseError
+        } else {
+            match completion {
+                Completion::Good => CswStatus::Passed,
+                _ => CswStatus::Failed,
             }
         };
-        match outcome {
-            CommandOutcome::Status => {
-                self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs)
+
+        let (relevant, wire, received, accepted, plan) = match self.phase {
+            Phase::Send(p) => (
+                u64::from(p.wire.min(p.plan)),
+                u64::from(p.wire),
+                0,
+                0,
+                u64::from(p.plan),
+            ),
+            Phase::Recv(p) => (
+                0,
+                0,
+                u64::from(p.received),
+                u64::from(p.accepted),
+                u64::from(p.plan),
+            ),
+            Phase::Idle => (0, 0, 0, 0, 0),
+        };
+        self.cmd_active = false;
+        self.phase = Phase::Idle;
+        self.delivery = Delivery::Pending;
+
+        if self.host_dir == BotDir::DataOut {
+            self.finish_data_out(tag, declared, received, accepted, plan, status, lun);
+        } else {
+            self.finish_data_in(tag, declared, relevant, wire, status, gate.phase_error, lun);
+        }
+    }
+
+    // ── Endings ────────────────────────────────────────────────────
+
+    /// A terminal status with no device data phase.
+    fn fail_command(&mut self, status: CswStatus) {
+        let tag = self.tag;
+        let declared = self.declared;
+        let lun = self.lun;
+        self.cmd_active = false;
+        self.phase = Phase::Idle;
+        if self.host_dir == BotDir::DataOut {
+            self.finish_data_out(tag, declared, 0, 0, 0, status, lun);
+        } else {
+            self.finish_data_in(tag, declared, 0, 0, status, false, lun);
+        }
+    }
+
+    /// Phase-error ending before any device data moved.
+    fn enter_phase_error(&mut self, dir: BotDir, declared: u64) {
+        self.cmd_active = false;
+        self.phase = Phase::Idle;
+        let csw = CswPending {
+            tag: self.tag,
+            residue: declared,
+            status: CswStatus::PhaseError,
+            lun: self.lun,
+        };
+        if dir == BotDir::DataOut && declared > 0 {
+            self.stage = Stage::Drain {
+                remaining: declared,
+                probe: false,
+                csw,
+            };
+        } else if declared > 0 {
+            // No device data went out; terminate the host's data-in phase.
+            self.stage = Stage::Zlp { csw, stall: false };
+        } else {
+            self.write_csw(csw);
+        }
+    }
+
+    /// Data-In ending: `relevant` device bytes were put on the wire out of
+    /// `declared` host bytes; `wire` includes any merged fill.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_data_in(
+        &mut self,
+        tag: u32,
+        declared: u64,
+        relevant: u64,
+        wire: u64,
+        status: CswStatus,
+        phase_error: bool,
+        lun: usize,
+    ) {
+        let relevant = relevant.min(declared);
+        let csw = CswPending {
+            tag,
+            residue: declared - relevant,
+            status,
+            lun,
+        };
+        if relevant >= declared {
+            self.write_csw(csw);
+            return;
+        }
+        if phase_error {
+            // Never fabricate data for a phase error: only the short-packet
+            // terminator (and the selected STALL) applies.
+            if wire.is_multiple_of(self.bulk_mps) {
+                self.stage = Stage::Zlp {
+                    csw,
+                    stall: self.shortfall == ShortfallPolicy::Short,
+                };
+            } else if self.shortfall == ShortfallPolicy::Short {
+                self.stage = Stage::Stall { csw };
+            } else {
+                self.write_csw(csw);
             }
-            CommandOutcome::StatusWithSense => {
-                self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs)
-            }
-            CommandOutcome::CheckCondition => {
-                self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs)
-            }
-            CommandOutcome::OutInline { len } => {
-                if declared == 0 {
-                    // BOT §6.7.1 Case (2) Hn<Di: Di with Hn => PhaseError.
-                    if len > 0 {
-                        return self.finish_cmd(
-                            cbw,
-                            0,
-                            CswStatus::PhaseError,
-                            work.len(),
-                            lun,
-                            devs,
-                        );
+            return;
+        }
+        match self.shortfall {
+            ShortfallPolicy::Pad => {
+                let target = declared.min(relevant.saturating_add(MAX_PAD));
+                if wire >= target {
+                    // Fully filled, or the cap ran out.
+                    if wire < declared && wire.is_multiple_of(self.bulk_mps) {
+                        self.stage = Stage::Zlp { csw, stall: false };
+                    } else {
+                        self.write_csw(csw);
                     }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                if cbw.dir != BotDir::DataIn {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-                }
-                // `len` is work-buffer-relative (`usize`); widen once at the
-                // BOT boundary (declared ≤ u32::MAX per the CBW spec, so the
-                // min below is exact on every target).
-                let actual = (len as u64).min(declared);
-                if actual == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                let mut chunk = (actual as usize).min(work.len());
-                if chunk as u64 == actual {
-                    chunk += self.merge_pad_boundary(work, chunk, declared, actual);
-                }
-                self.state = BotState::DataIn {
-                    expected: declared,
-                    transfer_len: actual,
-                    sent: chunk as u64,
-                    tag: cbw.tag,
-                    lun,
-                    chunk,
-                };
-                Action::HostSend {
-                    bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
+                } else if wire < declared && !wire.is_multiple_of(self.bulk_mps) {
+                    // A non-MPS-aligned wire length already ended the host's
+                    // bulk-IN; appending fill would corrupt the CSW.
+                    self.write_csw(csw);
+                } else {
+                    self.stage = Stage::Pad {
+                        target,
+                        wire,
+                        declared,
+                        chunk: (target - wire).min(ZERO_CHUNK.len() as u64) as u32,
+                        csw,
+                    };
                 }
             }
-            CommandOutcome::OutXfer { len: transfer_len } => {
-                if declared == 0 {
-                    // BOT §6.7.1 Case (2) Hn<Di.
-                    if transfer_len > 0 {
-                        return self.finish_cmd(
-                            cbw,
-                            0,
-                            CswStatus::PhaseError,
-                            work.len(),
-                            lun,
-                            devs,
-                        );
-                    }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                if cbw.dir != BotDir::DataIn {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-                }
-                let actual = transfer_len.min(declared);
-                if actual == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                let mut chunk = (actual as usize).min(work.len());
-                // The device may hand back a `Store` op whose buffer borrows
-                // `work`; because the `Inline` branch below still needs `work`,
-                // split the op into its Copy fields first (see [`StoreDesc`])
-                // and re-attach a fresh borrow only once the call's borrow of
-                // `work` has ended.
-                let probe = match devs[lun].xfer_out(0, &mut work[..chunk]) {
-                    Xfer::Inline { len } => Ok(len),
-                    Xfer::Store(op) => match StoreDesc::of(op) {
-                        Some(desc) => Err(desc),
-                        None => return Action::Error(BotTargetError::Internal),
-                    },
-                };
-                let produced = match probe {
-                    Ok(len) => len,
-                    Err(desc) => {
-                        self.state = BotState::DataInStore {
-                            expected: declared,
-                            transfer_len: actual,
-                            sent: 0,
-                            tag: cbw.tag,
-                            lun,
-                            chunk,
-                        };
-                        return Action::Store {
-                            lun,
-                            op: desc.attach(&mut work[..chunk]),
-                            next_recv: None,
-                        };
-                    }
-                };
-                if produced != chunk {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs);
-                }
-                if chunk as u64 == actual {
-                    chunk += self.merge_pad_boundary(work, chunk, declared, actual);
-                }
-                self.state = BotState::DataIn {
-                    expected: declared,
-                    transfer_len: actual,
-                    sent: chunk as u64,
-                    tag: cbw.tag,
-                    lun,
-                    chunk,
-                };
-                Action::HostSend {
-                    bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
+            ShortfallPolicy::Short => {
+                if relevant.is_multiple_of(self.bulk_mps) {
+                    self.stage = Stage::Zlp { csw, stall: true };
+                } else {
+                    self.stage = Stage::Stall { csw };
                 }
             }
-            CommandOutcome::InXfer { len: transfer_len } => {
-                if declared == 0 {
-                    // BOT §6.7.1 Case (3) Hn<Do.
-                    if transfer_len > 0 {
-                        return self.finish_cmd(
-                            cbw,
-                            0,
-                            CswStatus::PhaseError,
-                            work.len(),
-                            lun,
-                            devs,
-                        );
-                    }
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                if cbw.dir != BotDir::DataOut {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-                }
-                let to_write = transfer_len.min(declared);
-                let status = CswStatus::Passed;
-                let chunk = (declared as usize).min(work.len());
-                self.state = BotState::DataOut {
-                    declared,
-                    to_write,
-                    received: 0,
-                    written: 0,
-                    tag: cbw.tag,
-                    lun,
-                    status,
-                    chunk,
-                };
-                Action::HostRecv {
-                    len: chunk,
-                    probe: false,
-                }
-            }
-            CommandOutcome::InParam { expected_len } => {
-                let expected = expected_len as u64;
-                if expected == 0 {
-                    return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-                }
-                if cbw.dir != BotDir::DataOut {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-                }
-                // BOT §6.7.3 Case (13) Ho<Do: Ho < Do => PhaseError.
-                if declared < expected {
-                    return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-                }
-                if declared != expected {
-                    return self.finish_cmd(cbw, 0, CswStatus::Failed, work.len(), lun, devs);
-                }
-                let first_chunk = (expected as usize).min(work.len());
-                self.state = BotState::ParamOut {
-                    expected,
-                    received: 0,
-                    tag: cbw.tag,
-                    lun,
-                    cdb: {
-                        let mut cdb_buf = [0u8; 16];
-                        let cdb_len = cdb.len().min(16);
-                        cdb_buf[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
-                        cdb_buf
-                    },
-                    cdb_len: cdb.len().min(16),
-                    chunk: first_chunk,
-                };
-                Action::HostRecv {
-                    len: first_chunk,
-                    probe: false,
+            ShortfallPolicy::ShortNoStall => {
+                if relevant.is_multiple_of(self.bulk_mps) {
+                    self.stage = Stage::Zlp { csw, stall: false };
+                } else {
+                    self.write_csw(csw);
                 }
             }
         }
     }
 
-    /// Enter a Data-In phase for a response already synthesized into
-    /// `work[0..available]` (REPORT LUNS, core-injected sense).
-    fn synthesize_data_in<'a, D: ScsiDevice>(
-        &'a mut self,
-        cbw: &Cbw,
-        work: &'a mut [u8],
-        available: u64,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let declared = u64::from(cbw.data_len);
-        let lun = cbw.lun as usize;
-        if declared == 0 && available > 0 {
-            // BOT §6.7.1 Case (2) Hn<Di (synthesized REPORT LUNS/sense).
-            return self.finish_cmd(cbw, 0, CswStatus::PhaseError, work.len(), lun, devs);
-        }
-        let actual = available.min(declared);
-        if actual == 0 {
-            return self.finish_cmd(cbw, 0, CswStatus::Passed, work.len(), lun, devs);
-        }
-        let mut chunk = (actual as usize).min(work.len());
-        if chunk as u64 == actual {
-            chunk += self.merge_pad_boundary(work, chunk, declared, actual);
-        }
-        self.state = BotState::DataIn {
-            expected: declared,
-            transfer_len: actual,
-            sent: chunk as u64,
-            tag: cbw.tag,
-            lun: usize::from(cbw.lun),
-            chunk,
+    /// Data-Out ending: `received` host bytes reached the transport and
+    /// `accepted` is the device-confirmed prefix out of `declared`. Drains the
+    /// remainder (and probes for overrun) first.
+    ///
+    /// BOT §6.6.2 defines the residue as `dCBWDataTransferLength` minus the
+    /// data the device actually processed. Only a `Passed` completion proves
+    /// the accepted prefix reached the medium; any other ending (storage
+    /// error, CHECK CONDITION, phase error) must report the full declared
+    /// length so the host never believes an unconfirmed write landed.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_data_out(
+        &mut self,
+        tag: u32,
+        declared: u64,
+        received: u64,
+        accepted: u64,
+        plan: u64,
+        status: CswStatus,
+        lun: usize,
+    ) {
+        let processed = if status == CswStatus::Passed {
+            accepted.min(declared).min(plan)
+        } else {
+            0
         };
-        Action::HostSend {
-            bytes: &work[..chunk],
-            prefetch: data_in_prefetch(devs, lun, actual, chunk as u64, work.len()),
+        let csw = CswPending {
+            tag,
+            residue: declared - processed,
+            status,
+            lun,
+        };
+        if declared == 0 {
+            self.write_csw(csw);
+            return;
         }
+        self.stage = Stage::Drain {
+            remaining: declared.saturating_sub(received),
+            probe: received >= declared,
+            csw,
+        };
     }
 
-    /// Write the CSW for `(tag, residue, status)` into the internal buffer.
-    /// Does not change the state. Residue is clamped to `u32` (BOT §5.2).
-    fn store_csw(&mut self, tag: u32, residue: u64, status: CswStatus) {
-        // BOT §5.2: dCSWDataResidue is 32-bit; CBW dCBWDataTransferLength is 32-bit,
-        // so residue <= declared <= u32::MAX in practice. Clamp with warn if larger.
-        let residue_u32 = u32::try_from(residue).unwrap_or_else(|_| {
-            crate::warn!("bot: residue {} truncated to u32::MAX", residue);
+    /// Enter a synthesized Data-In phase for `available` bytes staged in
+    /// `work[0..available]`.
+    fn synthesize_data_in(&mut self, available: usize, declared: u64) {
+        self.cmd_active = false;
+        self.phase = Phase::Idle;
+        let available = available as u64;
+        if declared == 0 {
+            // BOT §6.7.1 Case (2) Hn<Di.
+            let csw = CswPending {
+                tag: self.tag,
+                residue: 0,
+                status: CswStatus::PhaseError,
+                lun: self.lun,
+            };
+            self.write_csw(csw);
+            return;
+        }
+        let total = available.min(declared);
+        if total == 0 {
+            let csw = CswPending {
+                tag: self.tag,
+                residue: declared,
+                status: CswStatus::Passed,
+                lun: self.lun,
+            };
+            self.write_csw(csw);
+            return;
+        }
+        self.stage = Stage::Synth {
+            total,
+            wire: 0,
+            staged: Some(total.min(WIRE_CHUNK as u64) as u32),
+            tag: self.tag,
+            declared,
+            lun: self.lun,
+        };
+    }
+
+    /// Serialize `csw` into the internal buffer and enter the CSW phase.
+    fn write_csw(&mut self, csw: CswPending) {
+        let residue = u32::try_from(csw.residue).unwrap_or_else(|_| {
+            crate::warn!("bot: residue {} truncated to u32::MAX", csw.residue);
             u32::MAX
         });
-        let csw = Csw {
-            tag,
-            residue: residue_u32,
-            status,
-        };
-        csw.write(&mut self.csw);
-    }
-
-    /// Assemble the CSW into the internal buffer and enter the terminal-status
-    /// agenda (which drains `next_store_op` before emitting the CSW).
-    fn finish_csw_bot<'a, D: ScsiDevice>(
-        &'a mut self,
-        tag: u32,
-        residue: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        self.enter_agenda(tag, residue, status, lun, devs)
-    }
-
-    /// Plain shortfall ending: the short packet is already on the wire; report
-    /// the shortfall via `dCSWDataResidue` and send the CSW (with a ZLP first
-    /// when the produced length is an MPS multiple, so a full-MPS last packet
-    /// is terminated). No padding, no STALL.
-    fn finish_short_fall<'a, D: ScsiDevice>(
-        &'a mut self,
-        tag: u32,
-        declared: u64,
-        actual: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
         crate::debug!(
             "bot csw tag={} residue={} status={:?}",
-            tag,
-            declared - actual,
-            status
+            csw.tag,
+            residue,
+            csw.status
         );
-        if actual < declared && actual.is_multiple_of(self.bulk_mps) {
-            self.store_csw(tag, declared - actual, status);
-            self.state = BotState::CswZlp {
-                tag,
-                declared,
-                actual,
-                status,
-                lun,
-            };
-            Action::HostSend {
-                bytes: &[],
-                prefetch: None,
-            }
-        } else {
-            self.enter_agenda(tag, declared - actual, status, lun, devs)
+        Csw {
+            tag: csw.tag,
+            residue,
+            status: csw.status,
         }
+        .write(&mut self.csw);
+        self.stage = Stage::Csw;
+        self.phase = Phase::Idle;
     }
 
-    /// `ShortfallPolicy::Short` ending: the short packet is on the wire; when it
-    /// was a full-MPS last packet, terminate it with a ZLP first. Then the phase
-    /// STALLs Bulk-In (`DataInStall`); the shell sets the halt and feeds
-    /// [`Event::StallApplied`], which drains the agenda and releases the
-    /// withheld CSW.
-    fn finish_short_stall<'a>(
-        &'a mut self,
-        tag: u32,
-        declared: u64,
-        actual: u64,
-        status: CswStatus,
-        lun: usize,
-    ) -> Action<'a> {
-        crate::debug!(
-            "bot csw (stall) tag={} residue={} status={:?}",
-            tag,
-            declared - actual,
-            status
-        );
-        self.store_csw(tag, declared - actual, status);
-        if actual.is_multiple_of(self.bulk_mps) {
-            self.state = BotState::CswZlp {
-                tag,
-                declared,
-                actual,
-                status,
-                lun,
-            };
-            Action::HostSend {
-                bytes: &[],
-                prefetch: None,
-            }
-        } else {
-            self.state = BotState::DataInStall {
-                tag,
-                declared,
-                actual,
-                status,
-                lun,
-            };
-            Action::StallIn
-        }
-    }
+    // ── Reset ──────────────────────────────────────────────────────
 
-    /// Zero-extend the final relevant Data-In chunk in `work` to the next
-    /// bulk-MPS boundary under `ShortfallPolicy::Pad`, so the host never sees a
-    /// premature short packet before the fill. Bounded by the fill budget
-    /// (`declared − produced`, capped at [`MAX_PAD`]) and the remaining buffer;
-    /// returns the number of fill bytes merged. A no-op for other policies or
-    /// when there is no shortfall. Requires an MPS-aligned work buffer for the
-    /// boundary to fit; callers degrade gracefully otherwise (see
-    /// [`end_shortfall_data_in`]).
-    fn merge_pad_boundary(
-        &self,
+    /// Abandon the active transaction without a CSW and without a unit
+    /// attention: cancel the core command (and any retained host token), then
+    /// return to the Command phase.
+    ///
+    /// A resident long operation is deliberately left running: the reset
+    /// abandons the command/framing boundary, not the medium operation.
+    fn abort_active<S: RuntimeSet>(
+        &mut self,
         work: &mut [u8],
-        chunk: usize,
-        declared: u64,
-        produced: u64,
-    ) -> usize {
-        if self.shortfall != ShortfallPolicy::Pad || produced >= declared {
-            return 0;
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) {
+        if self.cmd_active {
+            let lun = self.lun;
+            // Reset recovery keeps the command-abort path; no `Control::Nop`
+            // is queued because the boundary is not clean by definition here.
+            let _ = target.request_control(Control::Abort);
+            let _ = target.drive_step_rt(lun, storage, self, work, scratch);
         }
-        let budget = (declared - produced).min(MAX_PAD);
-        let mps = self.bulk_mps.max(1);
-        let rem = chunk as u64 % mps;
-        let boundary = if rem == 0 { 0 } else { mps - rem };
-        let room = work.len().saturating_sub(chunk) as u64;
-        let merge = boundary.min(budget).min(room) as usize;
-        if merge > 0 {
-            work[chunk..chunk + merge].fill(0);
-        }
-        merge
+        self.stage = Stage::Command { got: 0 };
+        self.phase = Phase::Idle;
+        self.cmd_active = false;
+        self.gate = Gate::EMPTY;
+        self.delivery = Delivery::NotApplicable;
     }
 
-    /// Pad a Data-In shortfall to `declared` (capped at [`MAX_PAD`]) or, once
-    /// the cap/alignment forbids it, end `ShortNoStall`-style. `produced` is
-    /// the relevant data sent; `wire` is the total already on the wire
-    /// (relevant + any boundary-merged fill). Residue is `declared − produced`
-    /// (the fill is *not* relevant data).
-    #[allow(clippy::too_many_arguments)]
-    fn end_shortfall_data_in<'a, D: ScsiDevice>(
-        &'a mut self,
-        tag: u32,
-        declared: u64,
-        produced: u64,
-        wire: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let mps = self.bulk_mps.max(1);
-        // A non-MPS-multiple wire length below `declared` means a short packet
-        // already terminated the host's bulk-IN (e.g. a non-MPS-aligned work
-        // buffer blocked the boundary merge); appending fill now would corrupt
-        // the CSW. End ShortNoStall-style.
-        if wire < declared && !wire.is_multiple_of(mps) {
-            return self.finish_short_fall(tag, declared, produced, status, lun, devs);
-        }
-        let target = declared.min(produced + MAX_PAD);
-        if wire >= target {
-            return self.write_pad_csw(tag, declared, produced, wire, status, lun, devs);
-        }
-        let chunk = ((target - wire) as usize).min(ZERO_CHUNK.len());
-        self.state = BotState::DataInPad {
-            tag,
-            declared,
-            produced,
-            wire,
-            status,
-            lun,
-            chunk,
-        };
-        Action::HostSend {
-            bytes: &ZERO_CHUNK[..chunk],
-            prefetch: None,
-        }
-    }
-
-    /// Send the CSW after a completed `Pad` fill. A fully-filled phase
-    /// (`wire == declared`) sends the CSW directly; a cap-exhausted phase
-    /// (`wire < declared`) ends like `ShortNoStall` — with a ZLP first when the
-    /// wire length is an MPS multiple, no STALL.
-    #[allow(clippy::too_many_arguments)]
-    fn write_pad_csw<'a, D: ScsiDevice>(
-        &'a mut self,
-        tag: u32,
-        declared: u64,
-        produced: u64,
-        wire: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        crate::debug!(
-            "bot csw (pad) tag={} residue={} wire={} status={:?}",
-            tag,
-            declared - produced,
-            wire,
-            status
-        );
-        if wire < declared && wire.is_multiple_of(self.bulk_mps) {
-            self.store_csw(tag, declared - produced, status);
-            self.state = BotState::CswZlp {
-                tag,
-                declared,
-                actual: produced,
-                status,
-                lun,
-            };
-            Action::HostSend {
-                bytes: &[],
-                prefetch: None,
-            }
-        } else {
-            self.enter_agenda(tag, declared - produced, status, lun, devs)
-        }
-    }
-
-    /// End a Data-In (or no-data) phase with the CSW.
+    /// Bulk-Only Reset / LinkReset body: abort any in-flight transaction,
+    /// return to the Command phase, and raise a BUS RESET unit attention on
+    /// every LUN (BOT §4.2, §5.2).
     ///
-    /// If fewer than `declared` bytes were produced, the shortfall is resolved
-    /// per the session's [`ShortfallPolicy`]: `Pad` fills to `declared` (capped
-    /// at [`MAX_PAD`]), `Short` ENDs the phase with a short packet then STALLs
-    /// Bulk-In, and `ShortNoStall` (the default) reports the shortfall via
-    /// `dCSWDataResidue` and sends a short packet. A produced length that is a
-    /// multiple of the bulk MPS is terminated with a ZLP first. Residue is
-    /// 32-bit (BOT §5.2); truncation is guarded (declared is 32-bit).
-    fn finish_data_in<'a, D: ScsiDevice>(
-        &'a mut self,
-        tag: u32,
-        declared: u64,
-        actual: u64,
-        status: CswStatus,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let actual = actual.min(declared);
-        if actual < declared {
-            return match self.shortfall {
-                ShortfallPolicy::Pad => {
-                    self.end_shortfall_data_in(tag, declared, actual, actual, status, lun, devs)
-                }
-                ShortfallPolicy::Short => {
-                    self.finish_short_stall(tag, declared, actual, status, lun)
-                }
-                ShortfallPolicy::ShortNoStall => {
-                    self.finish_short_fall(tag, declared, actual, status, lun, devs)
-                }
-            };
-        }
-        self.finish_short_fall(tag, declared, actual, status, lun, devs)
-    }
-
-    /// End a transaction, first resolving the data phase the CBW declared
-    /// `actual` is the number of Data-In bytes produced. A declared
-    /// Data-Out phase is drained instead of left in the bulk-OUT fifo (the
-    /// host will send `declared` bytes regardless of the outcome).
-    fn finish_cmd<'a, D: ScsiDevice>(
-        &'a mut self,
-        cbw: &Cbw,
-        actual: u64,
-        status: CswStatus,
-        work_len: usize,
-        lun: usize,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let declared = u64::from(cbw.data_len);
-        if declared > 0 && cbw.dir == BotDir::DataOut {
-            return self.start_data_out_drain(cbw, status, work_len, lun);
-        }
-        self.finish_data_in(cbw.tag, declared, actual, status, lun, devs)
-    }
-
-    /// Enter a Data-Out phase that writes nothing: receive and discard the
-    /// host's `declared` bytes so the next CBW is not corrupted,
-    /// then send the CSW with `status`.
-    fn start_data_out_drain<'a>(
-        &'a mut self,
-        cbw: &Cbw,
-        status: CswStatus,
-        work_len: usize,
-        lun: usize,
-    ) -> Action<'a> {
-        let declared = u64::from(cbw.data_len);
-        let chunk = (declared as usize).min(work_len);
-        self.state = BotState::DataOut {
-            declared,
-            to_write: 0,
-            received: 0,
-            written: 0,
-            tag: cbw.tag,
-            lun,
-            status,
-            chunk,
-        };
-        Action::HostRecv {
-            len: chunk,
-            probe: false,
+    /// This aborts the active command but leaves a resident long operation
+    /// running (`long_lun` is unchanged); no `Control::Nop` is issued because
+    /// reset recovery needs the command-abort path, not a clean boundary.
+    fn reset<S: RuntimeSet>(
+        &mut self,
+        work: &mut [u8],
+        scratch: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) {
+        self.abort_active(work, scratch, target, storage);
+        let count = target.slot_count();
+        for lun in 0..count {
+            let _ = target.raise_ua_rt(lun, UaClass::BusReset);
         }
     }
 
-    // ── Data-In phase ───────────────────────────────────────────────
+    // ── Action projection ─────────────────────────────────────────
 
-    fn poll_data_in<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataIn {
-            expected,
-            transfer_len,
-            sent,
-            tag,
-            lun,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostSent => {
-                if sent >= transfer_len {
-                    // Relevant data complete. `sent` may exceed `transfer_len`
-                    // when `Pad` boundary-merged fill zeros into the final chunk.
-                    if transfer_len < expected && self.shortfall == ShortfallPolicy::Pad {
-                        return self.end_shortfall_data_in(
-                            tag,
-                            expected,
-                            transfer_len,
-                            sent,
-                            CswStatus::Passed,
-                            lun,
-                            devs,
-                        );
-                    }
-                    return self.finish_data_in(
-                        tag,
-                        expected,
-                        transfer_len,
-                        CswStatus::Passed,
-                        lun,
-                        devs,
-                    );
-                }
-                let remaining = transfer_len - sent;
-                let mut next = (remaining as usize).min(work.len());
-                // See the `OutXfer` arm of `dispatch_cbw`: extract the op's
-                // Copy fields before re-borrowing `work` for the `Inline` send.
-                let probe = match devs[lun].xfer_out(sent, &mut work[..next]) {
-                    Xfer::Inline { len } => Ok(len),
-                    Xfer::Store(op) => match StoreDesc::of(op) {
-                        Some(desc) => Err(desc),
-                        None => return Action::Error(BotTargetError::Internal),
-                    },
-                };
-                let produced = match probe {
-                    Ok(len) => len,
-                    Err(desc) => {
-                        self.state = BotState::DataInStore {
-                            expected,
-                            transfer_len,
-                            sent,
-                            tag,
-                            lun,
-                            chunk: next,
-                        };
-                        return Action::Store {
-                            lun,
-                            op: desc.attach(&mut work[..next]),
-                            next_recv: None,
-                        };
-                    }
-                };
-                if produced != next {
-                    // Transfer failed midway.
-                    if sent < expected && self.shortfall == ShortfallPolicy::Pad {
-                        return self.end_shortfall_data_in(
-                            tag,
-                            expected,
-                            sent,
-                            sent,
-                            CswStatus::Failed,
-                            lun,
-                            devs,
-                        );
-                    }
-                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed, lun, devs);
-                }
-                if next as u64 == remaining {
-                    // Final relevant chunk: boundary-merge Pad fill in-buffer so
-                    // the host never sees a premature short packet.
-                    next += self.merge_pad_boundary(work, next, expected, transfer_len);
-                }
-                self.state = BotState::DataIn {
-                    expected,
-                    transfer_len,
-                    sent: sent + next as u64,
-                    tag,
-                    lun,
-                    chunk: next,
-                };
-                Action::HostSend {
-                    bytes: &work[..next],
-                    prefetch: data_in_prefetch(
-                        devs,
-                        lun,
-                        transfer_len,
-                        sent + next as u64,
-                        work.len(),
-                    ),
-                }
-            }
-            Event::HostRecv { .. } | Event::HostIdle => {
-                // No-op: still need to send the pending chunk.
-                Action::HostSend {
-                    bytes: &work[..chunk],
-                    prefetch: data_in_prefetch(devs, lun, transfer_len, sent, work.len()),
-                }
-            }
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    /// Finalize a Data-In chunk whose storage op finished (`Xfer::Store`).
-    ///
-    /// On success the chunk is sent exactly like the `Inline` path (including
-    /// the `Pad` boundary merge on the final relevant chunk); on failure the
-    /// data phase is terminated with the same residue/CSW path as the old
-    /// `produced != chunk` shortfall.
-    fn poll_data_in_store<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataInStore {
-            expected,
-            transfer_len,
-            sent,
-            tag,
-            lun,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::StoreDone { result } => {
-                if store_done_failed(devs, lun, result) {
-                    return self.finish_data_in(tag, expected, sent, CswStatus::Failed, lun, devs);
-                }
-                let remaining = transfer_len - sent;
-                let mut next = chunk;
-                if next as u64 == remaining {
-                    // Final relevant chunk: boundary-merge Pad fill in-buffer
-                    // so the host never sees a premature short packet.
-                    next += self.merge_pad_boundary(work, next, expected, transfer_len);
-                }
-                self.state = BotState::DataIn {
-                    expected,
-                    transfer_len,
-                    sent: sent + next as u64,
-                    tag,
-                    lun,
-                    chunk: next,
-                };
-                Action::HostSend {
-                    bytes: &work[..next],
-                    prefetch: data_in_prefetch(
-                        devs,
-                        lun,
-                        transfer_len,
-                        sent + next as u64,
-                        work.len(),
-                    ),
-                }
-            }
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    // ── Data-In pad (ShortfallPolicy::Pad) ──────────────────────────
-
-    fn poll_data_in_pad<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataInPad {
-            tag,
-            declared,
-            produced,
-            wire,
-            status,
-            lun,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostSent => {
-                let wire = wire + chunk as u64;
-                let target = declared.min(produced + MAX_PAD);
-                if wire >= target {
-                    return self.write_pad_csw(tag, declared, produced, wire, status, lun, devs);
-                }
-                let next = ((target - wire) as usize).min(ZERO_CHUNK.len());
-                self.state = BotState::DataInPad {
-                    tag,
-                    declared,
-                    produced,
-                    wire,
-                    status,
-                    lun,
-                    chunk: next,
-                };
-                Action::HostSend {
-                    bytes: &ZERO_CHUNK[..next],
-                    prefetch: None,
-                }
-            }
-            Event::HostRecv { .. } | Event::HostIdle => {
-                // No-op: still need to send the pending fill chunk.
-                Action::HostSend {
-                    bytes: &ZERO_CHUNK[..chunk],
-                    prefetch: None,
-                }
-            }
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    // ── Data-In stall (ShortfallPolicy::Short) ──────────────────────
-
-    /// Transient stall state: the shortfall's short packet (and any ZLP) is on
-    /// the wire and the shell is about to STALL Bulk-In. Bulk events are
-    /// ignored (the endpoint is halted, so none should arrive); `pending()`
-    /// keeps returning [`Action::StallIn`] until the shell feeds
-    /// [`Event::StallApplied`], which releases the CSW. A shell whose
-    /// `BotIo::stall_in` fails feeds [`Event::Reset`].
-    fn poll_data_in_stall<'a>(&'a mut self, _ev: Event) -> Action<'a> {
-        Action::StallIn
-    }
-
-    // ── Data-Out phase ──────────────────────────────────────────────
-
-    fn poll_data_out<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataOut {
-            declared,
-            to_write,
-            received,
-            written,
-            tag,
-            lun,
-            status,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostRecv { len } => {
-                let mut written = written;
-                let mut status = status;
-                if status == CswStatus::Passed && written < to_write {
-                    let w = (len as u64).min(to_write - written) as usize;
-                    if w > 0 {
-                        // Detach the op's Copy fields before re-borrowing `devs`
-                        // for the terminal-status agenda (see [`StoreDesc`]).
-                        let probe = match devs[lun].xfer_in(written, &work[..w]) {
-                            Xfer::Inline { len } => Ok(len),
-                            Xfer::Store(op) => match StoreDesc::of(op) {
-                                Some(desc) => Err(desc),
-                                None => return Action::Error(BotTargetError::Internal),
-                            },
-                        };
-                        let produced = match probe {
-                            Ok(len) => len,
-                            Err(desc) => {
-                                self.state = BotState::DataOutStore {
-                                    declared,
-                                    to_write,
-                                    received,
-                                    written,
-                                    tag,
-                                    lun,
-                                    status,
-                                    got: len,
-                                    w,
-                                };
-                                // `received` has not been incremented yet, so
-                                // account for this chunk's `len` here: the
-                                // remaining declared bytes (capped to the work
-                                // buffer) are the next write-ahead budget.
-                                let next_recv = declared
-                                    .checked_sub(received + len as u64)
-                                    .map(|r| (r as usize).min(work.len()))
-                                    .filter(|&n| n > 0);
-                                return Action::Store {
-                                    lun,
-                                    op: desc.attach(&mut work[..w]),
-                                    next_recv,
-                                };
-                            }
-                        };
-                        if produced == w {
-                            written += produced as u64;
-                        } else {
-                            status = CswStatus::Failed;
-                        }
-                    }
-                }
-                let received = received + len as u64;
-                if received >= declared {
-                    let residue = declared - written;
-                    if received > declared {
-                        // Overshoot already consumed the excess: straight to CSW.
-                        return self.finish_csw_bot(tag, residue, status, lun, devs);
-                    }
-                    // Exact end of the declared phase: probe for a host
-                    // overrun (leftover bytes would corrupt the next CBW).
-                    self.state = BotState::DataOutOverrun {
-                        tag,
-                        residue,
-                        status,
-                        lun,
-                        chunk: work.len(),
-                    };
-                    return Action::HostRecv {
-                        len: work.len(),
-                        probe: true,
-                    };
-                }
-                let next = ((declared - received) as usize).min(work.len());
-                self.state = BotState::DataOut {
-                    declared,
-                    to_write,
-                    received,
-                    written,
-                    tag,
-                    lun,
-                    status,
-                    chunk: next,
-                };
-                Action::HostRecv {
-                    len: next,
-                    probe: false,
-                }
-            }
-            Event::HostIdle => {
-                // Host paused mid phase: keep waiting for the chunk.
-                Action::HostRecv {
-                    len: chunk,
-                    probe: false,
-                }
-            }
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    /// Continue a Data-Out phase after its storage op finished
-    /// (`Xfer::Store`). On success `written` advances by the handed-to-
-    /// `xfer_in` count `w`; on failure `status` becomes `Failed`. The received
-    /// bookkeeping then proceeds exactly like the `Inline` path (overrun probe
-    /// or the next receive).
-    fn poll_data_out_store<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataOutStore {
-            declared,
-            to_write,
-            received,
-            written,
-            tag,
-            lun,
-            status,
-            got,
-            w,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::StoreDone { result } => {
-                let mut written = written;
-                let mut status = status;
-                if store_done_failed(devs, lun, result) {
-                    status = CswStatus::Failed;
-                } else {
-                    written += w as u64;
-                }
-                let received = received + got as u64;
-                if received >= declared {
-                    let residue = declared - written;
-                    if received > declared {
-                        // Overshoot already consumed the excess: straight to CSW.
-                        return self.finish_csw_bot(tag, residue, status, lun, devs);
-                    }
-                    // Exact end of the declared phase: probe for a host
-                    // overrun (leftover bytes would corrupt the next CBW).
-                    self.state = BotState::DataOutOverrun {
-                        tag,
-                        residue,
-                        status,
-                        lun,
-                        chunk: work.len(),
-                    };
-                    return Action::HostRecv {
-                        len: work.len(),
-                        probe: true,
-                    };
-                }
-                let next = ((declared - received) as usize).min(work.len());
-                self.state = BotState::DataOut {
-                    declared,
-                    to_write,
-                    received,
-                    written,
-                    tag,
-                    lun,
-                    status,
-                    chunk: next,
-                };
-                Action::HostRecv {
-                    len: next,
-                    probe: false,
-                }
-            }
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    // ── Parameter-list Data-Out ─────────────────────────────────────
-
-    fn poll_param_out<'a, D: ScsiDevice>(
-        &'a mut self,
-        ev: Event,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        let st = self.state;
-        let BotState::ParamOut {
-            expected,
-            received,
-            tag,
-            lun,
-            cdb,
-            cdb_len,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostRecv { len: n } => {
-                let remaining = expected - received;
-                let base = work.len() - expected as usize;
-                if n as u64 > remaining {
-                    // Host overran declared length: keep the first `remaining`
-                    // bytes, complete the parameter list, then drain the rest.
-                    let fit = remaining as usize;
-                    if fit > 0 {
-                        let dst = work.len() - received as usize - fit;
-                        work.copy_within(0..fit, dst);
-                    }
-                    let status = match devs[lun]
-                        .complete_param(&cdb[..cdb_len], &work[base..base + expected as usize])
-                    {
-                        CommandOutcome::Status | CommandOutcome::StatusWithSense => {
-                            CswStatus::Passed
-                        }
-                        _ => CswStatus::Failed,
-                    };
-                    self.state = BotState::DataOutOverrun {
-                        tag,
-                        residue: 0,
-                        status,
-                        lun,
-                        chunk: work.len(),
-                    };
-                    return Action::HostRecv {
-                        len: work.len(),
-                        probe: true,
-                    };
-                }
-                // Normal case: move the received bytes to the tail so they sit
-                // contiguously after the already-accumulated bytes.
-                let dst = work.len() - received as usize - n;
-                work.copy_within(0..n, dst);
-                let received = received + n as u64;
-                if received >= expected {
-                    let status = match devs[lun]
-                        .complete_param(&cdb[..cdb_len], &work[base..base + expected as usize])
-                    {
-                        CommandOutcome::Status | CommandOutcome::StatusWithSense => {
-                            CswStatus::Passed
-                        }
-                        _ => CswStatus::Failed,
-                    };
-                    // Exact end: probe for host overrun before CSW.
-                    self.state = BotState::DataOutOverrun {
-                        tag,
-                        residue: 0,
-                        status,
-                        lun,
-                        chunk: work.len(),
-                    };
-                    return Action::HostRecv {
-                        len: work.len(),
-                        probe: true,
-                    };
-                }
-                let next = ((expected - received) as usize).min(work.len() - received as usize);
-                self.state = BotState::ParamOut {
-                    expected,
-                    received,
-                    tag,
-                    lun,
-                    cdb,
-                    cdb_len,
-                    chunk: next,
-                };
-                Action::HostRecv {
-                    len: next,
-                    probe: false,
-                }
-            }
-            Event::HostIdle => Action::HostRecv {
-                len: chunk,
+    /// The action for the current state (re-emitted on `Event::Tick` and after
+    /// an out-of-band control event).
+    fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
+        self.stage_send(work.len());
+        let stage = self.stage;
+        match stage {
+            Stage::Command { got } => Action::HostRecv {
+                len: CBW_LEN - got,
                 probe: false,
             },
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    // ── Data-Out overrun drain ──────────────────────────────────────
-
-    fn poll_overrun<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
-        let st = self.state;
-        let BotState::DataOutOverrun {
-            tag,
-            residue,
-            status,
-            lun,
-            chunk,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostRecv { len } => {
-                if len < chunk {
-                    // Short packet: leftover drained → CSW.
-                    return self.finish_csw_bot(tag, residue, status, lun, devs);
+            Stage::Exec => match self.phase {
+                Phase::Send(p) => {
+                    let start = p.wire as usize;
+                    let end = start + p.staged.unwrap_or(0) as usize;
+                    if end > work.len() || start >= end {
+                        return Action::Error(BotTargetError::Internal);
+                    }
+                    // Fill bytes beyond the device's plan are zeros, never
+                    // stale bank contents.
+                    let plan = p.plan as usize;
+                    if end > plan {
+                        work[plan.max(start)..end].fill(0);
+                    }
+                    Action::HostSend {
+                        bytes: &work[start..end],
+                    }
                 }
-                // Full chunk: more leftover pending.
-                self.state = BotState::DataOutOverrun {
-                    tag,
-                    residue,
-                    status,
-                    lun,
-                    chunk,
-                };
-                Action::HostRecv {
-                    len: chunk,
+                Phase::Recv(p) => {
+                    let cap = work.len() as u32;
+                    let wire_target = p.wire_target.min(cap);
+                    if p.received < wire_target {
+                        Action::HostRecv {
+                            len: (wire_target - p.received) as usize,
+                            probe: false,
+                        }
+                    } else {
+                        // The core is still on a storage operation with no
+                        // wire phase; probe so the shell loops back with a
+                        // `HostIdle` and the next entry drives it again.
+                        Action::HostRecv {
+                            len: 1,
+                            probe: true,
+                        }
+                    }
+                }
+                Phase::Idle => Action::HostRecv {
+                    len: 1,
                     probe: true,
-                }
-            }
-            Event::HostIdle => self.finish_csw_bot(tag, residue, status, lun, devs),
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    // ── CSW phase ───────────────────────────────────────────────────
-
-    fn poll_csw<'a>(&'a mut self, ev: Event) -> Action<'a> {
-        match ev {
-            Event::HostSent => {
-                // Normal ending: no "done" boundary — hand back the next
-                // command-phase receive directly.
-                self.state = BotState::Command { got: 0 };
-                Action::HostRecv {
-                    len: CBW_LEN,
-                    probe: false,
-                }
-            }
-            Event::HostRecv { .. } | Event::HostIdle => Action::HostSend {
-                bytes: &self.csw[..],
-                prefetch: None,
+                },
             },
-            _ => Action::Error(BotTargetError::Internal),
-        }
-    }
-
-    /// The zero-length packet that terminates a short Data-In phase has been
-    /// sent; under `ShortfallPolicy::Short` the phase then STALLs (`DataInStall`)
-    /// instead of sending the CSW immediately. Otherwise the data phase is
-    /// complete and the device agenda is drained before the CSW.
-    fn poll_csw_zlp<'a, D: ScsiDevice>(&'a mut self, ev: Event, devs: &'a mut [D]) -> Action<'a> {
-        let st = self.state;
-        let BotState::CswZlp {
-            tag,
-            declared,
-            actual,
-            status,
-            lun,
-        } = st
-        else {
-            return Action::Error(BotTargetError::Internal);
-        };
-        match ev {
-            Event::HostSent => {
-                if self.shortfall == ShortfallPolicy::Short && actual < declared {
-                    self.state = BotState::DataInStall {
-                        tag,
-                        declared,
-                        actual,
-                        status,
-                        lun,
-                    };
-                    Action::StallIn
+            Stage::Synth {
+                total,
+                wire,
+                staged,
+                ..
+            } => {
+                let Some(chunk) = staged else {
+                    return Action::Error(BotTargetError::Internal);
+                };
+                let start = wire as usize;
+                let end = start + chunk as usize;
+                if end > work.len() || end as u64 > total {
+                    return Action::Error(BotTargetError::Internal);
+                }
+                Action::HostSend {
+                    bytes: &work[start..end],
+                }
+            }
+            Stage::Pad { chunk, .. } => Action::HostSend {
+                bytes: &ZERO_CHUNK[..chunk as usize],
+            },
+            Stage::Zlp { .. } => Action::HostSend { bytes: &[] },
+            Stage::Stall { .. } => Action::StallIn,
+            Stage::Drain {
+                remaining, probe, ..
+            } => Action::HostRecv {
+                len: if probe {
+                    DRAIN_CHUNK
                 } else {
-                    self.enter_agenda(tag, declared - actual, status, lun, devs)
-                }
-            }
-            Event::HostRecv { .. } | Event::HostIdle => Action::HostSend {
-                bytes: &[],
-                prefetch: None,
+                    remaining.min(DRAIN_CHUNK as u64) as usize
+                },
+                probe,
             },
-            _ => Action::Error(BotTargetError::Internal),
+            Stage::Csw => Action::HostSend {
+                bytes: &self.csw[..],
+            },
         }
     }
 }
 
-/// A byte-addressed [`StoreOp`] with its buffer detached, used to survive the
-/// borrow of `work` that `xfer_out` takes while the session still needs `work`
-/// on the `Inline` branch.
-///
-/// By contract the op returned by the device carries exactly the slice the
-/// session passed (`&mut work[..chunk]`), so it can be split into its Copy
-/// fields and the buffer and then rebuilt identically once the call's borrow
-/// has ended. This is the classic NLL "conditional borrow" workaround:
-/// returning the op directly would force the call's mutable borrow of `work`
-/// to live for the whole function, so the `Inline` branch could not re-borrow
-/// `work`. The reconstructed op is byte-identical, so the Store stays
-/// invisible on the wire.
-///
-/// Only the byte-addressed variants appear here: the data phase is
-/// byte-addressed (`BlockDevice::xfer_out`/`xfer_in`), while path-addressed FS
-/// ops are produced by the device agenda (`next_store_op`), never by the data
-/// phase. A path-addressed op in the data phase is a contract violation and is
-/// reported as [`BotTargetError::Internal`] (it also cannot be detached here —
-/// its `path` borrows the device for the same lifetime as the buffer).
-#[derive(Clone, Copy)]
-enum StoreDesc {
-    Read { off: u64 },
-    Write { off: u64 },
-    Fill { off: u64, len: u64, byte: u8 },
-    Sync,
-}
-
-impl StoreDesc {
-    /// Split a byte-addressed `op` into its Copy fields, dropping the buffer
-    /// borrow. `None` for a path-addressed (FS) op (see the type docs).
-    fn of(op: StoreOp<'_>) -> Option<Self> {
-        match op {
-            StoreOp::Read { off, .. } => Some(Self::Read { off }),
-            StoreOp::Write { off, .. } => Some(Self::Write { off }),
-            StoreOp::Fill { off, len, byte } => Some(Self::Fill { off, len, byte }),
-            StoreOp::Sync => Some(Self::Sync),
-            StoreOp::FileRead { .. } | StoreOp::FileWrite { .. } | StoreOp::FileRemove { .. } => {
-                None
-            }
-        }
+/// Fixed-format sense (SPC-3): response code, sense key, additional length,
+/// ASC/ASCQ. Writes at most 18 bytes into `dst` and returns the count.
+fn sense_write_fixed(sense: crate::core::Sense, dst: &mut [u8]) -> usize {
+    let n = dst.len().min(18);
+    dst[..n].fill(0);
+    if n > 0 {
+        dst[0] = 0x70;
     }
-
-    /// Re-attach `buf` — the same slice the device received — to rebuild the op.
-    fn attach<'b>(self, buf: &'b mut [u8]) -> StoreOp<'b> {
-        match self {
-            Self::Read { off } => StoreOp::Read { off, buf },
-            Self::Write { off } => StoreOp::Write { off, buf },
-            Self::Fill { off, len, byte } => StoreOp::Fill { off, len, byte },
-            Self::Sync => StoreOp::Sync,
-        }
+    if n > 2 {
+        dst[2] = sense.key;
     }
-}
-
-/// Read-phase read-ahead coordinate: after the current Data-In chunk is on the
-/// wire, where and how much the core will next read. `sent` is the number of
-/// bytes already accounted for (the end offset of the current chunk), so the
-/// next read starts there for `min(transfer_len - sent, work_len)` bytes.
-/// Returns `None` when the transfer is complete (`sent >= transfer_len`) or the
-/// remaining length is zero.
-fn data_in_prefetch<D: ScsiDevice>(
-    devs: &[D],
-    lun: usize,
-    transfer_len: u64,
-    sent: u64,
-    work_len: usize,
-) -> Option<(usize, u64, usize)> {
-    let n = (transfer_len.checked_sub(sent)? as usize).min(work_len);
-    if n == 0 {
-        return None;
+    if n > 7 {
+        dst[7] = 0x0A;
     }
-    // The address the device will use for this chunk, *not* the transfer-relative
-    // offset: `xfer_out` maps a transfer onto a byte plane at
-    // `base_byte + transfer_offset`, and the shell matches the following
-    // `StoreOp` against this coordinate.
-    devs.get(lun)?
-        .read_ahead_offset(sent)
-        .map(|off| (lun, off, n))
-}
-
-/// Feed a finished storage op to `devs[lun].store_done` and report whether the
-/// data phase must fail.
-///
-/// [`ScsiDevice::store_done`]'s default maps a [`StorageError`] to sense (so a
-/// left sense means failure); a recovering override leaves no sense and the
-/// phase continues. [`XferOutcome::Error`] means the device declined to take
-/// over the mapping, so the session applies it via
-/// [`sense_for_storage_error`].
-fn store_done_failed<D: ScsiDevice>(
-    devs: &mut [D],
-    lun: usize,
-    result: Result<(), StorageError>,
-) -> bool {
-    match devs[lun].store_done(result) {
-        XferOutcome::Ok => result.is_err() && devs[lun].peek_sense().is_some(),
-        XferOutcome::Error(e) => {
-            let (key, asc, ascq) = sense_for_storage_error(e);
-            devs[lun].set_sense(Sense::new(key, asc, ascq));
-            true
-        }
+    if n > 12 {
+        dst[12] = sense.asc;
     }
-}
-
-/// Build the REPORT LUNS response (SPC-4 §6.21) into `data`: 4-byte BE LUN
-/// list length + 4 reserved bytes + 8-byte single-level LUN entries. Returns
-/// the number of bytes written (clamped to `data.len()`).
-///
-/// The 4 reserved bytes keep the 8-byte entries 8-aligned, as required by
-/// Linux's `scsi_report_lun_scan` (see the iSCSI target's comment).
-fn write_report_luns(data: &mut [u8], num_luns: usize) -> usize {
-    let list_len = u32::try_from(num_luns)
-        .ok()
-        .and_then(|n| n.checked_mul(8))
-        .unwrap_or(u32::MAX);
-    let total = 8usize + (list_len as usize);
-    let n = total.min(data.len());
-    let entries = num_luns.min(n.saturating_sub(8) / 8);
-    data[0..4].copy_from_slice(&list_len.to_be_bytes());
-    data[4..n.min(8)].fill(0);
-    for i in 0..entries {
-        let off = 8 + i * 8;
-        data[off] = 0x00; // address method 00b, bus id 0
-        data[off + 1] = i as u8; // single-level LUN id
-        data[off + 2..off + 8].fill(0);
+    if n > 13 {
+        dst[13] = sense.ascq;
     }
     n
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scsi::backend::RamBackend;
-    use crate::scsi::block::BlockDevice;
-    use crate::scsi::device::{DeviceType, Error};
-    use crate::usb::{BotIo, BotIoErr, CBW_SIGNATURE};
-    use core::cell::RefCell;
-    use core::time::Duration;
-    use std::collections::VecDeque;
-
-    /// A 64 KiB block device over test-owned RAM.
-    ///
-    /// The built-in [`BlockDevice`] hands the platform a [`StoreOp`] and holds
-    /// no plane, so a plane-less device cannot read/write its own RAM. These
-    /// session tests exercise the **wire** (chunk lengths, CSW residue, ZLP,
-    /// shortfall policy), which is independent of whether the device yields
-    /// `Inline` or `Store`; the `Store` path itself is covered end-to-end by
-    /// the `snowscsi-tests` golden fixtures through `usb::serve`. So the test
-    /// LUN executes the built-in block op **inline** against its RAM and
-    /// reports `Inline`, keeping every session-level assertion unchanged.
-    struct TestLun<'r> {
-        inner: BlockDevice,
-        ram: &'r mut [u8],
+/// Small copyable projection of a runner fault for logging (defmt-safe).
+fn fault_state(fault: Fault) -> u8 {
+    match fault {
+        Fault::Io => 1,
+        Fault::OutOfBounds => 2,
+        Fault::NotWritable => 3,
+        Fault::Unsupported => 4,
+        Fault::Cancelled => 5,
+        Fault::NeedsRecovery => 6,
+        Fault::Commit => 7,
+        Fault::Contract => 8,
+        Fault::CounterExhausted => 9,
+        Fault::Boundary => 10,
+        Fault::ForeignBoundary => 11,
+        Fault::LunNotFound => 12,
     }
+}
 
-    impl ScsiDevice for TestLun<'_> {
-        fn do_cmd(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<CommandOutcome, Error> {
-            self.inner.do_cmd(cdb, data)
-        }
+/// Opcodes whose command CDB expects a Data-In phase even when the CBW does
+/// not set the direction bit. An unlisted opcode is treated as no-data.
+fn data_in_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        scsi_op::READ_6
+            | scsi_op::READ_10
+            | scsi_op::READ_16
+            | scsi_op::READ_12
+            | scsi_op::INQUIRY
+            | scsi_op::REQUEST_SENSE
+            | scsi_op::REPORT_LUNS
+            | scsi_op::MODE_SENSE_6
+            | scsi_op::MODE_SENSE_10
+            | scsi_op::READ_CAPACITY_10
+            | scsi_op::SERVICE_ACTION_IN
+            | scsi_op::READ_FORMAT_CAPACITIES
+            | scsi_op::GET_CONFIGURATION
+            | scsi_op::GET_EVENT_STATUS_NOTIFICATION
+            | scsi_op::READ_TOC
+            | scsi_op::READ_DISC_INFORMATION
+            | scsi_op::READ_TRACK_INFORMATION
+            | scsi_op::READ_BUFFER_CAPACITY
+            | scsi_op::READ_CD
+            | scsi_op::READ_CD_MSF
+            | scsi_op::GET_PERFORMANCE
+            | scsi_op::READ_DVD_STRUCTURE
+            | 0x1C // RECEIVE DIAGNOSTIC RESULTS
+    )
+}
 
-        fn xfer_out<'a>(&'a mut self, transfer_offset: u64, buf: &'a mut [u8]) -> Xfer<'a> {
-            match self.inner.xfer_out(transfer_offset, buf) {
-                Xfer::Store(StoreOp::Read { off, buf: b }) => {
-                    let off = off as usize;
-                    b.copy_from_slice(&self.ram[off..off + b.len()]);
-                    Xfer::Inline { len: b.len() }
-                }
-                other => other,
-            }
-        }
+/// Opcodes whose command CDB expects a Data-Out phase. Used only to detect a
+/// wire direction that contradicts the command family before the device is
+/// touched; an unknown vendor opcode is left to the device's own gate.
+fn data_out_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        scsi_op::WRITE_6
+            | scsi_op::WRITE_10
+            | scsi_op::WRITE_12
+            | scsi_op::WRITE_16
+            | scsi_op::MODE_SELECT_6
+            | scsi_op::MODE_SELECT_10
+            | scsi_op::FORMAT_UNIT
+            | scsi_op::SEND_DIAGNOSTIC
+            | 0x2E // WRITE AND VERIFY(10)
+            | 0x8E // WRITE AND VERIFY(16)
+            | 0x41 // WRITE SAME(10)
+            | 0x93 // WRITE SAME(16)
+            | 0x4C // LOG SELECT
+            | 0xBF // SEND DVD STRUCTURE
+            | 0xA1 // BLANK
+    )
+}
 
-        fn xfer_in<'a>(&'a mut self, transfer_offset: u64, buf: &'a [u8]) -> Xfer<'a> {
-            match self.inner.xfer_in(transfer_offset, buf) {
-                Xfer::Store(StoreOp::Write { off, buf: b }) => {
-                    let off = off as usize;
-                    self.ram[off..off + b.len()].copy_from_slice(b);
-                    Xfer::Inline { len: b.len() }
-                }
-                other => other,
-            }
-        }
+// ── HostTransport ─────────────────────────────────────────────────
 
-        fn peek_sense(&self) -> Option<&Sense> {
-            self.inner.peek_sense()
-        }
-
-        fn take_sense(&mut self) -> Option<Sense> {
-            self.inner.take_sense()
-        }
-
-        fn device_type(&self) -> DeviceType {
-            self.inner.device_type()
-        }
-
-        fn complete_param(&mut self, cdb: &[u8], data: &[u8]) -> CommandOutcome {
-            self.inner.complete_param(cdb, data)
-        }
-
-        fn sync(&mut self) -> Result<(), StorageError> {
-            self.inner.sync()
-        }
-
-        fn inject_unit_attention(&mut self, asc: u8, ascq: u8) {
-            self.inner.inject_unit_attention(asc, ascq);
-        }
-
-        fn set_sense(&mut self, sense: Sense) {
-            ScsiDevice::set_sense(&mut self.inner, sense);
-        }
-    }
-
-    /// A 64 KiB block device over stack-owned RAM.
-    fn test_dev(ram: &mut [u8]) -> TestLun<'_> {
-        let inner = BlockDevice::disk(&mut RamBackend::new(ram), 512).unwrap();
-        TestLun { inner, ram }
-    }
-
-    fn work() -> [u8; crate::MIN_DATA_LEN] {
-        [0u8; crate::MIN_DATA_LEN]
-    }
-
-    /// Build a raw 31-byte CBW from its logical fields (little endian).
-    fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
-        let mut raw = [0u8; CBW_LEN];
-        raw[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
-        raw[4..8].copy_from_slice(&tag.to_le_bytes());
-        raw[8..12].copy_from_slice(&data_len.to_le_bytes());
-        raw[12] = flags;
-        raw[13] = lun;
-        raw[14] = cdb.len() as u8;
-        raw[15..15 + cdb.len().min(16)].copy_from_slice(&cdb[..cdb.len().min(16)]);
-        raw
-    }
-
-    /// Feed host bytes into `work` and poll a `HostRecv` of that length.
-    fn recv<'a, D: ScsiDevice>(
-        s: &'a mut BotSession,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-        bytes: &[u8],
-    ) -> Action<'a> {
-        work[..bytes.len()].copy_from_slice(bytes);
-        s.poll(Event::HostRecv { len: bytes.len() }, work, devs)
-    }
-
-    /// Poll a `HostSent` (the pending bulk-IN packet has been sent).
-    fn sent<'a, D: ScsiDevice>(
-        s: &'a mut BotSession,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        s.poll(Event::HostSent, work, devs)
-    }
-
-    /// Poll a `HostIdle` (the shell's receive found nothing).
-    fn idle<'a, D: ScsiDevice>(
-        s: &'a mut BotSession,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        s.poll(Event::HostIdle, work, devs)
-    }
-
-    /// Poll an `Event::Reset` (BotReset / LinkReset).
-    fn reset<'a, D: ScsiDevice>(
-        s: &'a mut BotSession,
-        work: &'a mut [u8],
-        devs: &'a mut [D],
-    ) -> Action<'a> {
-        s.poll(Event::Reset, work, devs)
-    }
-
-    /// Assert the action is a receive of `len` bytes with the given `probe`.
-    fn expect_recv(action: Action<'_>, len: usize, probe: bool) {
-        match action {
-            Action::HostRecv { len: l, probe: p } => {
-                assert_eq!(l, len, "HostRecv len");
-                assert_eq!(p, probe, "HostRecv probe");
-            }
-            other => panic!("expected HostRecv {{ len: {len}, probe: {probe} }}, got {other:?}"),
-        }
-    }
-
-    /// Read the pending CSW from the session's internal buffer (via the
-    /// private `pending()` re-emit).
-    fn read_csw(s: &mut BotSession, work: &mut [u8]) -> (u32, u32, u8) {
-        let devs: &mut [&mut dyn ScsiDevice] = &mut [];
-        let csw = match s.pending(work, devs) {
-            Action::HostSend { bytes, .. } => bytes,
-            other => panic!("expected a pending HostSend, got {other:?}"),
+impl HostTransport for BotSession {
+    fn publish(&mut self, plan: DataPlan) -> Result<(), Fault> {
+        self.gate.seen = true;
+        let declared = self.declared;
+        let reject = |gate: &mut Gate| {
+            gate.phase_error = true;
+            gate.rejected = true;
+            Err(Fault::Contract)
         };
-        assert_eq!(csw.len(), CSW_LEN);
-        assert_eq!(&csw[0..4], b"USBS");
-        (
-            u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]),
-            u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]),
-            csw[12],
-        )
-    }
-
-    fn inquiry_cdb(alloc: u8) -> [u8; 6] {
-        let mut cdb = [0u8; 6];
-        cdb[0] = scsi_op::INQUIRY;
-        cdb[4] = alloc;
-        cdb
-    }
-
-    fn read_via_xfer(dev: &mut TestLun<'_>, lba: u64, buf: &mut [u8]) {
-        let mut work = [0u8; crate::MIN_DATA_LEN];
-        let blocks = (buf.len() as u64).div_ceil(512) as u32;
-        let nblocks = blocks.max(1) as u16; // at least 1 for small reads like 64B tail
-        let mut cdb = [0u8; 10];
-        cdb[0] = scsi_op::READ_10;
-        cdb[2] = ((lba >> 24) & 0xFF) as u8;
-        cdb[3] = ((lba >> 16) & 0xFF) as u8;
-        cdb[4] = ((lba >> 8) & 0xFF) as u8;
-        cdb[5] = (lba & 0xFF) as u8;
-        cdb[7] = ((nblocks >> 8) & 0xFF) as u8;
-        cdb[8] = (nblocks & 0xFF) as u8;
-        let outcome = dev.do_cmd(&cdb, &mut work).expect("READ setup");
-        match outcome {
-            CommandOutcome::OutXfer { len } => {
-                assert!(len >= buf.len() as u64);
-                let n = buf.len();
-                assert!(matches!(dev.xfer_out(0, buf), Xfer::Inline { len } if len == n));
+        match (self.host_dir, plan.direction) {
+            (BotDir::DataIn, Direction::ToHost) => {
+                if declared == 0 {
+                    // Hn < Di.
+                    return reject(&mut self.gate);
+                }
+                if plan.bytes > declared {
+                    // Hi < Di: send at most H, report the real count, phase
+                    // error.
+                    self.gate.phase_error = true;
+                }
+                Ok(())
             }
-            other => panic!("expected OutXfer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn need_starts_in_command_phase() {
-        let mut s = BotSession::new();
-        let mut work = work();
-        let devs: &mut [&mut dyn ScsiDevice] = &mut [];
-        match s.pending(&mut work, devs) {
-            Action::HostRecv { len, probe } => {
-                assert_eq!(len, 31);
-                assert!(!probe);
+            (BotDir::DataIn, Direction::FromHost) => {
+                // Hi <> Do: never feed a fabricated Data-Out.
+                reject(&mut self.gate)
             }
-            other => panic!("expected HostRecv, got {other:?}"),
-        }
-        assert_eq!(s.max_lun(), 0);
-    }
-
-    #[test]
-    fn with_luns_sets_max_lun() {
-        assert_eq!(BotSession::with_luns(1).max_lun(), 0);
-        assert_eq!(BotSession::with_luns(3).max_lun(), 2);
-        assert_eq!(BotSession::with_luns(17).max_lun(), 15);
-    }
-
-    #[test]
-    fn bulk_mps_default_and_override() {
-        // Default is the documented high-speed 512.
-        assert_eq!(BotSession::new().bulk_mps(), 512);
-        assert_eq!(BotSession::with_luns(2).bulk_mps(), 512);
-
-        // Builder override (Full-Speed 64).
-        assert_eq!(BotSession::new().with_bulk_mps(64).bulk_mps(), 64);
-
-        // Mutating setter.
-        let mut s = BotSession::new();
-        s.set_bulk_mps(64);
-        assert_eq!(s.bulk_mps(), 64);
-        s.set_bulk_mps(512);
-        assert_eq!(s.bulk_mps(), 512);
-
-        // 0 is rejected and falls back to the default.
-        assert_eq!(BotSession::new().with_bulk_mps(0).bulk_mps(), 512);
-        s.set_bulk_mps(0);
-        assert_eq!(s.bulk_mps(), 512);
-    }
-
-    #[test]
-    fn cbw_accumulates_across_partial_receives() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let raw = raw_cbw(1, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = recv(&mut s, &mut work, &mut devs, &raw[..20]);
-        expect_recv(step, 11, false);
-        // The pending action re-emitted on Tick matches.
-        expect_recv(s.poll(Event::Tick, &mut work, &mut devs), 11, false);
-
-        let step = recv(&mut s, &mut work, &mut devs, &raw[20..]);
-        match step {
-            Action::HostSend { .. } => {}
-            other => panic!("expected HostSend, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inquiry_roundtrip_with_csw() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let raw = raw_cbw(0xAAAA_AAAA, 96, 0x80, 0, &inquiry_cdb(96));
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        match step {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 96);
-                assert_eq!(bytes[0] & 0x1F, 0x00); // PDT = direct-access block
+            (BotDir::DataIn, Direction::None) => Ok(()),
+            (BotDir::DataOut, Direction::FromHost) => {
+                if declared == 0 {
+                    // Hn < Do.
+                    return reject(&mut self.gate);
+                }
+                if plan.bytes > declared {
+                    // Ho < Do: at most H, report the facts, phase error.
+                    self.gate.phase_error = true;
+                }
+                Ok(())
             }
-            other => panic!("expected HostSend with INQUIRY data, got {other:?}"),
-        }
-        match s.poll(Event::Tick, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
-            other => panic!("expected re-emitted INQUIRY data, got {other:?}"),
-        }
-
-        // Data sent → CSW pending (tag echo, Passed; residue 0: host
-        // declared 96 and the INQUIRY response is 96 bytes).
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 0xAAAA_AAAA);
-        assert_eq!(residue, 0);
-        assert_eq!(status, 0x00);
-
-        // CSW sent → back to Command (next CBW receive).
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn read_10_chunks_across_work_buffer() {
-        let mut ram = vec![0u8; 64 * 1024];
-        for (i, b) in ram.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // READ(10) LBA 0, 20 blocks → 10240 bytes (> one 8K chunk).
-        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 20, 0];
-        let raw = raw_cbw(0x1111, 10240, 0x80, 0, &cdb);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 8192);
-                assert_eq!(bytes[0], 0);
-                assert_eq!(bytes[8191], (8191 % 251) as u8);
+            (BotDir::DataOut, Direction::ToHost) => {
+                // Ho <> Di.
+                reject(&mut self.gate)
             }
-            other => panic!("expected first chunk, got {other:?}"),
-        }
-
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 2048);
-                assert_eq!(bytes[0], (8192 % 251) as u8);
-            }
-            other => panic!("expected second chunk, got {other:?}"),
-        }
-
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 0);
-        assert_eq!(status, 0x00);
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn write_10_writes_received_data_and_probes_overrun() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // WRITE(10) LBA 0, 1 block → 512 bytes.
-        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x2222, 512, 0x00, 0, &cdb);
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        expect_recv(step, 512, false);
-        expect_recv(s.poll(Event::Tick, &mut work, &mut devs), 512, false);
-
-        // Feed the data chunk → declared phase complete → overrun probe.
-        let payload: Vec<u8> = (0..512u16).map(|i| (i % 7) as u8).collect();
-        let wlen = work.len();
-        let step = recv(&mut s, &mut work, &mut devs, &payload);
-        expect_recv(step, wlen, true);
-        let mut check = [0u8; 512];
-        read_via_xfer(&mut devs[0], 0, &mut check);
-        assert_eq!(&check[..], payload.as_slice());
-
-        // No more data → OutIdle ends the drain → CSW.
-        match idle(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 0x2222);
-        assert_eq!(residue, 0);
-        assert_eq!(status, 0x00);
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn data_out_overrun_is_drained_to_short_packet() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x3333, 512, 0x00, 0, &cdb);
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        expect_recv(step, 512, false);
-
-        let payload: Vec<u8> = vec![0x5A; 512];
-        let wlen = work.len();
-        let step = recv(&mut s, &mut work, &mut devs, &payload);
-        expect_recv(step, wlen, true);
-
-        // Host over-sent 100 extra bytes: drain (short packet) → CSW.
-        let extra = vec![0x6B; 100];
-        match recv(&mut s, &mut work, &mut devs, &extra) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW after drain, got {other:?}"),
-        }
-        // The excess was discarded, not written to the backend.
-        let mut check = [0u8; 512];
-        read_via_xfer(&mut devs[0], 0, &mut check);
-        assert_eq!(&check[..], payload.as_slice());
-        let mut tail = [0u8; 64];
-        read_via_xfer(&mut devs[0], 1, &mut tail);
-        assert!(tail.iter().all(|&b| b == 0));
-
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 0);
-        assert_eq!(status, 0x00);
-    }
-
-    #[test]
-    fn phase_error_on_direction_mismatch() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // READ(10) declared with Data-Out direction → the host will send
-        // the declared bytes, so they are drained, then a Phase Error CSW.
-        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x4444, 512, 0x00, 0, &cdb);
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        expect_recv(step, 512, false);
-        let payload = vec![0u8; 512];
-        match recv(&mut s, &mut work, &mut devs, &payload) {
-            Action::HostRecv { probe: true, .. } => {}
-            other => panic!("expected overrun probe, got {other:?}"),
-        }
-        match idle(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 512);
-        assert_eq!(status, 0x02); // Phase Error
-    }
-
-    #[test]
-    fn zero_data_data_in_sends_zlp_then_csw() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut work = work();
-
-        // READ(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
-        // declared a 512-byte Data-In phase. The zero-byte phase must be
-        // closed with a ZLP before the CSW (BOT §6.7 Case (4)/(5)).
-        let cdb = [0x28, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x20, 512, 0x80, 0, &cdb);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
-            other => panic!("expected empty ZLP, got {other:?}"),
-        }
-        match s.poll(Event::Tick, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
-            other => panic!("expected pending ZLP, got {other:?}"),
-        }
-        // ZLP sent → CSW pending (Failed, residue = declared = 512).
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 0x20);
-        assert_eq!(residue, 512);
-        assert_eq!(status, 0x01); // Failed
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn mps_multiple_shortfall_sends_zlp_then_csw() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut work = work();
-
-        // READ(10) count 1 → 512 data bytes, while CBW declared 1024. The
-        // shortfall is not padded: the phase ends with a short packet. 512 is
-        // a multiple of the bulk MPS, so a ZLP must terminate the data phase
-        // before the CSW (BOT §6.7 Case (4)/(5)).
-        let cdb = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x21, 1024, 0x80, 0, &cdb);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
-            other => panic!("expected 512-byte chunk, got {other:?}"),
-        }
-        // 512 bytes sent: 512 % MPS == 0 → an empty ZLP first.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert!(bytes.is_empty(), "expected ZLP"),
-            other => panic!("expected ZLP, got {other:?}"),
-        }
-        // Then the CSW.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 0x21);
-        assert_eq!(residue, 1024 - 512);
-        assert_eq!(status, 0x00); // Passed
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn failed_data_out_drains_declared_then_csw() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // WRITE(10) at an out-of-range LBA → CHECK CONDITION, but the CBW
-        // declared a 512-byte Data-Out phase the host will still send. The
-        // bytes must be drained so they cannot corrupt the next CBW.
-        let cdb = [0x2A, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0x22, 512, 0x00, 0, &cdb);
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        expect_recv(step, 512, false);
-
-        // The host's data-out arrives and is discarded (nothing written).
-        let payload = vec![0xAA; 512];
-        match recv(&mut s, &mut work, &mut devs, &payload) {
-            Action::HostRecv { probe: true, .. } => {}
-            other => panic!("expected overrun probe, got {other:?}"),
-        }
-        match idle(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 0x22);
-        assert_eq!(residue, 512); // nothing written
-        assert_eq!(status, 0x01); // Failed
-                                  // The backend was not written.
-        let mut check = [0u8; 512];
-        read_via_xfer(&mut devs[0], 0, &mut check);
-        assert!(check.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn invalid_cbw_stalls_and_recovers() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // An invalid CBW STALLs both endpoints and returns to the Command
-        // phase (no persistent Stalled state; a new CBW clears the halt).
-        let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
-        bad[0] = b'X'; // bad signature
-        match recv(&mut s, &mut work, &mut devs, &bad) {
-            Action::StallBoth => {}
-            other => panic!("expected StallBoth, got {other:?}"),
-        }
-        // Back in Command: the next valid CBW is processed.
-        let raw = raw_cbw(2, 96, 0x80, 0, &inquiry_cdb(96));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
-            other => panic!("expected INQUIRY data, got {other:?}"),
-        }
-
-        // A reset also returns to the Command phase.
-        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn reset_interrupts_data_phase() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(5, 512, 0x00, 0, &cdb);
-        let step = recv(&mut s, &mut work, &mut devs, &raw);
-        expect_recv(step, 512, false);
-
-        // Partial data received.
-        let part = vec![0xAA; 128];
-        let step = recv(&mut s, &mut work, &mut devs, &part);
-        expect_recv(step, 384, false);
-
-        // Reset aborts the transaction and returns to Command.
-        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // A new valid CBW is processed.
-        let raw = raw_cbw(6, 96, 0x80, 0, &inquiry_cdb(96));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
-            other => panic!("expected INQUIRY data, got {other:?}"),
+            (BotDir::DataOut, Direction::None) => Ok(()),
         }
     }
 
-    #[test]
-    fn invalid_lun_failed_csw_then_request_sense() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // TEST UNIT READY to LUN 3 (only LUN 0 exists) → Failed CSW.
-        let raw = raw_cbw(7, 0, 0, 3, &[0x00, 0, 0, 0, 0, 0]);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
+    fn begin_recv(&mut self, req: HostReq) -> HostToken {
+        let token = self.next_token();
+        if req.dir != Direction::FromHost {
+            return HostToken::invalid();
         }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 7);
-        assert_eq!(residue, 0);
-        assert_eq!(status, 0x01); // Failed
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // REQUEST SENSE to the invalid LUN → LOGICAL UNIT NOT SUPPORTED.
-        let mut rs = [0u8; 6];
-        rs[0] = scsi_op::REQUEST_SENSE;
-        rs[4] = 18;
-        let raw = raw_cbw(8, 18, 0x80, 3, &rs);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 18);
-                assert_eq!(bytes[0], 0x70); // fixed format
-                assert_eq!(bytes[2], 0x05); // ILLEGAL REQUEST
-                assert_eq!(bytes[12], 0x25); // LOGICAL UNIT NOT SUPPORTED
-            }
-            other => panic!("expected sense data, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, _, status) = read_csw(&mut s, &mut work);
-        assert_eq!(status, 0x00); // Passed
+        let plan = req.len;
+        let limit = plan.min(self.declared.min(u64::from(u32::MAX)) as u32);
+        self.phase = Phase::Recv(RecvPhase {
+            token,
+            plan,
+            limit,
+            received: 0,
+            accepted: 0,
+            wire_target: self.declared.min(u64::from(u32::MAX)) as u32,
+            wire_done: false,
+        });
+        token
     }
 
-    #[test]
-    fn unit_attention_after_reset() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // First TEST UNIT READY → CHECK CONDITION (UA), Failed CSW.
-        let raw = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
+    fn begin_send(&mut self, req: HostReq) -> HostToken {
+        let token = self.next_token();
+        if req.dir != Direction::ToHost {
+            return HostToken::invalid();
         }
-        let (_, _, status) = read_csw(&mut s, &mut work);
-        assert_eq!(status, 0x01); // Failed
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // REQUEST SENSE → the UA (0x29/00) is reported and cleared.
-        let mut rs = [0u8; 6];
-        rs[0] = scsi_op::REQUEST_SENSE;
-        rs[4] = 18;
-        let raw = raw_cbw(2, 18, 0x80, 0, &rs);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes[2], 0x06); // UNIT ATTENTION
-                assert_eq!(bytes[12], 0x29);
-                assert_eq!(bytes[13], 0x00);
-            }
-            other => panic!("expected UA sense, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // Subsequent TEST UNIT READY → GOOD (Passed CSW).
-        let raw = raw_cbw(3, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, _, status) = read_csw(&mut s, &mut work);
-        assert_eq!(status, 0x00); // Passed
-    }
-
-    #[test]
-    fn report_luns_select_report_semantics() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        // 01h → empty inventory (no well-known logical units implemented).
-        let raw = raw_cbw(21, 16, 0x80, 0, &[0xA0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        let p1 = match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => bytes.to_vec(),
-            other => panic!("expected REPORT LUNS data, got {other:?}"),
+        let plan = req.len;
+        let declared = self.declared.min(u64::from(u32::MAX)) as u32;
+        let limit = plan.min(declared);
+        let pad_target = if self.shortfall == ShortfallPolicy::Pad && plan < declared {
+            declared.min(plan.saturating_add(MAX_PAD as u32))
+        } else {
+            limit
         };
-        assert_eq!(u32::from_be_bytes([p1[0], p1[1], p1[2], p1[3]]), 0);
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, _, st1) = read_csw(&mut s, &mut work);
-        assert_eq!(st1, 0x00);
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
+        self.phase = Phase::Send(SendPhase {
+            token,
+            plan,
+            limit,
+            wire: 0,
+            stage_limit: pad_target,
+            pad_target,
+            staged: None,
+        });
+        token
+    }
 
-        // 02h → full inventory (same as 00h for peripheral-only arrays).
-        let raw = raw_cbw(22, 16, 0x80, 0, &[0xA0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        let p2 = match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => bytes.to_vec(),
-            other => panic!("expected REPORT LUNS data, got {other:?}"),
+    fn poll_host(&mut self, token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
+        match self.phase {
+            Phase::Send(mut p) if p.token == token => {
+                let HostBuf::Send(b) = buf else {
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                };
+                if b.len() != p.plan as usize {
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                }
+                let Some(chunk) = p.staged.take() else {
+                    // First poll: the BOT layer has not staged a chunk yet;
+                    // the device must keep waiting.
+                    self.phase = Phase::Send(p);
+                    return Poll::Pending;
+                };
+                p.wire = p.wire.saturating_add(chunk);
+                // The stage limit is capped to the bank by the caller before
+                // it stages.
+                if p.wire < p.stage_limit {
+                    self.phase = Phase::Send(p);
+                    Poll::Pending
+                } else {
+                    let accepted = p.wire.min(p.plan);
+                    self.phase = Phase::Send(p);
+                    Poll::Ready(HostReceipt::from_adapter(accepted as usize, None))
+                }
+            }
+            Phase::Recv(p) if p.token == token => {
+                let HostBuf::Recv(b) = buf else {
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                };
+                if b.len() != p.plan as usize {
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                }
+                if !p.wire_done {
+                    self.phase = Phase::Recv(p);
+                    return Poll::Pending;
+                }
+                let accepted = p.received.min(p.plan).min(p.limit);
+                // Record the device-confirmed prefix: `finish` must not infer
+                // Data-Out progress from the wire byte count.
+                let mut p = p;
+                p.accepted = accepted;
+                self.phase = Phase::Recv(p);
+                Poll::Ready(HostReceipt::from_adapter(accepted as usize, None))
+            }
+            _ => Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
+        }
+    }
+
+    fn cancel(&mut self, token: HostToken) {
+        let live = match self.phase {
+            Phase::Send(p) => p.token == token,
+            Phase::Recv(p) => p.token == token,
+            Phase::Idle => false,
         };
-        assert_eq!(u32::from_be_bytes([p2[0], p2[1], p2[2], p2[3]]), 8);
-        assert_eq!(p2[8], 0x00); // address method 00b
-        assert_eq!(p2[9], 0x00); // LUN 0
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, _, st2) = read_csw(&mut s, &mut work);
-        assert_eq!(st2, 0x00);
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // 03h (reserved) → Failed CSW; 05/24 sense stored on the device.
-        // actual=0 < declared=16 → ZLP, then CSW (BOT §6.7.2 short packet).
-        let raw = raw_cbw(23, 16, 0x80, 0, &[0xA0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 16]);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 0), // ZLP
-            other => panic!("expected ZLP, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, _, st3) = read_csw(&mut s, &mut work);
-        assert_eq!(st3, 0x01); // Failed
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-
-        // REQUEST SENSE → INVALID FIELD IN CDB (0x24).
-        let mut rs = [0u8; 6];
-        rs[0] = scsi_op::REQUEST_SENSE;
-        rs[4] = 18;
-        let raw = raw_cbw(24, 18, 0x80, 0, &rs);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes[12], 0x24),
-            other => panic!("expected sense data, got {other:?}"),
+        if live {
+            self.phase = Phase::Idle;
+            self.host_gen = self.host_gen.wrapping_add(1).max(1);
         }
     }
 
-    #[test]
-    fn report_luns_is_synthesized_for_any_lun() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
+    fn delivery(&self) -> Delivery {
+        self.delivery
+    }
+}
 
-        // REPORT LUNS, allocation 16, addressed to LUN 0.
-        let cdb = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16];
-        let raw = raw_cbw(9, 16, 0x80, 0, &cdb);
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 16);
-                assert_eq!(
-                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                    8
-                ); // one LUN × 8
-                assert_eq!(bytes[8], 0x00); // address method 00b
-                assert_eq!(bytes[9], 0x00); // LUN id 0
+impl BotSession {
+    fn next_token(&mut self) -> HostToken {
+        self.host_gen = self.host_gen.wrapping_add(1).max(1);
+        HostToken::new(0, self.host_gen)
+    }
+
+    /// Stage the next Data-In chunk inside `work` (the caller's bank).
+    fn stage_send(&mut self, work_len: usize) {
+        if let Phase::Send(p) = &mut self.phase {
+            if p.staged.is_some() {
+                return;
             }
-            other => panic!("expected REPORT LUNS data, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn host_asks_for_more_data_gets_short_packet_and_residue() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::ShortNoStall);
-        let mut work = work();
-
-        // INQUIRY data is 96 bytes, but the host declared 192.
-        let raw = raw_cbw(10, 192, 0x80, 0, &inquiry_cdb(96));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
-            other => panic!("expected short INQUIRY packet, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 192 - 96); // short packet + residue, no STALL
-        assert_eq!(status, 0x00);
-    }
-
-    /// Scripted bulk driver for the local `drive_once` helper.
-    struct ScriptIo {
-        out: VecDeque<u8>,
-        sent: RefCell<Vec<u8>>,
-        stall: u32,
-    }
-
-    impl ScriptIo {
-        fn new(out: &[u8]) -> Self {
-            Self {
-                out: out.iter().copied().collect(),
-                sent: RefCell::new(Vec::new()),
-                stall: 0,
+            // Cap the wire phase to the bank; anything beyond it is fill the
+            // `Pad` stage emits from the zero source.
+            let cap = work_len.min(u32::MAX as usize) as u32;
+            if p.stage_limit > cap {
+                p.stage_limit = cap;
             }
-        }
-    }
-
-    impl BotIo for ScriptIo {
-        fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
-            if self.out.is_empty() {
-                return Err(BotIoErr::WouldBlock);
+            if p.wire < p.stage_limit {
+                let n = (p.stage_limit - p.wire).min(WIRE_CHUNK as u32);
+                p.staged = Some(n);
             }
-            let n = self.out.len().min(buf.len());
-            for (i, b) in self.out.drain(..n).enumerate() {
-                buf[i] = b;
-            }
-            Ok(n)
-        }
-
-        fn recv_out(
-            &mut self,
-            buf: &mut [u8],
-            _timeout: Option<Duration>,
-        ) -> Result<usize, BotIoErr> {
-            self.try_recv_out(buf)
-        }
-
-        fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
-            self.sent.borrow_mut().extend_from_slice(buf);
-            Ok(())
-        }
-
-        fn stall_both(&mut self) -> Result<(), ()> {
-            self.stall += 1;
-            Ok(())
-        }
-    }
-
-    /// Drive one transaction to completion over a scripted `BotIo` (the
-    /// removed blocking `step` wrapper's replacement). Returns once the CSW
-    /// has been sent and the core is back in the Command phase.
-    fn drive_once<D: ScsiDevice>(
-        s: &mut BotSession,
-        io: &mut ScriptIo,
-        work: &mut [u8],
-        devs: &mut [D],
-    ) {
-        let mut csw_sent = false;
-        let mut guard = 0usize;
-        loop {
-            guard += 1;
-            assert!(guard < 4096, "drive_once stuck");
-            match s.poll(Event::Tick, work, devs) {
-                Action::HostRecv { len, probe } => {
-                    if csw_sent && len == CBW_LEN {
-                        return;
-                    }
-                    match io.try_recv_out(&mut work[..len]) {
-                        Ok(n) => {
-                            if n == 0 {
-                                return;
-                            }
-                            let _ = s.poll(Event::HostRecv { len: n }, work, devs);
-                        }
-                        Err(BotIoErr::WouldBlock) => {
-                            if probe {
-                                let _ = s.poll(Event::HostIdle, work, devs);
-                            } else {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-                Action::HostSend { bytes, .. } => {
-                    let is_csw = bytes.len() == CSW_LEN && bytes.starts_with(b"USBS");
-                    io.send_in(bytes).expect("bulk send");
-                    let _ = s.poll(Event::HostSent, work, devs);
-                    if is_csw {
-                        csw_sent = true;
-                    }
-                }
-                Action::StallBoth => {
-                    let _ = io.stall_both();
-                }
-                Action::StallIn => {
-                    io.stall_in().expect("stall_in");
-                    let _ = s.poll(Event::StallApplied, work, devs);
-                }
-                Action::Error(e) => panic!("drive_once core error: {e:?}"),
-                // `TestLun` executes the built-in block op inline, so the
-                // session never yields a `Store` here (the `Store` path is
-                // covered end-to-end by the `snowscsi-tests` golden fixtures).
-                Action::Store { .. } => panic!("Store unreachable with the inline test LUN"),
-            }
-        }
-    }
-
-    #[test]
-    fn drive_inquiry_to_completion() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let raw = raw_cbw(0xCAFE, 96, 0x80, 0, &inquiry_cdb(96));
-        let mut io = ScriptIo::new(&raw);
-        drive_once(&mut s, &mut io, &mut work, &mut devs);
-
-        // Sent: 96-byte INQUIRY response then the 13-byte CSW.
-        let sent = io.sent.borrow();
-        assert_eq!(sent.len(), 96 + CSW_LEN);
-        assert_eq!(sent[0] & 0x1F, 0x00);
-        assert_eq!(
-            &sent[sent.len() - CSW_LEN..sent.len() - CSW_LEN + 4],
-            b"USBS"
-        );
-        assert_eq!(
-            u32::from_le_bytes([
-                sent[sent.len() - 9],
-                sent[sent.len() - 8],
-                sent[sent.len() - 7],
-                sent[sent.len() - 6],
-            ]),
-            0xCAFE
-        );
-        assert_eq!(sent[sent.len() - 1], 0x00); // Passed
-    }
-
-    #[test]
-    fn drive_write_with_data_phase() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new();
-        let mut work = work();
-
-        let cdb = [0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0];
-        let raw = raw_cbw(0xBEEF, 512, 0x00, 0, &cdb);
-        let payload: Vec<u8> = (0..512u16).map(|i| (i % 3) as u8).collect();
-        // Queue: CBW + data payload.
-        let mut stream = Vec::with_capacity(31 + 512);
-        stream.extend_from_slice(&raw);
-        stream.extend_from_slice(&payload);
-
-        let mut io = ScriptIo::new(&stream);
-        drive_once(&mut s, &mut io, &mut work, &mut devs);
-        let mut check = [0u8; 512];
-        read_via_xfer(&mut devs[0], 0, &mut check);
-        assert_eq!(&check[..], payload.as_slice());
-    }
-
-    // ── Data-In shortfall policy ────────────────────────────────────
-
-    /// A 10-byte READ(10) CDB for `blocks` blocks at LBA 0.
-    fn read10(blocks: u16) -> [u8; 10] {
-        let mut cdb = [0u8; 10];
-        cdb[0] = scsi_op::READ_10;
-        cdb[7] = (blocks >> 8) as u8;
-        cdb[8] = (blocks & 0xFF) as u8;
-        cdb
-    }
-
-    #[test]
-    fn default_shortfall_is_short_no_stall() {
-        assert_eq!(ShortfallPolicy::default(), ShortfallPolicy::ShortNoStall);
-        // The default session uses the max-compat policy.
-        assert_eq!(BotSession::new().shortfall(), ShortfallPolicy::ShortNoStall);
-        let mut s = BotSession::new();
-        s.set_shortfall(ShortfallPolicy::Pad);
-        assert_eq!(s.shortfall(), ShortfallPolicy::Pad);
-        assert_eq!(
-            BotSession::new()
-                .with_shortfall(ShortfallPolicy::Short)
-                .shortfall(),
-            ShortfallPolicy::Short
-        );
-    }
-
-    #[test]
-    fn pad_fills_shortfall_to_declared_with_relevant_residue() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut work = work();
-
-        // READ(10) 1 block = 512 bytes; host declared 1024.
-        let raw = raw_cbw(1, 1024, 0x80, 0, &read10(1));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
-            other => panic!("expected 512 relevant bytes, got {other:?}"),
-        }
-        // Fill zeros up to `declared`.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 512);
-                assert!(bytes.iter().all(|&b| b == 0), "fill must be zeros");
-            }
-            other => panic!("expected 512 fill bytes, got {other:?}"),
-        }
-        // Then the CSW; residue is the *relevant* shortfall, not 0.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 1);
-        assert_eq!(residue, 1024 - 512);
-        assert_eq!(status, 0x00);
-        expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
-    }
-
-    #[test]
-    fn pad_mps_multiple_shortfall_has_no_stray_trailer() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut work = work();
-
-        // READ(10) 2 blocks = 1024 bytes (2 MPS); host declared 2048.
-        let raw = raw_cbw(2, 2048, 0x80, 0, &read10(2));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 1024),
-            other => panic!("expected 1024 relevant bytes, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 1024),
-            other => panic!("expected 1024 fill bytes, got {other:?}"),
-        }
-        // Fully filled to declared → CSW directly (no ZLP/stray trailer).
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, residue, status) = read_csw(&mut s, &mut work); // asserts CSW length
-        assert_eq!(residue, 2048 - 1024);
-        assert_eq!(status, 0x00);
-    }
-
-    #[test]
-    fn pad_non_mps_aligned_shortfall_still_fills() {
-        // A 95-byte INQUIRY against a declared 192: the final relevant chunk is
-        // zero-extended in-buffer to declared, so the host never sees a
-        // premature short packet.
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut work = work();
-
-        let raw = raw_cbw(3, 192, 0x80, 0, &inquiry_cdb(95));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => {
-                assert_eq!(bytes.len(), 192, "one transfer reaching declared");
-                assert_eq!(bytes[0] & 0x1F, 0x00); // INQUIRY payload
-                assert!(bytes[95..].iter().all(|&b| b == 0), "tail is fill");
-            }
-            other => panic!("expected a single 192-byte transfer, got {other:?}"),
-        }
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 192 - 95);
-        assert_eq!(status, 0x00);
-    }
-
-    #[test]
-    fn pad_cap_hit_ends_short_no_stall() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut work = vec![0u8; 64 * 1024];
-
-        // READ(10) 1 block (512 produced); declared far past produced + MAX_PAD.
-        let declared = 512 + MAX_PAD as u32 + 512;
-        let raw = raw_cbw(4, declared, 0x80, 0, &read10(1));
-        let mut io = ScriptIo::new(&raw);
-        drive_once(&mut s, &mut io, &mut work, &mut devs);
-
-        // 512 relevant + exactly MAX_PAD fill + ZLP (wire is MPS-multiple) + CSW.
-        let wire = 512 + MAX_PAD as usize;
-        let sent = io.sent.borrow();
-        assert_eq!(sent.len(), wire + CSW_LEN, "no STALL, no oversized pour");
-        let csw = &sent[sent.len() - CSW_LEN..];
-        assert_eq!(&csw[..4], b"USBS");
-        assert_eq!(
-            u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]),
-            declared - 512
-        );
-        assert_eq!(csw[12], 0x00);
-    }
-
-    #[test]
-    fn drive_pad_to_declared() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-        let mut work = work();
-
-        let raw = raw_cbw(5, 1024, 0x80, 0, &read10(1));
-        let mut io = ScriptIo::new(&raw);
-        drive_once(&mut s, &mut io, &mut work, &mut devs);
-        // 512 relevant + 512 fill + CSW.
-        assert_eq!(io.sent.borrow().len(), 512 + 512 + CSW_LEN);
-    }
-
-    #[test]
-    fn short_shortfall_zlp_stall_applied_then_csw() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut work = work();
-
-        // READ 1 block (512, an MPS multiple) vs declared 1024.
-        let raw = raw_cbw(6, 1024, 0x80, 0, &read10(1));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 512),
-            other => panic!("expected 512 relevant bytes, got {other:?}"),
-        }
-        // 512 % MPS == 0 → a ZLP first.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
-            other => panic!("expected ZLP, got {other:?}"),
-        }
-        match s.poll(Event::Tick, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert!(bytes.is_empty()),
-            other => panic!("expected pending ZLP, got {other:?}"),
-        }
-        // Then the STALL.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::StallIn => {}
-            other => panic!("expected StallIn, got {other:?}"),
-        }
-        match s.poll(Event::Tick, &mut work, &mut devs) {
-            Action::StallIn => {}
-            other => panic!("expected pending StallIn, got {other:?}"),
-        }
-        // Bulk events are ignored while stalled.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::StallIn => {}
-            other => panic!("expected StallIn, got {other:?}"),
-        }
-        match recv(&mut s, &mut work, &mut devs, &[]) {
-            Action::StallIn => {}
-            other => panic!("expected StallIn, got {other:?}"),
-        }
-        // The shell releases the stall (no CLEAR_FEATURE event to wait for).
-        match s.poll(Event::StallApplied, &mut work, &mut devs) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-            other => panic!("expected CSW, got {other:?}"),
-        }
-        let (tag, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(tag, 6);
-        assert_eq!(residue, 1024 - 512);
-        assert_eq!(status, 0x00);
-    }
-
-    #[test]
-    fn short_non_mps_shortfall_stalls_without_zlp() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut work = work();
-
-        let raw = raw_cbw(7, 192, 0x80, 0, &inquiry_cdb(95));
-        match recv(&mut s, &mut work, &mut devs, &raw) {
-            Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 95),
-            other => panic!("expected 95 relevant bytes, got {other:?}"),
-        }
-        // 95 % MPS != 0: the short packet already terminated the read → STALL
-        // directly, no ZLP.
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::StallIn => {}
-            other => panic!("expected StallIn, got {other:?}"),
-        }
-        let _ = s.poll(Event::StallApplied, &mut work, &mut devs);
-        let (_, residue, status) = read_csw(&mut s, &mut work);
-        assert_eq!(residue, 192 - 95);
-        assert_eq!(status, 0x00);
-    }
-
-    #[test]
-    fn short_bot_reset_in_data_in_stall_aborts() {
-        let mut ram = vec![0u8; 64 * 1024];
-        let mut devs = [test_dev(&mut ram)];
-        let mut s = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-        let mut work = work();
-
-        let raw = raw_cbw(8, 192, 0x80, 0, &inquiry_cdb(95));
-        let _ = recv(&mut s, &mut work, &mut devs, &raw);
-        match sent(&mut s, &mut work, &mut devs) {
-            Action::StallIn => {}
-            other => panic!("expected StallIn, got {other:?}"),
-        }
-
-        // Bot Reset aborts the transaction; the CSW is dropped.
-        expect_recv(reset(&mut s, &mut work, &mut devs), CBW_LEN, false);
-        // A later (stale) release is a no-op: no CSW is emitted.
-        expect_recv(
-            s.poll(Event::StallApplied, &mut work, &mut devs),
-            CBW_LEN,
-            false,
-        );
-    }
-
-    #[test]
-    fn exact_length_transfer_unaffected_by_policy() {
-        for policy in [
-            ShortfallPolicy::Pad,
-            ShortfallPolicy::Short,
-            ShortfallPolicy::ShortNoStall,
-        ] {
-            let mut ram = vec![0u8; 64 * 1024];
-            let mut devs = [test_dev(&mut ram)];
-            let mut s = BotSession::new().with_shortfall(policy);
-            let mut work = work();
-
-            // INQUIRY alloc 96, declared 96: no shortfall.
-            let raw = raw_cbw(10, 96, 0x80, 0, &inquiry_cdb(96));
-            match recv(&mut s, &mut work, &mut devs, &raw) {
-                Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), 96),
-                other => panic!("[{policy:?}] expected 96 bytes, got {other:?}"),
-            }
-            match sent(&mut s, &mut work, &mut devs) {
-                Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
-                other => panic!("[{policy:?}] expected CSW, got {other:?}"),
-            }
-            let (_, residue, status) = read_csw(&mut s, &mut work);
-            assert_eq!(residue, 0, "[{policy:?}] exact transfer has no residue");
-            assert_eq!(status, 0x00);
-            expect_recv(sent(&mut s, &mut work, &mut devs), CBW_LEN, false);
         }
     }
 }

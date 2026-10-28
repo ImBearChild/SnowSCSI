@@ -1,10 +1,8 @@
 //! Golden USB (BOT) replay driver.
 //!
-//! The baseline was recorded with a test-local "driver A"
-//! (`need()`/`poll()` loop plus the `clear_feature_halt()` unlock dance).
-//! The USB session core converged on `Action`/`Event` and the loop
-//! moved into the library as [`snowscsi::usb::serve`], so golden replay now
-//! goes through that shipped loop — the baseline locks the real driver.
+//! Golden replay goes through the shipped `usb::serve` loop over a real core
+//! [`Target`] and its synchronous storage plane — the baseline locks the real
+//! driver.
 //!
 //! [`RecBotIo`] reports script exhaustion as `WouldBlock` (its probe signal,
 //! which ends a Data-Out overrun drain with `Event::HostIdle`), whereas
@@ -16,7 +14,8 @@
 use core::sync::atomic::AtomicBool;
 use core::time::Duration;
 
-use snowscsi::scsi::Luns;
+use snowscsi::core::storage::Storage;
+use snowscsi::core::{RuntimeSet, Target};
 use snowscsi::usb::{serve, BotIo, BotIoErr, BotSession, ServeError};
 
 use crate::golden::{RecBotIo, RecGadget};
@@ -69,19 +68,23 @@ impl BotIo for GoldenBotIo<'_> {
 /// loop (`usb::serve`), which owns the control plane (`RecGadget`) and the
 /// `Action`/`Event` loop. The script ends at a command boundary, where the
 /// adapter reports EOF.
-pub fn serve_usb(
+pub fn serve_usb<S: RuntimeSet>(
     io: &mut RecBotIo,
     gadget: &mut RecGadget,
     session: &mut BotSession,
     work: &mut [u8],
-    luns: &mut Luns<'_>,
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut dyn Storage,
 ) {
     let stop = AtomicBool::new(false);
     let mut io = GoldenBotIo::new(io);
     // The replay script ends at a command boundary: the adapter reports EOF,
     // which `usb::serve` surfaces as `ServeError::Closed` — a clean end for a
     // finite wire script, exactly like `serve_conn`'s iSCSI EOF.
-    match serve(&mut io, gadget, session, work, luns, &stop) {
+    match serve(
+        &mut io, gadget, session, work, scratch, target, storage, &stop,
+    ) {
         Ok(()) | Err(ServeError::Closed) => {}
         Err(e) => panic!("usb::serve failed: {e}"),
     }
@@ -91,12 +94,10 @@ pub fn serve_usb(
 mod tests {
     use super::serve_usb;
     use crate::golden::{split, InStep, TraceEntry, CBW_MAGIC, CSW_MAGIC};
+    use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
     use snowscsi::common::store::StorePlane;
-    use snowscsi::scsi::backend::RamBackend;
-    use snowscsi::scsi::block::BlockDevice;
-    use snowscsi::scsi::device::ScsiDevice;
-    use snowscsi::scsi::Luns;
-    use snowscsi::usb::{Action, BotSession, Event, CBW_LEN, CSW_LEN};
+    use snowscsi::core::{Lu, Target};
+    use snowscsi::usb::{BotSession, CBW_LEN, CSW_LEN};
 
     /// Build a raw 31-byte CBW from its logical fields (little endian).
     ///
@@ -115,28 +116,33 @@ mod tests {
         raw
     }
 
-    fn block_device(backend: &mut RamBackend<'_>) -> BlockDevice {
-        BlockDevice::disk(backend, 512).unwrap()
-    }
-
     /// A normal INQUIRY: the CBW in, 36 data bytes and the CSW out.
     #[test]
     fn normal_inquiry_transaction() {
         let mut ram = vec![0u8; 64 * 1024];
-        let mut backend = RamBackend::new(&mut ram);
-        let mut dev = block_device(&mut backend);
+        let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(128, 512, 0)];
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> =
+            slots.iter_mut().map(|s| s as _).collect();
+        let mut target = Target::new(&mut table[..]);
         let mut session = BotSession::new();
         let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+        let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
 
         // INQUIRY, allocation length 36, Data-In.
         let cdb = [0x12u8, 0, 0, 0, 36, 0];
         let cbw = raw_cbw(1, 36, 0x80, 0, &cdb);
         let (mut io, mut gadget) = split(vec![InStep::Bytes(cbw.to_vec())]);
-
-        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-        let mut luns = Luns::new(&mut devs, &mut planes);
-        serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+        serve_usb(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
 
         // Wire trace: CBW, the 36-byte INQUIRY response, then the CSW.
         assert_eq!(io.trace.len(), 3, "trace: {:?}", io.trace);
@@ -168,10 +174,15 @@ mod tests {
     #[test]
     fn invalid_cbw_stalls_then_unlock_allows_next_cbw() {
         let mut ram = vec![0u8; 64 * 1024];
-        let mut backend = RamBackend::new(&mut ram);
-        let mut dev = block_device(&mut backend);
+        let mut backend = snowscsi::scsi::backend::RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(128, 512, 0)];
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> =
+            slots.iter_mut().map(|s| s as _).collect();
+        let mut target = Target::new(&mut table[..]);
         let mut session = BotSession::new();
         let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+        let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
 
         // Bad signature, then a valid INQUIRY.
         let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
@@ -182,11 +193,15 @@ mod tests {
             InStep::Bytes(bad.to_vec()),
             InStep::Bytes(good.to_vec()),
         ]);
-
-        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-        let mut luns = Luns::new(&mut devs, &mut planes);
-        serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+        serve_usb(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
 
         // Both pipes STALLed exactly once, and the drive recovered to run the
         // valid CBW.
@@ -215,27 +230,35 @@ mod tests {
     }
 
     /// The control seam is serviced by `usb::serve` per the control rules:
-    /// Get Max LUN replies
-    /// with `max_lun()`, Bot Reset acks after `Event::Reset`, Link Reset resets.
+    /// Get Max LUN replies with `max_lun()`, Bot Reset acks after
+    /// `Event::Reset`, Link Reset resets.
     #[test]
     fn control_requests_are_serviced() {
         use crate::golden::CtrlStep;
         use std::sync::atomic::Ordering;
 
+        let mut slots: [TestLu; 0] = [];
+        let mut storage = PlaneSet::new(vec![]);
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> =
+            slots.iter_mut().map(|s| s as _).collect();
+        let mut target = Target::new(&mut table[..]);
         let mut session = BotSession::with_luns(2);
         let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+        let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
         let (mut io, mut gadget) = split(vec![
             InStep::Ctrl(CtrlStep::GetMaxLun),
             InStep::Ctrl(CtrlStep::BotReset),
             InStep::Ctrl(CtrlStep::LinkReset),
         ]);
-
-        let mut devs: [&mut dyn ScsiDevice; 0] = [];
-        let mut planes: [Option<StorePlane<'_>>; 0] = [];
-        {
-            let mut luns = Luns::new(&mut devs, &mut planes);
-            serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
-        }
+        serve_usb(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
 
         assert!(
             io.is_empty(),
@@ -248,11 +271,22 @@ mod tests {
         // Bot Reset acked (after the reset).
         assert_eq!(gadget.acks.len(), 1);
         assert!(gadget.acks[0].acked.load(Ordering::SeqCst));
-        // Link Reset returned to the Command phase without a UA ack handle.
-        // (A fresh empty LUN slice avoids the `Luns` element-lifetime coupling.)
-        let mut poll_devs: [&mut dyn ScsiDevice; 0] = [];
-        match session.poll(Event::Tick, &mut work, &mut poll_devs) {
-            Action::HostRecv {
+        // Link Reset returned the session to the Command phase. The target
+        // used by the replay is terminal after the script closes, so probe
+        // the session with a fresh one.
+        let mut slots2: [TestLu; 0] = [];
+        let mut table2: Vec<&mut dyn Lu<Pair = TestPair>> =
+            slots2.iter_mut().map(|s| s as _).collect();
+        let mut target2 = Target::new(&mut table2[..]);
+        let mut storage2 = PlaneSet::new(vec![]);
+        match session.poll(
+            snowscsi::usb::Event::Tick,
+            &mut work,
+            &mut scratch,
+            &mut target2,
+            &mut storage2,
+        ) {
+            snowscsi::usb::Action::HostRecv {
                 len: CBW_LEN,
                 probe: false,
             } => {}

@@ -1,8 +1,9 @@
 //! Golden wire-level scenarios for USB MSC (BOT).
 //!
 //! Each `#[test]` drives one deterministic scenario through
-//! [`crate::golden_drive::serve_usb`] (the library `usb::serve` loop),
-//! renders the recorded trace and calls [`crate::golden::bless_or_check`] plus
+//! [`crate::golden_drive::serve_usb`] (the library `usb::serve` loop over a
+//! real core `Target`), renders the recorded trace and calls
+//! [`crate::golden::bless_or_check`] plus
 //! [`crate::golden::assert_well_formed`].
 //!
 //! Scenarios are authored in `golden_usb`; the CBW/CDB byte helpers are the
@@ -18,17 +19,35 @@
 
 use crate::golden::{self, InStep, TraceEntry, CSW_MAGIC};
 use crate::golden_drive;
-use crate::usb_bot::{block_device, raw_cbw, rw10};
+use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
+use crate::usb_bot::{raw_cbw, rw10};
 use snowscsi::common::store::StorePlane;
+use snowscsi::core::{Lu, Target};
 use snowscsi::scsi::backend::RamBackend;
-use snowscsi::scsi::device::ScsiDevice;
-use snowscsi::scsi::Luns;
 use snowscsi::usb::{BotSession, ShortfallPolicy, CSW_LEN};
 
 /// Default scenario config: High-Speed BOT, no shortfall STALL, one LUN.
 const CONFIG: &str = "kind=bot mps=512 policy=ShortNoStall luns=1";
 
-/// Fixed deterministic backend pattern (`i % 251`), as pinned by
+/// Build the core target + storage and the two banks for one scenario.
+macro_rules! fixture {
+    (
+        $slots:ident, $table:ident, $target:ident, $storage:ident, $work:ident, $scratch:ident
+        = $slots_init:expr, $planes:expr
+    ) => {
+        let mut $slots = $slots_init;
+        let mut $table: Vec<&mut dyn Lu<Pair = TestPair>> = $slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut $target = Target::new(&mut $table[..]);
+        let mut $storage = PlaneSet::new($planes);
+        let mut $work = vec![0u8; 64 * 1024];
+        let mut $scratch = vec![0u8; 1 << 20];
+    };
+}
+
+/// Fixed deterministic backend pattern (`i % 251`).
 fn pattern_ram(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
@@ -87,22 +106,34 @@ fn finish(name: &str, config: &str, io: &golden::RecBotIo) {
     golden::bless_or_check(name, &text);
 }
 
-/// ① INQUIRY (OutInline + CSW).
+/// ① INQUIRY (device data + CSW).
 #[test]
 fn usb_01_inquiry() {
     const NAME: &str = "usb_01_inquiry";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let cdb = [0x12, 0, 0, 0, 36, 0];
     let (mut io, mut gadget) =
         golden::split(vec![InStep::Bytes(raw_cbw(1, 36, 0x80, 0, &cdb).to_vec())]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_eq!(data_chunks(&io, 36).len(), 1);
     assert_csw(&io, 1, 0, 0x00);
@@ -115,16 +146,28 @@ fn usb_02_read_single_block() {
     const NAME: &str = "usb_02_read_single_block";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![InStep::Bytes(
         raw_cbw(2, 512, 0x80, 0, &rw10(0x28, 0, 1)).to_vec(),
     )]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_eq!(data_chunks(&io, 512).len(), 1);
     assert_csw(&io, 2, 0, 0x00);
@@ -137,16 +180,28 @@ fn usb_03_read_three_chunks() {
     const NAME: &str = "usb_03_read_three_chunks";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![InStep::Bytes(
         raw_cbw(3, 20480, 0x80, 0, &rw10(0x28, 0, 40)).to_vec(),
     )]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     let lens: Vec<usize> = data_entries(&io).iter().map(|b| b.len()).collect();
     assert_eq!(lens, vec![8192, 8192, 4096], "chunk split");
@@ -160,20 +215,32 @@ fn usb_04_write_then_read() {
     const NAME: &str = "usb_04_write_then_read";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
-    let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let payload: Vec<u8> = (0..512).map(|i| (i * 7 % 256) as u8).collect();
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
+    let mut session = BotSession::new();
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(raw_cbw(4, 512, 0x00, 0, &rw10(0x2A, 1, 1)).to_vec()),
         InStep::Bytes(payload.clone()),
         InStep::WouldBlock,
         InStep::Bytes(raw_cbw(5, 512, 0x80, 0, &rw10(0x28, 1, 1)).to_vec()),
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_csw(&io, 4, 0, 0x00);
     assert_csw(&io, 5, 0, 0x00);
@@ -189,19 +256,31 @@ fn usb_05_write_short_residue() {
     const NAME: &str = "usb_05_write_short_residue";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let payload = vec![0x5Au8; 1024];
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(raw_cbw(1, 1024, 0x00, 0, &rw10(0x2A, 0, 1)).to_vec()),
         InStep::Bytes(payload),
         InStep::WouldBlock,
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_csw(&io, 1, 512, 0x00);
     finish(NAME, CONFIG, &io);
@@ -214,16 +293,28 @@ fn usb_06_shortfall_short() {
     const SHORT_CONFIG: &str = "kind=bot mps=512 policy=Short luns=1";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new().with_shortfall(ShortfallPolicy::Short);
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![InStep::Bytes(
         raw_cbw(1, 1024, 0x80, 0, &rw10(0x28, 0, 1)).to_vec(),
     )]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_eq!(data_chunks(&io, 512).len(), 1, "512 relevant bytes");
     assert!(
@@ -238,53 +329,78 @@ fn usb_06_shortfall_short() {
     finish(NAME, SHORT_CONFIG, &io);
 }
 
-/// ⑦ `ShortNoStall` (default): INQUIRY 95 vs declared 192 → short packet.
+/// ⑦ `ShortNoStall` (default): INQUIRY 95 against the 36-byte core page vs
+/// declared 192 → short packet.
 #[test]
 fn usb_07_shortfall_short_no_stall() {
     const NAME: &str = "usb_07_shortfall_short_no_stall";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![InStep::Bytes(
         raw_cbw(2, 192, 0x80, 0, &[0x12, 0, 0, 0, 95, 0]).to_vec(),
     )]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
-    assert_eq!(data_chunks(&io, 95).len(), 1, "short packet is 95 bytes");
-    assert_csw(&io, 2, 97, 0x00);
+    assert_eq!(data_chunks(&io, 36).len(), 1, "short packet is 36 bytes");
+    assert_csw(&io, 2, 192 - 36, 0x00);
     finish(NAME, CONFIG, &io);
 }
 
-/// ⑧ `Pad`: the 95-byte response is zero-padded to 192 in-buffer.
+/// ⑧ `Pad`: the 36-byte response is zero-padded to 192 in-buffer.
 #[test]
 fn usb_08_shortfall_pad() {
     const NAME: &str = "usb_08_shortfall_pad";
     const PAD_CONFIG: &str = "kind=bot mps=512 policy=Pad luns=1";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new().with_shortfall(ShortfallPolicy::Pad);
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![InStep::Bytes(
         raw_cbw(2, 192, 0x80, 0, &[0x12, 0, 0, 0, 95, 0]).to_vec(),
     )]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     let padded = data_chunks(&io, 192);
     assert_eq!(padded.len(), 1, "padded wire line is 192 bytes");
     assert!(
-        padded[0][95..].iter().all(|&b| b == 0),
-        "the 97 fill bytes are zero"
+        padded[0][36..].iter().all(|&b| b == 0),
+        "the 156 fill bytes are zero"
     );
-    assert_csw(&io, 2, 97, 0x00);
+    assert_csw(&io, 2, 192 - 36, 0x00);
     finish(NAME, PAD_CONFIG, &io);
 }
 
@@ -294,19 +410,31 @@ fn usb_09_write_overrun() {
     const NAME: &str = "usb_09_write_overrun";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(raw_cbw(1, 512, 0x00, 0, &rw10(0x2A, 0, 1)).to_vec()),
         InStep::Bytes(vec![0x5A; 512]),
         InStep::Bytes(vec![0x6B; 8192]),
         InStep::WouldBlock,
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     // The extra 8192 bytes were drained, so only the declared 512 were written.
     assert_csw(&io, 1, 0, 0x00);
@@ -319,19 +447,31 @@ fn usb_10_invalid_cbw() {
     const NAME: &str = "usb_10_invalid_cbw";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let mut bad = raw_cbw(1, 0, 0, 0, &[0, 0, 0, 0, 0, 0]);
     bad[0] = b'X';
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(bad.to_vec()),
         InStep::Bytes(raw_cbw(2, 36, 0x80, 0, &[0x12, 0, 0, 0, 36, 0]).to_vec()),
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert!(
         io.trace.contains(&TraceEntry::Mark("stall_both")),
@@ -348,20 +488,31 @@ fn usb_11_write_read_only() {
     const NAME: &str = "usb_11_write_read_only";
     let mut ram = pattern_ram(64 * 1024);
     let mut backend = RamBackend::new(&mut ram);
-    let mut dev = block_device(&mut backend);
-    dev.set_writable(false);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block_read_only(128, 512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(raw_cbw(1, 512, 0x00, 0, &rw10(0x2A, 0, 1)).to_vec()),
         InStep::Bytes(vec![0u8; 512]),
         InStep::WouldBlock,
         InStep::Bytes(raw_cbw(2, 18, 0x80, 0, &[0x03, 0, 0, 0, 18, 0]).to_vec()),
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_csw(&io, 1, 512, 0x01); // Failed, declared drained (residue = declared)
     let sense = data_chunks(&io, 18);
@@ -381,10 +532,19 @@ fn usb_12_multi_lun() {
     let mut ram1 = vec![0x02u8; 64 * 1024];
     let mut backend0 = RamBackend::new(&mut ram0);
     let mut backend1 = RamBackend::new(&mut ram1);
-    let mut dev0 = block_device(&mut backend0);
-    let mut dev1 = block_device(&mut backend1);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::block(128, 512, 0), TestLu::block(128, 512, 1)],
+        vec![
+            Some(StorePlane::BlockRw(&mut backend0)),
+            Some(StorePlane::BlockRw(&mut backend1)),
+        ]
+    );
     let mut session = BotSession::with_luns(2);
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let payload = vec![0xABu8; 512];
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(raw_cbw(1, 512, 0x00, 0, &rw10(0x2A, 0, 1)).to_vec()),
@@ -393,13 +553,15 @@ fn usb_12_multi_lun() {
         InStep::Bytes(raw_cbw(2, 512, 0x80, 0, &rw10(0x28, 0, 1)).to_vec()),
         InStep::Bytes(raw_cbw(3, 512, 0x80, 1, &rw10(0x28, 0, 1)).to_vec()),
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 2] = [&mut dev0, &mut dev1];
-    let mut planes: [Option<StorePlane<'_>>; 2] = [
-        Some(StorePlane::BlockRw(&mut backend0)),
-        Some(StorePlane::BlockRw(&mut backend1)),
-    ];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_csw(&io, 1, 0, 0x00);
     assert_csw(&io, 2, 0, 0x00);
@@ -418,19 +580,18 @@ fn usb_12_multi_lun() {
 #[test]
 fn usb_13_format_read_sync() {
     const NAME: &str = "usb_13_format_read_sync";
-    use snowscsi::cdrom::dvdram::DvdRamMedia;
-    use snowscsi::cdrom::{CdMedia, CdromDrive, HYPER_MULTI_CAPS};
-
     let mut ram = vec![0u8; 1 << 20];
-    let mut be = snowscsi::scsi::backend::RamBackend::new(&mut ram);
-    let mut drive = CdromDrive::builder().capabilities(HYPER_MULTI_CAPS).build();
-    // The media caches only the geometry; the byte plane is handed to the
-    // session as the LUN's store plane below (FORMAT's `Fill` and SYNC
-    // CACHE's `Sync` agenda ops are executed against it, invisibly on wire).
-    let _ = drive.load_quiet(CdMedia::Rw(DvdRamMedia::open(&mut be)));
-
+    let mut backend = RamBackend::new(&mut ram);
+    fixture!(
+        slots,
+        table,
+        target,
+        storage,
+        work,
+        scratch = [TestLu::dvdram(512, 0)],
+        vec![Some(StorePlane::BlockRw(&mut backend))]
+    );
     let mut session = BotSession::new();
-    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
     let (mut io, mut gadget) = golden::split(vec![
         InStep::Bytes(
             raw_cbw(1, 12, 0x00, 0, &[0x04, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to_vec(),
@@ -443,12 +604,15 @@ fn usb_13_format_read_sync() {
         InStep::Bytes(raw_cbw(3, 2048, 0x80, 0, &rw10(0x28, 0, 1)).to_vec()),
         InStep::Bytes(raw_cbw(4, 0, 0x00, 0, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to_vec()),
     ]);
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
-    // Real writable plane for the DVD-RAM LUN: the drive yields its FORMAT
-    // `Fill` and SYNC CACHE `Sync` maintenance here (agenda), never inline.
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut be))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    golden_drive::serve_usb(&mut io, &mut gadget, &mut session, &mut work, &mut luns);
+    golden_drive::serve_usb(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
 
     assert_csw(&io, 1, 0, 0x00);
     assert_csw(&io, 2, 0, 0x00);

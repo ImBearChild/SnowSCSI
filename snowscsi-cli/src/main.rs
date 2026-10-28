@@ -44,10 +44,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser};
 use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
-use snowscsi::cdrom::drive::CdromDrive;
 #[cfg(feature = "dvdram")]
-use snowscsi::cdrom::dvdram::DvdRamMedia;
-use snowscsi::cdrom::media::{CdMedia, LiveData};
+use snowscsi::cdrom::media::LiveData;
 use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
@@ -59,10 +57,7 @@ use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{FlatCdMedium, MmcDrive};
 use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
-use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::ScsiDevice;
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
-use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
 use spec::{Backing, DeviceRole, DeviceSpec};
 use stack::{CliLu, CliMedium, CliPair, CliStorage};
@@ -204,6 +199,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::needless_return)]
 fn run_serve(args: ServeArgs) -> ExitCode {
     init_logging(args.verbose);
 
@@ -224,67 +220,31 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The two transports use different LUN stacks while the USB rewrite is
-    // pending: iSCSI drives the core `Target`, USB keeps the legacy
-    // `ScsiDevice` bundle. Only one transport is selected at a time.
+    // Both transports drive the seam-first core `Target`: only one transport
+    // is selected at a time.
     if args.usb.is_none() {
         return run_serve_iscsi(args, &specs, work_size);
     }
-    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
-    let mut backends: Vec<BlockBackend> = Vec::new();
-    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
-    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
-    let mut disks: Vec<BlockDevice> = Vec::new();
-    let mut drives: Vec<CdromDrive> = Vec::new();
-    // Store planes, one per LUN, 1:1 aligned with `devs` below.
-    let mut planes: Vec<Option<StorePlane>> = Vec::new();
-    if build_devices(
-        &specs,
-        &mut ram_disks,
-        &mut backends,
-        &mut lives,
-        &mut bundles,
-        &mut disks,
-        &mut drives,
-        &mut planes,
-    )
-    .is_err()
+    #[cfg(target_os = "linux")]
     {
-        return ExitCode::FAILURE;
+        let selector = args.usb.as_deref().unwrap_or("auto");
+        return run_serve_usb(&args, &specs, work_size, selector);
     }
-    // LUN array in protocol order: all --block LUNs, then all --cdrom LUNs.
-    // `devs` and `planes` are built in the same spec order, so index `i` of
-    // each describes the same LUN (the 1:1 invariant `Luns` relies on).
-    let mut devs: Vec<&mut dyn ScsiDevice> = disks
-        .iter_mut()
-        .map(|d| d as &mut dyn ScsiDevice)
-        .chain(drives.iter_mut().map(|d| d as &mut dyn ScsiDevice))
-        .collect();
-    let mut luns = Luns::new(&mut devs, &mut planes);
-
-    if let Some(selector) = args.usb.as_deref() {
-        #[cfg(target_os = "linux")]
-        {
-            return run_serve_usb(&args, &mut luns, work_size, selector);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!("snowscsi: --usb is only supported on Linux");
-            return ExitCode::FAILURE;
-        }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = work_size;
+        eprintln!("snowscsi: --usb is only supported on Linux");
+        ExitCode::FAILURE
     }
-
-    // `run_serve` only reachable with `--usb`; the iSCSI branch returned above.
-    ExitCode::FAILURE
 }
 
-/// Build the core `Target` slot set for the iSCSI transport.
+/// Build the core `Target` slot set shared by both transports.
 ///
-/// Mirrors [`build_devices`]'s plane mapping but produces `Spc<BlockDevice>` /
-/// `Spc<MmcDrive<CliMedium>>` slots instead of the legacy `ScsiDevice`
-/// profiles. Every spec pushes exactly one slot and one plane, in spec order.
+/// Produces `Spc<BlockDevice>` / `Spc<MmcDrive<CliMedium>>` slots and their
+/// matching store planes. Every spec pushes exactly one slot and one plane, in
+/// spec order.
 #[allow(clippy::too_many_arguments)]
-fn build_iscsi_slots<'a>(
+fn build_core_slots<'a>(
     specs: &[DeviceSpec],
     ram_disks: &'a mut Vec<Vec<u8>>,
     backends: &'a mut Vec<BlockBackend<'a>>,
@@ -448,7 +408,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> E
     let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
     let mut planes: Vec<Option<StorePlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_iscsi_slots(
+    if build_core_slots(
         specs,
         &mut ram_disks,
         &mut backends,
@@ -552,17 +512,6 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> E
     }
     log::info!("shutting down");
     ExitCode::SUCCESS
-}
-
-/// Flush every store plane; errors are reported to stderr but not fatal.
-fn sync_planes(planes: &mut [Option<StorePlane<'_>>]) {
-    for (i, plane) in planes.iter_mut().enumerate() {
-        if let Some(plane) = plane {
-            if let Err(e) = plane.sync() {
-                eprintln!("snowscsi: sync failed for LUN {i}: {e}");
-            }
-        }
-    }
 }
 
 // ── iSCSI auto-config (open-iscsi) ─────────────────────────────────────
@@ -1092,193 +1041,6 @@ fn build_resources<'a>(
     Ok(())
 }
 
-/// Shared device pipeline: build every parsed [`DeviceSpec`] into a device and
-/// its store plane, in order (all `--block` devices first, then all `--cdrom`
-/// devices).
-///
-/// Ownership model: the caller owns every resource — RAM slots
-/// (`ram_disks`), block/optical backends, live scanners and bundles — and the
-/// store planes borrow from them. Each spec pushes exactly one device
-/// (`disks`/`drives`) and one plane (`planes`), so the two are 1:1 aligned and
-/// can be zipped into a [`Luns`] bundle. The caller then lends that bundle to a
-/// transport. On failure prints the error and returns `Err(())`.
-///
-/// Plane mapping:
-/// - writable `--block` → [`BlockDevice::disk`] + [`StorePlane::BlockRw`];
-/// - read-only `--block` → [`BlockDevice::disk_read_only`] +
-///   [`StorePlane::BlockRo`];
-/// - `--block …,profile=cd` → [`BlockDevice::cdrom`] +
-///   [`StorePlane::BlockRo`];
-/// - `--cdrom img=<iso>` / `live=<dir>` → `CdromDrive` +
-///   [`StorePlane::BlockRo`] (the drive keeps only cached geometry; reads go
-///   through the plane);
-/// - `--cdrom dvdram=<img>` → `CdromDrive` + [`StorePlane::BlockRw`].
-#[allow(clippy::too_many_arguments)]
-fn build_devices<'a>(
-    specs: &[DeviceSpec],
-    ram_disks: &'a mut Vec<Vec<u8>>,
-    backends: &'a mut Vec<BlockBackend<'a>>,
-    lives: &'a mut Vec<LiveData<StdFsBackend>>,
-    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
-    disks: &mut Vec<BlockDevice>,
-    drives: &mut Vec<CdromDrive>,
-    planes: &mut Vec<Option<StorePlane<'a>>>,
-) -> Result<(), ()> {
-    if specs.is_empty() {
-        eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
-        return Err(());
-    }
-
-    for w in spec::check_dual_mount(specs) {
-        eprintln!("{w}");
-    }
-
-    build_resources(specs, ram_disks, backends, lives, bundles)?;
-
-    // ── Phase B: build one (device, plane) pair per spec ──────────
-    // Each backend is lent exactly once: both the block devices and the MMC
-    // `CdromDrive` read geometry once at construction and hand the plane to
-    // the LUN's `StorePlane` (reads/writes then flow through the plane).
-    // Every arm pushes exactly one device and one plane, in spec order, so
-    // the two stay 1:1 aligned.
-    disks.clear();
-    drives.clear();
-    planes.clear();
-    let mut be_iter = backends.iter_mut();
-    let mut live_iter = lives.iter_mut();
-    #[cfg(feature = "bundle")]
-    let mut bundle_iter = bundles.iter_mut();
-    for (lun, spec) in specs.iter().enumerate() {
-        log::debug!("LUN {lun}: {}", spec.raw);
-        match (spec.role, &spec.backing) {
-            #[cfg(feature = "bundle")]
-            (DeviceRole::BlockDisk, Backing::ImgDir { dir }) => {
-                let be = bundle_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
-                let cap = be.capacity();
-                if spec.plane.read_only {
-                    // Read-only disk image: lock the device policy and expose
-                    // the plane read-only — both layers agree.
-                    let dev =
-                        BlockDevice::disk_read_only(&mut *be, spec.plane.sector).map_err(|e| {
-                            eprintln!("snowscsi: bundle: invalid geometry for {dir}: {e}")
-                        })?;
-                    disks.push(dev);
-                    planes.push(Some(StorePlane::BlockRo(be)));
-                } else {
-                    let dev = BlockDevice::disk(&mut *be, spec.plane.sector).map_err(|e| {
-                        eprintln!("snowscsi: bundle: invalid geometry for {dir}: {e}")
-                    })?;
-                    disks.push(dev);
-                    planes.push(Some(StorePlane::BlockRw(be)));
-                }
-                log::debug!(
-                    "LUN {lun}: bundle block device ({cap} bytes, sector {})",
-                    spec.plane.sector
-                );
-            }
-            #[cfg(feature = "bundle")]
-            (DeviceRole::BlockCd, Backing::ImgDir { dir }) => {
-                let be = bundle_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
-                let cap = be.capacity();
-                let dev = BlockDevice::cdrom(&mut *be).map_err(|e| {
-                    eprintln!("snowscsi: bundle: invalid CD geometry for {dir}: {e}")
-                })?;
-                disks.push(dev);
-                planes.push(Some(StorePlane::BlockRo(be)));
-                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
-            }
-            (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
-                if spec.plane.read_only {
-                    let dev = BlockDevice::disk_read_only(&mut *be, SECTOR_SIZE)
-                        .expect("SECTOR_SIZE is nonzero");
-                    disks.push(dev);
-                    planes.push(Some(StorePlane::BlockRo(be)));
-                } else {
-                    let dev =
-                        BlockDevice::disk(&mut *be, SECTOR_SIZE).expect("SECTOR_SIZE is nonzero");
-                    disks.push(dev);
-                    planes.push(Some(StorePlane::BlockRw(be)));
-                }
-                log::debug!(
-                    "LUN {lun}: block device ({cap} bytes{})",
-                    if spec.plane.read_only {
-                        ", read-only"
-                    } else {
-                        ""
-                    }
-                );
-            }
-            (DeviceRole::BlockCd, Backing::Img { .. } | Backing::Ram { .. }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
-                // Optical image profile (PDT 0x05): writes rejected at the
-                // profile level; the plane is read-only to match.
-                let dev = BlockDevice::cdrom(&mut *be).expect("nonzero sectors");
-                disks.push(dev);
-                planes.push(Some(StorePlane::BlockRo(be)));
-                log::debug!("LUN {lun}: CD profile ({cap} bytes)");
-            }
-            (DeviceRole::MmcCd, Backing::Img { path }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
-                let mut drive = CdromDrive::new();
-                drive.load(CdMedia::ro(&mut *be));
-                log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
-                drives.push(drive);
-                planes.push(Some(StorePlane::BlockRo(be)));
-            }
-            (DeviceRole::MmcCd, Backing::Live { dir }) => {
-                let live = live_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: live pool exhausted"))?;
-                let total = live.layout().total;
-                let mut drive = CdromDrive::new();
-                drive.load(CdMedia::ro(&mut *live));
-                log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
-                drives.push(drive);
-                planes.push(Some(StorePlane::BlockRo(live)));
-            }
-            #[cfg(feature = "dvdram")]
-            (DeviceRole::MmcCd, Backing::DvdRam { path: _ }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                // A blank, random-writable DVD-RAM over the byte plane. The
-                // host formats it (FORMAT UNIT + its own UDF mkfs); the device
-                // never writes file-system structures.
-                let media = DvdRamMedia::open(&mut *be);
-                log::debug!("LUN {lun}: DvdRam DVD-RAM ({} bytes)", media.capacity());
-                let mut drive = CdromDrive::builder()
-                    .capabilities(snowscsi::cdrom::HYPER_MULTI_CAPS)
-                    .build();
-                drive.load(CdMedia::Rw(media));
-                drives.push(drive);
-                planes.push(Some(StorePlane::BlockRw(be)));
-            }
-            _ => {
-                eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
-                return Err(());
-            }
-        }
-    }
-    // One plane per LUN: `disks` then `drives` reproduces spec order because
-    // `parse_all` emits every `--block` spec before every `--cdrom` spec.
-    debug_assert_eq!(disks.len() + drives.len(), planes.len());
-    Ok(())
-}
-
 fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
     let f = File::create(path)?;
     f.set_len(size)?;
@@ -1287,13 +1049,39 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 /// `snowscsi serve --usb`: assemble the MSC FunctionFS gadget, bind it to a
-/// UDC and drive the library BOT loop ([`usb_serve`], §6).
+/// UDC, build the core `Target` over the parsed specs and drive the library
+/// BOT loop ([`usb_serve`]).
 fn run_serve_usb(
     args: &ServeArgs,
-    luns: &mut Luns<'_>,
+    specs: &[DeviceSpec],
     work_size: usize,
     selector: &str,
 ) -> ExitCode {
+    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
+    let mut backends: Vec<BlockBackend> = Vec::new();
+    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
+    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
+    let mut planes: Vec<Option<StorePlane>> = Vec::new();
+    let mut slots: Vec<CliLu> = Vec::new();
+    if build_core_slots(
+        specs,
+        &mut ram_disks,
+        &mut backends,
+        &mut lives,
+        &mut bundles,
+        &mut planes,
+        &mut slots,
+    )
+    .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = CliPair>)
+        .collect();
+    let mut storage = CliStorage::new(planes);
+
     // Gadget assembly: a single MSC interface (class 08/06/50) with
     // one bulk OUT + one bulk IN endpoint.
     let (ep_out, out_dir) = EndpointDirection::host_to_device();
@@ -1357,25 +1145,35 @@ fn run_serve_usb(
             return ExitCode::FAILURE;
         }
     };
-    let mut session = BotSession::with_luns(luns.len()).with_shortfall(shortfall);
+    let lun_count = table.len();
+    let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
     let mut work = vec![0u8; work_size];
+    let mut scratch = vec![0u8; work_size];
+    let mut target = snowscsi::core::Target::new(&mut table[..]);
 
-    log::info!("serving {} LUN(s) over USB", luns.len());
+    log::info!("serving {} LUN(s) over USB", lun_count);
     if let Err(e) = usb_serve(
         &mut ffs_bot,
         &mut ffs_gadget,
         &mut session,
         &mut work,
-        luns,
+        &mut scratch,
+        &mut target,
+        &mut storage,
         &stop,
     ) {
         eprintln!("snowscsi: usb serve error: {e}");
+        if let Err((i, e)) = storage.sync() {
+            eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+        }
         return ExitCode::FAILURE;
     }
 
     // Graceful exit: flush every store plane, unregister the gadget (RAII),
     // then unmount configfs again if the `dummy` auto-config mounted it.
-    sync_planes(luns.planes);
+    if let Err((i, e)) = storage.sync() {
+        eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+    }
     drop(reg);
     release_configfs(owns_configfs);
     log::info!("shutting down");

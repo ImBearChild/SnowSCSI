@@ -49,12 +49,9 @@ pub enum RecvMode {
 ///   transport may return several packets in one call. Either way `n` is a
 ///   byte count — the caller re-receives until the phase ends, so a short
 ///   `n` is progress, not a partial read to retry.
-/// - `buf` is the caller's receive scratch. Paths that pre-receive ahead of
-///   the core must size it to at least one bulk max packet size; a path that
-///   receives only the core-requested length may pass a shorter buffer (a
-///   31-byte CBW, or a sub-MPS final data chunk). A host packet larger than
-///   `buf` is a host overrun — the transport reports it as an error
-///   ([`BotIoErr::Io`]), not a caller sizing bug.
+/// - `buf` is the caller's receive scratch, sized to the chunk the core asked
+///   for. A host packet larger than `buf` is a host overrun — the transport
+///   reports it as an error ([`BotIoErr::Io`]), not a caller sizing bug.
 /// - `Ok(0)` means the link is down — the stream has ended (host unplug /
 ///   device detach). The shell treats it as terminal (it closes the loop, like
 ///   a closed connection); a transport that can tell a recoverable disconnect

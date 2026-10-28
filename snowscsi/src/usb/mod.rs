@@ -8,6 +8,10 @@
 //! outside the lib (FunctionFS on Linux, embedded USB device stacks on MCUs)
 //! and implement [`BotIo`] / [`Gadget`].
 //!
+//! SCSI command execution is delegated to the core [`Target`](crate::core::Target);
+//! the session is the transport's [`HostTransport`](crate::core::storage::HostTransport)
+//! and the shell's storage adapter executes the device's I/O.
+//!
 //! The data area handed to the SCSI device layer is a pure data region
 //! ([`crate::MIN_DATA_LEN`]); CBWs and CSWs live in `BotSession`'s internal
 //! buffers, so protocol frames never share memory with SCSI data.
@@ -17,17 +21,32 @@
 //! The shell feeds bulk events in; the session hands back the next action.
 //! A complete no-data transaction (TEST UNIT READY) is two steps:
 //!
-//! ```
-//! use snowscsi::common::seekable_storage::RamBackend;
-//! use snowscsi::scsi::block::BlockDevice;
+//! ```no_run
+//! use snowscsi::block::{BlockAttrs, BlockDevice};
+//! use snowscsi::core::storage::{BlockingStorage, IoBuf, IoReq, StorageReceipt, SyncStorage};
+//! use snowscsi::core::{Lu, LuImpl, NoMedium, Pair, Target};
 //! use snowscsi::usb::{Action, BotSession, Event, CBW_LEN, CBW_SIGNATURE, CSW_LEN};
 //! use snowscsi::MIN_DATA_LEN;
 //!
-//! let mut ram = vec![0u8; 64 * 1024];
-//! let mut lun = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
-//! let mut devs = [lun];
+//! struct Zeroes;
+//! impl SyncStorage for Zeroes {
+//!     fn exec(&mut self, _req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+//!         let len = match &buf {
+//!             IoBuf::None => 0,
+//!             IoBuf::Read(b) => b.len(),
+//!             IoBuf::Write(b) => b.len(),
+//!         };
+//!         StorageReceipt::ok(len)
+//!     }
+//! }
+//!
+//! let mut slot = LuImpl::new(BlockDevice::new(BlockAttrs::new(16, 512)), 0u8);
+//! let table: &mut [&mut dyn Lu<Pair = Pair<NoMedium, u8>>] = &mut [&mut slot];
+//! let mut target = Target::new(table);
+//! let mut storage = BlockingStorage::new(Zeroes);
 //! let mut session = BotSession::new();
 //! let mut work = vec![0u8; MIN_DATA_LEN];
+//! let mut scratch = vec![0u8; MIN_DATA_LEN];
 //!
 //! // A valid TEST UNIT READY CBW: signature + tag + declared length 0 +
 //! // flags 0 (no data phase) + LUN 0 + 6-byte CDB (opcode 0x00).
@@ -38,13 +57,25 @@
 //!
 //! // Host bytes land in `work`; one bulk-OUT completion → the CSW is pending.
 //! work[..CBW_LEN].copy_from_slice(&cbw);
-//! match session.poll(Event::HostRecv { len: CBW_LEN }, &mut work, &mut devs) {
-//!     Action::HostSend { bytes, .. } => assert_eq!(bytes.len(), CSW_LEN),
+//! match session.poll(
+//!     Event::HostRecv { len: CBW_LEN },
+//!     &mut work,
+//!     &mut scratch,
+//!     &mut target,
+//!     &mut storage,
+//! ) {
+//!     Action::HostSend { bytes } => assert_eq!(bytes.len(), CSW_LEN),
 //!     other => panic!("expected CSW, got {other:?}"),
 //! }
 //!
 //! // Bulk-IN sent → back in the Command phase, ready for the next CBW.
-//! match session.poll(Event::HostSent, &mut work, &mut devs) {
+//! match session.poll(
+//!     Event::HostSent,
+//!     &mut work,
+//!     &mut scratch,
+//!     &mut target,
+//!     &mut storage,
+//! ) {
 //!     Action::HostRecv { len, probe: false } => assert_eq!(len, CBW_LEN),
 //!     other => panic!("expected next CBW receive, got {other:?}"),
 //! }
