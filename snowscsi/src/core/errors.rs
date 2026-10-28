@@ -70,7 +70,7 @@ pub enum Completion {
     Check(Sense),
     /// The device is busy and the command was not started.
     Busy,
-    /// Reservation conflict (no reservations are created in P2a).
+    /// Reservation conflict (no reservations are created).
     ReservationConflict,
     /// The task set is full.
     TaskSetFull,
@@ -106,7 +106,7 @@ pub enum Fault {
     Boundary,
     /// A permit/receipt belongs to another target.
     ForeignBoundary,
-    /// Runtime wire LUN is outside this Target's fixed slot set (R30).
+    /// Runtime wire LUN is outside this Target's fixed slot set.
     LunNotFound,
 }
 

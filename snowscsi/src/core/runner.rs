@@ -265,13 +265,13 @@ pub struct Runner {
 
 impl Runner {
     /// Standalone runner (owner [`TargetId::UNBOUND`]).
-    #[allow(dead_code)] // wired by `Target::new` (C2) and driven by tests here
+    #[allow(dead_code)] // wired by `Target::new` and driven by tests here
     pub(crate) fn new() -> Self {
         Self::for_target(TargetId::UNBOUND)
     }
 
     /// Runner owned by `owner`; permits minted here only match that owner.
-    #[allow(dead_code)] // `Target` (C2) constructs its runner with its identity
+    #[allow(dead_code)] // `Target` constructs its runner with its identity
     pub(crate) fn for_target(owner: TargetId) -> Self {
         Self {
             owner,
@@ -302,7 +302,7 @@ impl Runner {
     }
 
     /// Owning target identity.
-    #[allow(dead_code)] // read by `Target::owner` (C2)
+    #[allow(dead_code)] // read by `Target::owner`
     pub(crate) const fn owner(&self) -> TargetId {
         self.owner
     }
@@ -594,7 +594,7 @@ impl Runner {
 
     /// Start one command: admission and `prepare` only. All data/IO work happens
     /// in [`Runner::step_command`], which may return `Pending` across calls.
-    #[allow(dead_code)] // `Target::drive_start_*` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::drive_start_*`; driven by tests here
     pub(crate) fn start_command<L: Lu + ?Sized>(
         &self,
         lu: &mut L,
@@ -973,8 +973,8 @@ impl Runner {
 
     /// Advance one command step. `Pending` across calls keeps the feedback, the
     /// command phase and the pending token; `scratch` is the shell-owned second
-    /// bank (unused in P2a, which runs one command at a time).
-    #[allow(dead_code)] // `Target::drive_step_*` (C2); driven by tests here
+    /// bank (one command runs at a time).
+    #[allow(dead_code)] // `Target::drive_step_*`; driven by tests here
     pub(crate) fn step_command<L: Lu + ?Sized>(
         &mut self,
         lu: &mut L,
@@ -1375,9 +1375,9 @@ impl Runner {
                     return Ok(DriveStep::Done(completion));
                 }
                 PollStep::Idle => {
-                    // The device produced neither work nor a completion. P2a
-                    // keeps the model's no-progress fallback: the command is
-                    // fixed as `Busy` instead of spinning.
+                    // The device produced neither work nor a completion; the
+                    // no-progress fallback fixes the command as `Busy` instead
+                    // of spinning.
                     lu.finish_delivery(&permit, Delivery::Pending);
                     self.note_command_finished();
                     self.drive_state.set(None);
@@ -1561,7 +1561,7 @@ impl Runner {
     /// the deferred force for **this** LUN (see [`Self::resume_pending_force`]);
     /// forces deferred on other LUNs are released by `Target::take_rt`, which
     /// can reach their slots.
-    #[allow(dead_code)] // `Target::take_rt` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::take_rt`; driven by tests here
     pub(crate) fn take_rt<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
@@ -1711,7 +1711,7 @@ impl Runner {
 
     /// Propose a candidate change. The transaction cannot cross an ended,
     /// control-pending or result-barrier state.
-    #[allow(dead_code)] // `Target::propose_rt` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::propose_rt`; driven by tests here
     pub(crate) fn propose_rt<L: Lu + ?Sized>(
         &mut self,
         lu: &mut L,
@@ -1729,7 +1729,7 @@ impl Runner {
 
     /// `propose → advance → take`. The commit is the device's local hook, never
     /// an injected runner `Sync`.
-    #[allow(dead_code)] // `Target::advance_rt` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::advance_rt`; driven by tests here
     pub(crate) fn advance_rt<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
@@ -1750,7 +1750,7 @@ impl Runner {
     }
 
     /// Install an application-returned pair.
-    #[allow(dead_code)] // `Target::install_rt` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::install_rt`; driven by tests here
     pub(crate) fn install_rt<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
@@ -1799,7 +1799,7 @@ impl Runner {
     /// live token/command/barrier, and is cleared by any pair change
     /// (`take` completion without an armed force, `advance`, `install`, host
     /// eject, force detach).
-    #[allow(dead_code)] // `Target::force_remove_rt` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::force_remove_rt`; driven by tests here
     pub(crate) fn force_remove_rt<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
@@ -1916,7 +1916,7 @@ impl Runner {
 
     /// A host EJECT committed and detached its pair; the next `tick` reports
     /// `ResourcesReady`. Exactly one handback may be pending.
-    #[allow(dead_code)] // `Target::host_eject_succeeded_*` (C2)
+    #[allow(dead_code)] // `Target::host_eject_succeeded_*`
     pub(crate) fn host_eject_succeeded(&mut self, lun: usize) -> Result<(), BoundaryReject> {
         self.begin_eject(lun)?;
         self.finish_eject(lun)
@@ -1926,7 +1926,7 @@ impl Runner {
     /// check every resident slot's boundary via `SlotSet::check_boundary`;
     /// `Abort` is accepted while a command is active and consumed as a no-op
     /// when idle.
-    #[allow(dead_code)] // `Target::request_control` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::request_control`; driven by tests here
     pub(crate) fn request_control(&mut self, control: Control) -> Result<(), BoundaryReject> {
         if self.pending_control.is_some() {
             return Err(BoundaryReject::ControlPending);
@@ -1958,19 +1958,19 @@ impl Runner {
 
     /// Application control plane: close new submission and drain the active
     /// command (`Target::stop`).
-    #[allow(dead_code)] // `Target::stop` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::stop`; driven by tests here
     pub(crate) fn request_stop(&mut self) {
         self.stop = true;
     }
 
     /// Transport ended (link reset/disconnect); not recoverable.
-    #[allow(dead_code)] // `Target::transport_ended` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::transport_ended`; driven by tests here
     pub(crate) fn transport_ended(&mut self) {
         self.transport_end = true;
     }
 
     /// Enter the fatal state; the next settled `tick` reports `Ended{Fatal}`.
-    #[allow(dead_code)] // `Target::fatal` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::fatal`; driven by tests here
     pub(crate) fn set_fatal(&mut self, fault: Fault) {
         // The first fault is the authoritative one; later failures must not
         // mask the root cause of an already-ended service.
@@ -1984,7 +1984,7 @@ impl Runner {
     /// Order (`§4.11`): fatal → transport ended → stopped → await take →
     /// pending `Nop` → `ServiceReady`. A live command is never reported as
     /// `Ended`.
-    #[allow(dead_code)] // `Target::tick` (C2); driven by tests here
+    #[allow(dead_code)] // `Target::tick`; driven by tests here
     pub(crate) fn tick(&mut self) -> RunOutcome {
         if let Some(outcome) = self.settled_terminal_outcome() {
             return outcome;
@@ -2069,7 +2069,7 @@ impl Runner {
     /// A `Fault::Contract` receipt is delivered back to the device in the same
     /// entry (one bounded settle step, never a loop) so an `MmcDrive` is
     /// already `Settled` before `Err(Fault::Contract)` is surfaced.
-    #[allow(dead_code)] // `Target::poll_long_entry_*` (C2)
+    #[allow(dead_code)] // `Target::poll_long_entry_*`
     pub(crate) fn poll_long_entry<L: Lu + ?Sized>(
         &mut self,
         lun: usize,

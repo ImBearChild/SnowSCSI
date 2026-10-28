@@ -4,9 +4,10 @@
 //! same-class merge, fixed priority) and `__ARCH__/design/02-api-core.md`
 //! §4.13.
 //!
-//! P2a defines the vocabulary and the minimal merge/priority/clear behaviour.
+//! This module defines the vocabulary and the minimal merge/priority/clear
+//! behaviour.
 //! Transport/power-on/reset wiring that actually raises or consumes UA is
-//! P2/P3 work and is not claimed here.
+//! not claimed here.
 
 use super::errors::Sense;
 

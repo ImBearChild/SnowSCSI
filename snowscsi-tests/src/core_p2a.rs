@@ -26,7 +26,7 @@ enum LegalOp {
 
 /// Recording sync plane: an application-owned backing with a deterministic
 /// op trace. `fail_io_prefix` injects a short/failed write with a confirmed
-/// prefix (T06).
+/// prefix.
 struct Plane {
     ops: [Option<LegalOp>; 8],
     count: usize,
@@ -93,7 +93,7 @@ impl SyncStorage for Plane {
     }
 }
 
-/// One recorded host-seam call (T22): proves what the transport saw.
+/// One recorded host-seam call: proves what the transport saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostEvent {
     Publish(snowscsi::core::DataPlan),
@@ -102,7 +102,7 @@ enum HostEvent {
 }
 
 /// Host data plane: records every plan/buffer call, fills WRITE data with
-/// 0xa5, and reports configurable accepted prefixes (T06 short send, T22).
+/// 0xa5, and reports configurable accepted prefixes (short send, short receive).
 struct TestHost {
     read_accepts: Option<usize>,
     recv_accepts: Option<usize>,
@@ -210,9 +210,9 @@ where
     <S as snowscsi::core::At<Here>>::slot(target.slots())
 }
 
-/// T01: complete write + explicit synchronize; no hidden runner Sync.
+/// Complete write + explicit synchronize; no hidden runner Sync.
 #[test]
-fn t01_write_then_sync_records_the_exact_sequence() {
+fn write_then_sync_records_the_exact_sequence() {
     let mut target = Target::new(cons(slot(1), Nil));
     let mut storage = BlockingStorage::new(Plane::new());
     let mut host = BlockingHost::new(TestHost::new());
@@ -270,10 +270,10 @@ fn t01_write_then_sync_records_the_exact_sequence() {
     );
 }
 
-/// T06: a storage error keeps the confirmed prefix and maps to WRITE ERROR;
+/// A storage error keeps the confirmed prefix and maps to WRITE ERROR;
 /// a short host send maps to ABORTED COMMAND without replacing the data fact.
 #[test]
-fn t06_effect_and_double_error() {
+fn effect_and_double_error() {
     let mut target = Target::new(cons(slot(1), Nil));
     let mut plane = Plane::new();
     plane.fail_io_prefix = Some(128);
@@ -317,10 +317,10 @@ fn t06_effect_and_double_error() {
     assert_eq!(slot0(&target).device_ref().io_issues(), 1);
 }
 
-/// T21: two LUNs with independent backing planes; the same `resource: 0`
-/// never crosses the LUN boundary (G6 application contract).
+/// Two LUNs with independent backing planes; the same `resource: 0`
+/// never crosses the LUN boundary (application contract).
 #[test]
-fn t21_two_luns_use_independent_backings() {
+fn two_luns_use_independent_backings() {
     let mut target = Target::new(cons(slot(1), cons(slot(2), Nil)));
     let mut storage0 = BlockingStorage::new(Plane::new());
     let mut storage1 = BlockingStorage::new(Plane::new());
@@ -370,9 +370,9 @@ fn t21_two_luns_use_independent_backings() {
     assert_eq!(storage1.inner().data[512], 0, "no cross-LUN write");
 }
 
-/// T22: host eject publishes `ResourcesReady` and the pair is taken once.
+/// Host eject publishes `ResourcesReady` and the pair is taken once.
 #[test]
-fn t22_host_eject_hands_the_pair_back_once() {
+fn host_eject_hands_the_pair_back_once() {
     let mut target = Target::new(cons(slot(7), Nil));
     let mut storage = BlockingStorage::new(Plane::new());
     let mut host = BlockingHost::new(TestHost::new());
@@ -421,10 +421,10 @@ fn t22_host_eject_hands_the_pair_back_once() {
     );
 }
 
-/// T22 data-integrity slice: a short host receive must write only the accepted
+/// Data integrity: a short host receive must write only the accepted
 /// prefix and report CHECK, never a full buffer with GOOD.
 #[test]
-fn t22_short_receive_writes_only_the_accepted_prefix() {
+fn short_receive_writes_only_the_accepted_prefix() {
     let mut target = Target::new(cons(slot(1), Nil));
     let mut storage = BlockingStorage::new(Plane::new());
     let mut host = TestHost::new();
@@ -457,10 +457,10 @@ fn t22_short_receive_writes_only_the_accepted_prefix() {
     );
 }
 
-/// T23: the public Spc wrapper answers the six commands and uses the R31
+/// The public Spc wrapper answers the six commands and uses the
 /// REPORT LUNS layout.
 #[test]
-fn t23_spc_six_commands_and_report_luns_layout() {
+fn spc_six_commands_and_report_luns_layout() {
     let spc = |backing: u8| {
         LuImpl::new(
             Spc::new(BlockDevice::new(BlockAttrs::new(16, BLOCK))),

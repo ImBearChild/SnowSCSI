@@ -5,7 +5,7 @@
 //! Two paths are kept: static `Cons` + type-level indices for embedded users,
 //! and `&mut [&mut dyn Lu]` for runtime-sized/heterogeneous LUN tables. A
 //! `Target` owns exactly one of them; the storage adapter is bound by the
-//! application per LUN (G6).
+//! application per LUN.
 
 use ::core::marker::PhantomData;
 
@@ -107,7 +107,7 @@ pub trait SlotSet {
     /// Bind every slot to the owning target identity.
     fn bind_owner(&mut self, permit: &OwnerBindPermit, owner: TargetId);
 
-    /// R30 control gate: check the authoritative boundary of every resident
+    /// Control gate: check the authoritative boundary of every resident
     /// slot before a `Nop` control is queued. This is an internal extension of
     /// §4.9 needed by `Target::request_control`; applications never call it.
     ///

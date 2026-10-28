@@ -1,7 +1,7 @@
 //! Optional SPC profile capabilities for the public query commands.
 //!
 //! Authority: `__ARCH__/design/02-api-core.md` §4.19 (extension clause):
-//! P2 may add defaulted capability methods so that MODE SENSE, READ
+//! Defaulted capability methods let MODE SENSE, READ
 //! CAPACITY, GET CONFIGURATION and GET EVENT STATUS NOTIFICATION can be
 //! served by [`Spc`](super::spc::Spc) without changing the six-command
 //! semantics or forcing existing [`Device`](super::device::Device)
@@ -10,7 +10,7 @@
 //! Every method is **defaulted to "not supported"**. A device opts in by
 //! overriding [`Device::spc_profile`](super::device::Device::spc_profile) to
 //! return `Some(self)`. When it returns `None`, `Spc` delegates the opcode to
-//! the inner device exactly as in P2a.
+//! the inner device unchanged.
 //!
 //! Encoding convention: each command method returns the **complete response
 //! length** and writes `min(length, out.len())` bytes when `out` is `Some`.

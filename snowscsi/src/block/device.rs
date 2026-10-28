@@ -93,7 +93,7 @@ enum Stage {
 }
 
 /// Non-generic block device. Geometry and policy only; the backing lives in
-/// the application's `Storage` adapter (`05 §5.1`, G6).
+/// the application's `Storage` adapter (`05 §5.1`).
 pub struct BlockDevice {
     attrs: BlockAttrs,
     stage: Stage,
@@ -107,7 +107,7 @@ pub struct BlockDevice {
     accepted: u32,
     /// The current command requested FUA (force unit access).
     fua: bool,
-    /// Host failure that takes precedence over a later storage result (T06).
+    /// Host failure that takes precedence over a later storage result.
     host_error: Option<Completion>,
     last_completion: Option<Completion>,
     effects: KnownEffects,
@@ -550,7 +550,7 @@ impl Device for BlockDevice {
                 }
                 if receipt.effect() != Effect::Known {
                     // The flush did not confirm its effect: a FUA write must not
-                    // report GOOD (`05 T05`, `03 §3.4`).
+                    // report GOOD (`03 §3.4`).
                     self.effects.unknown_remainder = true;
                     return self.finish(Completion::Check(WRITE_ERROR));
                 }

@@ -11,7 +11,7 @@
 //! Byte layouts follow the production baseline in `crate::cdrom::{common,drive}`
 //! and are re-implemented here, so this module has no runtime dependency on the
 //! old `cdrom` module. [`flat::FlatCdMedium`] is the single-track, single-
-//! session, read-only CD medium used by the P2b fixtures;
+//! session, read-only CD medium used by the fixtures;
 //! [`vendor::VendorMedium`] is a second independent read-only medium (a new
 //! medium is a new `MmcMedium` impl, never a `MmcDrive` match); and
 //! `DvdRamMedium` is the feature-gated rewritable DVD-RAM medium.

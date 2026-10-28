@@ -1,8 +1,8 @@
-//! P2b acceptance fixtures: the public query commands served by the `Spc`
+//! Query-command fixtures: the public commands served by the `Spc`
 //! wrapper through the guest profile seam.
 //!
 //! Covered here: MODE SENSE(6/10) on `BlockDevice`, READ CAPACITY(10),
-//! allocation-length truncation, the P2a delegation path (a device without an
+//! allocation-length truncation, the delegation path (a device without an
 //! `SpcProfile`), GET CONFIGURATION / GESN fall-through on Block, and the
 //! foreground FORMAT admission gate.
 //!
@@ -431,7 +431,7 @@ fn allocation_zero_sends_nothing() {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MockKind {
-    /// No `SpcProfile`: every opcode must reach `Device::prepare` (P2a).
+    /// No `SpcProfile`: every opcode must reach `Device::prepare`.
     NoProfile,
     /// Profile answers GET CONFIGURATION and GESN.
     Queries,
@@ -587,7 +587,7 @@ fn mock_target(kind: MockKind) -> MockTarget {
 }
 
 /// Without an `SpcProfile` the four new opcodes are delegated to the inner
-/// device exactly as in P2a: the wrapper itself would answer INVALID_FIELD,
+/// device: the wrapper itself would answer INVALID_FIELD,
 /// the inner device answers ILLEGAL REQUEST.
 #[test]
 fn no_profile_delegates_the_new_opcodes() {
@@ -626,7 +626,7 @@ fn no_profile_delegates_the_new_opcodes() {
 
 /// Block implements MODE SENSE/READ CAPACITY only; GET CONFIGURATION and GESN
 /// keep the default profile answer and fall through to the inner Block, which
-/// rejects the opcode (P2a behavior).
+/// rejects the opcode (delegated behavior).
 #[test]
 fn block_get_configuration_and_gesn_fall_through() {
     let mut target = block_target();
@@ -776,7 +776,7 @@ fn foreground_format_is_gated_at_admission() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// P2b format / BLANK / long-operation / DVD-RAM / vendor fixtures
+// Format / BLANK / long-operation / DVD-RAM / vendor fixtures
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Byte-plane storage mock: real bytes for round trips, recorded IO, and
@@ -1083,7 +1083,7 @@ fn mmc_format_immed_one_gates_media_commands_and_settles() {
         );
     }
     // REQUEST SENSE during the foreground phase carries the FORMAT IN
-    // PROGRESS sense with SKSV and a progress value (T14).
+    // PROGRESS sense with SKSV and a progress value.
     let mut sense_host = BlockingHost::new(TestHost::new());
     let request_sense = [0x03u8, 0, 0, 0, 18, 0];
     assert_eq!(
@@ -1282,7 +1282,7 @@ fn mmc_format_immed_zero_zero_fills_in_poll() {
 /// A zero-sector writable medium arms an already-settled fill. Both FORMAT
 /// encodings must still complete GOOD and clear the command query; a
 /// mid-command `Idle` here used to be mapped to Busy by the runner and wedged
-/// the LU. Regression for the independent review finding.
+/// the LU. Regression for the reported defect.
 #[test]
 fn mmc_format_zero_sector_medium_does_not_wedge() {
     let mut work = vec![0u8; 64];

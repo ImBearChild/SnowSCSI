@@ -309,7 +309,7 @@ fn unlock_flush_failure_keeps_the_normal_latch() {
 // ── Management transactions ────────────────────────────────────────────────
 // `03 §3.6` state machine, `02-api-core §4.10` sequencing and the `§4.11`
 // gates. Every entry below is the public `Target`/`StaticTarget` one; the
-// pair's `u8` is its backing identity (G6 keeps the adapter application-side).
+// pair's `u8` is its backing identity (the adapter stays application-side).
 
 /// Install into an empty slot. The candidate becomes current and the
 /// transaction produces **no** result, so `take` is `NothingToTake`.
@@ -2049,7 +2049,7 @@ fn operator_eject_policy_reads_live_latches_and_detaches_nothing() {
 //
 // - "partial header" / "complete header not admitted": core receives an
 //   already-complete CDB slice (`Target::drive_start_*`); BHS/CBW framing and
-//   the input barrier are transport facts, covered by the transport card. This
+//   the input barrier are transport facts, covered by the transport layer. This
 //   slice must not fake a header the runner never sees.
 // - "sending frame" segment prefixes: the exact wire framing belongs to
 //   `HostTransport`; core only observes the returned receipt, which the

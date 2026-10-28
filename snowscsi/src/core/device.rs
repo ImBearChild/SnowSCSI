@@ -8,7 +8,7 @@
 //! trait bound: it may be [`NoMedium`], an MMC medium, or an application type.
 //!
 //! `Feedback`/`FeedbackKind`/`PollStep` are declared here because the
-//! [`Device::poll`] signature needs them. This is the P2a staging shape: the
+//! [`Device::poll`] signature needs them. This is the staging shape: the
 //! runner owns construction/consumption of `Feedback`, and the storage
 //! (`Io`/`Prefetch`) variants of [`PollStep`] arrive with the `StorageOp`
 //! vocabulary in the storage/host card.
@@ -79,7 +79,7 @@ impl InquiryData {
     }
 }
 
-/// PREVENT/ALLOW encoding family (`02-api.md` §4.1, R30).
+/// PREVENT/ALLOW encoding family (`02-api.md` §4.1).
 ///
 /// `Scsi` is the SPC-3 Table 119 two-bit enumeration; `Mmc` is MMC-6 Table 329
 /// (bit 1 selects normal/persistent, bit 0 selects clear/set).
@@ -107,7 +107,7 @@ pub enum Direction {
 pub struct CommandContext {
     /// Wire LUN of the addressed slot.
     pub lun: u64,
-    /// Fixed slot count of the owning Target (R30). Target/StaticTarget fill
+    /// Fixed slot count of the owning Target. Target/StaticTarget fill
     /// this from `slot_count()`; standalone callers pass at least 1.
     pub lun_count: u32,
     /// Total host byte count declared by the command (0 = no host data).
@@ -348,7 +348,7 @@ pub trait Device {
         RemovalEncoding::Scsi
     }
 
-    /// Optional capability set for the public SPC query commands added in P2
+    /// Optional capability set for the public SPC query commands
     /// (MODE SENSE, READ CAPACITY, GET CONFIGURATION, GET EVENT STATUS
     /// NOTIFICATION). Default: `None`, so the wrapper delegates those opcodes
     /// to the device unchanged.

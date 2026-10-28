@@ -4,18 +4,18 @@
 //! `02-api-core.md` §4.12):
 //!
 //! 1. a long entry uses the `scratch` bank only; a sentinel in `work` survives
-//!    the whole operation (D1);
+//!    the whole operation;
 //! 2. a `Fault::Contract` long-operation receipt is fed back before the error,
-//!    so the next entry settles and never re-issues the cancelled write (D2);
-//! 3. the drive-owned zero-fill ends with exactly one `Sync` (D3 success);
+//!    so the next entry settles and never re-issues the cancelled write;
+//! 3. the drive-owned zero-fill ends with exactly one `Sync`;
 //! 4. a failing final `Sync` settles the device with an error, no GOOD and no
-//!    replay (D3 failure);
-//! 5. GC/GESN answer explicitly after `take_medium` (D4);
+//!    replay;
+//! 5. GC/GESN answer explicitly after `take_medium`;
 //! 6. INQUIRY/RS/GC/GESN are admitted with `work` while TUR/READ/WRITE get
 //!    `2/04/04`, with zero medium/backing access, and the long op still
 //!    advances from `scratch`.
 //!
-//! The compile-time borrow-domain proof (D6) lives next to the concrete
+//! The compile-time borrow-domain proof lives next to the concrete
 //! `MmcDrive` in `snowscsi/src/mmc/drive.rs` so it can name the profile type.
 
 use snowscsi::core::storage::{
@@ -680,7 +680,7 @@ fn request_sense() -> [u8; 6] {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// D1 — the long entry uses `scratch`; `work` keeps its sentinel
+// The long entry uses `scratch`; `work` keeps its sentinel
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -736,7 +736,7 @@ fn long_entry_uses_scratch_and_leaves_work_untouched() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// D2 — a Contract receipt is fed back before the error
+// A Contract receipt is fed back before the error
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -814,7 +814,7 @@ fn a_contract_long_receipt_settles_before_the_error_and_is_never_reissued() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// D3 — final Sync success and failure
+// Final Sync success and failure
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1061,7 +1061,7 @@ fn sync_and_async_adapters_produce_the_same_long_operation_trace() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// D4 — explicit no-medium GC/GESN through Spc
+// Explicit no-medium GC/GESN through Spc
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]

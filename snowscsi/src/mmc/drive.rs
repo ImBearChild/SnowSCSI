@@ -1,7 +1,6 @@
 //! MMC drive: media-command decoding over an [`MmcMedium`].
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §6.1/§6.5 and the P2b
-//! implementation log (`__ARCH__/handoff/P2B-IMPLEMENT-LOG.md` §3).
+//! Authority: `__ARCH__/design/02-api-profiles.md` §6.1/§6.5.
 //!
 //! The drive decodes the media command table, validates CDB fields/reserved
 //! bits/allocation length and encodes the media-description responses
@@ -536,7 +535,7 @@ impl<M: MmcMedium> MmcDrive<M> {
     ///
     /// MMC-6 Table 237 has no Immed bit in the CDB (bit 0 is part of the Format
     /// Code); both Try-out and Immed live in the Format List Header (Table 240).
-    /// The default encoding is an IMMED=0 P2b extension for the design subset.
+    /// The default encoding is an IMMED=0 extension for the design subset.
     fn prepare_format(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
         if cdb.len() < 6 {
             return Err(Completion::Check(INVALID_FIELD));
@@ -2154,7 +2153,7 @@ mod tests {
 
     #[test]
     fn format_and_blank_are_wired_to_the_zero_fill_slice() {
-        // The old P2b stub rejected both opcodes; this test now pins the new
+        // The old stub rejected both opcodes; this test now pins the new
         // contract: FORMAT on read-only media is a write-protect CHECK, BLANK
         // with a non-zero blanking type is an INVALID FIELD CHECK.
         let mut dev = drive(100);
@@ -2503,7 +2502,7 @@ mod tests {
 
     #[test]
     fn poll_long_io_borrows_the_caller_bank_not_the_device() {
-        // D6 borrow-domain proof: the returned `PollStep::Io` may be held while
+        // Borrow-domain proof: the returned `PollStep::Io` may be held while
         // the device is read (`long_info`/`medium`), so a concurrent query is
         // possible. The IO buffer points into the caller's bank.
         let permit = permit();
@@ -3112,7 +3111,7 @@ mod tests {
 
     #[test]
     fn no_medium_get_configuration_matches_a_zero_sector_medium() {
-        // D4: after `take_medium` the profile answers instead of delegating.
+        // No medium: after `take_medium` the profile answers instead of delegating.
         let mut dev = drive(100);
         let removed = dev.take_medium(&boundary()).expect("medium");
         assert_eq!(removed.attrs().sectors, 100);

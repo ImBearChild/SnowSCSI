@@ -181,7 +181,7 @@ fn admitted_during_foreground(opcode: u8) -> bool {
 /// Canonical slot: a [`Device`] plus the application's backing handle.
 ///
 /// The backing is only an identity/handle; the bytes live in the application's
-/// storage adapter (G6). The slot never stores the adapter.
+/// storage adapter. The slot never stores the adapter.
 pub struct LuImpl<D: Device, B> {
     device: D,
     backing: Option<B>,
@@ -216,7 +216,7 @@ impl<D: Device, B> LuImpl<D, B> {
     ///
     /// Crate-internal: production binding goes through `Target::new`, which
     /// mints the [`OwnerBindPermit`]; an application must not forge an owner.
-    #[allow(dead_code)] // `Target` (C2) builds bound slots; tests use it here
+    #[allow(dead_code)] // `Target` builds bound slots; tests use it here
     pub(crate) fn with_owner(owner: TargetId, device: D, backing: B) -> Self {
         let mut slot = Self::new(device, backing);
         slot.owner = owner;
@@ -306,7 +306,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             return Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT));
         }
         // A slot that failed to restore its old medium must not serve: its
-        // backing/adapter binding is stale (§4.10, R30).
+        // backing/adapter binding is stale (§4.10).
         if self.needs_recovery {
             return Admission::Reject(Completion::Check(NEEDS_RECOVERY));
         }
@@ -490,7 +490,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             pair: Some(Pair { medium, backing }),
             // Force deliberately did not commit: local success, with
             // `sync_durable = false` and any unknown write remainder reported
-            // as an effect — never as `Err(Fault::Commit)` (§4.10, R30).
+            // as an effect — never as `Err(Fault::Commit)` (§4.10).
             local: Ok(()),
             delivery: Delivery::NotApplicable,
             effects,
@@ -737,7 +737,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             local: Ok(()),
             delivery: Delivery::Pending,
             // Report the effects captured by an earlier abnormal settlement
-            // (never silently drop an unknown write remainder, §4.14/R30).
+            // (never silently drop an unknown write remainder, §4.14).
             effects: self.force_effects(),
         });
         Ok(())

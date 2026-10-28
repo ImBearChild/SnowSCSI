@@ -59,7 +59,7 @@ pub struct Target<S: SlotSet> {
 impl<S: SlotSet> Target<S> {
     /// The only public constructor: binds every slot to a fresh identity.
     ///
-    /// G6 adapter rebinding is the application's responsibility; the library
+    /// Adapter rebinding is the application's responsibility; the library
     /// never verifies that an adapter really points at the pair's backing.
     pub fn new(mut slots: S) -> Self {
         // `fetch_add` may wrap; slot ownership must never fall back to
@@ -95,7 +95,7 @@ impl<S: SlotSet> Target<S> {
         &self.runner
     }
 
-    /// Application control entry (`R30`).
+    /// Application control entry.
     ///
     /// `Nop` requires a complete boundary on every resident slot; `Abort` may
     /// be requested while a command is active (and is consumed as a no-op when

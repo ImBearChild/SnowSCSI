@@ -1,6 +1,6 @@
 //! Public SPC wrapper: the six-command host subset over any [`Device`].
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.19 (R30/R31),
+//! Authority: `__ARCH__/design/02-api-core.md` §4.19,
 //! `02-api-behavior.md` §10.2 and `02-api.md` §4.1.
 //!
 //! [`Spc`] owns only query state and the prevent/start latches; media commands
@@ -15,14 +15,14 @@
 //! (0x1E) and START STOP UNIT (0x1B). `0x1B` stores only the start bit; it
 //! never ejects or handles `LoEj`.
 //!
-//! P2b adds the public query commands MODE SENSE(6/10) (0x1A/0x5A), READ
+//! The public query commands MODE SENSE(6/10) (0x1A/0x5A), READ
 //! CAPACITY(10) (0x25), GET CONFIGURATION (0x46) and GET EVENT STATUS
 //! NOTIFICATION (0x4A). They are intercepted **only** when the inner device
 //! opts in through [`Device::spc_profile`]; otherwise the CDB is delegated to
-//! the inner device exactly as in P2a. The profile encodes the response, so
+//! the inner device. The profile encodes the response, so
 //! the wrapper still owns no response buffer.
 //!
-//! REPORT LUNS uses the R31 layout: 8-byte header (`LUN LIST LENGTH` =
+//! REPORT LUNS uses this layout: 8-byte header (`LUN LIST LENGTH` =
 //! `8 * lun_count`, then reserved) followed by SAM-3 single-level LUN
 //! descriptors `[0x00, lun, 0, 0, 0, 0, 0, 0]` — the LUN number is in byte 1,
 //! never byte 0.
@@ -214,7 +214,7 @@ impl<D: Device> Spc<D> {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
                 // Standard INQUIRY only: EVPD/CMDDT and a non-zero page code
-                // are unsupported in P2a and must CHECK, not return the
+                // are unsupported and must CHECK, not return the
                 // standard page (SPC-3 6.4.2).
                 if cdb[1] & 0x03 != 0 || cdb[2] != 0 {
                     return Err(Completion::Check(INVALID_FIELD));
@@ -252,7 +252,7 @@ impl<D: Device> Spc<D> {
             }
             MODE_SENSE_6 | MODE_SENSE_10 => {
                 // Interception is profile-gated: without a profile the CDB
-                // belongs to the inner device exactly as in P2a.
+                // belongs to the inner device unchanged.
                 if self.inner.spc_profile().is_none() {
                     return self.inner.prepare(permit, ctx, cdb);
                 }
@@ -358,7 +358,7 @@ impl<D: Device> Spc<D> {
                     .and_then(|p| p.get_configuration(rt, start, None));
                 let Some(total) = total else {
                     // Unsupported by the profile: the opcode stays with the
-                    // inner device (P2a delegation, e.g. Block).
+                    // inner device (delegation, e.g. Block).
                     return self.inner.prepare(permit, ctx, cdb);
                 };
                 self.len = total.min(alloc);
@@ -377,7 +377,7 @@ impl<D: Device> Spc<D> {
                 if cdb.len() < 10 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
-                // P2b keeps the baseline rejection of non-polled GESN.
+                // Keep the baseline rejection of non-polled GESN.
                 if cdb[1] & 0x01 == 0 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
@@ -548,7 +548,7 @@ fn fill_sense(sense: Sense, progress: Option<u32>, data: &mut [u8], n: usize) {
     }
 }
 
-/// Write the REPORT LUNS response into `data` (R31 layout).
+/// Write the REPORT LUNS response into `data`.
 fn fill_report_luns(lun_count: u32, data: &mut [u8], n: usize) {
     for byte in &mut data[..n] {
         *byte = 0;
@@ -836,7 +836,7 @@ impl<D: Device> Device for Spc<D> {
             Query::RequestSense => {
                 if self.len == 0 {
                     // A completed REQUEST SENSE consumes the saved sense even
-                    // when no data is transferred (R31/B10).
+                    // when no data is transferred.
                     self.saved_sense = None;
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);

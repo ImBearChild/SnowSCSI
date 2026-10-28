@@ -1,7 +1,7 @@
 //! Core contract layer: errors, device lifecycle, permits and values.
 //!
 //! This is the `no_std`, allocation-free, `unsafe`-free vocabulary layer of the
-//! P1 API (`__ARCH__/design/02-api.md` §4 and
+//! public API (`__ARCH__/design/02-api.md` §4 and
 //! `__ARCH__/design/02-api-core.md` §4.7–§4.18). It contains only pure values
 //! and seams:
 //!

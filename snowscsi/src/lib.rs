@@ -7,7 +7,7 @@
 //! # Workspace map
 //!
 //! - **this crate** — SPC/SBC/MMC command layers, `BlockDevice` /
-//!   [`CdromDrive`](cdrom::CdromDrive), the P2 MMC profile ([`mmc::MmcDrive`])
+//!   [`CdromDrive`](cdrom::CdromDrive), the MMC profile ([`mmc::MmcDrive`])
 //!   with its flat CD medium, iSCSI target (`iscsi`), USB BOT core (`usb`).
 //! - [`snowscsi_common`] — the storage seams everything is written
 //!   against: the capability ladder

@@ -43,7 +43,7 @@ const SLOTS: usize = 4;
 /// Bounded storage operation family (`02-api.md` §4.5).
 ///
 /// `resource` is interpreted **only inside the current Lu's pair/backing set**
-/// (G6): it is not a global resource id, and a command on LUN *n* can never
+/// and are not global resource ids: a command on LUN *n* can never
 /// address LUN *m*'s resource.
 #[derive(Debug)]
 pub enum StorageOp<'a> {
