@@ -91,8 +91,18 @@ pub mod tmf {
 
 /// SCSI Task Management response codes (RFC 3720 §10.6.1).
 pub mod tmf_response {
+    /// The function completed.
     pub const COMPLETE: u8 = 0x00;
-    pub const NOT_SUPPORTED: u8 = 0x04;
+    /// The referenced task does not exist.
+    pub const TASK_DOES_NOT_EXIST: u8 = 0x01;
+    /// The addressed LUN does not exist.
+    pub const LUN_DOES_NOT_EXIST: u8 = 0x02;
+    /// The task is still allegiant to another connection.
+    pub const TASK_STILL_ALLEGIANT: u8 = 0x03;
+    /// Task allegiance reassignment is not supported.
+    pub const TASK_REASSIGNMENT_NOT_SUPPORTED: u8 = 0x04;
+    /// The task management function is not supported.
+    pub const NOT_SUPPORTED: u8 = 0x05;
 }
 
 /// Login phase stages (RFC 3720 §5.1, §10.12).

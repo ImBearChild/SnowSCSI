@@ -14,17 +14,18 @@
 //! fresh [`IscsiSession`], retrying accept failures with a backoff instead of C's
 //! infinite busy retry. Each connection is driven by [`serve_conn`], the
 //! protocol-agnostic shell loop over [`Action`]/[`Event`] (the session owns all
-//! framing).
+//! framing and drives the core [`Target`] itself).
 
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::core::storage::Storage;
+use crate::core::{RuntimeSet, Target};
 use crate::iscsi::conn::{read_exact, write_all, Conn};
 use crate::iscsi::pdu::BHS_SIZE;
 use crate::iscsi::target::{Action, Event, IscsiSession, TargetError};
-use crate::scsi::Luns;
 
 /// Default read timeout guarding login / command loop / Data-Out.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,38 +79,55 @@ impl embedded_io::Write for TcpConn {
 
 /// Drive one iSCSI connection to completion over any byte stream.
 ///
-/// The shell is protocol-agnostic: it feeds the [`IscsiSession`]'s next
-/// [`Action`] to the connection (or to a [`Luns`] storage plane for
-/// [`Action::Store`]) and hands the completion back as an [`Event`]. The
-/// session owns all framing — the two-stage receive (48-byte BHS, then
-/// AHS + data segment + padding) is driven by `Action::HostRecv { len }`, so
-/// this loop carries no protocol knowledge.
+/// The shell is protocol-agnostic: it stores received bytes at the offset the
+/// session asked for, writes complete PDUs, and hands the completion back as
+/// an [`Event`]. The session owns all framing and drives the core [`Target`]
+/// (with `storage` executing the device's storage operations).
 ///
 /// Returns `Ok(())` when the session closes the connection or the peer hangs
 /// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
-pub fn serve_conn<C: Conn>(
+pub fn serve_conn<C: Conn, S: RuntimeSet>(
     conn: &mut C,
     work: &mut [u8],
+    scratch: &mut [u8],
     session: &mut IscsiSession,
-    luns: &mut Luns<'_>,
+    target: &mut Target<S>,
+    storage: &mut dyn Storage,
+) -> Result<(), TargetError> {
+    let result = serve_conn_loop(conn, work, scratch, session, target, storage);
+    // Whatever ended the loop, the wire is gone: a live command must be settled
+    // before the slots can be served by the next connection. `connection_lost`
+    // makes the session's host seam fail closed (no PDU can be staged).
+    session.connection_lost();
+    let _ = target.settle_transport_end(storage, session);
+    result
+}
+
+fn serve_conn_loop<C: Conn, S: RuntimeSet>(
+    conn: &mut C,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    session: &mut IscsiSession,
+    target: &mut Target<S>,
+    storage: &mut dyn Storage,
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
         return Err(TargetError::WorkBufTooSmall);
     }
-    // Disjoint borrows: `devs` is handed to `poll`, `planes` executes the
-    // device-yielded `Store` ops without aliasing the device slice.
-    let Luns { devs, planes } = luns;
+    if scratch.len() < crate::MIN_DATA_LEN {
+        return Err(TargetError::WorkBufTooSmall);
+    }
     let mut ev = Event::Tick;
     loop {
-        match session.poll(ev, work, devs) {
-            Action::HostRecv { len } => {
-                if len > work.len() {
+        match session.poll(ev, work, scratch, target, storage) {
+            Action::HostRecv { offset, len } => {
+                if offset.checked_add(len).is_none_or(|end| end > work.len()) {
                     return Err(TargetError::Internal);
                 }
-                // Exact read of the framing length the session asked for (BHS
-                // first, then AHS + data + pad). EOF or an I/O failure ends
-                // the connection cleanly.
-                if read_exact(conn, &mut work[..len]).is_err() {
+                // Exact read of the framing length the session asked for, at
+                // the offset it chose. EOF or an I/O failure ends the
+                // connection (settled by the caller).
+                if read_exact(conn, &mut work[offset..offset + len]).is_err() {
                     return Ok(());
                 }
                 ev = Event::HostRecv { len };
@@ -120,16 +138,12 @@ pub fn serve_conn<C: Conn>(
                 }
                 ev = Event::HostSent;
             }
-            Action::Store { lun, op } => {
-                let result = planes
-                    .get_mut(lun)
-                    .and_then(|plane| plane.as_mut())
-                    .ok_or(TargetError::Internal)?
-                    .do_op(op);
-                ev = Event::StoreDone { result };
+            Action::Closed => {
+                return Ok(());
             }
-            Action::Closed => return Ok(()),
-            Action::Error(e) => return Err(e),
+            Action::Error(e) => {
+                return Err(e);
+            }
         }
     }
 }
@@ -137,26 +151,32 @@ pub fn serve_conn<C: Conn>(
 /// Serial accept loop: serve one connection at a time,
 /// with accept-failure backoff retry.
 ///
-/// Each accepted connection gets a fresh [`IscsiSession`] (login restarts the
-/// sequence numbers). Returns when `stop` is set, or on a caller bug
-/// (work buffer too small).
+/// Each accepted connection gets a fresh [`IscsiSession`] **and a fresh core
+/// [`Target`] over the same slots**: a new session starts from a clean
+/// protocol state (login restarts the sequence numbers) and a target that
+/// ended with the previous transport never leaks its terminal state into the
+/// next connection. Returns when `stop` is set, or on a caller bug (work buffer
+/// too small).
 ///
-/// `luns` bundles the LUN devices and their aligned storage planes (see
-/// [`crate::scsi::Luns`]); it is shared across every connection and handed to
-/// [`serve_conn`], which executes device-yielded `Store` ops against the
-/// planes.
+/// `table` is the runtime slot table (the target rebinds its owner per
+/// connection) and `storage` is shared across connections.
 ///
 /// Note: `std::net::TcpListener::bind` uses the OS default listen backlog
 /// (SOMAXCONN), not the C `listen(fd, 1)`; the serial loop still queues a
 /// second connection in the backlog until the current one ends.
-pub fn serve(
+pub fn serve<P>(
     listener: TcpListener,
     stop: &AtomicBool,
     work: &mut [u8],
-    luns: &mut Luns<'_>,
+    scratch: &mut [u8],
+    table: &mut [&mut dyn crate::core::Lu<Pair = P>],
+    storage: &mut dyn Storage,
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE {
+    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+        return Err(TargetError::WorkBufTooSmall);
+    }
+    if scratch.len() < crate::MIN_DATA_LEN {
         return Err(TargetError::WorkBufTooSmall);
     }
     loop {
@@ -183,7 +203,8 @@ pub fn serve(
             }
         };
         let mut session = IscsiSession::new();
-        match serve_conn(&mut conn, work, &mut session, luns) {
+        let mut target = Target::new(&mut *table);
+        match serve_conn(&mut conn, work, scratch, &mut session, &mut target, storage) {
             Ok(()) => crate::info!("connection from {} ended", peer),
             Err(e) => return Err(e),
         }
@@ -193,12 +214,11 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::seekable_storage::RamBackend;
-    use crate::common::store::StorePlane;
+    use crate::block::{BlockAttrs, BlockDevice};
+    use crate::core::storage::{BlockingStorage, IoBuf, IoReq, StorageReceipt, SyncStorage};
+    use crate::core::{Lu, LuImpl, NoMedium, Pair, Spc};
     use crate::iscsi::conn::{read_exact, write_all};
     use crate::iscsi::pdu::{flag, op, stage};
-    use crate::scsi::block::BlockDevice;
-    use crate::scsi::device::ScsiDevice;
     use crate::MIN_DATA_LEN;
     use std::io::{Read as _, Write as _};
 
@@ -245,6 +265,20 @@ mod tests {
         client.write_all(&[0u8; 3][..pad]).unwrap();
     }
 
+    /// Storage double: login/NOP/logout never issue storage IO.
+    struct Sink;
+
+    impl SyncStorage for Sink {
+        fn exec(&mut self, _req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+            let len = match &buf {
+                IoBuf::None => 0,
+                IoBuf::Read(b) => b.len(),
+                IoBuf::Write(b) => b.len(),
+            };
+            StorageReceipt::ok(len)
+        }
+    }
+
     #[test]
     fn tcp_conn_roundtrip() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -285,17 +319,14 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = AtomicBool::new(false);
-        let mut work = vec![0u8; MIN_DATA_LEN + crate::iscsi::pdu::BHS_SIZE];
-        let mut ram = vec![0u8; 16 * 1024 * 1024];
-        let mut dev = BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap();
-        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-        // Login/NOP/Logout never yield a `Store`; the aligned plane slot is
-        // the self-backed placeholder (`None`).
-        let mut planes: [Option<StorePlane>; 1] = [None];
-        let mut luns = Luns::new(&mut devs, &mut planes);
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        let mut slot = LuImpl::new(Spc::new(BlockDevice::new(BlockAttrs::new(32, 512))), 0u8);
+        let mut table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 1] = [&mut slot];
+        let mut storage = BlockingStorage::new(Sink);
 
-        // `Luns` (hence `StorePlane`) is intentionally `!Send`, so `serve`
-        // runs on this thread and the initiator runs on the scoped thread.
+        // The adapter is deliberately `!Send`: `serve` runs on this thread and
+        // the initiator runs on the scoped thread.
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
                 let mut client = TcpStream::connect(addr).unwrap();
@@ -346,7 +377,9 @@ mod tests {
                 listener,
                 &stop,
                 &mut work,
-                &mut luns,
+                &mut scratch,
+                &mut table,
+                &mut storage,
                 Some(Duration::from_secs(5)),
             )
             .unwrap();

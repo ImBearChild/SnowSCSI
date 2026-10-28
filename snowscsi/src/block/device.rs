@@ -21,7 +21,7 @@ use crate::core::{
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, NoMedium, PollStep, RemovalEncoding,
     SpcProfile, COMMAND_ABORTED, ILLEGAL_REQUEST, INTERNAL_FAILURE, INVALID_FIELD,
-    LBA_OUT_OF_RANGE, MEDIUM_ERROR, NEEDS_RECOVERY, WRITE_ERROR, WRITE_PROTECTED,
+    LBA_OUT_OF_RANGE, MEDIUM_ERROR, NEEDS_RECOVERY, RESOURCE_FAILURE, WRITE_ERROR, WRITE_PROTECTED,
 };
 
 /// Opcode TEST UNIT READY (SPC-3 6.33). Owned by the Block profile so the
@@ -163,6 +163,15 @@ impl BlockDevice {
         self.effects
     }
 
+    /// Delivery outcome booked for the last fixed completion.
+    ///
+    /// Probe view for fixtures; not a business API.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn delivery(&self) -> Delivery {
+        self.delivery
+    }
+
     /// Whether the device still owns an unfinished command.
     const fn busy(&self) -> bool {
         !matches!(self.stage, Stage::Idle | Stage::Done)
@@ -232,9 +241,12 @@ impl BlockDevice {
                 }
                 self.lba = be32(&cdb[2..6]) as u64;
                 self.blocks = be16(&cdb[7..9]);
-                if self.blocks == 0 && ctx.host_bytes != 0 {
+                if self.blocks == 0
+                    && matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0)
+                {
                     // A zero-block command declares no data phase; a non-zero
-                    // ctx.host_bytes would otherwise bypass the plan contract.
+                    // declared host count would otherwise bypass the plan
+                    // contract.
                     return Err(Completion::Check(INVALID_FIELD));
                 }
                 // No device cache: a read FUA is accepted and needs no extra IO.
@@ -256,7 +268,9 @@ impl BlockDevice {
                 }
                 self.lba = be32(&cdb[2..6]) as u64;
                 self.blocks = be16(&cdb[7..9]);
-                if self.blocks == 0 && ctx.host_bytes != 0 {
+                if self.blocks == 0
+                    && matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0)
+                {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
                 // FUA=1 on a write is honoured by a post-write Sync.
@@ -427,7 +441,8 @@ impl Device for BlockDevice {
         data: &'a mut [u8],
     ) -> PollStep<'a> {
         let Some(len) = self.slice_len(data.len()) else {
-            return self.finish(Completion::Check(INVALID_FIELD));
+            // The CDB is valid; the target's bank cannot stage the transfer.
+            return self.finish(Completion::Check(RESOURCE_FAILURE));
         };
         match (self.stage, fb.kind()) {
             (Stage::Publish, FeedbackKind::Begin) => {

@@ -56,6 +56,13 @@ pub const MEDIUM_REMOVAL_PREVENTED: Sense = Sense::new(0x05, 0x53, 0x02);
 pub const LBA_OUT_OF_RANGE: Sense = Sense::new(0x05, 0x21, 0x00);
 /// ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED (`LunNotFound`).
 pub const LUN_NOT_SUPPORTED: Sense = Sense::new(0x05, 0x25, 0x00);
+/// ILLEGAL REQUEST / SYSTEM RESOURCE FAILURE.
+///
+/// A **target-side** resource condition (the target cannot stage the
+/// transfer), not a malformed CDB: used when the caller's data bank is smaller
+/// than the transfer the device published. The ASC — not the command — names
+/// the shortage.
+pub const RESOURCE_FAILURE: Sense = Sense::new(0x05, 0x55, 0x00);
 
 /// Command completion as fixed by the device; `Check` carries the exact sense
 /// instance for this command (saved sense is a separate fact).

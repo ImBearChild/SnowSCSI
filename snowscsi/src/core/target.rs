@@ -31,13 +31,14 @@ use ::core::task::Poll;
 
 use super::collections::{At, Index, RuntimeSet, SlotSet};
 use super::device::{CommandContext, Control, DataPlan, Direction, TargetId};
-use super::errors::{Completion, Delivery, Fault};
+use super::errors::{Completion, Delivery, Fault, Sense};
 use super::long::LongInfo;
 use super::lu::Lu;
 use super::management::{BoundaryReject, Change, ChangeResult, LuInfo};
-use super::permit::{BoundaryPermit, OwnerBindPermit};
+use super::permit::{BoundaryPermit, CommandPermit, OwnerBindPermit};
 use super::runner::{DriveStep, RunOutcome, Runner};
 use super::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport};
+use super::ua::UaClass;
 
 /// Source of fresh target identities (never reused, `Relaxed` is enough).
 static NEXT_TARGET: AtomicU32 = AtomicU32::new(1);
@@ -137,6 +138,36 @@ impl<S: RuntimeSet> Target<S> {
             .ok_or(BoundaryReject::WrongSlot)
     }
 
+    /// Settle the command left live by a transport end and report the terminal
+    /// outcome.
+    ///
+    /// [`Self::transport_ended`] only raises the terminal flag: without a later
+    /// command step the slot would stay active and every command on the next
+    /// connection would answer BUSY. This entry cancels the retained token (the
+    /// wire is gone), settles the device with `InterruptReason::Stop`, and books
+    /// the failed delivery. It is idempotent and is a no-op when no command was
+    /// active.
+    ///
+    /// The host seam is expected to be dead (typically after
+    /// `IscsiSession::connection_lost`): no PDU is staged or sent here.
+    pub fn settle_transport_end(
+        &mut self,
+        storage: &mut dyn super::storage::Storage,
+        host: &mut dyn HostTransport,
+    ) -> RunOutcome {
+        self.runner.transport_ended();
+        if let Some(lun) = self.active_lun.take() {
+            storage.select_lun(lun);
+            if let Some(slot) = self.slots.get(lun) {
+                let Self { runner, .. } = self;
+                return runner.settle_transport_end(slot, storage, host);
+            }
+        }
+        self.runner
+            .terminal_outcome()
+            .unwrap_or(RunOutcome::ServiceReady)
+    }
+
     /// Start a command on a runtime LUN.
     ///
     /// The LUN and `ctx.lun` are checked before any slot/backing is touched.
@@ -179,6 +210,7 @@ impl<S: RuntimeSet> Target<S> {
         if self.active_lun != Some(lun) {
             return Err(Fault::Contract);
         }
+        storage.select_lun(lun);
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
         let result = runner.step_command(slot, storage, host, work, scratch)?;
@@ -241,10 +273,10 @@ impl<S: RuntimeSet> Target<S> {
     ///
     /// # Operator eject is application policy, not a library entry
     ///
-    /// / name only the host-side success entries and a
-    /// closed public API list; the operator/control-plane eject (GUI/hardware
-    /// button) belongs to the application. The application reads the latches
-    /// from [`Self::snapshot_rt`], calls
+    /// The library exposes only the host-side success entry; the
+    /// operator/control-plane eject (GUI/hardware button) belongs to the
+    /// application. The application reads the latches from
+    /// [`Self::snapshot_rt`], calls
     /// [`decide_eject`](super::eject::decide_eject) with
     /// [`EjectOrigin::Operator`](super::eject::EjectOrigin), and performs or
     /// refuses its own removal. The library deliberately offers no
@@ -283,6 +315,41 @@ impl<S: RuntimeSet> Target<S> {
                 Err(fault)
             }
         }
+    }
+
+    /// Record that the transport delivered a fixed CHECK CONDITION as
+    /// autosense in the completion frame.
+    ///
+    /// The command is already settled (`drive_step_rt` returned
+    /// [`DriveStep::Done`]); this only forwards the autosense-consumption event
+    /// to the slot so a later REQUEST SENSE starts from a cleared instance.
+    /// `sense` is the instance the completion carried, so a runner-fabricated
+    /// completion cannot consume an unrelated saved sense. Transports without
+    /// autosense never call it.
+    #[allow(dead_code)] // called by the iSCSI transport (feature `iscsi`)
+    pub(crate) fn autosense_delivered_rt(&mut self, lun: usize, sense: Sense) -> Result<(), Fault> {
+        let Self { slots, owner, .. } = self;
+        let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
+        let permit = CommandPermit::new(*owner);
+        slot.autosense_delivered(&permit, sense);
+        Ok(())
+    }
+
+    /// Raise a pending unit attention on a runtime LUN.
+    ///
+    /// This is the transport-driven entry (a LOGICAL UNIT RESET task
+    /// management function); an out-of-range LUN is [`Fault::LunNotFound`].
+    /// The addressed slot decides how to report it: the public
+    /// [`Spc`](super::spc::Spc) wrapper stores the condition and reports it on
+    /// the next reporting command, while a bare profile keeps no
+    /// unit-attention state.
+    #[allow(dead_code)] // called by the iSCSI transport (feature `iscsi`)
+    pub fn raise_ua_rt(&mut self, lun: usize, class: UaClass) -> Result<(), Fault> {
+        let Self { slots, owner, .. } = self;
+        let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
+        let permit = CommandPermit::new(*owner);
+        slot.raise_ua(&permit, class);
+        Ok(())
     }
 
     /// Take a detached pair exactly once; an out-of-range LUN is `WrongSlot`.
@@ -391,6 +458,7 @@ impl<S: RuntimeSet> Target<S> {
     ) -> Result<(), Fault> {
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
+        storage.select_lun(lun);
         runner.force_remove_rt(lun, slot, storage, host)
     }
 
@@ -412,6 +480,7 @@ impl<S: RuntimeSet> Target<S> {
     ) -> Result<LongInfo, Fault> {
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
+        storage.select_lun(lun);
         // `work` is intentionally unused: a long entry must not consume the
         // bank a concurrent query command is using.
         let _ = work;
@@ -600,6 +669,10 @@ pub trait StaticTarget<S: SlotSet> {
         <S as At<I>>::Slot: Lu;
 
     /// Emergency removal on the static slot.
+    ///
+    /// The storage adapter is told the slot's wire LUN
+    /// ([`Storage::select_lun`](super::storage::Storage::select_lun)) before the
+    /// detach, exactly like the runtime path.
     fn force_remove_static<I>(
         &mut self,
         storage: &mut dyn super::storage::Storage,
@@ -687,6 +760,9 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         if self.active_lun != Some(I::INDEX) {
             return Err(Fault::Contract);
         }
+        // A static target may still carry several LUNs (`Cons<Nil>`), so the
+        // adapter needs the same per-entry LUN selection as the runtime path.
+        storage.select_lun(I::INDEX);
         let Self { runner, slots, .. } = self;
         let result = runner.step_command(slots.slot_mut(), storage, host, work, scratch)?;
         if matches!(result, DriveStep::Done(_)) {
@@ -891,6 +967,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         <S as At<I>>::Slot: Lu,
     {
         let Self { runner, slots, .. } = self;
+        storage.select_lun(I::INDEX);
         runner.force_remove_rt(I::INDEX, slots.slot_mut(), storage, host)
     }
 
@@ -909,6 +986,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         // `work` belongs to the current command; the resident long operation
         // uses `scratch` only.
         let _ = work;
+        storage.select_lun(I::INDEX);
         runner.poll_long_entry(I::INDEX, slots.slot_mut(), storage, scratch)
     }
 }
@@ -1080,6 +1158,60 @@ mod tests {
                 &mut scratch
             ),
             Ok(Completion::Good)
+        );
+    }
+
+    struct LunRecorder {
+        selected: Option<usize>,
+    }
+
+    impl crate::core::storage::Storage for LunRecorder {
+        fn select_lun(&mut self, lun: usize) {
+            self.selected = Some(lun);
+        }
+
+        fn begin_exec(&mut self, _req: IoReq) -> crate::core::storage::IoToken {
+            crate::core::storage::IoToken::new(0, 1)
+        }
+
+        fn poll_exec(
+            &mut self,
+            _token: crate::core::storage::IoToken,
+            buf: IoBuf<'_>,
+        ) -> core::task::Poll<StorageReceipt> {
+            let len = match &buf {
+                IoBuf::None => 0,
+                IoBuf::Read(b) => b.len(),
+                IoBuf::Write(b) => b.len(),
+            };
+            core::task::Poll::Ready(StorageReceipt::ok(len))
+        }
+
+        fn cancel(&mut self, _token: crate::core::storage::IoToken) {}
+    }
+
+    #[test]
+    fn static_multi_slot_drive_selects_the_wire_lun_on_the_adapter() {
+        let slots = cons(slot(1), cons(slot(2), Nil));
+        let mut target = Target::new(slots);
+        let mut storage = LunRecorder { selected: None };
+        let mut work = [0u8; 512];
+        let mut scratch = [0u8; 512];
+        assert_eq!(
+            target.drive_static_at::<There<Here>>(
+                1,
+                &mut storage,
+                ctx(1, Direction::None, 0),
+                &sync_cdb(),
+                &mut work,
+                &mut scratch
+            ),
+            Ok(Completion::Good)
+        );
+        assert_eq!(
+            storage.selected,
+            Some(1),
+            "the adapter must be told the wire LUN, not the static slot index"
         );
     }
 
@@ -1258,6 +1390,89 @@ mod tests {
         assert_eq!(
             target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
             Ok(DriveStep::Done(Completion::Good))
+        );
+    }
+
+    #[test]
+    fn raise_ua_rt_addresses_the_runtime_slot() {
+        use crate::core::{Sense, Spc, UaClass};
+
+        let mut slots = [LuImpl::new(
+            Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))),
+            1u8,
+        )];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut work = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        assert_eq!(
+            target.raise_ua_rt(1, UaClass::LuReset),
+            Err(Fault::LunNotFound)
+        );
+        target.raise_ua_rt(0, UaClass::LuReset).expect("raise");
+        assert_eq!(
+            target.drive_rt(
+                0,
+                &mut storage,
+                ctx(0, Direction::None, 0),
+                &[0x00, 0, 0, 0, 0, 0],
+                &mut work,
+                &mut scratch
+            ),
+            Ok(Completion::Check(Sense::new(0x06, 0x29, 0x03)))
+        );
+    }
+
+    #[test]
+    fn unit_attention_outranks_the_empty_slot_gate() {
+        use crate::core::{Sense, Spc, UaClass};
+
+        let mut slots = [LuImpl::new(
+            Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))),
+            1u8,
+        )];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BlockingHost::new(RecordingHost);
+        let mut work = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        target.raise_ua_rt(0, UaClass::LuReset).expect("raise");
+        target
+            .force_remove_rt(0, &mut storage, &mut host)
+            .expect("force remove");
+        assert!(target.take_rt(0).expect("take").pair.is_some());
+        assert!(!target.snapshot_rt(0).expect("slot").ready);
+
+        let tur = [0x00u8, 0, 0, 0, 0, 0];
+        assert_eq!(
+            target.drive_rt(
+                0,
+                &mut storage,
+                ctx(0, Direction::None, 0),
+                &tur,
+                &mut work,
+                &mut scratch
+            ),
+            Ok(Completion::Check(Sense::new(0x06, 0x29, 0x03))),
+            "the pending unit attention is delivered on the empty slot"
+        );
+        assert_eq!(
+            target.drive_rt(
+                0,
+                &mut storage,
+                ctx(0, Direction::None, 0),
+                &tur,
+                &mut work,
+                &mut scratch
+            ),
+            Ok(Completion::Check(crate::core::MEDIUM_NOT_PRESENT)),
+            "the empty-slot gate applies once the attention was delivered"
         );
     }
 

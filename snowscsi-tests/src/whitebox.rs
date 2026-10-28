@@ -20,13 +20,13 @@ use std::thread;
 
 use snowscsi::common::seekable_storage::RamBackend;
 use snowscsi::common::store::StorePlane;
+use snowscsi::core::{Lu, Target};
 use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::target::{IscsiSession, TargetError};
 use snowscsi::iscsi::transport::{serve_conn, TcpConn, DEFAULT_READ_TIMEOUT};
-use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::ScsiDevice;
-use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
+
+use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 
 /// libiscsi constants (iscsi.h / scsi-lowlevel.h).
 const ISCSI_SESSION_NORMAL: c_int = 2;
@@ -283,30 +283,47 @@ fn start_target_n_luns(
         let (stream, _peer) = listener.accept().expect("target accept");
         let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
         let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
         let mut session = IscsiSession::new();
         // Hold RAM guards in a Vec to extend their lifetime across `serve_conn`.
         let mut guards: Vec<std::sync::MutexGuard<'_, Vec<u8>>> = Vec::with_capacity(n);
         for r in &rams_for_thread {
             guards.push(r.lock().unwrap());
         }
-        // Coerce each guard to a `&mut [u8]` slice view, build the device and
-        // its aligned store plane.
+        // Coerce each guard to a `&mut [u8]` slice view, build the slot and its
+        // aligned store plane.
         let mut backends: Vec<RamBackend<'_>> = guards
             .iter_mut()
             .map(|g| RamBackend::new(&mut g[..]))
             .collect();
-        let mut devs: Vec<BlockDevice> = backends
-            .iter_mut()
-            .map(|b| BlockDevice::disk(b, BLOCK_SIZE).expect("device"))
+        let mut slots: Vec<TestLu> = (0..n)
+            .map(|i| {
+                TestLu::block(
+                    (RAM_SIZE / BLOCK_SIZE as usize) as u64,
+                    BLOCK_SIZE,
+                    i as u32,
+                )
+            })
             .collect();
-        let mut dev_slices: Vec<&mut dyn ScsiDevice> =
-            devs.iter_mut().map(|d| d as &mut dyn ScsiDevice).collect();
-        let mut planes: Vec<Option<StorePlane<'_>>> = backends
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
             .iter_mut()
-            .map(|b| Some(StorePlane::BlockRw(b)))
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
             .collect();
-        let mut luns = Luns::new(&mut dev_slices, &mut planes);
-        serve_conn(&mut conn, &mut work, &mut session, &mut luns)
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(
+            backends
+                .iter_mut()
+                .map(|b| Some(StorePlane::BlockRw(b)))
+                .collect(),
+        );
+        serve_conn(
+            &mut conn,
+            &mut work,
+            &mut scratch,
+            &mut session,
+            &mut target,
+            &mut storage,
+        )
     });
     (port, handle, rams)
 }
@@ -350,17 +367,13 @@ fn test_unit_ready_inquiry_read_capacity() {
         iscsi.error()
     );
     let data = task.datain();
-    assert!(data.len() >= 66, "INQUIRY data too short: {}", data.len());
+    assert_eq!(data.len(), 36, "the standard INQUIRY page is 36 bytes");
     assert_eq!(data[0] & 0x1F, 0, "PDT must be 0 (direct-access)");
-    assert_eq!(data[2], 0x06, "byte[2] must be SPC-4 (分歧2)");
-    assert_eq!(&data[8..16], b"SnowSCSI", "vendor ID");
-    assert_eq!(&data[16..32], b"Virtual Disk    ", "product ID");
-    assert_eq!(&data[32..36], b"0100", "product revision");
-    let desc = |i: usize| u16::from_be_bytes([data[58 + 2 * i], data[58 + 2 * i + 1]]);
-    assert_eq!(desc(0), 0x00A0, "version descriptor SAM-5");
-    assert_eq!(desc(1), 0x0960, "version descriptor iSCSI");
-    assert_eq!(desc(2), 0x0460, "version descriptor SPC-4");
-    assert_eq!(desc(3), 0x04C0, "version descriptor SBC-3");
+    assert_eq!(data[2], 5, "byte[2] must be SPC-3");
+    assert_eq!(data[4], 31, "additional length");
+    assert_eq!(&data[8..16], b"SNOW\0\0\0\0", "vendor ID");
+    assert_eq!(&data[16..32], b"SCSI\0\0\0\0\0\0\0\0\0\0\0\0", "product ID");
+    assert_eq!(&data[32..36], b"P1  ", "product revision");
 
     let task = iscsi.read_capacity10(0);
     assert_eq!(
@@ -494,7 +507,8 @@ fn bundle_scattered_writes_over_iscsi() {
     let handle = thread::spawn(move || {
         let (stream, _peer) = listener.accept().expect("target accept");
         let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
-        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        // A 4 MiB WRITE(10) must fit the command bank in one transfer.
+        let mut work = vec![0u8; 4 * 1024 * 1024 + BHS_SIZE];
         let mut session = IscsiSession::new();
         let mut bundle = FlatBundle::new(
             StdFsBackend::new(&dir_for_thread),
@@ -503,11 +517,22 @@ fn bundle_scattered_writes_over_iscsi() {
             BLOCK_SIZE,
         )
         .expect("bundle");
-        let mut dev = BlockDevice::disk(&mut bundle, BLOCK_SIZE).expect("device");
-        let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-        let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut bundle))];
-        let mut luns = Luns::new(&mut devs, &mut planes);
-        serve_conn(&mut conn, &mut work, &mut session, &mut luns)
+        let mut slots = [TestLu::block(size / u64::from(BLOCK_SIZE), BLOCK_SIZE, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut bundle))]);
+        serve_conn(
+            &mut conn,
+            &mut work,
+            &mut scratch,
+            &mut session,
+            &mut target,
+            &mut storage,
+        )
     });
 
     let iscsi = connect(port);

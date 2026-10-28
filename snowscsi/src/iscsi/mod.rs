@@ -2,21 +2,19 @@
 //!
 //! A pure session state machine: [`target::IscsiSession`] consumes one
 //! [`target::Event`] per [`target::IscsiSession::poll`] call and returns the
-//! next [`target::Action`] (receive, send, a storage op, or close). It never
-//! touches platform I/O, so the same core serves a blocking TCP server, an
-//! async executor task, or a bare-metal driver.
+//! next [`target::Action`] (receive, send or close). It never touches platform
+//! I/O, so the same core serves a blocking TCP server, an async executor task,
+//! or a bare-metal driver. SCSI commands are executed by the seam-first core:
+//! the session builds the command context from the wire and drives a
+//! [`Target`](crate::core::Target) one step per entry, implementing the host
+//! data seam ([`HostTransport`](crate::core::storage::HostTransport)) itself.
 //!
-//! The session owns all framing: incoming PDUs are read in two stages (the
-//! 48-byte BHS, then the AHS + data segment + padding), driven by the
-//! [`Action::HostRecv`](target::Action::HostRecv) lengths, so a shell carries
-//! no protocol knowledge. A device whose data phase yields a
-//! [`Xfer::Store`](crate::scsi::device::Xfer::Store) op is handed to the shell
-//! as [`Action::Store`](target::Action::Store); the shell executes it against
-//! the LUN's storage plane and feeds the result back as
-//! [`Event::StoreDone`](target::Event::StoreDone), which the session maps
-//! through
-//! [`ScsiDevice::store_done`](crate::scsi::device::ScsiDevice::store_done);
-//! the wire bytes are unchanged.
+//! The session owns all framing: incoming PDUs are read in stages (the 48-byte
+//! BHS, then the AHS + data segment + padding), driven by the
+//! [`Action::HostRecv`](target::Action::HostRecv) offset/length pairs, so a
+//! shell carries no protocol knowledge. A device data phase that yields a
+//! host `Send` is chunked into Data-In PDUs; a host `Receive` is solicited with
+//! R2T and consumed one Data-Out PDU at a time.
 //!
 //! [`pdu`] holds the 48-byte BHS field codec. The blocking shell
 //! `transport::serve` (behind `std`) wraps a `std::net::TcpListener` in a
@@ -24,30 +22,62 @@
 //!
 //! # Work-buffer contract
 //!
-//! All calls share one caller-provided scratch buffer:
-//! `work.len() >= crate::MIN_DATA_LEN + pdu::BHS_SIZE`. The leading
-//! [`pdu::BHS_SIZE`] bytes carry the wire header; the remainder is the
-//! SCSI data area handed to the devices. Undersized buffers are rejected
-//! with [`target::TargetError::WorkBufTooSmall`].
+//! All calls share two caller-provided banks: `work` (PDU + command data,
+//! `len >= crate::MIN_DATA_LEN + pdu::BHS_SIZE`) and `scratch` (the resident
+//! long-operation bank, `len >= crate::MIN_DATA_LEN`). Undersized banks are
+//! rejected with [`target::TargetError::WorkBufTooSmall`].
+//!
+//! `work` is **one** data bank: the leading [`pdu::BHS_SIZE`] bytes carry the
+//! wire header, so the usable SCSI data area is exactly `work.len() -
+//! pdu::BHS_SIZE`. A command's whole host transfer must fit in that area: the
+//! core device publishes a single [`DataPlan`](crate::core::DataPlan) and the
+//! transport sends (or receives) it in that one bank, so a transfer larger than
+//! the bank is **not** streamed in chunks. Such a command is answered with a
+//! target-side resource condition
+//! ([`RESOURCE_FAILURE`](crate::core::RESOURCE_FAILURE): `05/55/00`) and the
+//! connection stays usable — it is not a CDB error. Size `work` for the largest
+//! transfer the initiator will issue (plus the 48-byte BHS).
 //!
 //! # Example
 //!
 //! A fresh session, driven by a no-I/O tick, asks for the next PDU's BHS:
 //!
 //! ```
-//! use snowscsi::common::seekable_storage::RamBackend;
+//! use snowscsi::block::{BlockAttrs, BlockDevice};
+//! use snowscsi::core::storage::{BlockingStorage, IoBuf, IoReq, StorageReceipt, SyncStorage};
+//! use snowscsi::core::{Lu, LuImpl, Pair, Spc, Target};
 //! use snowscsi::iscsi::pdu::BHS_SIZE;
 //! use snowscsi::iscsi::target::{Action, Event, IscsiSession};
-//! use snowscsi::scsi::block::BlockDevice;
 //! use snowscsi::MIN_DATA_LEN;
 //!
-//! let mut ram = vec![0u8; 64 * 1024];
-//! let mut devs = [BlockDevice::disk(&mut RamBackend::new(&mut ram), 512).unwrap()];
+//! struct Sink;
+//! impl SyncStorage for Sink {
+//!     fn exec(&mut self, _req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+//!         let len = match &buf {
+//!             IoBuf::None => 0,
+//!             IoBuf::Read(b) => b.len(),
+//!             IoBuf::Write(b) => b.len(),
+//!         };
+//!         StorageReceipt::ok(len)
+//!     }
+//! }
+//!
+//! let mut slot = LuImpl::new(Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))), 0u8);
+//! let mut table = [&mut slot as &mut dyn Lu<Pair = Pair<_, u8>>];
+//! let mut target = Target::new(&mut table[..]);
+//! let mut storage = BlockingStorage::new(Sink);
 //! let mut session = IscsiSession::new();
 //! let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+//! let mut scratch = vec![0u8; MIN_DATA_LEN];
 //!
-//! match session.poll(Event::Tick, &mut work, &mut devs) {
-//!     Action::HostRecv { len } => assert_eq!(len, BHS_SIZE),
+//! match session.poll(
+//!     Event::Tick,
+//!     &mut work,
+//!     &mut scratch,
+//!     &mut target,
+//!     &mut storage,
+//! ) {
+//!     Action::HostRecv { offset: 0, len } => assert_eq!(len, BHS_SIZE),
 //!     other => panic!("expected HostRecv, got {other:?}"),
 //! }
 //! ```

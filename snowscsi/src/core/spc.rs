@@ -31,11 +31,12 @@ use super::device::{
 use super::eject::RemovalLocks;
 use super::errors::{
     Completion, Delivery, Effect, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS, INVALID_FIELD,
-    MEDIUM_NOT_PRESENT, WRITE_ERROR,
+    MEDIUM_NOT_PRESENT, RESOURCE_FAILURE, WRITE_ERROR,
 };
 use super::long::{LongInfo, LongPhase};
 use super::permit::{BoundaryPermit, CommandPermit};
 use super::storage::StorageOp;
+use super::ua::{ClearReason, ClearRule, Ua, UaClass, UaSet};
 
 /// TEST UNIT READY.
 const TEST_UNIT_READY: u8 = 0x00;
@@ -127,6 +128,8 @@ pub struct Spc<D: Device> {
     /// LUN count reported by REPORT LUNS (0 is treated as 1).
     lun_count: u32,
     saved_sense: Option<Sense>,
+    /// Pending unit attentions (one slot per class, fixed priority).
+    ua: UaSet,
 }
 
 impl<D: Device> Spc<D> {
@@ -142,6 +145,7 @@ impl<D: Device> Spc<D> {
             started: true,
             lun_count: 1,
             saved_sense: None,
+            ua: UaSet::new(),
         }
     }
 
@@ -175,6 +179,19 @@ impl<D: Device> Spc<D> {
         self.saved_sense
     }
 
+    /// Raise a pending unit attention (SPC-3 5.6).
+    ///
+    /// Same-class raises merge into the existing instance. Returns whether a
+    /// new instance was stored.
+    pub fn raise_unit_attention(&mut self, class: UaClass) -> bool {
+        self.ua.raise(class, 0)
+    }
+
+    /// Highest-priority pending unit attention, without consuming it.
+    pub fn pending_ua(&self) -> Option<Ua> {
+        self.ua.peek()
+    }
+
     /// Body of `Device::prepare`; the trait wrapper records a prepare-level
     /// CHECK as the saved sense so a following REQUEST SENSE can return it.
     fn prepare_inner(
@@ -189,6 +206,18 @@ impl<D: Device> Spc<D> {
         let Some(opcode) = cdb.first().copied() else {
             return Err(Completion::Check(INVALID_FIELD));
         };
+        // A pending unit attention is reported before the command itself
+        // (SPC-3 5.6). The highest-priority request-sense class becomes a
+        // CHECK CONDITION for the next reporting command. INQUIRY stays
+        // executable and never clears it; REPORT LUNS must also execute while
+        // the condition is pending (SPC-3 6.21) and clears only the
+        // inventory-change class; REQUEST SENSE reports the instance as sense
+        // data (GOOD) and consumes it, but only after its own CDB checks pass.
+        if opcode != INQUIRY && opcode != REPORT_LUNS && opcode != REQUEST_SENSE {
+            if let Some(pending) = self.ua.next() {
+                return Err(Completion::Check(pending.sense));
+            }
+        }
         match opcode {
             TEST_UNIT_READY => {
                 if cdb.len() < 6 {
@@ -227,6 +256,14 @@ impl<D: Device> Spc<D> {
                 if cdb.len() < 5 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
+                // Only a valid REQUEST SENSE consumes the pending instance.
+                // A failed CDB check above leaves it pending for the next
+                // reporting command.
+                if self.saved_sense.is_none() {
+                    if let Some(pending) = self.ua.next() {
+                        self.saved_sense = Some(pending.sense);
+                    }
+                }
                 let alloc = cdb[4] as usize;
                 self.len = alloc.min(SENSE_LEN);
                 self.published = false;
@@ -238,8 +275,26 @@ impl<D: Device> Spc<D> {
                 if cdb.len() < 10 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
+                // SPC-3 Table 148: only 00h (all non well-known), 01h
+                // (well-known only) and 02h (all) are defined; the rest are
+                // reserved → CHECK CONDITION / INVALID FIELD IN CDB.
+                let select = cdb[2];
+                if select > 0x02 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                // A valid REPORT LUNS executes even while a unit attention is
+                // pending; only the inventory-change class is cleared by it.
+                self.ua.clear_by(ClearReason::ReportLuns);
+                // 01h asks for well-known logical units only; this device has
+                // none, so the list is empty.
+                self.lun_count = if select == 0x01 {
+                    0
+                } else if ctx.lun_count == 0 {
+                    1
+                } else {
+                    ctx.lun_count
+                };
                 let alloc = be32(&cdb[6..10]) as usize;
-                self.lun_count = if ctx.lun_count == 0 { 1 } else { ctx.lun_count };
                 let list = 8usize.saturating_mul(self.lun_count as usize);
                 let total = 8usize.saturating_add(list);
                 self.len = alloc.min(total);
@@ -596,8 +651,12 @@ impl<D: Device> Device for Spc<D> {
         if let Err(Completion::Check(sense)) = result {
             // A prepare-level CHECK (range, write protect, invalid CDB) is a
             // real command sense; REQUEST SENSE must return it exactly like a
-            // poll-level CHECK.
-            self.saved_sense = Some(sense);
+            // poll-level CHECK. A failed REQUEST SENSE must not overwrite an
+            // instance that is still waiting to be delivered.
+            let request_sense = cdb.first() == Some(&REQUEST_SENSE);
+            if !(request_sense && self.saved_sense.is_some()) {
+                self.saved_sense = Some(sense);
+            }
         }
         result
     }
@@ -680,8 +739,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < self.len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 fill_report_luns(self.lun_count, data, self.len);
                 PollStep::Send(&data[..self.len])
@@ -704,8 +765,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 // The profile writes directly into the caller's bank; header
                 // lengths describe the complete, untruncated response.
@@ -733,8 +796,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let capacity = self.inner.spc_profile().and_then(|p| p.read_capacity());
                 let Some(capacity) = capacity else {
@@ -763,8 +828,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let filled = self
                     .inner
@@ -794,8 +861,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let filled = self
                     .inner
@@ -824,8 +893,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < self.len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 fill_inquiry(self.inner.inquiry_data(), data, self.len);
                 PollStep::Send(&data[..self.len])
@@ -858,8 +929,10 @@ impl<D: Device> Device for Spc<D> {
                     return PollStep::Complete(Completion::Good);
                 }
                 if data.len() < self.len {
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // response.
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let info = self.inner.long_info();
                 let sense = if info.phase == LongPhase::Foreground && info.progress.is_some() {
@@ -905,6 +978,27 @@ impl<D: Device> Device for Spc<D> {
 
     fn finish_delivery(&mut self, permit: &CommandPermit, delivery: Delivery) {
         self.inner.finish_delivery(permit, delivery);
+    }
+
+    fn autosense_delivered(&mut self, permit: &CommandPermit, sense: Sense) {
+        // Only the instance the completion actually carried is consumed. A
+        // completion the runner fabricated (e.g. ABORTED COMMAND) must not
+        // clear a saved sense that never reached the host.
+        if self.saved_sense == Some(sense) {
+            self.saved_sense = None;
+        }
+        self.inner.autosense_delivered(permit, sense);
+    }
+
+    fn raise_ua(&mut self, _permit: &CommandPermit, class: UaClass) {
+        self.raise_unit_attention(class);
+    }
+
+    fn pending_ua(&self) -> Option<UaClass> {
+        self.ua
+            .peek()
+            .filter(|ua| ua.clear == ClearRule::RequestSense)
+            .map(|ua| ua.class)
     }
 
     fn commit(&mut self, permit: &BoundaryPermit) -> Result<(), Completion> {
@@ -1365,6 +1459,234 @@ mod tests {
             spc.saved_sense().is_some(),
             "a short send must not consume the sense"
         );
+    }
+
+    #[test]
+    fn lu_reset_ua_is_reported_by_tur_and_inquiry_does_not_clear_it() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        assert!(spc.raise_unit_attention(UaClass::LuReset));
+
+        // INQUIRY stays executable and leaves the condition pending.
+        let mut data = [0u8; 36];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 36), &inquiry_cdb(36)),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            spc.poll(&permit, Feedback::plan_accepted(), &mut data),
+            PollStep::Send(_)
+        ));
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(36, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(
+            spc.pending_ua().map(|ua| ua.class),
+            Some(UaClass::LuReset),
+            "INQUIRY must not clear a pending unit attention"
+        );
+
+        // The next reporting command gets CHECK CONDITION with the class
+        // sense and consumes exactly one instance.
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(Sense::new(0x06, 0x29, 0x03)))
+        );
+        assert!(spc.pending_ua().is_none());
+        // The prepare-level CHECK is the saved sense a later REQUEST SENSE
+        // returns when the transport has no autosense.
+        assert_eq!(spc.saved_sense(), Some(Sense::new(0x06, 0x29, 0x03)));
+    }
+
+    #[test]
+    fn request_sense_reports_and_consumes_a_pending_ua() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        spc.raise_unit_attention(UaClass::LuReset);
+
+        let mut data = [0u8; 18];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 18), &rs_cdb(18)),
+            Ok(())
+        );
+        assert!(spc.pending_ua().is_none(), "REQUEST SENSE consumed it");
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            spc.poll(&permit, Feedback::plan_accepted(), &mut data),
+            PollStep::Send(_)
+        ));
+        assert_eq!(data[0], 0x70);
+        assert_eq!(data[2], 0x06);
+        assert_eq!(data[12], 0x29);
+        assert_eq!(data[13], 0x03);
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(18, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert!(spc.saved_sense().is_none());
+    }
+
+    #[test]
+    fn report_luns_executes_while_a_unit_attention_is_pending() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        spc.raise_unit_attention(UaClass::LuReset);
+
+        let mut data = [0u8; 16];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 16), &report_luns_cdb(16)),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(plan) if plan.direction == Direction::ToHost && plan.bytes == 16
+        ));
+        assert!(matches!(
+            spc.poll(&permit, Feedback::plan_accepted(), &mut data),
+            PollStep::Send(_)
+        ));
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(16, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(&data[0..4], &8u32.to_be_bytes(), "one LUN descriptor");
+        assert_eq!(
+            spc.pending_ua().map(|ua| ua.class),
+            Some(UaClass::LuReset),
+            "REPORT LUNS clears only the inventory-change class"
+        );
+
+        // The condition is still owed to the next reporting command.
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(Sense::new(0x06, 0x29, 0x03)))
+        );
+    }
+
+    #[test]
+    fn failed_request_sense_keeps_the_pending_ua() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        spc.raise_unit_attention(UaClass::LuReset);
+
+        // W=1 declares a Data-Out phase, so REQUEST SENSE fails its own
+        // direction check with 05/24/00.
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::FromHost, 18), &rs_cdb(18)),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            spc.pending_ua().map(|ua| ua.class),
+            Some(UaClass::LuReset),
+            "a failed REQUEST SENSE must not consume the pending instance"
+        );
+
+        // The next reporting command still delivers it, and the captured
+        // instance is not overwritten by another failed REQUEST SENSE.
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(Sense::new(0x06, 0x29, 0x03)))
+        );
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::FromHost, 18), &rs_cdb(18)),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            spc.saved_sense(),
+            Some(Sense::new(0x06, 0x29, 0x03)),
+            "REQUEST SENSE's own exception must not replace a pending instance"
+        );
+    }
+
+    #[test]
+    fn same_class_ua_raises_merge_and_keep_the_first_instance() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        assert!(spc.raise_unit_attention(UaClass::LuReset));
+        assert!(!spc.raise_unit_attention(UaClass::LuReset));
+
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(Sense::new(0x06, 0x29, 0x03)))
+        );
+        assert!(spc.pending_ua().is_none());
+        // Only one instance existed: the next command is TUR's normal GOOD.
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Good)
+        );
+    }
+
+    #[test]
+    fn ua_priority_is_fixed() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        spc.raise_unit_attention(UaClass::MediumChanged);
+        spc.raise_unit_attention(UaClass::LuReset);
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(Sense::new(0x06, 0x29, 0x03))),
+            "LU reset (priority 2) reports before medium changed (priority 4)"
+        );
+    }
+
+    #[test]
+    fn report_luns_clears_only_the_inventory_change() {
+        use crate::core::UaClass;
+
+        let mut spc = device();
+        let permit = permit();
+        spc.raise_unit_attention(UaClass::InventoryChanged);
+        // Inventory change is never a CHECK CONDITION ...
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Good)
+        );
+        assert!(spc.pending_ua().is_some());
+
+        // ... and REPORT LUNS clears it while answering normally.
+        let mut data = [0u8; 16];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 16), &report_luns_cdb(16)),
+            Ok(())
+        );
+        assert!(spc.pending_ua().is_none());
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
     }
 
     #[test]

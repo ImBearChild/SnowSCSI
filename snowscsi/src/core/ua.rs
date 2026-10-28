@@ -1,9 +1,10 @@
 //! Unit-attention classes and the fixed-size pending UA set.
 //!
 //! This module defines the vocabulary and the minimal merge/priority/clear
-//! behaviour.
-//! Transport/power-on/reset wiring that actually raises or consumes UA is
-//! not claimed here.
+//! behaviour. The public [`Spc`](super::spc::Spc) wrapper owns the pending set:
+//! it raises through `Device::raise_ua` (reached from
+//! [`Target::raise_ua_rt`](super::target::Target::raise_ua_rt)) and reports /
+//! consumes the highest-priority class on the next reporting command.
 
 use super::errors::Sense;
 

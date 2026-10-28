@@ -25,8 +25,8 @@ use crate::core::{
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, LongPhase, PollStep, RemovalEncoding,
     Sense, SpcProfile, COMMAND_ABORTED, FORMAT_IN_PROGRESS, INTERNAL_FAILURE, INVALID_FIELD,
-    LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, WRITE_ERROR,
-    WRITE_PROTECTED,
+    LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, RESOURCE_FAILURE,
+    WRITE_ERROR, WRITE_PROTECTED,
 };
 
 /// TEST UNIT READY.
@@ -289,7 +289,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         if blocks == 0 {
             // A zero-block command declares no data phase.
-            if ctx.host_bytes != 0 {
+            if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
                 return Err(Completion::Check(INVALID_FIELD));
             }
             return Err(Completion::Good);
@@ -477,7 +477,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(MEDIUM_NOT_PRESENT));
         }
         if blocks == 0 {
-            if ctx.host_bytes != 0 {
+            if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
                 return Err(Completion::Check(INVALID_FIELD));
             }
             return Err(Completion::Good);
@@ -545,13 +545,17 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         if fmt_data {
             // The transport declares the 12-byte parameter list as its Data-Out
-            // phase; the plan published in `poll` must match it exactly.
+            // phase; a declared bound must match it exactly, while a transport
+            // that declares no bound leaves the length to its own publish gate.
             if ctx.host_direction != Direction::FromHost
-                || ctx.host_bytes != FORMAT_PARAMS_LEN as u64
+                || matches!(ctx.declared_host_bytes(),
+                    Some(declared) if declared != FORMAT_PARAMS_LEN as u64)
             {
                 return Err(Completion::Check(INVALID_FIELD));
             }
-        } else if ctx.host_direction != Direction::None || ctx.host_bytes != 0 {
+        } else if ctx.host_direction != Direction::None
+            || matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0)
+        {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
@@ -576,7 +580,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(INVALID_FIELD));
         }
         check_direction(ctx, Direction::None)?;
-        if ctx.host_bytes != 0 {
+        if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
@@ -797,8 +801,9 @@ impl<M: MmcMedium> MmcDrive<M> {
             return PollStep::Complete(Completion::Good);
         }
         if data.len() < len {
+            // The CDB is valid; the caller's bank cannot stage the response.
             self.query = Query::None;
-            return PollStep::Complete(Completion::Check(INVALID_FIELD));
+            return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
         }
         if !fill(&mut data[..len]) {
             self.query = Query::None;
@@ -884,14 +889,14 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                     });
                 }
                 if data.len() < bytes as usize {
-                    // A short caller bank is a runner contract breach; drop the
-                    // admitted medium operation so the medium is not left
-                    // half-active.
+                    // The CDB is valid; the caller's bank cannot stage the
+                    // transfer. Drop the admitted medium operation so the
+                    // medium is not left half-active.
                     if let Some(medium) = self.medium.as_mut() {
                         medium.interrupt(InterruptReason::TransportRestriction, KnownEffects::NONE);
                     }
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let Some(medium) = self.medium.as_mut() else {
                     self.query = Query::None;
@@ -989,7 +994,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                         if data.len() < FORMAT_PARAMS_LEN {
                             self.query = Query::None;
                             self.long = LongOp::Idle;
-                            return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                            return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                         }
                         self.published = true;
                         return PollStep::Publish(DataPlan {
@@ -1002,7 +1007,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                             if data.len() < FORMAT_PARAMS_LEN {
                                 self.query = Query::None;
                                 self.long = LongOp::Idle;
-                                return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                                return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                             }
                             PollStep::Receive(&mut data[..FORMAT_PARAMS_LEN])
                         }
@@ -1010,7 +1015,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                             if data.len() < FORMAT_PARAMS_LEN {
                                 self.query = Query::None;
                                 self.long = LongOp::Idle;
-                                return PollStep::Complete(Completion::Check(INVALID_FIELD));
+                                return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                             }
                             let (accepted, failed) = match fb.host() {
                                 Some(receipt) => (receipt.accepted(), receipt.error().is_some()),
@@ -3101,7 +3106,7 @@ mod tests {
         let mut data = [0u8; 16];
         assert!(matches!(
             dev.poll(&permit, Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Check(INVALID_FIELD))
+            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
         ));
         assert!(!dev.active());
         assert!(!dev.medium().expect("medium").active());

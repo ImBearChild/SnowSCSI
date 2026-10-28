@@ -30,6 +30,7 @@
 //! `serve()` returns, and every store plane is `sync()`ed before exit.
 
 mod spec;
+mod stack;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -42,6 +43,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::{Args, Parser};
+use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
 use snowscsi::cdrom::drive::CdromDrive;
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::dvdram::DvdRamMedia;
@@ -50,7 +52,12 @@ use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
 use snowscsi::common::store::StorePlane;
+use snowscsi::core::{Lu, Spc, Writability};
+use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
+#[cfg(feature = "dvdram")]
+use snowscsi::mmc::DvdRamMedium;
+use snowscsi::mmc::{FlatCdMedium, MmcDrive};
 use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
 use snowscsi::scsi::block::BlockDevice;
 use snowscsi::scsi::device::ScsiDevice;
@@ -58,6 +65,7 @@ use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
 use spec::{Backing, DeviceRole, DeviceSpec};
+use stack::{CliLu, CliMedium, CliPair, CliStorage};
 
 #[cfg(target_os = "linux")]
 use snowscsi::usb::{
@@ -72,8 +80,13 @@ use usb_gadget::function::custom::{
 #[cfg(target_os = "linux")]
 use usb_gadget::{udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
 
-/// Default work buffer size (256 KiB).
-const DEFAULT_WORK_BUF_SIZE: usize = 256 * 1024;
+/// Default work buffer size (1 MiB).
+///
+/// The core devices publish the whole host transfer as one data plan and read
+/// it from (or write it into) the caller's bank, so the bank must cover the
+/// largest host transfer the initiator issues; 1 MiB covers the kernel's
+/// default iSCSI transfer cap.
+const DEFAULT_WORK_BUF_SIZE: usize = 1024 * 1024;
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
@@ -158,7 +171,10 @@ struct ServeArgs {
     #[arg(long, short, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Work buffer size in bytes (accepts K/M/G suffixes; default 256K).
+    /// Work buffer size in bytes (accepts K/M/G suffixes; default 1M).
+    /// It is one bank: the SCSI data area is this size minus the 48-byte iSCSI
+    /// BHS, and the whole host transfer must fit in it. A larger READ/WRITE is
+    /// answered with a target resource sense (05/55/00), not streamed.
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
 }
@@ -208,6 +224,12 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The two transports use different LUN stacks while the USB rewrite is
+    // pending: iSCSI drives the core `Target`, USB keeps the legacy
+    // `ScsiDevice` bundle. Only one transport is selected at a time.
+    if args.usb.is_none() {
+        return run_serve_iscsi(args, &specs, work_size);
+    }
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
@@ -252,7 +274,199 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     }
 
-    // iSCSI transport: the ArgGroup guarantees --iscsi when --usb is absent.
+    // `run_serve` only reachable with `--usb`; the iSCSI branch returned above.
+    ExitCode::FAILURE
+}
+
+/// Build the core `Target` slot set for the iSCSI transport.
+///
+/// Mirrors [`build_devices`]'s plane mapping but produces `Spc<BlockDevice>` /
+/// `Spc<MmcDrive<CliMedium>>` slots instead of the legacy `ScsiDevice`
+/// profiles. Every spec pushes exactly one slot and one plane, in spec order.
+#[allow(clippy::too_many_arguments)]
+fn build_iscsi_slots<'a>(
+    specs: &[DeviceSpec],
+    ram_disks: &'a mut Vec<Vec<u8>>,
+    backends: &'a mut Vec<BlockBackend<'a>>,
+    lives: &'a mut Vec<LiveData<StdFsBackend>>,
+    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
+    planes: &mut Vec<Option<StorePlane<'a>>>,
+    slots: &mut Vec<CliLu>,
+) -> Result<(), ()> {
+    if specs.is_empty() {
+        eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
+        return Err(());
+    }
+    for w in spec::check_dual_mount(specs) {
+        eprintln!("{w}");
+    }
+    build_resources(specs, ram_disks, backends, lives, bundles)?;
+
+    planes.clear();
+    slots.clear();
+    let mut be_iter = backends.iter_mut();
+    let mut live_iter = lives.iter_mut();
+    #[cfg(feature = "bundle")]
+    let mut bundle_iter = bundles.iter_mut();
+
+    for (lun, spec) in specs.iter().enumerate() {
+        let backing = lun as u32;
+        log::debug!("LUN {lun}: {}", spec.raw);
+        match (spec.role, &spec.backing) {
+            #[cfg(feature = "bundle")]
+            (DeviceRole::BlockDisk, Backing::ImgDir { dir }) => {
+                let be = bundle_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
+                let cap = be.capacity();
+                let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
+                if spec.plane.read_only {
+                    attrs.write_mode = Writability::ReadOnly;
+                    planes.push(Some(StorePlane::BlockRo(be)));
+                } else {
+                    planes.push(Some(StorePlane::BlockRw(be)));
+                }
+                slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
+                    Spc::new(CoreBlockDevice::new(attrs)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: bundle block device ({cap} bytes)");
+                let _ = dir;
+            }
+            #[cfg(feature = "bundle")]
+            (DeviceRole::BlockCd, Backing::ImgDir { dir }) => {
+                let be = bundle_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
+                let cap = be.capacity();
+                let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
+                attrs.write_mode = Writability::ReadOnly;
+                planes.push(Some(StorePlane::BlockRo(be)));
+                slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
+                    Spc::new(CoreBlockDevice::new(attrs)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
+                let _ = dir;
+            }
+            (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
+                let cap = be.capacity();
+                let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
+                if spec.plane.read_only {
+                    attrs.write_mode = Writability::ReadOnly;
+                    planes.push(Some(StorePlane::BlockRo(be)));
+                } else {
+                    planes.push(Some(StorePlane::BlockRw(be)));
+                }
+                slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
+                    Spc::new(CoreBlockDevice::new(attrs)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: block device ({cap} bytes)");
+            }
+            (DeviceRole::BlockCd, Backing::Img { .. } | Backing::Ram { .. }) => {
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
+                let cap = be.capacity();
+                let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
+                attrs.write_mode = Writability::ReadOnly;
+                planes.push(Some(StorePlane::BlockRo(be)));
+                slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
+                    Spc::new(CoreBlockDevice::new(attrs)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: CD profile ({cap} bytes)");
+            }
+            (DeviceRole::MmcCd, Backing::Img { path }) => {
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
+                let cap = be.capacity();
+                let medium = CliMedium::Flat(FlatCdMedium::new(cap));
+                planes.push(Some(StorePlane::BlockRo(be)));
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
+                    Spc::new(MmcDrive::new(medium)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
+            }
+            (DeviceRole::MmcCd, Backing::Live { dir }) => {
+                let live = live_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: live pool exhausted"))?;
+                let total = live.layout().total;
+                let medium = CliMedium::Flat(FlatCdMedium::new(
+                    u64::from(total) * u64::from(ISO_SECTOR_SIZE),
+                ));
+                planes.push(Some(StorePlane::BlockRo(live)));
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
+                    Spc::new(MmcDrive::new(medium)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
+            }
+            #[cfg(feature = "dvdram")]
+            (DeviceRole::MmcCd, Backing::DvdRam { path: _ }) => {
+                let be = be_iter
+                    .next()
+                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
+                let cap = be.capacity();
+                let medium = CliMedium::DvdRam(DvdRamMedium::new(cap / u64::from(ISO_SECTOR_SIZE)));
+                planes.push(Some(StorePlane::BlockRw(be)));
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
+                    Spc::new(MmcDrive::new(medium)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: DvdRam DVD-RAM ({cap} bytes)");
+            }
+            #[cfg(not(feature = "dvdram"))]
+            (DeviceRole::MmcCd, Backing::DvdRam { .. }) => {
+                eprintln!("snowscsi: dvdram= requires the `dvdram` feature");
+                return Err(());
+            }
+            _ => {
+                eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
+                return Err(());
+            }
+        }
+    }
+    debug_assert_eq!(specs.len(), planes.len());
+    debug_assert_eq!(specs.len(), slots.len());
+    Ok(())
+}
+
+/// `snowscsi serve --iscsi`: bind the portal, build the core target and drive
+/// the session shell until shutdown.
+fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> ExitCode {
+    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
+    let mut backends: Vec<BlockBackend> = Vec::new();
+    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
+    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
+    let mut planes: Vec<Option<StorePlane>> = Vec::new();
+    let mut slots: Vec<CliLu> = Vec::new();
+    if build_iscsi_slots(
+        specs,
+        &mut ram_disks,
+        &mut backends,
+        &mut lives,
+        &mut bundles,
+        &mut planes,
+        &mut slots,
+    )
+    .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = CliPair>)
+        .collect();
+    let mut storage = CliStorage::new(planes);
+
     let is_auto = args.iscsi.as_deref() == Some("auto");
     let (listener, bound) = if is_auto {
         match bind_iscsi_auto() {
@@ -287,9 +501,6 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         (listener, bound)
     };
 
-    // Graceful shutdown: SIGINT/SIGTERM set `stop`;
-    // a probe connection wakes the blocking accept() so serve() can observe
-    // it and return (transport serves one connection at a time).
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
@@ -306,13 +517,9 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     let mut work = vec![0u8; work_size];
-    // Report the actual bound address: `--iscsi 127.0.0.1:0` picks an
-    // ephemeral port, so callers (tests) must learn it from this line.
-    log::info!("listening on {bound} with {} LUN(s)", luns.len());
+    let mut scratch = vec![0u8; work_size];
+    log::info!("listening on {bound} with {} LUN(s)", table.len());
 
-    // Auto-config: use open-iscsi to log in and expose a block device.
-    // Runs in a helper thread so the blocking `serve` loop can start
-    // accepting immediately.
     let auto_handle = if is_auto {
         spawn_iscsi_auto_helper(bound, Arc::clone(&stop))
     } else {
@@ -323,13 +530,13 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         listener,
         &stop,
         &mut work,
-        &mut luns,
+        &mut scratch,
+        &mut table[..],
+        &mut storage,
         Some(DEFAULT_READ_TIMEOUT),
     );
 
-    // Tear down the auto-config session (logout, delete node, SELinux).
     if let Some(handle) = auto_handle {
-        // Wake the helper if it is still waiting for the device.
         stop.store(true, Ordering::SeqCst);
         let _ = handle.join();
         teardown_iscsi_auto(bound);
@@ -340,16 +547,14 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush every store plane.
-    sync_planes(luns.planes);
+    if let Err((i, e)) = storage.sync() {
+        eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+    }
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
 
 /// Flush every store plane; errors are reported to stderr but not fatal.
-///
-/// A `None` plane is skipped (the CLI now always supplies a real plane, but
-/// `Luns` still admits self-backed LUNs).
 fn sync_planes(planes: &mut [Option<StorePlane<'_>>]) {
     for (i, plane) in planes.iter_mut().enumerate() {
         if let Some(plane) = plane {
@@ -700,48 +905,21 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
     }
 }
 
-/// Shared device pipeline: build every parsed [`DeviceSpec`] into a device and
-/// its store plane, in order (all `--block` devices first, then all `--cdrom`
-/// devices).
+/// Own every backing resource a LUN specification needs, in LUN order.
 ///
-/// Ownership model: the caller owns every resource — RAM slots
-/// (`ram_disks`), block/optical backends, live scanners and bundles — and the
-/// store planes borrow from them. Each spec pushes exactly one device
-/// (`disks`/`drives`) and one plane (`planes`), so the two are 1:1 aligned and
-/// can be zipped into a [`Luns`] bundle. The caller then lends that bundle to a
-/// transport. On failure prints the error and returns `Err(())`.
-///
-/// Plane mapping:
-/// - writable `--block` → [`BlockDevice::disk`] + [`StorePlane::BlockRw`];
-/// - read-only `--block` → [`BlockDevice::disk_read_only`] +
-///   [`StorePlane::BlockRo`];
-/// - `--block …,profile=cd` → [`BlockDevice::cdrom`] +
-///   [`StorePlane::BlockRo`];
-/// - `--cdrom img=<iso>` / `live=<dir>` → `CdromDrive` +
-///   [`StorePlane::BlockRo`] (the drive keeps only cached geometry; reads go
-///   through the plane);
-/// - `--cdrom dvdram=<img>` → `CdromDrive` + [`StorePlane::BlockRw`].
+/// Exactly one byte-plane backend per non-Live LUN; `Live` owns its scanner.
+/// RAM slots are consumed from `ram_disks` via a walking split cursor (no
+/// reallocation, disjoint borrows). Each `--block`/`--cdrom` spec pushes at
+/// most one backend or one live scanner, so Phase B can lend them in the same
+/// order.
 #[allow(clippy::too_many_arguments)]
-fn build_devices<'a>(
+fn build_resources<'a>(
     specs: &[DeviceSpec],
     ram_disks: &'a mut Vec<Vec<u8>>,
-    backends: &'a mut Vec<BlockBackend<'a>>,
-    lives: &'a mut Vec<LiveData<StdFsBackend>>,
-    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
-    disks: &mut Vec<BlockDevice>,
-    drives: &mut Vec<CdromDrive>,
-    planes: &mut Vec<Option<StorePlane<'a>>>,
+    backends: &mut Vec<BlockBackend<'a>>,
+    lives: &mut Vec<LiveData<StdFsBackend>>,
+    bundles: &mut Vec<FlatBundle<StdFsBackend>>,
 ) -> Result<(), ()> {
-    if specs.is_empty() {
-        eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
-        return Err(());
-    }
-
-    for w in spec::check_dual_mount(specs) {
-        eprintln!("{w}");
-    }
-
-    // ── Phase A: own every resource, in LUN order ──────────────────
     // Exactly one byte-plane backend per non-Live LUN; Live owns its
     // scanner. RAM slots are consumed from `ram_disks` via a walking
     // split cursor (no reallocation, disjoint borrows).
@@ -911,6 +1089,51 @@ fn build_devices<'a>(
             }
         }
     }
+    Ok(())
+}
+
+/// Shared device pipeline: build every parsed [`DeviceSpec`] into a device and
+/// its store plane, in order (all `--block` devices first, then all `--cdrom`
+/// devices).
+///
+/// Ownership model: the caller owns every resource — RAM slots
+/// (`ram_disks`), block/optical backends, live scanners and bundles — and the
+/// store planes borrow from them. Each spec pushes exactly one device
+/// (`disks`/`drives`) and one plane (`planes`), so the two are 1:1 aligned and
+/// can be zipped into a [`Luns`] bundle. The caller then lends that bundle to a
+/// transport. On failure prints the error and returns `Err(())`.
+///
+/// Plane mapping:
+/// - writable `--block` → [`BlockDevice::disk`] + [`StorePlane::BlockRw`];
+/// - read-only `--block` → [`BlockDevice::disk_read_only`] +
+///   [`StorePlane::BlockRo`];
+/// - `--block …,profile=cd` → [`BlockDevice::cdrom`] +
+///   [`StorePlane::BlockRo`];
+/// - `--cdrom img=<iso>` / `live=<dir>` → `CdromDrive` +
+///   [`StorePlane::BlockRo`] (the drive keeps only cached geometry; reads go
+///   through the plane);
+/// - `--cdrom dvdram=<img>` → `CdromDrive` + [`StorePlane::BlockRw`].
+#[allow(clippy::too_many_arguments)]
+fn build_devices<'a>(
+    specs: &[DeviceSpec],
+    ram_disks: &'a mut Vec<Vec<u8>>,
+    backends: &'a mut Vec<BlockBackend<'a>>,
+    lives: &'a mut Vec<LiveData<StdFsBackend>>,
+    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
+    disks: &mut Vec<BlockDevice>,
+    drives: &mut Vec<CdromDrive>,
+    planes: &mut Vec<Option<StorePlane<'a>>>,
+) -> Result<(), ()> {
+    if specs.is_empty() {
+        eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
+        return Err(());
+    }
+
+    for w in spec::check_dual_mount(specs) {
+        eprintln!("{w}");
+    }
+
+    build_resources(specs, ram_disks, backends, lives, bundles)?;
 
     // ── Phase B: build one (device, plane) pair per spec ──────────
     // Each backend is lent exactly once: both the block devices and the MMC
@@ -1663,18 +1886,21 @@ fn init_logging(verbose: u8) {
     let _ = builder.try_init();
 }
 
-/// Resolve the work buffer size (default 256K), validating it against
-/// [`MIN_DATA_LEN`].
+/// Resolve the work buffer size (default 1M), validating it against
+/// [`MIN_DATA_LEN`] plus the iSCSI PDU header.
+///
+/// The buffer is one bank for the whole host transfer, with the 48-byte BHS
+/// prefix in front of the SCSI data area, so anything below that cannot serve
+/// an iSCSI connection at all.
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     let bytes = match s {
         None => DEFAULT_WORK_BUF_SIZE as u64,
         Some(v) => spec::parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
     };
     let n = usize::try_from(bytes).map_err(|_| format!("--work-buf-size {bytes} is too large"))?;
-    if n < MIN_DATA_LEN {
-        return Err(format!(
-            "--work-buf-size {n} is below the minimum {MIN_DATA_LEN}"
-        ));
+    let min = MIN_DATA_LEN + BHS_SIZE;
+    if n < min {
+        return Err(format!("--work-buf-size {n} is below the minimum {min}"));
     }
     Ok(n)
 }
@@ -1712,7 +1938,15 @@ mod tests {
     fn parse_work_size_defaults_and_validation() {
         assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
         assert_eq!(parse_work_size(Some("128K")).unwrap(), 128 * 1024);
-        assert!(parse_work_size(Some("1000")).is_err()); // below MIN_DATA_LEN
+        assert!(parse_work_size(Some("1000")).is_err()); // far below the minimum
+        assert!(
+            parse_work_size(Some("8192")).is_err(),
+            "the 48-byte iSCSI BHS must fit in front of the data area"
+        );
+        assert_eq!(
+            parse_work_size(Some("8240")).unwrap(),
+            MIN_DATA_LEN + BHS_SIZE
+        );
         assert!(parse_work_size(Some("bogus")).is_err());
     }
 

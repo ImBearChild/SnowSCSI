@@ -188,6 +188,15 @@ const fn contract_receipt() -> StorageReceipt {
 /// the token (idempotent; the token is dead afterwards). A buffer must not be
 /// reused between a `Pending` poll and the matching `Ready`/`cancel`.
 pub trait Storage {
+    /// Select the LUN whose backing the next operations address.
+    ///
+    /// One adapter may serve several LUNs (a CLI target with independent
+    /// backends); the runner calls this once per entry before addressing
+    /// `lun`. Single-LUN adapters keep the default no-op.
+    fn select_lun(&mut self, lun: usize) {
+        let _ = lun;
+    }
+
     /// Start one operation from metadata alone.
     ///
     /// Returns a token that the adapter rejects on every poll when no slot is

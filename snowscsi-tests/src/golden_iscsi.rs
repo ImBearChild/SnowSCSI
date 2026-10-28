@@ -16,15 +16,15 @@
 //! private to that module): the golden scenarios build raw wire bytes inline
 //! rather than depending on any library builder.
 
+use snowscsi::common::seekable_storage::RamBackend;
 use snowscsi::common::store::StorePlane;
+use snowscsi::core::{Lu, Target};
 use snowscsi::iscsi::pdu::{flag, op, stage, status, BHS_SIZE};
 use snowscsi::iscsi::target::IscsiSession;
 use snowscsi::iscsi::transport::serve_conn;
-use snowscsi::scsi::backend::RamBackend;
-use snowscsi::scsi::block::BlockDevice;
-use snowscsi::scsi::device::ScsiDevice;
-use snowscsi::scsi::Luns;
 use snowscsi::MIN_DATA_LEN;
+
+use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 
 use crate::golden::{self, RecConn};
 
@@ -201,13 +201,25 @@ fn run(name: &str, config: &str, ram: &mut [u8], script: impl FnOnce(&mut RecCon
     script(&mut conn);
 
     let mut work = vec![0u8; WORK_LEN];
+    let mut scratch = vec![0u8; MIN_DATA_LEN];
     let mut session = IscsiSession::new();
     let mut backend = RamBackend::new(ram);
-    let mut dev = BlockDevice::disk(&mut backend, 512).unwrap();
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut dev];
-    let mut planes: [Option<StorePlane<'_>>; 1] = [Some(StorePlane::BlockRw(&mut backend))];
-    let mut luns = Luns::new(&mut devs, &mut planes);
-    serve_conn(&mut conn, &mut work, &mut session, &mut luns).expect("serve_conn returns Ok");
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    serve_conn(
+        &mut conn,
+        &mut work,
+        &mut scratch,
+        &mut session,
+        &mut target,
+        &mut storage,
+    )
+    .expect("serve_conn returns Ok");
 
     let text = golden::render(config, &conn.trace);
     golden::assert_well_formed(name, &text);

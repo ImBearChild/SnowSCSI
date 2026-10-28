@@ -905,7 +905,10 @@ impl Runner {
         };
         if state.done.is_some() {
             // A completion fixed by admission/prepare never started execution:
-            // forbids `interrupt` here (no command, no IO).
+            // forbids `interrupt` here (no command, no IO). The status never
+            // reached the host, so its delivery is `Failed`.
+            let permit = self.command_permit();
+            lu.finish_delivery(&permit, Delivery::Failed);
             self.note_command_finished();
             self.consume_completion();
             self.drive_state.set(None);
@@ -1964,6 +1967,61 @@ impl Runner {
         self.transport_end = true;
     }
 
+    /// Settle the command left live by a transport end.
+    ///
+    /// The terminal flag alone leaves the slot's command active: this cancels
+    /// the retained token (the wire is gone), settles the device with
+    /// [`InterruptReason::Stop`] and books the failed delivery. The resident
+    /// long operation's retained token is cancelled too, even though no
+    /// `poll_long_entry` can run after the transport is gone. Idempotent: a
+    /// second call with no live command or long token changes nothing.
+    pub(crate) fn settle_transport_end<L: Lu + ?Sized>(
+        &mut self,
+        lu: &mut L,
+        storage: &mut dyn Storage,
+        host: &mut dyn HostTransport,
+    ) -> RunOutcome {
+        self.transport_end = true;
+        // Captured before settling: the slot this entry was given belongs to
+        // the live command's LUN, which may differ from the long operation's.
+        let command_lun = self.drive_state.get().map(|state| state.ctx.lun as usize);
+        if let Err(fault) = self.settle_abnormally(lu, storage, host, InterruptReason::Stop) {
+            self.set_fatal(fault);
+        }
+        self.cancel_long_at_transport_end(lu, storage, command_lun);
+        self.terminal_outcome().unwrap_or(RunOutcome::ServiceReady)
+    }
+
+    /// Cancel the resident long operation's retained token because the wire is
+    /// gone.
+    ///
+    /// No later `poll_long_entry` can reach the token, so it must be cancelled
+    /// here instead of being dropped. The facts follow the same rules as the
+    /// long-entry cancellation path: a read (or a speculative prefetch) never
+    /// fabricates a write remainder, while an unobserved write/sync reports
+    /// `unknown_remainder`. Only a slot that owns the token is notified; a
+    /// query command on another LUN can be the one that was live, and its
+    /// device must not inherit another LUN's effects.
+    fn cancel_long_at_transport_end<L: Lu + ?Sized>(
+        &mut self,
+        lu: &mut L,
+        storage: &mut dyn Storage,
+        command_lun: Option<usize>,
+    ) {
+        let Some((lun, pending)) = self.long_pending else {
+            return;
+        };
+        storage.cancel(pending.token);
+        self.clear_long_token();
+        self.clear_long_feedback(lun);
+        let known = Self::known_unobserved(pending.req.dir);
+        if known == KnownEffects::NONE || command_lun.is_some_and(|owner| owner != lun) {
+            return;
+        }
+        let permit = self.command_permit();
+        let _ = lu.interrupt(&permit, InterruptReason::Stop, known);
+    }
+
     /// Enter the fatal state; the next settled `tick` reports `Ended{Fatal}`.
     #[allow(dead_code)] // `Target::fatal`; driven by tests here
     pub(crate) fn set_fatal(&mut self, fault: Fault) {
@@ -2424,16 +2482,24 @@ enum HostResume {
 
 /// The host-data contract: the direction must match; a Data-In response may be
 /// shorter than the declared host capacity, while Data-Out and no-data must
-/// match exactly (`, A1).
+/// match exactly unless the transport declared no bound at all
+/// ([`CommandContext::UNBOUNDED_HOST_BYTES`]).
 fn plan_contract(ctx: CommandContext, plan: DataPlan) -> bool {
     if plan.direction != ctx.host_direction {
         return true;
     }
     match plan.direction {
         // Data-In: `ctx.host_bytes` is the host's declared receive capacity,
-        // so a shorter natural response is legal SCSI (`05 §5.1`). Underflow is
+        // so a shorter natural response is legal SCSI. Underflow is
         // accounted by the host receipt, never by fabricating bytes.
         Direction::ToHost => plan.bytes > ctx.host_bytes,
+        // No declared bound: the transport's own publish gate owns the
+        // protocol length; this layer must not invent an exact match.
+        Direction::FromHost | Direction::None
+            if ctx.host_bytes == CommandContext::UNBOUNDED_HOST_BYTES =>
+        {
+            false
+        }
         // Data-Out and no-data phases must match exactly: the device may not
         // write less/more than the host declared.
         Direction::FromHost | Direction::None => plan.bytes != ctx.host_bytes,
@@ -2735,6 +2801,9 @@ mod tests {
     enum ProbeMode {
         /// Consume the receipt, then ask for another IO (R1).
         SettleIo,
+        /// Same long operation, but the storage request is a read: cancelling it
+        /// must never fabricate a write remainder.
+        SettleRead,
         /// First entry issues IO; the next returns `Idle` while still
         /// `Foreground`, then the third consumes the same receipt (R2).
         IdleOnce,
@@ -2770,6 +2839,14 @@ mod tests {
                 resource: 1,
                 offset: 0,
                 buf: &data[..8],
+            })
+        }
+
+        fn read<'a>(data: &'a mut [u8]) -> PollStep<'a> {
+            PollStep::Io(StorageOp::Read {
+                resource: 1,
+                offset: 0,
+                buf: &mut data[..8],
             })
         }
     }
@@ -2823,6 +2900,18 @@ mod tests {
                     };
                     match feedback.kind() {
                         FeedbackKind::Begin | FeedbackKind::IoDone => ProbeLong::io(data),
+                        _ => PollStep::Idle,
+                    }
+                }
+                ProbeMode::SettleRead => {
+                    self.long = LongInfo {
+                        phase: LongPhase::Foreground,
+                        write_accessible: false,
+                        progress: Some(0),
+                        error: None,
+                    };
+                    match feedback.kind() {
+                        FeedbackKind::Begin | FeedbackKind::IoDone => ProbeLong::read(data),
                         _ => PollStep::Idle,
                     }
                 }
@@ -3181,6 +3270,55 @@ mod tests {
                 "a contract settle never claims delivery"
             );
         }
+    }
+
+    #[test]
+    fn unbounded_host_bytes_accepts_any_data_out_and_no_data_plan() {
+        // The transport declared no bound: `FromHost`/`None` skip the exact
+        // match, so the device's natural transfer length is accepted.
+        let script = [
+            Some(Script::Publish(DataPlan {
+                direction: Direction::FromHost,
+                bytes: 512,
+            })),
+            Some(Script::Write { len: 512 }),
+            Some(Script::Complete(Completion::Good)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut bench = Bench::new(script, 0);
+        bench
+            .start(ctx(
+                Direction::FromHost,
+                CommandContext::UNBOUNDED_HOST_BYTES,
+            ))
+            .expect("start");
+        assert_eq!(bench.step(), Ok(DriveStep::Done(Completion::Good)));
+        assert_eq!(bench.host.recorder().publishes, 1);
+        assert_eq!(bench.storage.recorder().writes, 1);
+
+        let script = [
+            Some(Script::Publish(DataPlan {
+                direction: Direction::None,
+                bytes: 0,
+            })),
+            Some(Script::Sync),
+            Some(Script::Complete(Completion::Good)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut bench = Bench::new(script, 0);
+        bench
+            .start(ctx(Direction::None, CommandContext::UNBOUNDED_HOST_BYTES))
+            .expect("start");
+        assert_eq!(bench.step(), Ok(DriveStep::Done(Completion::Good)));
+        assert_eq!(bench.host.recorder().publishes, 1);
     }
 
     #[test]
@@ -3677,6 +3815,80 @@ mod tests {
             "a cancelled write keeps an unknown remainder"
         );
         assert_eq!(probe.interrupts, 1, "exactly one bounded cleanup");
+    }
+
+    #[test]
+    fn transport_end_cancels_a_retained_long_operation() {
+        // A write whose end is never observed keeps the unknown remainder.
+        let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 1u8);
+        let mut runner = Runner::new();
+        let mut storage = HoldStorage::new(usize::MAX);
+        let mut host = HoldHost::new();
+        let mut bank = [0u8; 64];
+
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut bank)
+            .expect("long entry");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        runner.claim_long_feedback(0, info);
+        assert!(runner.long_pending.is_some());
+        assert!(runner.long_feedback.is_some());
+        assert_eq!(storage.cancels, 0);
+
+        assert_eq!(
+            runner.settle_transport_end(&mut slot, &mut storage, &mut host),
+            RunOutcome::Ended {
+                reason: RunEnd::TransportEnded,
+                error: None,
+            }
+        );
+        assert_eq!(storage.cancels, 1, "the retained token is cancelled");
+        assert!(runner.long_pending.is_none(), "the long state is idle");
+        assert!(runner.long_feedback.is_none());
+        let probe = slot.device_ref();
+        assert_eq!(probe.last_reason, Some(InterruptReason::Stop));
+        assert!(
+            probe.last_known.unknown_remainder,
+            "an unobserved write reports the unknown remainder"
+        );
+
+        // Idempotent: nothing is left to cancel.
+        assert_eq!(
+            runner.settle_transport_end(&mut slot, &mut storage, &mut host),
+            RunOutcome::Ended {
+                reason: RunEnd::TransportEnded,
+                error: None,
+            }
+        );
+        assert_eq!(storage.cancels, 1);
+
+        // A read never fabricates a write remainder (and needs no interrupt).
+        let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleRead), 1u8);
+        let mut runner = Runner::new();
+        let mut storage = HoldStorage::new(usize::MAX);
+        let mut host = HoldHost::new();
+        let mut bank = [0u8; 64];
+
+        let info = runner
+            .poll_long_entry(0, &mut slot, &mut storage, &mut bank)
+            .expect("long entry");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        runner.claim_long_feedback(0, info);
+        assert_eq!(storage.cancels, 0);
+
+        let _ = runner.settle_transport_end(&mut slot, &mut storage, &mut host);
+        assert_eq!(storage.cancels, 1);
+        assert!(runner.long_pending.is_none(), "the long state is idle");
+        assert!(runner.long_feedback.is_none());
+        let probe = slot.device_ref();
+        assert!(
+            !probe.last_known.unknown_remainder,
+            "a cancelled read has no write remainder"
+        );
+        assert!(
+            probe.last_reason.is_none(),
+            "a read needs no device interrupt"
+        );
     }
 
     #[test]

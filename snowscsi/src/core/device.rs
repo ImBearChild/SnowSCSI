@@ -11,11 +11,12 @@
 //! vocabulary in the storage/host card.
 
 use super::eject::RemovalLocks;
-use super::errors::{Completion, Delivery, Fault, KnownEffects};
+use super::errors::{Completion, Delivery, Fault, KnownEffects, Sense};
 use super::long::LongInfo;
 use super::permit::{BoundaryPermit, CommandPermit};
 use super::profile::SpcProfile;
 use super::storage::{HostReceipt, IoReceipt, PrefetchOp, StorageOp};
+use super::ua::UaClass;
 
 /// Core's zero-sized placeholder pair member. It implements no trait; a
 /// medium-less device uses `type Medium = NoMedium` and treats it purely as an
@@ -108,9 +109,33 @@ pub struct CommandContext {
     /// this from `slot_count()`; standalone callers pass at least 1.
     pub lun_count: u32,
     /// Total host byte count declared by the command (0 = no host data).
+    ///
+    /// [`Self::UNBOUNDED_HOST_BYTES`] means the transport declared **no
+    /// bound**: the exact-length rules for `FromHost`/`None` are skipped and
+    /// the transport's own `HostTransport::publish` gate enforces the protocol
+    /// limit. `ToHost` still treats it as an unlimited receive capacity.
     pub host_bytes: u64,
     /// Direction of the host data phase.
     pub host_direction: Direction,
+}
+
+impl CommandContext {
+    /// Sentinel `host_bytes` value meaning "the host declared no bound".
+    pub const UNBOUNDED_HOST_BYTES: u64 = u64::MAX;
+
+    /// The declared host byte count, or `None` when the context carries
+    /// [`Self::UNBOUNDED_HOST_BYTES`].
+    ///
+    /// Profiles use this instead of comparing `host_bytes` to `0` so a
+    /// transport that declares no bound is not mistaken for "declared zero".
+    #[must_use]
+    pub const fn declared_host_bytes(&self) -> Option<u64> {
+        if self.host_bytes == Self::UNBOUNDED_HOST_BYTES {
+            None
+        } else {
+            Some(self.host_bytes)
+        }
+    }
 }
 
 /// The single data plan a device may publish for a command. It is accepted
@@ -411,6 +436,44 @@ pub trait Device {
     /// Book the delivery outcome of a command whose completion is fixed. Must
     /// not restart the command or overwrite the issued completion.
     fn finish_delivery(&mut self, permit: &CommandPermit, delivery: Delivery);
+
+    /// The transport delivered `sense` as **autosense** in the completion
+    /// frame.
+    ///
+    /// A full autosense delivery reports the saved sense to the host, so the
+    /// device clears the instance it just handed over (SPC-3: autosense data
+    /// is equivalent to REQUEST SENSE). Only the instance the completion
+    /// actually carried is consumed: a completion fabricated by the runner
+    /// (e.g. ABORTED COMMAND) must not clear a sense that never reached the
+    /// host. Transports without autosense never call this and keep the saved
+    /// sense for a later REQUEST SENSE. Default: no-op for devices that keep no
+    /// saved sense.
+    fn autosense_delivered(&mut self, permit: &CommandPermit, sense: Sense) {
+        let _ = (permit, sense);
+    }
+
+    /// Raise a pending unit attention (SPC-3 5.6) for the next command that
+    /// reports it.
+    ///
+    /// The permit is the target's command permit, so only the owning target
+    /// can raise the condition; a device that keeps no unit-attention state
+    /// uses the default no-op. Same-class raises merge (the first instance is
+    /// kept). [`Spc`](super::spc::Spc) owns the pending set for the public
+    /// wrapper; a bare profile never answers it.
+    fn raise_ua(&mut self, permit: &CommandPermit, class: UaClass) {
+        let _ = (permit, class);
+    }
+
+    /// Highest-priority pending unit attention that the next reporting command
+    /// must deliver before any medium/backing gate.
+    ///
+    /// `None` when nothing is pending, or when only a class cleared by
+    /// REPORT LUNS is pending (that class is never a CHECK CONDITION).
+    /// [`Spc`](super::spc::Spc) owns the pending set; a bare profile answers
+    /// `None`.
+    fn pending_ua(&self) -> Option<UaClass> {
+        None
+    }
 
     /// Local medium-metadata commit before detaching the old pair. It has no
     /// `Storage` parameter, must not issue storage IO, and is not a durability

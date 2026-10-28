@@ -11,6 +11,9 @@ mod mock;
 mod usb_bot;
 
 #[cfg(test)]
+mod iscsi_harness;
+
+#[cfg(test)]
 mod iso_cross;
 
 #[cfg(test)]

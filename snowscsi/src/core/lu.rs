@@ -17,12 +17,13 @@ use super::device::{
 };
 use super::eject::RemovalLocks;
 use super::errors::{
-    commit_fault, Completion, Delivery, Fault, KnownEffects, FORMAT_IN_PROGRESS, INTERNAL_FAILURE,
-    MEDIUM_NOT_PRESENT, NEEDS_RECOVERY,
+    commit_fault, Completion, Delivery, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS,
+    INTERNAL_FAILURE, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY,
 };
 use super::long::{LongInfo, LongPhase};
 use super::management::{Change, ChangeResult, LuInfo};
 use super::permit::{BoundaryPermit, CommandPermit, OwnerBindPermit};
+use super::ua::UaClass;
 
 /// One addressable slot: a device plus the pair it currently owns.
 ///
@@ -103,6 +104,26 @@ pub trait Lu {
 
     /// Book the delivery outcome of a completion that is already fixed.
     fn finish_delivery(&mut self, permit: &CommandPermit, delivery: Delivery);
+
+    /// The transport delivered the fixed CHECK CONDITION as autosense.
+    ///
+    /// Only transports that can carry the sense data inside the completion
+    /// frame call this; it clears the saved sense instance that was just
+    /// reported. `sense` is the instance the completion carried, so a
+    /// runner-fabricated completion cannot consume an unrelated saved sense.
+    /// Default: no-op.
+    fn autosense_delivered(&mut self, permit: &CommandPermit, sense: Sense) {
+        let _ = (permit, sense);
+    }
+
+    /// Raise a pending unit attention (SPC-3 5.6) on this slot.
+    ///
+    /// The permit is the owning target's command permit; a foreign permit is
+    /// ignored. The condition is reported by the device on the next command
+    /// that reports it (never by INQUIRY) and consumed exactly once. A bare
+    /// profile keeps no unit-attention state and ignores the raise; the public
+    /// [`Spc`](super::spc::Spc) wrapper owns the pending set.
+    fn raise_ua(&mut self, permit: &CommandPermit, class: UaClass);
 
     /// Target identity this slot is bound to.
     fn owner(&self) -> TargetId;
@@ -296,8 +317,13 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         // No pair means no medium: media commands must not reach a stale
         // adapter binding after Remove/host-eject. The
         // mandatory query set (INQUIRY/REQUEST SENSE/REPORT LUNS/…) stays
-        // answerable on an empty slot (`§4.19`, SPC-3 6.21).
-        if self.backing.is_none() && !admitted_during_foreground(opcode) {
+        // answerable on an empty slot (`§4.19`, SPC-3 6.21). A pending unit
+        // attention outranks the empty-slot gate: the next reporting command
+        // must deliver it before the device can report MEDIUM NOT PRESENT.
+        if self.backing.is_none()
+            && !admitted_during_foreground(opcode)
+            && self.device.pending_ua().is_none()
+        {
             return Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT));
         }
         // A slot that failed to restore its old medium must not serve: its
@@ -323,9 +349,10 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         }
         // Defensive repeat of the admission check: an empty slot forwards only
         // the mandatory query set; a media command never issues storage IO.
+        // A pending unit attention still has to be delivered first.
         if self.backing.is_none() {
             let opcode = cdb.first().copied().unwrap_or(0xFF);
-            if !admitted_during_foreground(opcode) {
+            if !admitted_during_foreground(opcode) && self.device.pending_ua().is_none() {
                 return Err(Completion::Check(MEDIUM_NOT_PRESENT));
             }
         }
@@ -414,6 +441,20 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             return;
         }
         self.device.finish_delivery(permit, delivery);
+    }
+
+    fn autosense_delivered(&mut self, permit: &CommandPermit, sense: Sense) {
+        if !self.command_ok(permit) {
+            return;
+        }
+        self.device.autosense_delivered(permit, sense);
+    }
+
+    fn raise_ua(&mut self, permit: &CommandPermit, class: UaClass) {
+        if !self.command_ok(permit) {
+            return;
+        }
+        self.device.raise_ua(permit, class);
     }
 
     fn owner(&self) -> TargetId {
@@ -752,6 +793,7 @@ mod tests {
         active: bool,
         commits: u32,
         ejects: u32,
+        uas: u32,
         medium: Option<NoMedium>,
         commit_result: Result<(), Completion>,
     }
@@ -763,6 +805,7 @@ mod tests {
                 active: false,
                 commits: 0,
                 ejects: 0,
+                uas: 0,
                 medium: Some(NoMedium),
                 commit_result: Ok(()),
             }
@@ -823,6 +866,10 @@ mod tests {
         }
 
         fn finish_delivery(&mut self, _permit: &CommandPermit, _delivery: Delivery) {}
+
+        fn raise_ua(&mut self, _permit: &CommandPermit, _class: UaClass) {
+            self.uas = self.uas.saturating_add(1);
+        }
 
         fn commit(&mut self, _permit: &BoundaryPermit) -> Result<(), Completion> {
             self.commits = self.commits.saturating_add(1);
@@ -942,6 +989,10 @@ mod tests {
         );
         // A foreign delivery report is silently ignored.
         slot.finish_delivery(&command, Delivery::Failed);
+        // A foreign unit-attention raise is ignored too.
+        let foreign_owner = TargetId::new(8);
+        slot.raise_ua(&CommandPermit::new(foreign_owner), UaClass::LuReset);
+        assert_eq!(slot.device_ref().uas, 0);
         assert_eq!(slot.take_rt(&boundary), None);
         assert_eq!(slot.force_remove_rt(&boundary), Err(Fault::ForeignBoundary));
         assert!(!slot.has_result());
@@ -1026,6 +1077,16 @@ mod tests {
         assert!(!slot.snapshot().ready);
         // A second force on an empty slot is a no-op, not a contract failure.
         assert_eq!(slot.force_remove_rt(&permit), Ok(()));
+    }
+
+    #[test]
+    fn raise_ua_forwards_only_with_the_owning_permit() {
+        let owner = TargetId::new(21);
+        let mut slot = LuImpl::with_owner(owner, HookDevice::new(), 1u8);
+        slot.raise_ua(&CommandPermit::new(owner), UaClass::LuReset);
+        assert_eq!(slot.device_ref().uas, 1);
+        slot.raise_ua(&CommandPermit::new(TargetId::new(22)), UaClass::LuReset);
+        assert_eq!(slot.device_ref().uas, 1);
     }
 
     #[test]
