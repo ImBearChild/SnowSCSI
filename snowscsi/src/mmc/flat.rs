@@ -1,4 +1,4 @@
-//! Flat read-only CD medium (`02-api-profiles.md` §6.7/§7.4).
+//! Flat read-only CD medium.
 //!
 //! A single-track, single-session, finalized CD data medium with no backing
 //! bytes of its own: reads become

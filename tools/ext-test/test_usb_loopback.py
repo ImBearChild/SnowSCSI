@@ -3,7 +3,7 @@
 
 Spawns `snowscsi serve --usb`, binds a FunctionFS gadget to a `dummy_hcd`
 UDC, and lets the kernel's own `usb-storage` host driver attach and create a
-`/dev/sdX`. Then exercises the §8.3 checklist through the real block layer:
+`/dev/sdX`. Then exercises the full checklist through the real block layer:
 capacity matches the backend, a `dd`/`badblocks` full-disk roundtrip, ext4
 format / mount / write / read / fsck, and read-only backend write
 protection.

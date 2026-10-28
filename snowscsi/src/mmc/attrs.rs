@@ -1,8 +1,5 @@
 //! MMC medium attributes and descriptive values.
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §6.3/§6.4. These types are
-//! profile-private vocabulary: core/Block never see them.
-//!
 //! `MmcAttrs` carries facts only. The drive reads `block_len`, `sectors`,
 //! `write_mode` and `write_protected`; it never dispatches on a media class.
 
@@ -38,7 +35,7 @@ impl MmcAttrs {
     }
 }
 
-/// MMC write mode (design §6.3). Core's `Writability` is Block-only.
+/// MMC write mode (design). Core's `Writability` is Block-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmcWriteMode {
     /// Read-only medium (CD-ROM, DVD-ROM).

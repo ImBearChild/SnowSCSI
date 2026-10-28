@@ -1,4 +1,4 @@
-//! `MmcMedium` seam (`02-api-profiles.md` §6.1/§6.7).
+//! `MmcMedium` seam.
 //!
 //! The medium owns semantics and state; the drive owns CDB decoding,
 //! validation and response encoding. A medium is a `Device::Medium` member,

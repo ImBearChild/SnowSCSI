@@ -1,7 +1,5 @@
 //! Resident long-operation projection.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.12.
-//!
 //! The long-operation state lives in the Device; `poll_long` rebuilds the
 //! execution context on every call and persists only this state. The runner
 //! keeps the *one* retained adapter token (and the caller's `data` bank

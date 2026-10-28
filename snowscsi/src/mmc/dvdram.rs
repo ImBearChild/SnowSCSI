@@ -1,4 +1,4 @@
-//! DVD-RAM medium (`02-api-profiles.md` §6.6/§6.7).
+//! DVD-RAM medium.
 //!
 //! A rewritable single-track data medium behind the `dvdram` feature. Like
 //! [`FlatCdMedium`](super::flat::FlatCdMedium) it owns only geometry and the

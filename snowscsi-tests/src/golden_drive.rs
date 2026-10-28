@@ -101,7 +101,7 @@ mod tests {
     /// Build a raw 31-byte CBW from its logical fields (little endian).
     ///
     /// A local copy of `usb_bot::raw_cbw` (private to that module): the golden
-    /// scenarios build their CBWs inline (§5.1) rather than depending on the
+    /// scenarios build their CBWs inline rather than depending on the
     /// library's parse-only `Cbw`.
     fn raw_cbw(tag: u32, data_len: u32, flags: u8, lun: u8, cdb: &[u8]) -> [u8; CBW_LEN] {
         let mut raw = [0u8; CBW_LEN];
@@ -214,7 +214,8 @@ mod tests {
         assert_eq!(csw[12], 0x00);
     }
 
-    /// The control seam is serviced by `usb::serve` per §3: Get Max LUN replies
+    /// The control seam is serviced by `usb::serve` per the control rules:
+    /// Get Max LUN replies
     /// with `max_lun()`, Bot Reset acks after `Event::Reset`, Link Reset resets.
     #[test]
     fn control_requests_are_serviced() {

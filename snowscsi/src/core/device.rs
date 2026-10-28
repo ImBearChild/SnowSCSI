@@ -1,8 +1,5 @@
 //! Device lifecycle seam and the static profile descriptors it exposes.
 //!
-//! Authority: `__ARCH__/design/02-api.md` §4.1/§4.2/§4.4/§4.18 and
-//! `__ARCH__/design/02-api-core.md` §4.18.
-//!
 //! [`Device`] owns only "can a pair member be handed back / installed" and the
 //! command lifecycle; it never sees profile behaviour. `Medium` has no unified
 //! trait bound: it may be [`NoMedium`], an MMC medium, or an application type.
@@ -35,7 +32,7 @@ pub struct Pair<M, B> {
     pub backing: B,
 }
 
-/// Static INQUIRY facts (`02-api-core.md` §4.18). Block defaults to PDT 0x00;
+/// Static INQUIRY facts. Block defaults to PDT 0x00;
 /// CD-ROM/MMC overrides to 0x05.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InquiryData {
@@ -79,7 +76,7 @@ impl InquiryData {
     }
 }
 
-/// PREVENT/ALLOW encoding family (`02-api.md` §4.1).
+/// PREVENT/ALLOW encoding family.
 ///
 /// `Scsi` is the SPC-3 Table 119 two-bit enumeration; `Mmc` is MMC-6 Table 329
 /// (bit 1 selects normal/persistent, bit 0 selects clear/set).
@@ -146,7 +143,7 @@ impl TargetId {
     pub const UNBOUND: TargetId = TargetId(0);
 
     /// Mint an identity. Crate-private: only `Target`/`Runner` may stamp one
-    /// (`02-api-core.md` §4.18); applications cannot forge ownership.
+    /// Applications cannot forge ownership.
     #[allow(dead_code)] // minted by `Target` in the target/runner card
     pub(crate) const fn new(raw: u32) -> Self {
         Self(raw)
@@ -184,7 +181,7 @@ pub enum Control {
     Abort,
 }
 
-/// Static writability of a backing (`02-api-core.md` §4.15). It is a fact
+/// Static writability of a backing. It is a fact
 /// field, never a behaviour dispatch; `write_protected` remains the runtime
 /// policy/latch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +192,7 @@ pub enum Writability {
     Writable,
 }
 
-/// Feedback kind for one poll step (`02-api.md` §4.4).
+/// Feedback kind for one poll step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedbackKind {
     /// First step after `prepare`; no prior plan/receipt.
@@ -212,7 +209,7 @@ pub enum FeedbackKind {
 
 /// Opaque per-poll feedback.
 ///
-/// Only the runner may mint one (`02-api.md` §4.4); a device can read it but
+/// Only the runner may mint one; a device can read it but
 /// cannot forge it. A device reads `kind()` and, for the matching kind, the
 /// opaque [`IoReceipt`]/[`HostReceipt`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,7 +295,7 @@ impl Feedback {
     }
 }
 
-/// One step of a command or resident long operation (`02-api.md` §4.4).
+/// One step of a command or resident long operation.
 ///
 /// Slices are valid only for this poll step; the runner re-borrows a caller
 /// bank on every pending poll and core never stores `&mut [u8]`.
@@ -307,8 +304,7 @@ impl Feedback {
 /// token: `Io`/`Prefetch` is issued once and polls at most once per entry
 /// (`Pending` keeps the token, `Ready` delivers one `FeedbackKind::IoDone` on a
 /// later entry). The runner's `data` bank (`scratch`) stays owned by the caller
-/// until the operation settles, while `work` remains free for query commands
-/// (`03 §3.7`).
+/// until the operation settles, while `work` remains free for query commands.
 #[derive(Debug)]
 pub enum PollStep<'a> {
     /// Publish the one data plan; accepted once, then frozen.
@@ -327,7 +323,7 @@ pub enum PollStep<'a> {
     Idle,
 }
 
-/// Device lifecycle seam (`02-api.md` §4.1).
+/// Device lifecycle seam.
 ///
 /// `inquiry_data`/`removal_encoding` are defaulted so existing implementations
 /// compile unchanged; `Spc<D>` uses them for profile-aware INQUIRY and
@@ -391,7 +387,7 @@ pub trait Device {
     /// entry, retaining the token across `Pending`; the receipt comes back as a
     /// [`FeedbackKind::IoDone`] on a later entry. The bank stays owned by the
     /// caller until the operation settles; a concurrent query command uses
-    /// `work`, never this bank (`03 §3.7`).
+    /// `work`, never this bank.
     fn poll_long<'a>(
         &mut self,
         permit: &CommandPermit,

@@ -1,7 +1,5 @@
 //! Eject policy: host-command versus operator/control-plane origin.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.14.
-//!
 //! The host's own EJECT is its explicit choice and is not blocked by its own
 //! PREVENT latch; performing it clears the **normal** (never the persistent)
 //! latch. An operator/control-plane eject is exactly what PREVENT protects

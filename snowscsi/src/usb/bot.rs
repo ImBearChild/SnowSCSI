@@ -1,5 +1,5 @@
 //! Command Block Wrapper (CBW) / Command Status Wrapper (CSW) encoding and
-//! decoding (USB MSC Bulk-Only Transport §5.1 / §5.2).
+//! decoding (USB MSC Bulk-Only Transport /).
 //!
 //! All multi-byte CBW/CSW fields are little endian on the wire; the
 //! signatures `"USBC"` / `"USBS"` are read back little endian too.

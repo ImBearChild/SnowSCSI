@@ -1,9 +1,6 @@
 //! Management values: pending changes, transaction results, slot projections
 //! and boundary rejects.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.7/§4.10/§4.11 and
-//! `__ARCH__/design/02-api.md` §4.3.
-//!
 //! These are pure values. They do not implement the management transaction;
 //! `Target`/`Runner` own that state machine.
 
@@ -84,7 +81,7 @@ pub enum BoundaryReject {
     /// (AwaitDelivery); `take` has nothing to hand back.
     EjectPending,
     /// A detached result is resident and must be taken; this is distinct from
-    /// [`Self::EjectPending`] (`§4.11`).
+    /// [`Self::EjectPending`].
     AwaitingResourceTake,
     /// The target has ended its lifecycle.
     Ended,

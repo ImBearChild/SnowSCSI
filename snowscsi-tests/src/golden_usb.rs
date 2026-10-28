@@ -28,7 +28,7 @@ use snowscsi::usb::{BotSession, ShortfallPolicy, CSW_LEN};
 /// Default scenario config: High-Speed BOT, no shortfall STALL, one LUN.
 const CONFIG: &str = "kind=bot mps=512 policy=ShortNoStall luns=1";
 
-/// Fixed deterministic backend pattern (`i % 251`), as pinned by §5.1.
+/// Fixed deterministic backend pattern (`i % 251`), as pinned by
 fn pattern_ram(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }

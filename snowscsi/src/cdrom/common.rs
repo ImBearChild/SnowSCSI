@@ -219,7 +219,7 @@ pub struct CdromCapabilities {
 }
 impl CdromCapabilities {
     /// A read-only CD-ROM drive: Mode-1 data read is the implicit baseline,
-    /// tray mechanism, eject/lock/load per real device calibration (§6.8).
+    /// tray mechanism, eject/lock/load per real device calibration.
     pub const fn read_only_cd_rom() -> Self {
         Self {
             tray: true,
@@ -576,7 +576,7 @@ pub fn build_get_config_features_for_media(
     };
     // Profile List (0x0000) identifies the profiles the drive supports; the
     // mounted profile is marked current (or 0000h when no media). Per
-    // §6.5.2.3 it is always current, so it also survives the RT=01b filter.
+    // it is always current, so it also survives the RT=01b filter.
     if include(0x0000) {
         // Build profile list from caps in descending numerical order
         // per MMC-6 §6.5.2.3.

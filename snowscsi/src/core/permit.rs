@@ -1,7 +1,5 @@
 //! Private-minting permits and the RAII execution borrow.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.8 and §4.11.
-//!
 //! Applications can never build a permit: every type here has private fields
 //! and only crate-private minting entry points. `Target` mints
 //! [`OwnerBindPermit`]; the `Runner` mints [`CommandPermit`]/[`BoundaryPermit`]

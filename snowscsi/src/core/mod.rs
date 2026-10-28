@@ -1,25 +1,22 @@
 //! Core contract layer: errors, device lifecycle, permits and values.
 //!
 //! This is the `no_std`, allocation-free, `unsafe`-free vocabulary layer of the
-//! public API (`__ARCH__/design/02-api.md` §4 and
-//! `__ARCH__/design/02-api-core.md` §4.7–§4.18). It contains only pure values
-//! and seams:
+//! public API. It contains only pure values and seams:
 //!
 //! - [`errors`] — [`Sense`]/[`Completion`]/[`Fault`], the `storage_fault_sense`
-//!   table and `commit_fault` (§4.17);
+//!   table and `commit_fault`;
 //! - [`device`] — the [`Device`] lifecycle trait, [`NoMedium`]/[`Pair`] and the
-//!   static [`InquiryData`]/[`RemovalEncoding`] descriptors (§4.1/§4.2);
+//!   static [`InquiryData`]/[`RemovalEncoding`] descriptors;
 //! - [`profile`] — the defaulted [`SpcProfile`] capability seam for the public
-//!   query commands (§4.19 extension clause);
-//! - [`permit`] — privately minted permits and [`ExecutionGuard`] (§4.8/§4.11);
+//!   query commands (extension clause);
+//! - [`permit`] — privately minted permits and [`ExecutionGuard`];
 //! - [`long`], [`management`], [`ua`], [`eject`] — long-operation, management,
-//!   unit-attention and eject values (§4.7/§4.12–§4.14);
+//!   unit-attention and eject values;
 //! - [`storage`] — [`Storage`](storage::Storage)/[`HostTransport`](storage::HostTransport)
-//!   and their synchronous adapters (§4.5/§4.6);
+//!   and their synchronous adapters;
 //! - [`collections`], [`lu`], [`runner`], [`target`] — slot sets, the `Lu`
-//!   seam, the runner state machine and the `Target`/`StaticTarget` entries
-//!   (§4.3/§4.9/§4.11/§4.20);
-//! - [`spc`] — the six-command public `Spc` wrapper (§4.19).
+//!   seam, the runner state machine and the `Target`/`StaticTarget` entries;
+//! - [`spc`] — the six-command public `Spc` wrapper.
 //!
 //! The core layer holds no executor task, no buffer ownership and no profile
 //! behaviour; buffers are re-borrowed by the caller on every poll.

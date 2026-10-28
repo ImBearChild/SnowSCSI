@@ -1,9 +1,6 @@
 //! Block profile: direct-access geometry, static writability and the
 //! READ(10)/WRITE(10)/SYNCHRONIZE CACHE(10)/FORMAT UNIT command family.
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §5 and
-//! `__ARCH__/design/05-acceptance.md`.
-//!
 //! The profile is **non-generic**: [`BlockDevice`] owns geometry, policy and
 //! command state, while the backing bytes stay in the application's `Storage`
 //! adapter. It never sees paths, media kinds or MMC vocabulary, and it

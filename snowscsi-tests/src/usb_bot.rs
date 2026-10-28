@@ -1,5 +1,5 @@
 //! Integration tests for the USB MSC Bulk-Only Transport session core
-//! (§7.2): command sequences, CSW validation, phase/invalid-CBW/invalid-LUN
+//! Command sequences, CSW validation, phase/invalid-CBW/invalid-LUN
 //! error paths, the usb-storage probe script, control-request ordering,
 //! reset-during-data-phase, and cross-platform data-phase regressions.
 //!
@@ -203,7 +203,7 @@ fn run_command<D: ScsiDevice>(
     drive_until_done(session, io, work, devs, planes)
 }
 
-/// Handle one queued control request the way `usb::serve` does (§6.3).
+/// Handle one queued control request the way `usb::serve` does.
 fn serve_ctrl_once<D: ScsiDevice>(
     session: &mut BotSession,
     gadget: &mut MockGadget,
@@ -595,7 +595,7 @@ fn invalid_cbw_without_stall_falls_back_to_command() {
     io.stall_available = false;
 
     // Bad signature followed by a valid CBW: no STALL, no CSW for the bad
-    // one, then the valid one is processed (§4.5 fallback).
+    // one, then the valid one is processed (fallback).
     let mut bad = raw_cbw(1, 0, 0, 0, &[0x00, 0, 0, 0, 0, 0]);
     bad[0] = b'X';
     io.feed_out(&bad);
@@ -870,7 +870,7 @@ fn bot_reset_interrupts_data_phase() {
     assert_eq!(csw_fields(&sent), (2, 0, 0x00));
 }
 
-// ── 9. Cross-platform data-phase regressions (§4.7) ─────────────────
+// ── 9. Cross-platform data-phase regressions  ─────────────────
 
 #[test]
 fn mode_sense_10_and_prevent_allow() {

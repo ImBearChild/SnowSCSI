@@ -1,4 +1,4 @@
-//! Minimal vendor medium (`02-api-profiles.md` §6.1/§6.7).
+//! Minimal vendor medium.
 //!
 //! A second, independent [`MmcMedium`] implementation used to prove that a new
 //! medium is a new implementation rather than a new device branch: `MmcDrive`

@@ -1,7 +1,5 @@
 //! Static block-device attributes.
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §5.2.
-//!
 //! These are facts fixed at construction time. They contain no MMC media
 //! vocabulary and no behaviour dispatch: [`BlockDevice`](super::BlockDevice)
 //! reads them, the application decides what to build.

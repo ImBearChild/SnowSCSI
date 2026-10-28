@@ -1,7 +1,5 @@
 //! Fixed slot collections: static `Cons`/`Nil` and runtime dyn slices.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.9 and `02-api.md` §4.3.
-//!
 //! Two paths are kept: static `Cons` + type-level indices for embedded users,
 //! and `&mut [&mut dyn Lu]` for runtime-sized/heterogeneous LUN tables. A
 //! `Target` owns exactly one of them; the storage adapter is bound by the
@@ -109,7 +107,7 @@ pub trait SlotSet {
 
     /// Control gate: check the authoritative boundary of every resident
     /// slot before a `Nop` control is queued. This is an internal extension of
-    /// §4.9 needed by `Target::request_control`; applications never call it.
+    /// needed by `Target::request_control`; applications never call it.
     ///
     /// The default accepts (safe for an empty set); a custom `SlotSet` that
     /// owns resident slots must override it with the same conjunction.

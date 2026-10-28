@@ -1,4 +1,4 @@
-//! Medium operation vocabulary (`02-api-profiles.md` §6.2).
+//! Medium operation vocabulary.
 //!
 //! `MmcDrive` decodes a CDB into one `MmcOp`; the medium owns the semantics.
 //! `Commit` (SYNCHRONIZE CACHE) and `Close` (CLOSE TRACK SESSION) are

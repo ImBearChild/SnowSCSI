@@ -1,10 +1,5 @@
 //! Storage and host execution seams.
 //!
-//! Authority: `__ARCH__/design/02-api.md` §4.5 (execution seams) and §4.6
-//! (receipts), `__ARCH__/design/02-api-core.md` §4.11 (buffer ownership) and
-//! §4.18 (`IoReq`/`IoBuf`/`IoToken`), `02-api-behavior.md` §8.1/§8.3 and
-//! `03-lifecycles.md` §3.4.
-//!
 //! Both seams are **metadata token + re-borrow on every poll**:
 //! `begin_exec`/`begin_recv`/`begin_send` only see metadata, and the buffer is
 //! re-borrowed by `poll_exec`/`poll_host`. This module therefore never stores a
@@ -40,7 +35,7 @@ const SLOTS: usize = 4;
 // Storage vocabulary
 // ===========================================================================
 
-/// Bounded storage operation family (`02-api.md` §4.5).
+/// Bounded storage operation family.
 ///
 /// `resource` is interpreted **only inside the current Lu's pair/backing set**
 /// and are not global resource ids: a command on LUN *n* can never
@@ -72,7 +67,7 @@ pub enum StorageOp<'a> {
     },
 }
 
-/// Read-only speculative prefetch (`02-api-core.md` §4.18).
+/// Read-only speculative prefetch.
 ///
 /// Deliberately a separate type from [`StorageOp`] so a write or sync can
 /// never be disguised as a prefetch. Prefetch shares
@@ -90,7 +85,7 @@ pub enum PrefetchOp<'a> {
     },
 }
 
-/// Metadata-only storage request (`02-api.md` §4.5).
+/// Metadata-only storage request.
 ///
 /// [`IoToken`] is unrelated to buffer lifetime: `dir` and `len` are what
 /// `begin_exec` sees, and `poll_exec` must be handed a matching [`IoBuf`].
@@ -106,10 +101,9 @@ pub struct IoReq {
     pub dir: Direction,
 }
 
-/// Buffer supplied on each [`Storage::poll_exec`] (`02-api.md` §4.5).
+/// Buffer supplied on each [`Storage::poll_exec`].
 ///
-/// The correspondence with [`IoReq::dir`] is exhaustive (`02-api.md` §4.5,
-/// `02-api-behavior.md` §8.1):
+/// The correspondence with [`IoReq::dir`] is exhaustive:
 ///
 /// - `Direction::None` ⇔ `IoBuf::None` and `len == 0` (sync/no-data ops must
 ///   **not** pass a zero-length `Read`/`Write`);
@@ -128,7 +122,7 @@ pub enum IoBuf<'a> {
     Write(&'a [u8]),
 }
 
-/// Opaque storage adapter token (`02-api.md` §4.5).
+/// Opaque storage adapter token.
 ///
 /// Fields are private, it is `Copy` and it carries no lifetime, so a token can
 /// never pin a buffer across a `Pending` poll. A token is valid for exactly one
@@ -172,7 +166,7 @@ impl IoToken {
     }
 }
 
-/// Whether `buf` is the legal buffer for `req` (`02-api.md` §4.5).
+/// Whether `buf` is the legal buffer for `req`.
 const fn buf_matches(req: IoReq, buf: &IoBuf<'_>) -> bool {
     match (req.dir, buf) {
         (Direction::None, IoBuf::None) => req.len == 0,
@@ -187,7 +181,7 @@ const fn contract_receipt() -> StorageReceipt {
     StorageReceipt::failed(Fault::Contract, 0, Effect::Known)
 }
 
-/// Poll-first storage seam (`02-api.md` §4.5, `03-lifecycles.md` §3.4).
+/// Poll-first storage seam.
 ///
 /// The runner owns the buffers and the ordering: `begin_exec` takes metadata
 /// only, `poll_exec` re-borrows the buffer on every call, and `cancel` settles
@@ -212,7 +206,7 @@ pub trait Storage {
     fn cancel(&mut self, token: IoToken);
 }
 
-/// Synchronous storage convenience (`02-api.md` §4.5).
+/// Synchronous storage convenience.
 ///
 /// [`BlockingStorage`] lifts it into [`Storage`]. Sync/no-data operations use
 /// [`IoBuf::None`] here as well.
@@ -221,7 +215,7 @@ pub trait SyncStorage {
     fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt;
 }
 
-/// Fixed four-slot synchronous storage adapter (`02-api.md` §4.5).
+/// Fixed four-slot synchronous storage adapter.
 ///
 /// No allocation, no thread or executor binding, and the inner adapter only
 /// ever sees requests through [`SyncStorage::exec`]. Pool exhaustion, unknown
@@ -323,7 +317,7 @@ impl<S: SyncStorage> Storage for BlockingStorage<S> {
 // Host vocabulary
 // ===========================================================================
 
-/// Metadata-only host request (`02-api.md` §4.5).
+/// Metadata-only host request.
 ///
 /// [`HostToken`] is unrelated to buffer lifetime; the buffer is re-borrowed on
 /// every [`HostTransport::poll_host`].
@@ -335,7 +329,7 @@ pub struct HostReq {
     pub dir: Direction,
 }
 
-/// Buffer supplied on each [`HostTransport::poll_host`] (`02-api.md` §4.5).
+/// Buffer supplied on each [`HostTransport::poll_host`].
 ///
 /// `Recv` pairs with `Direction::FromHost` and `Send` with `Direction::ToHost`;
 /// the length must equal [`HostReq::len`]. There is no "no-data" variant: a
@@ -348,7 +342,7 @@ pub enum HostBuf<'a> {
     Send(&'a [u8]),
 }
 
-/// Opaque host-side token (`02-api.md` §4.5).
+/// Opaque host-side token.
 ///
 /// Same opacity rules as [`IoToken`]: private fields, `Copy`, no lifetime, one
 /// operation per token, dead after `Ready` or `cancel`.
@@ -382,7 +376,7 @@ impl HostToken {
     }
 }
 
-/// Whether `buf` is the legal buffer for `req` (`02-api.md` §4.5).
+/// Whether `buf` is the legal buffer for `req`.
 const fn host_buf_matches(req: HostReq, buf: &HostBuf<'_>) -> bool {
     match (req.dir, buf) {
         (Direction::FromHost, HostBuf::Recv(b)) => req.len as usize == b.len(),
@@ -396,7 +390,7 @@ const fn host_contract_receipt() -> HostReceipt {
     HostReceipt::new(0, Some(Fault::Contract), TargetId::UNBOUND)
 }
 
-/// Transport-facing data seam (`02-api.md` §4.5, `02-api-behavior.md` §8.1).
+/// Transport-facing data seam.
 ///
 /// The runner owns command/storage ordering; the transport owns wire framing,
 /// burst limits, R2T/Data-Out, BOT data phases and partial delivery. Polls only
@@ -432,7 +426,7 @@ pub trait HostTransport {
     fn delivery(&self) -> Delivery;
 }
 
-/// Synchronous transport convenience (`02-api.md` §4.5).
+/// Synchronous transport convenience.
 ///
 /// [`BlockingHost`] lifts it into [`HostTransport`]; synchronous platforms only
 /// implement this plus [`SyncStorage`].
@@ -455,7 +449,7 @@ pub trait SyncHost {
     fn delivery(&self) -> Delivery;
 }
 
-/// Fixed four-slot synchronous host adapter (`02-api.md` §4.5).
+/// Fixed four-slot synchronous host adapter.
 ///
 /// Symmetric to [`BlockingStorage`]: `begin_recv`/`begin_send` complete
 /// immediately and `poll_host` is always `Ready`. Pool exhaustion, unknown
@@ -575,11 +569,10 @@ impl<H: SyncHost> HostTransport for BlockingHost<H> {
 }
 
 // ===========================================================================
-// Receipts (`02-api.md` §4.6)
+// Receipts
 // ===========================================================================
 
-/// Application-side execution facts returned by a storage adapter
-/// (`02-api.md` §4.6, `03-lifecycles.md` §3.4).
+/// Application-side execution facts returned by a storage adapter.
 ///
 /// [`StorageReceipt::confirmed`] is the confirmed prefix, not a success flag: a
 /// short/failed operation keeps the bytes it really confirmed, and
@@ -615,7 +608,7 @@ impl StorageReceipt {
     }
 }
 
-/// Opaque storage-IO receipt (`02-api.md` §4.6).
+/// Opaque storage-IO receipt.
 ///
 /// Fields are private: only the runner constructs one and stamps its owner, so
 /// a device can report facts but cannot forge an [`IoReceipt`]. Identity is the
@@ -678,7 +671,7 @@ impl IoReceipt {
     }
 }
 
-/// Opaque host-delivery receipt (`02-api.md` §4.6).
+/// Opaque host-delivery receipt.
 ///
 /// Fields are private; only the runner constructs one and stamps its owner.
 /// [`HostReceipt::accepted`] is the actual accepted/sent prefix, which may be

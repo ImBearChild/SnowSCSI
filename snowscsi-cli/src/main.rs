@@ -80,7 +80,7 @@ const SECTOR_SIZE: u32 = 512;
 const ISO_SECTOR_SIZE: u32 = 2048;
 
 /// USB bulk endpoint maximum packet size (high-speed). FunctionFS aio reads
-/// require an MPS-multiple buffer (§6.2 / §1.4).
+/// require an MPS-multiple buffer.
 #[cfg(target_os = "linux")]
 const USB_MPS: usize = 512;
 
@@ -1071,7 +1071,7 @@ fn run_serve_usb(
     work_size: usize,
     selector: &str,
 ) -> ExitCode {
-    // Gadget assembly (§6.1): a single MSC interface (class 08/06/50) with
+    // Gadget assembly: a single MSC interface (class 08/06/50) with
     // one bulk OUT + one bulk IN endpoint.
     let (ep_out, out_dir) = EndpointDirection::host_to_device();
     let (ep_in, in_dir) = EndpointDirection::device_to_host();
@@ -1312,7 +1312,7 @@ fn release_configfs(owned: bool) {
 ///
 /// The crate's bulk endpoints use Linux native aio with `Bytes`/`BytesMut`
 /// buffers; each receive copies the aio buffer into the caller's slice
-/// (§6.2). `halt()` reports success as `Err(-EBADMSG)` (errno 74), so
+/// `halt` reports success as `Err(-EBADMSG)` (errno 74), so
 /// `stall_both` treats it as success and ignores the error.
 struct FfsBot {
     out: EndpointReceiver,
@@ -1348,8 +1348,8 @@ impl FfsBot {
     }
 
     /// Round `n` up to the next multiple of the USB bulk MPS (minimum one
-    /// MPS). FunctionFS aio reads require an MPS-multiple buffer (§6.2 /
-    /// §1.4), so this platform quirk lives here rather than in the
+    /// MPS). FunctionFS aio reads require an MPS-multiple buffer, so this
+    /// platform quirk lives here rather than in the
     /// platform-agnostic library `usb::serve` loop.
     fn round_up_mps(n: usize) -> usize {
         (n + USB_MPS - 1) & !(USB_MPS - 1)
@@ -1429,7 +1429,7 @@ impl BotIo for FfsBot {
 
     fn stall_both(&mut self) -> Result<(), ()> {
         // halt() succeeds by returning Err(-EBADMSG) (errno 74) — treated as
-        // success; discard in-flight aio first (§4.7).
+        // success; discard in-flight aio first.
         let _ = self.out.control().and_then(|c| {
             let _ = c.discard_fifo();
             c.halt()
@@ -1494,7 +1494,7 @@ impl BotIo for FfsBot {
 
 #[cfg(target_os = "linux")]
 /// Bulk-Only Reset ack handle: completing the control status stage is the
-/// drop of the FunctionFS receiver (§6.2).
+/// drop of the FunctionFS receiver.
 struct FfsAck<'a> {
     /// Held for its drop side-effect; never read.
     #[allow(dead_code)]
@@ -1516,7 +1516,7 @@ struct FfsReply<'a> {
 impl CtrlReply for FfsReply<'_> {
     fn send(&mut self, data: &[u8]) -> Result<(), ()> {
         // CtrlSender::send consumes itself; the short write (≤ wLength) is
-        // tolerated. Never STALL Get Max LUN (§4.3).
+        // tolerated. Never STALL Get Max LUN.
         self.sender
             .take()
             .map(|s| s.send(data))

@@ -221,7 +221,7 @@ impl Bhs {
     // ── Response PDUs: StatSN / ExpCmdSN / MaxCmdSN ──────────────
     // Same offsets for SCSI Response (§10.4.9-.11), Login Response (§10.13),
     // NOP-In (§10.18), R2T (§10.8), Reject (§10.17), TMF Response (§10.6)
-    // and the final (S=1) Data-In (§10.7).
+    // and the final (S=1) Data-In.
 
     /// StatSN, bytes 24-27.
     pub fn stat_sn(&self) -> u32 {
@@ -305,8 +305,8 @@ impl Bhs {
 
     /// CID, bytes 20-21 (RFC 3720 §10.12.7).
     ///
-    /// Bytes 20-21 per §10.12 — NOT 22-23. There is no
-    /// setter: the Login Response keeps bytes 20-23 Reserved (§10.13).
+    /// Bytes 20-21 per — NOT 22-23. There is no
+    /// setter: the Login Response keeps bytes 20-23 Reserved.
     pub fn cid(&self) -> u16 {
         (u16::from(self.0[20]) << 8) | u16::from(self.0[21])
     }

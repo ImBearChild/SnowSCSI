@@ -1340,7 +1340,7 @@ impl IscsiSession {
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
 
-        // §6.4.1: the receive data-segment capability scales with the
+        // The receive data-segment capability scales with the
         // caller's scratch buffer (data area = work minus BHS, 4-aligned,
         // bounded by the 24-bit DataSegmentLength field). Negotiation then
         // clamps the initiator's declared value to this cap.
@@ -1387,7 +1387,7 @@ impl IscsiSession {
         resp.as_mut_bytes()[3] = 0x00; // Version-active
                                        // ISID echo (bytes 8-13, RFC 3720 §10.12).
         resp.as_mut_bytes()[8..14].copy_from_slice(&req.as_bytes()[8..14]);
-        // TSIH: non-zero for a new session's final response (§10.13.3).
+        // TSIH: non-zero for a new session's final response.
         if req.tsih() == 0 {
             resp.as_mut_bytes()[15] = 1;
         } else {
@@ -1484,8 +1484,8 @@ impl IscsiSession {
                         return None;
                     }
                 } else if key == b"MaxRecvDataSegmentLength" {
-                    // Advertise the negotiated (buffer-derived) value
-                    // (§6.4.1), not the raw initiator figure.
+                    // Advertise the negotiated (buffer-derived) value,
+                    // not the raw initiator figure.
                     self.apply_neg(LOGIN_TABLE[idx].key, val);
                     if !append_kv_u32(dst, &mut w, key, self.max_recv_data_segment) {
                         return None;

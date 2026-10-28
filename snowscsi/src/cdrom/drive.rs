@@ -171,7 +171,7 @@ impl CdromDrive {
     /// a new [`Self::load`] swaps it. On an
     /// empty or already-parked tray it merely presents the tray; an
     /// empty tray presenting itself is not a medium-change event
-    /// (§14.3 次-1), so no UNIT ATTENTION is queued.
+    /// (次-1), so no UNIT ATTENTION is queued.
     pub(crate) fn park(&mut self) {
         if let Some(m) = core::mem::replace(&mut self.tray, Tray::Empty).disc() {
             self.tray = Tray::Parked(m);
@@ -707,7 +707,7 @@ impl CdromDrive {
                 // ── SET STREAMING (0xB6) ─────────────────────────
                 // MMC-6 §6.41: only Type=0 (performance descriptor) is
                 // supported — no Enhanced Defect Reporting / DBI cache model,
-                // so other Types are 05/24 (§6.41.2.2). Receive the declared
+                // so other Types are 05/24. Receive the declared
                 // Parameter List (Table 625) and discard it.
                 op::SET_STREAMING => {
                     if cdb[8] != 0 {
@@ -1330,7 +1330,7 @@ impl CdromDrive {
         // MMC-6 §6.7 GET PERFORMANCE. Only Type 00h (performance data,
         // required by the Real-time Streaming feature we advertise) is
         // supported for this medium; other Type values (unusable area,
-        // defect status, write speed, DBI) return 05/24 per §6.7.2.5.
+        // defect status, write speed, DBI) return 05/24 per
         if cdb.len() < 12 || cdb[11] != 0 {
             return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
         }
@@ -1342,7 +1342,7 @@ impl CdromDrive {
         }
         let write = (data_type >> 2) & 1 != 0;
         // Maximum Number of Descriptors (bytes 8-9): zero → header only
-        // (§6.7.2.4). We surface one nominal descriptor.
+        // We surface one nominal descriptor.
         let max_desc = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
         // Nominal read/write performance (Table 295): a single extent from
         // block 0 to the last addressable block at the drive's rated speed,
@@ -1356,7 +1356,7 @@ impl CdromDrive {
         let mut buf = [0u8; 24]; // header (8) + one descriptor (16)
                                  // Performance Data Length = bytes following the length field
                                  // (header tail 4 + 16 per descriptor); not reduced when max_desc
-                                 // truncates the transfer (§6.7.3.1).
+                                 // truncates the transfer.
         buf[0..4].copy_from_slice(&20u32.to_be_bytes());
         buf[4] = if write { 0x04 } else { 0x00 }; // Write / Except=0
         buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // Start LBA
@@ -1823,13 +1823,13 @@ mod tests {
         let mut dev = CdromDrive::new();
         let mut w = work();
 
-        // SEND OPC: DoOpc=1 → GOOD, list ignored (§6.38.2.2).
+        // SEND OPC: DoOpc=1 → GOOD, list ignored.
         let mut cdb = [0u8; 10];
         cdb[0] = op::SEND_OPC_INFORMATION;
         cdb[1] = 0x01; /* DoOpc */
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
 
-        // SEND OPC: DoOpc=0, PLL=0 → GOOD, no operation (§6.38.2.4).
+        // SEND OPC: DoOpc=0, PLL=0 → GOOD, no operation.
         let mut cdb = [0u8; 10];
         cdb[0] = op::SEND_OPC_INFORMATION;
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
@@ -1844,7 +1844,7 @@ mod tests {
         );
         assert_eq!(dev.complete_param(&cdb, &w[..16]), CommandOutcome::Status);
 
-        // SEND OPC: PLL not an integral multiple of 8 → 05/24 (§6.38.2.4).
+        // SEND OPC: PLL not an integral multiple of 8 → 05/24.
         let mut cdb = [0u8; 10];
         cdb[0] = op::SEND_OPC_INFORMATION;
         cdb[8] = 12;
@@ -1853,7 +1853,7 @@ mod tests {
         assert_eq!(dev.peek_sense().unwrap().key, SenseKey::IllegalRequest);
         assert_eq!(dev.peek_sense().unwrap().asc, asc::INVALID_FIELD);
 
-        // SET STREAMING: Type=0, PLL=0 → GOOD (§6.41.2.3).
+        // SET STREAMING: Type=0, PLL=0 → GOOD.
         let mut cdb = [0u8; 12];
         cdb[0] = op::SET_STREAMING;
         assert_eq!(dev.do_cmd(&cdb, &mut w).unwrap(), CommandOutcome::Status);
@@ -1868,7 +1868,7 @@ mod tests {
         );
         assert_eq!(dev.complete_param(&cdb, &w[..28]), CommandOutcome::Status);
 
-        // SET STREAMING: Type=1 (reserved) → 05/24 (§6.41.2.2).
+        // SET STREAMING: Type=1 (reserved) → 05/24.
         let mut cdb = [0u8; 12];
         cdb[0] = op::SET_STREAMING;
         cdb[8] = 0x01;
@@ -1958,7 +1958,7 @@ mod tests {
         assert_eq!(&buf[16..20], &last.to_be_bytes()); // End LBA
         assert_eq!(&buf[20..24], &22160u32.to_be_bytes()); // End Perf
 
-        // max descriptors = 0 → header only (§6.7.2.4).
+        // max descriptors = 0 → header only.
         let mut cdb0 = [0u8; 12];
         cdb0[0] = op::GET_PERFORMANCE;
         let n = data_in(dev.do_cmd(&cdb0, &mut w).unwrap(), &w, &mut buf);
@@ -2671,7 +2671,7 @@ mod tests {
     #[test]
     #[allow(unused_mut, unused_variables)]
     fn dvd_ram_always_formatted_no_medium_not_formatted() {
-        // Logical DVD-RAM never returns NOT READY/MEDIUM NOT FORMATTED per §2.1
+        // Logical DVD-RAM never returns NOT READY/MEDIUM NOT FORMATTED per
         let mut img = vec![0u8; 4096 * 2048];
         #[cfg(feature = "dvdram")]
         {

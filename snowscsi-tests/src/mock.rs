@@ -141,7 +141,7 @@ mod tests {
     fn write10_bhs(lba: u32, blocks: u16, itt: u32, cmd_sn: u32, dsl: u32) -> [u8; 48] {
         let mut bhs = [0u8; 48];
         bhs[0] = op::SCSI_CMD;
-        // Kernel write layout (§2.3.3): F(0x80) | W(0x20) | ATTR_SIMPLE(0x01) = 0xA1.
+        // Kernel write layout (RFC 3720 §2.3.3): F(0x80) | W(0x20) | ATTR_SIMPLE(0x01) = 0xA1.
         bhs[1] = 0xA1;
         bhs[5] = (dsl >> 16) as u8;
         bhs[6] = (dsl >> 8) as u8;
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
     }
 
-    // ── RFC §10.12.8: first FullFeature command reuses login CmdSN ──
+    // ── RFC: first FullFeature command reuses login CmdSN ──
 
     #[test]
     fn first_command_reuses_login_cmd_sn() {

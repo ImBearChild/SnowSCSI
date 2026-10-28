@@ -1,9 +1,6 @@
 //! Direct-access block profile: READ(10) / WRITE(10) / SYNCHRONIZE CACHE(10)
 //! and FORMAT UNIT over the core poll seam.
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §5.1–§5.5,
-//! `02-api-behavior.md` §8.1/§8.3 and `03-lifecycles.md` §3.4.
-//!
 //! The device is **non-generic**: it owns geometry, command state, sense and
 //! the runtime write policy, but never the backing bytes. Data IO is expressed
 //! as [`StorageOp`] and executed by the runner through a [`Storage`] adapter;
@@ -13,7 +10,7 @@
 //! access. The runner adds the orthogonal facts it alone owns: `host_bytes`
 //! contract checks, short transfer accounting and cancellation. The device
 //! converts an adapter [`Fault`] into a wire sense through
-//! [`storage_fault_sense`] (`02-api-core.md` §4.17), never a raw fault.
+//! [`storage_fault_sense`], never a raw fault.
 //!
 //! [`Storage`]: crate::core::storage::Storage
 
@@ -93,7 +90,7 @@ enum Stage {
 }
 
 /// Non-generic block device. Geometry and policy only; the backing lives in
-/// the application's `Storage` adapter (`05 §5.1`).
+/// the application's `Storage` adapter.
 pub struct BlockDevice {
     attrs: BlockAttrs,
     stage: Stage,
@@ -159,7 +156,7 @@ impl BlockDevice {
 
     /// Confirmed effects observed from receipts (not a success flag).
     ///
-    /// Probe view for fixtures; not a business API (`§4.20`).
+    /// Probe view for fixtures; not a business API.
     #[doc(hidden)]
     #[must_use]
     pub const fn known_effects(&self) -> KnownEffects {
@@ -550,7 +547,7 @@ impl Device for BlockDevice {
                 }
                 if receipt.effect() != Effect::Known {
                     // The flush did not confirm its effect: a FUA write must not
-                    // report GOOD (`03 §3.4`).
+                    // report GOOD.
                     self.effects.unknown_remainder = true;
                     return self.finish(Completion::Check(WRITE_ERROR));
                 }

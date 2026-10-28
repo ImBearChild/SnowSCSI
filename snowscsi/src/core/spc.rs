@@ -1,8 +1,5 @@
 //! Public SPC wrapper: the six-command host subset over any [`Device`].
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.19,
-//! `02-api-behavior.md` §10.2 and `02-api.md` §4.1.
-//!
 //! [`Spc`] owns only query state and the prevent/start latches; media commands
 //! (READ/WRITE/FORMAT/…) are delegated to the inner device. The wrapper
 //! **does not allocate an internal response buffer**: every response is written
@@ -263,7 +260,7 @@ impl<D: Device> Spc<D> {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
                 // Foreground FORMAT blocks the medium query commands before
-                // any profile access (`02-api-core.md` §4.12, MMC-6 6.5).
+                // any profile access (MMC-6 6.5).
                 if foreground_format(self.inner.long_info()) {
                     return Err(Completion::Check(FORMAT_IN_PROGRESS));
                 }
@@ -463,7 +460,7 @@ fn check_direction(ctx: CommandContext, expected: Direction) -> Result<(), Compl
 ///
 /// MODE SENSE and READ CAPACITY are medium queries and must not report
 /// geometry/parameters while the medium is being formatted; GET
-/// CONFIGURATION and GESN stay admitted (`02-api-core.md` §4.12).
+/// CONFIGURATION and GESN stay admitted.
 fn foreground_format(info: LongInfo) -> bool {
     info.phase == LongPhase::Foreground && info.progress.is_some()
 }
@@ -916,7 +913,7 @@ impl<D: Device> Device for Spc<D> {
 
     fn host_eject_succeeded(&mut self, permit: &BoundaryPermit) {
         // The host's own EJECT clears the normal PREVENT latch; the persistent
-        // latch is never implicitly cleared (`02-api-core.md` §4.19, `03 §3.6`).
+        // latch is never implicitly cleared.
         self.prevent = false;
         self.inner.host_eject_succeeded(permit);
     }

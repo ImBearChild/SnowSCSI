@@ -8,8 +8,7 @@
 //! `StorageOp::Sync` whose known success is the only thing that clears it.
 //! The management fixtures drive the public `Target`/`StaticTarget` entries
 //! over real `BlockingStorage`/`BlockingHost` adapters and assert the
-//! ownership rules of `__ARCH__/design/02-api-core.md` §4.10/§4.11 and
-//! `03-lifecycles.md` §3.6.
+//! ownership and sequencing rules.
 
 use snowscsi::block::{BlockAttrs, BlockDevice};
 use snowscsi::core::storage::{
@@ -307,8 +306,8 @@ fn unlock_flush_failure_keeps_the_normal_latch() {
 }
 
 // ── Management transactions ────────────────────────────────────────────────
-// `03 §3.6` state machine, `02-api-core §4.10` sequencing and the `§4.11`
-// gates. Every entry below is the public `Target`/`StaticTarget` one; the
+// State machine, sequencing and gates. Every entry below is the public
+// `Target`/`StaticTarget` one; the
 // pair's `u8` is its backing identity (the adapter stays application-side).
 
 /// Install into an empty slot. The candidate becomes current and the
@@ -352,7 +351,7 @@ fn install_into_an_empty_slot_becomes_current_without_a_result() {
     assert!(info.ready);
     assert!(info.boundary);
     // Install has no old pair, so there is no result to hand back: both the
-    // first and any later take are `NothingToTake` (§4.10 "Install: no old").
+    // first and any later take are `NothingToTake` ("Install: no old").
     assert_eq!(
         target.take_static_at::<Here>(0),
         Err(BoundaryReject::NothingToTake)
@@ -386,7 +385,7 @@ fn replace_commits_installs_and_hands_the_old_pair_back_once() {
         "new pair is current"
     );
     // `advance_static` takes no storage adapter at all, so it cannot inject a
-    // runner `Sync` (§4.10). The observable fact is the reported effect set
+    // runner `Sync`. The observable fact is the reported effect set
     // (asserted below); the local-commit hook count is pinned directly by the
     // scripted-device fixtures further down.
 
@@ -452,7 +451,7 @@ fn competing_and_late_proposals_are_refused_with_the_original_input() {
         Ok(())
     );
     // A competing proposal is refused and returns its own input unchanged; the
-    // resident candidate is never overwritten (§4.10).
+    // resident candidate is never overwritten.
     match target.propose_static::<Here>(Change::Replace(pair_none(11))) {
         Err((returned, fault)) => {
             assert_eq!(fault, Fault::Contract);
@@ -468,7 +467,7 @@ fn competing_and_late_proposals_are_refused_with_the_original_input() {
     );
 
     // A result is resident: the take barrier must be cleared by `take` before
-    // any new normal proposal (§3.6 AwaitTake row, §4.11 `service_gate`).
+    // any new normal proposal (AwaitTake row, `service_gate`).
     match target.propose_static::<Here>(Change::Replace(pair_none(13))) {
         Err((returned, fault)) => {
             assert_eq!(fault, Fault::Boundary);
@@ -486,7 +485,7 @@ fn competing_and_late_proposals_are_refused_with_the_original_input() {
     );
 }
 
-/// §4.11: `take` before `advance` has no result; a prepared candidate is not a
+/// `take` before `advance` has no result; a prepared candidate is not a
 /// result.
 #[test]
 fn take_before_advance_is_nothing_to_take() {
@@ -505,7 +504,7 @@ fn take_before_advance_is_nothing_to_take() {
     );
 }
 
-/// §4.11 permission table: a foreground long operation refuses `take`
+/// Permission table: a foreground long operation refuses `take`
 /// (`take_gate`) and `propose`/`advance`/`install` (`service_gate`).
 #[test]
 fn foreground_long_operation_blocks_take_and_management() {
@@ -515,7 +514,7 @@ fn foreground_long_operation_blocks_take_and_management() {
     let mut scratch = [0u8; 64];
 
     // BLANK with IMMED (MMC-6 Table 229): the command completes GOOD while the
-    // drive-owned zero-fill stays resident in the foreground phase (§3.7).
+    // drive-owned zero-fill stays resident in the foreground phase.
     assert_eq!(
         target.drive_static::<Here>(
             &mut storage,
@@ -554,7 +553,7 @@ fn foreground_long_operation_blocks_take_and_management() {
     assert_eq!(target.advance_static::<Here>(), Err(Fault::Boundary));
 }
 
-/// §4.10 force row: no commit, no durability claim, the old pair leaves through
+/// Force row: no commit, no durability claim, the old pair leaves through
 /// the one-shot result, and a force that arrives while a result is resident is
 /// accepted and deferred.
 ///
@@ -583,7 +582,7 @@ fn force_removes_without_commit_and_defers_a_second_detach() {
     assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
 
     // A resident result is never silently overwritten: the second force is
-    // accepted and deferred until the application takes (§4.10).
+    // accepted and deferred until the application takes.
     assert_eq!(
         target.force_remove_static::<Here>(&mut storage, &mut host),
         Ok(())
@@ -680,7 +679,7 @@ fn lu_info_ready_and_the_latches_survive_eject_take_and_install() {
     assert!(!info.is_locked());
 }
 
-/// §4.10/§4.11 through the *runtime* entries: `force_remove_rt` detaches into a
+/// Through the *runtime* entries: `force_remove_rt` detaches into a
 /// one-shot result and the result barrier blocks a new normal proposal until
 /// the application takes it.
 #[test]
@@ -722,7 +721,7 @@ fn runtime_force_remove_sets_the_result_barrier_until_take() {
 // order instead of inferring them.
 
 /// One management hook observed by [`ScriptedDevice`], in call order. Order
-/// matters for the design (`03 §3.6`): a host eject is commit → detach, a force
+/// The observable order: a host eject is commit → detach, a force
 /// is interrupt → detach, and Abort never detaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hook {
@@ -999,7 +998,7 @@ fn replace_commit_failure_keeps_the_old_pair_and_returns_the_candidate() {
     );
 
     // Known failure terminates the transaction: after the take the slot is
-    // Ready again and a new proposal is accepted (§4.10).
+    // Ready again and a new proposal is accepted.
     assert_eq!(
         target.propose_static::<Here>(Change::Replace(pair_none(11))),
         Ok(())
@@ -1034,7 +1033,7 @@ fn replace_install_failure_restores_the_old_pair_and_returns_the_candidate() {
     let candidate = target.take_static_at::<Here>(0).expect("candidate");
     assert_eq!(candidate.pair, Some(pair_none(9)));
     // The reported fault is the real install failure, never rewritten as a
-    // commit failure (§4.10/§4.17).
+    // commit failure.
     assert_eq!(candidate.local, Err(Fault::Io));
     assert_eq!(
         target.take_static_at::<Here>(0),
@@ -1052,7 +1051,7 @@ fn replace_install_failure_restores_the_old_pair_and_returns_the_candidate() {
     }
 }
 
-/// §4.10 restore failure: the slot must not pretend the old pair is
+/// Restore failure: the slot must not pretend the old pair is
 /// healthy. It reports `NeedsRecovery`, is not ready, keeps the candidate in
 /// the result and preserves the old pair for force — and `install` is refused
 /// until the result has been taken (AwaitTake barrier).
@@ -1084,7 +1083,7 @@ fn replace_install_and_restore_failure_needs_recovery_and_blocks_reinstall_befor
     assert!(!info.ready, "LuInfo.ready must be false in needs_recovery");
 
     // The management gate is the AwaitTake barrier: recovery-by-reinstall needs
-    // the result taken first (§3.6 permission table, §4.11 service_gate).
+    // the result taken first (permission table, service_gate).
     match target.install_static::<Here>(pair_none(7)) {
         Err((returned, fault)) => {
             assert_eq!(fault, Fault::Boundary);
@@ -1114,7 +1113,7 @@ fn replace_install_and_restore_failure_needs_recovery_and_blocks_reinstall_befor
     assert!(target.snapshot_static::<Here>().ready);
 }
 
-/// §4.10 force recovery: after a failed restore the old pair is preserved and
+/// Force recovery: after a failed restore the old pair is preserved and
 /// handed back by `force_remove_*`, never by a silent reinstall.
 #[test]
 fn force_returns_the_pair_preserved_by_a_failed_restore() {
@@ -1227,7 +1226,7 @@ fn install_failure_into_an_empty_slot_leaves_it_empty_and_returns_the_candidate(
     assert!(target.snapshot_static::<Here>().ready);
 }
 
-/// §3.6 drop windows: a saved proposal and a produced result both survive an
+/// Drop windows: a saved proposal and a produced result both survive an
 /// event-loop turn that neither advances nor takes.
 #[test]
 fn a_prepared_candidate_and_a_produced_result_survive_an_event_loop_turn() {
@@ -1255,7 +1254,7 @@ fn a_prepared_candidate_and_a_produced_result_survive_an_event_loop_turn() {
     assert_eq!(old.pair, Some(pair_none(7)));
 }
 
-/// §4.11 barrier scope (documented drift): a resident result blocks new
+/// Barrier scope (documented drift): a resident result blocks new
 /// management only. Commands keep being serviced while it awaits `take`,
 /// otherwise the application could never inspect the slot it must drain.
 #[test]
@@ -1278,7 +1277,7 @@ fn a_resident_result_blocks_management_but_not_commands() {
         "serving a command does not consume the result"
     );
 
-    // Management is refused until the result is claimed (§3.6 AwaitTake row).
+    // Management is refused until the result is claimed (AwaitTake row).
     assert!(matches!(
         target.propose_static::<Here>(Change::Remove),
         Err((Change::Remove, Fault::Boundary))
@@ -1288,7 +1287,7 @@ fn a_resident_result_blocks_management_but_not_commands() {
     assert_eq!(target.propose_static::<Here>(Change::Remove), Ok(()));
 }
 
-/// §4.10 force row (deferred detach): a force that arrives while a result is
+/// Force row (deferred detach): a force that arrives while a result is
 /// resident is accepted, detaches nothing yet, and its detach runs when the
 /// older result is taken — the forced pair is handed back exactly once.
 #[test]
@@ -1309,7 +1308,7 @@ fn force_defers_while_a_result_is_resident_and_hands_the_forced_pair_back_once()
     assert_eq!(commits, 1, "only the Replace committed");
 
     // Accepted, but deferred: handing back a second pair now would silently
-    // overwrite the resident result (§4.10).
+    // overwrite the resident result.
     assert_eq!(
         target.force_remove_static::<Here>(&mut storage, &mut host),
         Ok(())
@@ -1364,7 +1363,7 @@ fn force_defers_while_a_result_is_resident_and_hands_the_forced_pair_back_once()
 }
 
 /// The same deferred sequence through the **runtime** entries
-/// (`force_remove_rt`/`take_rt`, §4.10): the forced pair is handed back only
+/// (`force_remove_rt`/`take_rt`): the forced pair is handed back only
 /// after the older result, and only once.
 #[test]
 fn runtime_deferred_force_hands_the_forced_pair_back_after_the_old_result() {
@@ -1392,7 +1391,7 @@ fn runtime_deferred_force_hands_the_forced_pair_back_after_the_old_result() {
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
 }
 
-/// §4.10 delayed-force failure (Contract): if the deferred detach cannot run,
+/// Delayed-force failure (Contract): if the deferred detach cannot run,
 /// the application still gets the older result back, and the next `tick` ends
 /// the service instead of pretending it is healthy.
 #[test]
@@ -1434,7 +1433,7 @@ fn a_deferred_force_that_cannot_detach_ends_the_service() {
     );
 }
 
-/// §4.10 delayed-force failure (NeedsRecovery): when the cooperative
+/// Delayed-force failure (NeedsRecovery): when the cooperative
 /// settlement of a live command cannot finish, force keeps the fixed facts and
 /// ends the service with `Fault::NeedsRecovery`.
 #[test]
@@ -1486,7 +1485,7 @@ fn a_force_that_cannot_settle_ends_the_service_with_needs_recovery() {
 // (bounded to 64, `Fault::Contract` above), and a take releases one deferred
 // force at a time because `await_take` is a single global handback.
 
-/// §4.10 force row: a force deferred behind a barrier on **another** LUN is
+/// Force row: a force deferred behind a barrier on **another** LUN is
 /// released by the take that clears that barrier, and its pair is handed back
 /// exactly once.
 #[test]
@@ -1536,7 +1535,7 @@ fn a_take_releases_a_force_deferred_on_another_lun() {
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
 }
 
-/// §4.10 force row: two forces deferred on different LUNs are both accepted
+/// Force row: two forces deferred on different LUNs are both accepted
 /// (not `Fault::Contract`) and are released one handback at a time, because the
 /// runner publishes at most one `ResourcesReady` before the next `take`.
 #[test]
@@ -1591,7 +1590,7 @@ fn two_deferred_forces_are_released_one_handback_at_a_time() {
 // `active()` with no state left to step (`step_command` → `Fault::Contract`),
 // and a later force would detach a device that was never settled.
 
-/// §3.3 immediate-cancel / §4.10 force row: forcing an idle LUN while another
+/// Immediate-cancel / force row: forcing an idle LUN while another
 /// LUN runs detaches only the addressed slot and leaves the running command
 /// untouched and steppable.
 #[test]
@@ -1655,7 +1654,7 @@ fn a_force_on_one_lun_leaves_the_active_command_on_another_lun_alone() {
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
 }
 
-/// §4.10 deferred force row, second trigger: repeating a force for a LUN whose
+/// Deferred force row, second trigger: repeating a force for a LUN whose
 /// result is resident used to re-settle the *global* `drive_state`, i.e. the
 /// command another LUN owns. The repeat may only re-arm the deferral.
 #[test]
@@ -1735,7 +1734,7 @@ fn host_eject_commits_detaches_and_the_returned_pair_restores_service() {
     assert_eq!(device.commits, 1, "local commit ran");
     assert_eq!(device.takes, 1, "the pair was detached");
     assert_eq!(device.installs, 0);
-    // The fixed host-eject order (`03 §3.6`): local commit, then detach.
+    // The fixed host-eject order: local commit, then detach.
     assert_eq!(device.events, [Hook::Commit, Hook::Take]);
     assert!(slot0(&target).has_result());
     assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
@@ -1748,7 +1747,7 @@ fn host_eject_commits_detaches_and_the_returned_pair_restores_service() {
     let result = target.take_static_at::<Here>(0).expect("ejected pair");
     assert_eq!(result.pair, Some(pair_none(7)), "the old pair, once");
     assert_eq!(result.local, Ok(()));
-    // The result was produced before the status was sent (§3.6 order).
+    // The result was produced before the status was sent (order).
     assert_eq!(result.delivery, Delivery::Pending);
     assert_eq!(result.effects, KnownEffects::NONE);
     assert_eq!(
@@ -1842,7 +1841,7 @@ fn host_eject_commit_failure_keeps_the_slot_ready() {
     assert_eq!(target.propose_static::<Here>(Change::Remove), Ok(()));
 }
 
-/// §4.14: a failed status send after the detach does not roll back the
+/// A failed status send after the detach does not roll back the
 /// commit/detach; the result stays resident and is takeable once even after the
 /// transport ends.
 #[test]
@@ -1884,7 +1883,7 @@ fn a_failed_host_status_keeps_the_result_takeable() {
 
 // ── Force from abnormal states / Abort ─────────────────────────────────────
 
-/// §3.3/§4.10: force from an active command settles it with `interrupt` before
+/// Force from an active command settles it with `interrupt` before
 /// detaching; the old pair is handed back once and no commit runs.
 #[test]
 fn force_settles_an_active_command_before_detaching() {
@@ -1924,7 +1923,7 @@ fn force_settles_an_active_command_before_detaching() {
     );
 }
 
-/// §3.6/§4.10 delayed-force failure: a detach that cannot run is reported, not
+/// Delayed-force failure: a detach that cannot run is reported, not
 /// hidden — the pair stays installed, no result is invented and the next
 /// settled `tick` ends the service with the fault.
 #[test]
@@ -1960,7 +1959,7 @@ fn a_force_that_cannot_detach_ends_the_service_without_a_result() {
     );
 }
 
-/// §4.10: `Control::Abort` ends the command (`0B/45/00`) but never detaches the
+/// `Control::Abort` ends the command (`0B/45/00`) but never detaches the
 /// medium, produces no management result and leaves the target serving.
 #[test]
 fn abort_ends_the_command_without_detaching_the_medium() {
@@ -1995,7 +1994,7 @@ fn abort_ends_the_command_without_detaching_the_medium() {
     );
 }
 
-/// §4.14: operator eject is a policy decision, not a library detach entry — the
+/// Operator eject is a policy decision, not a library detach entry — the
 /// application reads the live latches, calls `decide_eject`, and a refused
 /// request changes no slot state.
 #[test]
@@ -2035,9 +2034,6 @@ fn operator_eject_policy_reads_live_latches_and_detaches_nothing() {
 // Abnormal settlement: Stop drains, every other end cancels
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Authority: `03-lifecycles.md` §3.3 (phase × interruption matrix),
-// §3.4 (issue/poll/feedback) and `02-api-core.md` §4.10/§4.11/§4.17.
-//
 // Every fixture drives the public `Target` entries over a scripted device and
 // scripted adapter pair that append to **one** shared call log, so the design's
 // order is asserted on the real sequence: `cancel`/the drained receipt returns
@@ -2045,7 +2041,7 @@ fn operator_eject_policy_reads_live_latches_and_detaches_nothing() {
 // re-polled and never re-issued (no replay), and no settlement path detaches or
 // installs a medium.
 //
-// Rows that cannot be modelled in core (written reason, §3.3):
+// Rows that cannot be modelled in core (written reason):
 //
 // - "partial header" / "complete header not admitted": core receives an
 //   already-complete CDB slice (`Target::drive_start_*`); BHS/CBW framing and
@@ -2650,7 +2646,7 @@ fn plan_512(direction: Direction) -> DataPlan {
     }
 }
 
-// ── Row 1: Stop is a drain (`03 §3.3`) ─────────────────────────────────────
+// ── Row 1: Stop is a drain ─────────────────────────────────────
 
 /// `stop` closes submission and **drains** a pending write. The drain
 /// polls the same token, merges the confirmed prefix into `known`, and only then
@@ -3028,7 +3024,7 @@ fn stop_drains_an_errored_host_receive_keeping_the_host_prefix() {
     );
 }
 
-/// `03:60/83/118` + §3.4: a Stop drain of a pending **read** whose receipt is
+/// `03:60/83/118` +: a Stop drain of a pending **read** whose receipt is
 /// `failed(Io, 0, Known)` keeps `NONE` (a read never fabricates a write/sync
 /// remainder). The errored token is still cancelled for slot hygiene, which is
 /// the widened drain handling this fixture pins.
@@ -3095,7 +3091,7 @@ fn stop_drains_an_errored_read_without_fabricating_a_write_remainder() {
     );
 }
 
-/// §3.4: a Sync is issued with `IoBuf::None` (`dir == None`, `len == 0`)
+/// A Sync is issued with `IoBuf::None` (`dir == None`, `len == 0`)
 /// and a successful drain of it becomes `known.sync_durable`.
 #[test]
 fn stop_drains_a_pending_sync_into_a_durable_effect() {
@@ -3283,7 +3279,7 @@ fn stop_drains_a_pending_host_send() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.3 (preparing, IO not yet issued): Stop settles with the honest empty
+/// (preparing, IO not yet issued): Stop settles with the honest empty
 /// `KnownEffects` — nothing was issued, so nothing is claimed or marked
 /// unknown — and does not invent IO.
 #[test]
@@ -3323,7 +3319,7 @@ fn stop_with_no_io_in_flight_settles_with_no_effects() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.4: a drained speculative prefetch never manufactures a write `Unknown`.
+/// A drained speculative prefetch never manufactures a write `Unknown`.
 /// Stop ends the command, so no completion is expected or asserted here — only
 /// the absence of a write remainder (and the lack of a cancel) is pinned.
 #[test]
@@ -3374,7 +3370,7 @@ fn stop_drains_a_speculative_prefetch_without_an_unknown_remainder() {
     );
 }
 
-/// §4.3 (work-bank identity): a step that passes a different work bank cannot
+/// (work-bank identity): a step that passes a different work bank cannot
 /// re-borrow the retained window. The step entry cancels the token once and
 /// settles; it must not spin, re-issue, or reinterpret the token against the
 /// wrong bytes.
@@ -3396,7 +3392,7 @@ fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
         Ok(DriveStep::Pending)
     );
     target.stop();
-    // A different work bank cannot re-borrow the retained window (`§4.3`).
+    // A different work bank cannot re-borrow the retained window.
     assert_eq!(
         target.drive_step_static::<Here>(&mut storage, &mut host, &mut other, &mut scratch),
         Err(Fault::Contract)
@@ -3413,7 +3409,7 @@ fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
 
 // ── Row 2: `transport_ended` / `fatal` / `Abort` cancel ─────────────────────
 
-/// §3.3 (transport_ended): the pending token is cancelled **before**
+/// (transport_ended): the pending token is cancelled **before**
 /// `interrupt`; a write remainder becomes unknown; the service ends only after
 /// the settlement.
 #[test]
@@ -3489,7 +3485,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
     assert_eq!(slot0(&target).device_ref().interrupts, 1);
 }
 
-/// §3.4 ("读取取消不凭空制造写入 Unknown"): an immediate cancel of a pending
+/// ("读取取消不凭空制造写入 Unknown"): an immediate cancel of a pending
 /// *read* settles with no write/sync remainder and no confirmed write prefix,
 /// even though the cancelled token is reported exactly once.
 #[test]
@@ -3548,7 +3544,7 @@ fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.3 (fatal): a pending host token is cancelled first, the settle carries the
+/// (fatal): a pending host token is cancelled first, the settle carries the
 /// host prefix/unknown facts, and `tick` reports the first fault once settled.
 #[test]
 fn fatal_cancels_a_pending_host_token_before_the_interrupt() {
@@ -3676,7 +3672,7 @@ fn fatal_cancels_a_pending_storage_write_before_the_interrupt() {
     );
 }
 
-/// §4.10: `Control::Abort` cancels the pending send, settles once, and returns
+/// `Control::Abort` cancels the pending send, settles once, and returns
 /// `0B/45/00` without detaching the medium or ending the target.
 #[test]
 fn abort_of_a_pending_send_returns_aborted_command_without_detaching() {
@@ -3753,7 +3749,7 @@ fn abort_of_a_pending_send_returns_aborted_command_without_detaching() {
     assert_eq!(slot0(&target).device_ref().interrupts, 1);
 }
 
-/// §4.10: an Abort of a pending write reports the unknown remainder instead of a
+/// An Abort of a pending write reports the unknown remainder instead of a
 /// fabricated clean state.
 #[test]
 fn abort_of_a_pending_write_reports_the_unknown_remainder() {
@@ -3791,7 +3787,7 @@ fn abort_of_a_pending_write_reports_the_unknown_remainder() {
 
 // ── Row 3: injection points ────────────────────────────────────────────────
 
-/// §3.4 (`begin_exec` before issue): a pool-exhausted (invalid) token means no
+/// (`begin_exec` before issue): a pool-exhausted (invalid) token means no
 /// operation exists, so the settle carries no fabricated effect and nothing is
 /// polled.
 #[test]
@@ -3826,7 +3822,7 @@ fn a_pool_exhausted_token_settles_without_an_adapter_operation() {
     );
 }
 
-/// §3.4 (`Ready(Err(n))`): the receipt error reaches the device exactly once;
+/// (`Ready(Err(n))`): the receipt error reaches the device exactly once;
 /// the operation is never replayed, and a command that completed normally is
 /// never interrupted afterwards — a late transport end does not roll back an
 /// already booked status.
@@ -3901,7 +3897,7 @@ fn a_receipt_error_is_fed_back_once_and_never_replayed() {
     assert_eq!(storage.begins, 1);
 }
 
-/// §3.3 ("receipt 已返回") + §3.4: a returned receipt is authoritative for its
+/// ("receipt 已返回") +: a returned receipt is authoritative for its
 /// own facts. An adapter receipt that breaks the contract settles the command
 /// before the device is polled again, the confirmed write prefix it reports is
 /// preserved, and `unknown_remainder` follows the receipt's `Effect` — a
@@ -3959,7 +3955,7 @@ fn a_contract_receipt_settles_before_the_next_poll() {
     assert_eq!((storage.begins, storage.polls), (1, 1), "no replay");
 }
 
-/// §3.4 (`Ready(n > requested)` / `Effect::UnknownRemainder`): the effect on the
+/// (`Ready(n > requested)` / `Effect::UnknownRemainder`): the effect on the
 /// returned receipt stays authoritative. A write receipt that reports both a
 /// confirmed prefix and an unknown remainder reaches the device with both,
 /// instead of being flattened to a clean or a fabricated state.
@@ -3997,7 +3993,7 @@ fn a_contract_receipt_with_an_unknown_effect_keeps_the_remainder_unknown() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.4 ("读取取消不凭空制造写入 Unknown"): a read never carries a write/sync
+/// ("读取取消不凭空制造写入 Unknown"): a read never carries a write/sync
 /// remainder. Even a contract-violating read receipt that claims
 /// `Effect::UnknownRemainder` cannot make the runner report one.
 #[test]
@@ -4106,7 +4102,7 @@ fn a_contract_host_send_receipt_keeps_the_accepted_prefix() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.4 (`Ready(n > requested)` on the **inline** host path): a receive whose
+/// (`Ready(n > requested)` on the **inline** host path): a receive whose
 /// first poll returns `accepted > req.len` with `Fault::Contract` settles with
 /// the prefix clamped to the request and no fabricated unknown remainder. The
 /// inline contract branch does not cancel (the receipt already returned).
@@ -4177,7 +4173,7 @@ fn an_inline_contract_host_receive_clamps_the_accepted_prefix() {
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
 }
 
-/// §3.4 (`IoBuf::None`): a *Sync* is polled with `IoBuf::None`, and a storage
+/// (`IoBuf::None`): a *Sync* is polled with `IoBuf::None`, and a storage
 /// that returns a contract violation for it is settled without claiming
 /// durability, without inventing an unknown write remainder, and without polling
 /// the device again after the returned receipt.
@@ -4233,7 +4229,7 @@ fn a_sync_contract_violation_reports_no_durability() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
 }
 
-/// §3.3 (cleanup failure): a settle that cannot be proven safe is terminal, is
+/// (cleanup failure): a settle that cannot be proven safe is terminal, is
 /// attempted exactly once (no recursion), and the next `tick` reports the fault.
 #[test]
 fn a_failed_interrupt_settles_once_and_ends_the_service() {
@@ -4276,7 +4272,7 @@ fn a_failed_interrupt_settles_once_and_ends_the_service() {
     assert_eq!(slot0(&target).device_ref().interrupts, 1);
 }
 
-/// §3.3 (cleanup failure) + first-fault precedence: a settle failure must not
+/// (cleanup failure) + first-fault precedence: a settle failure must not
 /// overwrite an already-recorded fatal root cause (`set_fatal` keeps the first
 /// fault). The step still reports the settle fault; `tick` keeps the root one.
 #[test]
@@ -4316,7 +4312,7 @@ fn a_failed_settle_does_not_overwrite_the_first_fatal_fault() {
     );
 }
 
-/// §4.3/§4.4: a rejected data plan moves no data and starts no storage IO.
+/// A rejected data plan moves no data and starts no storage IO.
 #[test]
 fn a_rejected_data_plan_starts_no_io() {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
@@ -4344,7 +4340,7 @@ fn a_rejected_data_plan_starts_no_io() {
     assert!(!device.active);
 }
 
-/// §3.3 (local settled before send): a completion fixed while the host data
+/// (local settled before send): a completion fixed while the host data
 /// phase has not started is reported without inventing a send.
 #[test]
 fn a_completion_fixed_before_the_send_starts_no_host_phase() {
@@ -4392,7 +4388,7 @@ fn a_completion_fixed_before_the_send_starts_no_host_phase() {
 
 // ── Row 4: idle / empty / drop windows ─────────────────────────────────────
 
-/// §3.3: `stop` with no command settles nothing — no `interrupt`, no delivery,
+/// `stop` with no command settles nothing — no `interrupt`, no delivery,
 /// no IO — and the next `tick` reports the end.
 #[test]
 fn stop_with_no_command_reports_ended_without_an_interrupt() {
@@ -4426,7 +4422,7 @@ fn stop_with_no_command_reports_ended_without_an_interrupt() {
     assert_eq!(events(&log), Vec::new(), "no adapter or device call at all");
 }
 
-/// §4.10: an idle `Abort` is accepted as a no-op; nothing is settled and service
+/// An idle `Abort` is accepted as a no-op; nothing is settled and service
 /// continues.
 #[test]
 fn abort_with_no_active_command_is_a_no_op() {
@@ -4453,7 +4449,7 @@ fn abort_with_no_active_command_is_a_no_op() {
     );
 }
 
-/// §3.3 (retained input / unconsumed completion): an admission rejection is a
+/// (retained input / unconsumed completion): an admission rejection is a
 /// completion the shell still owes; until it is reported the boundary stays
 /// incomplete, so neither a new command nor a management transaction may start.
 #[test]
@@ -4501,7 +4497,7 @@ fn an_unconsumed_completion_blocks_the_next_command_until_it_is_reported() {
 
 // ── Row 5: the long-operation entry polls the adapter once per entry ───────
 
-/// §3.4/§3.5: a long operation may span entries with **one retained token**.
+/// A long operation may span entries with **one retained token**.
 /// Each entry polls the adapter at most once: `Pending` returns the unchanged
 /// projection (the device is not polled again), `Ready` is stored for the next
 /// entry. The operation is begun once, never re-issued and never cancelled.
@@ -4597,7 +4593,7 @@ fn a_live_command_blocks_the_long_entry_without_polling_its_adapter() {
     assert_eq!(long_storage.cancels, 0);
 }
 
-/// §3.4/§3.5/§3.7: an adapter that never leaves `Pending` cannot grow work or
+/// An adapter that never leaves `Pending` cannot grow work or
 /// memory — the entry polls it exactly once and yields `Ok(Foreground)`; there
 /// is **no** runner-side budget, busy loop or contract fault. The escape is
 /// `force_remove_*`, which cancels the retained token exactly once before it
@@ -4667,7 +4663,7 @@ fn a_stalled_long_entry_yields_and_force_cancels_the_token_once() {
     assert_eq!(storage.polls, polls, "no token to poll after the cancel");
 }
 
-/// `03 §3.3` force row: force cancels a stalled long **write** token. Its
+/// Force row: force cancels a stalled long **write** token. Its
 /// end was never observed, so the handback must carry
 /// `unknown_remainder = true` (confirmed prefix 0) instead of `NONE`.
 #[test]

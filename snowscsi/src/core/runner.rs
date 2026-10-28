@@ -1,21 +1,17 @@
 //! Command runner: authoritative boundary, command step machine and
 //! stop/abort settlement.
 //!
-//! Authority: `__ARCH__/design/02-api.md` §4.3/§4.4,
-//! `__ARCH__/design/02-api-core.md` §4.7/§4.11 and
-//! `__ARCH__/design/03-lifecycles.md` §3.2–§3.4/§3.6.
-//!
 //! The runner owns what a slot cannot know:
 //!
 //! - the authoritative boundary (`command_active`, required/speculative IO,
 //!   retained input, unconsumed completion, live execution borrow) plus the
-//!   long-operation settled check (`§4.11`);
+//!   long-operation settled check;
 //! - the current [`Feedback`] and one pending adapter token with metadata only —
 //!   core never stores a `&mut [u8]`, the shell re-supplies `work` on every
 //!   step. A resident long operation may additionally retain **one** adapter
 //!   token across entries, re-borrowed from the caller's `data` bank;
 //! - lifecycle settlement: **Stop is a drain, everything else cancels**
-//!   (`03 §3.3`).
+//!
 //!
 //! `stop`, `transport_ended` and `fatal` may be requested while a command is
 //! live. `tick` reports `Ended` only after a `step_command` call settled the
@@ -166,7 +162,7 @@ enum IoAbsorb {
     ///
     /// The receipt was **returned**, so its own facts (confirmed prefix,
     /// [`Effect`]) are carried instead of an unreported-cancel guess
-    /// (`03 §3.3` "receipt 已返回").
+    /// ("receipt 已返回").
     Contract(KnownEffects),
 }
 
@@ -204,15 +200,14 @@ pub struct Runner {
     fatal: Option<Fault>,
     await_take: Option<usize>,
     /// Host-eject transaction in flight (AwaitDelivery): commit/detach may be
-    /// under way but no result is resident yet (`§4.11`).
+    /// under way but no result is resident yet.
     eject_pending: Option<usize>,
     /// Pending long-operation receipt, keyed to the LUN that owns it.
     ///
-    /// A Target runs at most one resident long operation at a time
-    /// (`02-api-core.md:350`, `03 §3.7`): a fixed per-LUN array is not
-    /// possible without allocation, so the runner serializes long entries on
-    /// the owning LUN. A different LUN's entry fails closed with
-    /// `Fault::Boundary` without consuming this receipt.
+    /// A Target runs at most one resident long operation at a time: a fixed
+    /// per-LUN array is not possible without allocation, so the runner
+    /// serializes long entries on the owning LUN. A different LUN's entry
+    /// fails closed with `Fault::Boundary` without consuming this receipt.
     long_feedback: Option<(usize, Feedback)>,
     /// Retained adapter token of the resident long operation, keyed to its LUN.
     ///
@@ -230,7 +225,7 @@ pub struct Runner {
     /// Deferred emergency removals, one bit per LUN.
     ///
     /// A force accepted while a result/handback barrier is resident must not
-    /// overwrite that result (`02-api-core.md` §4.10); it is recorded here and
+    /// overwrite that result; it is recorded here and
     /// completed by the `take` that clears the barrier. The slot used to be a
     /// single `Option<usize>`, which silently lost a force aimed at another
     /// LUN: the take that released the barrier only ever continued its own
@@ -330,7 +325,7 @@ impl Runner {
         ExecutionGuard::new(&self.execution_borrow)
     }
 
-    /// The authoritative boundary, in the fixed order of `§4.11`.
+    /// The authoritative boundary, in the documented order.
     ///
     /// `LuInfo::boundary` is only the command/long-operation projection; this
     /// conjunction is the authority.
@@ -352,7 +347,7 @@ impl Runner {
     /// reject the command at the runner: the medium gate belongs to the device
     /// (`Lu::admit` returns `2/04/04` and the profile refuses before any IO).
     /// The same holds for the long operation's retained IO token: queries stay
-    /// serviceable while a long IO is pending (`03 §3.7`), so this path
+    /// serviceable while a long IO is pending, so this path
     /// ignores both the long phase and the long IO obligation. Management
     /// entries keep the stricter [`Self::boundary_of`].
     fn command_boundary_of<L: Lu + ?Sized>(&self, slot: &L) -> Result<(), BoundaryReject> {
@@ -376,9 +371,9 @@ impl Runner {
         }
         // The resident long operation's retained token is an IO obligation too,
         // but it is **not** the command-owned `required_io` flag: queries must
-        // still start while it is live (`03 §3.7`), while management/take must
+        // still start while it is live, while management/take must
         // not cross it. `RequiredIoInFlight` is the boundary-row reason for a
-        // live IO obligation (`02-api-core §4.11`).
+        // live IO obligation.
         if reject_long_io && self.long_io_in_flight() {
             return Err(BoundaryReject::RequiredIoInFlight);
         }
@@ -444,7 +439,7 @@ impl Runner {
         Ok(())
     }
 
-    /// Service gate for management (`§4.11`): ended, control-pending, result
+    /// Service gate for management: ended, control-pending, result
     /// barrier, boundary.
     ///
     /// `awaiting_resource_take` has two sources: the runner's global
@@ -452,11 +447,11 @@ impl Runner {
     /// the slot itself still holds from `advance`/`force`. Both are the same
     /// design term — "a result has been produced and awaits `take`" — so a new
     /// transaction cannot start before the one-shot result is claimed
-    /// (`03 §3.6` AwaitTake row). `take` deliberately does not use this gate; it
+    /// (AwaitTake row). `take` deliberately does not use this gate; it
     /// is what clears the barrier.
     ///
-    /// **Barrier scope (deliberate, documented drift).** `03 §3.6` and
-    /// `02-api-core §4.11` name `service_gate` the gate for commands, long
+    /// **Barrier scope (deliberate, documented drift).** and
+    /// name `service_gate` the gate for commands, long
     /// operations *and* management. The production scope is narrower: this
     /// gate (with `slot.has_result()`) blocks only `propose`/`advance`/`install`.
     /// `command_gate` and `poll_long_gate` consult the global `result_barrier`
@@ -540,7 +535,7 @@ impl Runner {
     /// This is the long-entry analogue of `required_io`: an in-flight IO
     /// obligation that management/take must not cross. It is deliberately **not**
     /// the command-owned [`Runner`] flag, because queries must stay serviceable
-    /// while a long IO is pending (`03 §3.7`); see
+    /// while a long IO is pending; see
     /// [`Self::command_boundary_of`].
     const fn long_io_in_flight(&self) -> bool {
         self.long_pending.is_some()
@@ -658,7 +653,7 @@ impl Runner {
     }
 
     /// Cancel one pending token. `cancel`/`poll_exec` return before the buffer
-    /// may be reused, so this must complete before settling (`03 §3.3`).
+    /// may be reused, so this must complete before settling.
     fn cancel_pending(
         &self,
         pending: PendingOp,
@@ -696,7 +691,7 @@ impl Runner {
     /// observing its end (long-entry bank mismatch / unaddressable window).
     ///
     /// The shape mirrors [`Self::known_unobserved`]: a write/sync reports
-    /// [`Effect::UnknownRemainder`], a read never invents one (`03 §3.4`).
+    /// [`Effect::UnknownRemainder`], a read never invents one.
     fn cancelled_receipt(dir: Direction) -> StorageReceipt {
         let effect = if matches!(dir, Direction::FromHost | Direction::None) {
             Effect::UnknownRemainder
@@ -717,7 +712,7 @@ impl Runner {
     ///
     /// Only `force_remove_*` can reach this: it is the one immediate-cancel path
     /// that carries a `Storage` adapter. Returns the cancelled request so the
-    /// caller can book its unobserved effects (`03 §3.3` force row); the device
+    /// caller can book its unobserved effects (force row); the device
     /// keeps its `Foreground`/`Background` projection because the operation's
     /// end was never observed, so [`Self::resume_pending_force`] still refuses
     /// to treat it as settled.
@@ -748,15 +743,15 @@ impl Runner {
     /// Facts confirmed by a storage receipt that was **returned** by the
     /// adapter.
     ///
-    /// A returned receipt is authoritative for its own facts (`03 §3.3`
-    /// "receipt 已返回" = consume the receipt first, a later cancel must not
+    /// A returned receipt is authoritative for its own facts: "receipt
+    /// 已返回" means consume the receipt first, a later cancel must not
     /// overwrite it): the confirmed write prefix is kept exactly as reported and
     /// `unknown_remainder` follows the receipt's [`Effect`]. An error on the
     /// receipt — including [`Fault::Contract`] — does not by itself fabricate an
     /// unknown remainder; only a write/sync whose end was never observed does
     /// (see [`Self::known_unobserved`]). A read never produces a write/sync
-    /// remainder (`03 §3.4`: cancelling a read must not invent a write
-    /// `Unknown`), so an impossible read-side `UnknownRemainder` is masked.
+    /// remainder (cancelling a read must not invent a write `Unknown`), so an
+    /// impossible read-side `UnknownRemainder` is masked.
     fn known_from_storage_receipt(req: IoReq, receipt: StorageReceipt) -> KnownEffects {
         let write_or_sync = matches!(req.dir, Direction::FromHost | Direction::None);
         let mut known = KnownEffects::NONE;
@@ -773,7 +768,7 @@ impl Runner {
 
     /// Facts confirmed by a host receipt that was **returned** by the
     /// adapter: the accepted/sent prefix is a returned fact and is never
-    /// replaced by a fabricated unknown remainder (`03 §3.3`).
+    /// replaced by a fabricated unknown remainder.
     fn known_from_host_receipt(receipt: HostReceipt) -> KnownEffects {
         KnownEffects {
             host_prefix: receipt.accepted() as u64,
@@ -781,7 +776,7 @@ impl Runner {
         }
     }
 
-    /// Stop is a cooperative **drain**, not a cancel (`03 §3.3`).
+    /// Stop is a cooperative **drain**, not a cancel.
     ///
     /// New submission is already closed by `Target::stop`. The pending token is
     /// polled once more: `Pending` keeps the state, `Ready` merges its confirmed
@@ -824,7 +819,7 @@ impl Runner {
                             // An errored token is cancelled for slot
                             // hygiene. `cancel` returning does not rewrite the
                             // facts the returned receipt already established
-                            // (`03 §3.3` "receipt 已返回").
+                            // ("receipt 已返回").
                             storage.cancel(token);
                         }
                         known
@@ -887,7 +882,7 @@ impl Runner {
         self.drive_state.set(None);
         if let Err(fault) = interrupted {
             // A failed settle is terminal: the slot can no longer prove a safe
-            // state (`03 §3.3`). The first fault wins; a settle failure must not
+            // state. The first fault wins; a settle failure must not
             // mask an already-recorded root cause.
             self.set_fatal(fault);
             return Err(fault);
@@ -910,7 +905,7 @@ impl Runner {
         };
         if state.done.is_some() {
             // A completion fixed by admission/prepare never started execution:
-            // `03 §3.3` forbids `interrupt` here (no command, no IO).
+            // forbids `interrupt` here (no command, no IO).
             self.note_command_finished();
             self.consume_completion();
             self.drive_state.set(None);
@@ -964,7 +959,7 @@ impl Runner {
         self.control_events = self.control_events.saturating_add(1);
         if self.drive_state.get().is_none() {
             // `Abort` is queued only while a command is active; an idle Abort is
-            // an accepted no-op (`§4.10`).
+            // an accepted no-op.
             return Ok(DriveStep::Control(RunOutcome::ServiceReady));
         }
         self.settle_abnormally(lu, storage, host, InterruptReason::Stop)?;
@@ -986,7 +981,7 @@ impl Runner {
         let mut state = self.drive_state.get().ok_or(Fault::Contract)?;
 
         // A `Pending` command must be continued with the *same* work bank
-        // (`§4.3`): a different address/length would reinterpret the retained
+        // A different address/length would reinterpret the retained
         // token against the wrong bytes.
         let work_addr = work.as_ptr() as usize;
         let work_len = work.len();
@@ -1009,7 +1004,7 @@ impl Runner {
             return Ok(DriveStep::Done(completion));
         }
 
-        // 2. Lifecycle settlement settles before any new IO (`03 §3.3`).
+        // 2. Lifecycle settlement settles before any new IO.
         if let Some(outcome) = self.terminal_outcome() {
             match outcome {
                 RunOutcome::Ended {
@@ -1075,7 +1070,7 @@ impl Runner {
                         None => {
                             // The retained window is no longer addressable in
                             // `work`: cancel before settling, never drop a live
-                            // token (`03 §3.4`).
+                            // token.
                             storage.cancel(token);
                             if prefetch {
                                 self.cancel_speculative_io();
@@ -1148,7 +1143,7 @@ impl Runner {
             match step {
                 PollStep::Publish(plan) => {
                     if state.published {
-                        // A command publishes exactly one data plan (`§4.4`).
+                        // A command publishes exactly one data plan.
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     }
@@ -1458,7 +1453,7 @@ impl Runner {
             IoSettlement::Ready(raw) if raw.error == Some(Fault::Contract) => {
                 // The adapter answered (the receipt is a returned fact): keep
                 // its confirmed prefix and effect instead of treating the
-                // operation as an unreported cancel (`03 §3.3`).
+                // operation as an unreported cancel.
                 let receipt = sanitize_storage_receipt(req, raw);
                 IoAbsorb::Contract(Self::known_from_storage_receipt(req, receipt))
             }
@@ -1507,7 +1502,7 @@ impl Runner {
         self.note_command_finished();
         self.drive_state.set(None);
         if let Err(fault) = interrupted {
-            // A settle that cannot be proven safe ends the service (`03 §3.3`).
+            // A settle that cannot be proven safe ends the service.
             self.set_fatal(fault);
         }
     }
@@ -1648,7 +1643,7 @@ impl Runner {
     ///
     /// A failed detach (or a failure to publish the handback) ends the service
     /// with `Fatal`/`NeedsRecovery`; it is never a silent success
-    /// (`03 §3.6`, delayed-force failure row). One call completes at most one
+    /// (delayed-force failure row). One call completes at most one
     /// LUN. The caller loops while [`Self::result_barrier`] is clear: a force
     /// that actually detached a pair publishes `await_take` and stops the
     /// sweep, while a force on an empty slot detaches nothing, so more than one
@@ -1779,7 +1774,7 @@ impl Runner {
     /// settled. A force aimed at another, idle LUN detaches that LUN and leaves
     /// the running command untouched; settling the addressed slot instead would
     /// interrupt a device that owns nothing and clear a state the running LUN
-    /// can no longer step (`03 §3.3` immediate-cancel, `03 §3.6` force row). A
+    /// can no longer step (immediate-cancel, force row). A
     /// slot that still reports `Lu::active()` while `drive_state` is empty or
     /// belongs elsewhere is refused with `Fault::Contract`: detaching it would
     /// leave its command unsettled, and settling it would corrupt the owner.
@@ -1808,7 +1803,7 @@ impl Runner {
         host: &mut dyn HostTransport,
     ) -> Result<(), Fault> {
         let bit = Self::force_bit(lun)?;
-        // Force is one of the immediate-cancel paths (`03 §3.3`). Settle first,
+        // Force is one of the immediate-cancel paths. Settle first,
         // even when an earlier force is still deferred: a command may have
         // started on this LUN while its result was resident.
         match self.drive_state.get() {
@@ -1821,7 +1816,7 @@ impl Runner {
             _ => {}
         }
         // A resident long operation may hold one retained adapter token for
-        // this LUN. Force is an immediate-cancel path (`03 §3.3`): cancel the
+        // this LUN. Force is an immediate-cancel path: cancel the
         // token before any detach, including before a deferral, so the adapter
         // slot is freed even if the detach happens later. A write/sync whose
         // end was never observed must leave `unknown_remainder` in the force
@@ -1909,7 +1904,7 @@ impl Runner {
     /// A host-eject attempt failed before detaching the old pair (empty slot,
     /// unresolved candidate/result, or local commit). The pair is still
     /// installed, so this is a normal error — not a fatal service condition
-    /// (`02-api-core §4.11`, `03 §3.6`); it must not leave a take barrier.
+    /// It must not leave a take barrier.
     pub(crate) fn eject_failed(&mut self) {
         self.eject_pending = None;
     }
@@ -1981,7 +1976,7 @@ impl Runner {
 
     /// One service entry: at most one reason, never a queued event.
     ///
-    /// Order (`§4.11`): fatal → transport ended → stopped → await take →
+    /// Order: fatal → transport ended → stopped → await take →
     /// pending `Nop` → `ServiceReady`. A live command is never reported as
     /// `Ended`.
     #[allow(dead_code)] // `Target::tick`; driven by tests here
@@ -2226,7 +2221,7 @@ impl Runner {
 
     /// Terminal-flag settlement for a retained long-operation token.
     ///
-    /// `Stop` drains (`03 §3.3`): one adapter poll per entry until `Ready`,
+    /// `Stop` drains: one adapter poll per entry until `Ready`,
     /// then one bounded device poll with the returned receipt. A bank mismatch
     /// cannot advance the drain, so it cancels and books the unobserved effect
     /// instead. `transport_ended`/`fatal` cancel immediately: one
@@ -2316,7 +2311,7 @@ impl Runner {
     /// `Ready` returns the sanitized receipt. Nothing loops, and **no**
     /// `required_io`/`speculative_io` flag is set: those are command-owned
     /// obligations, while a long IO must leave queries serviceable
-    /// (`03 §3.7`). The obligation is [`Self::long_io_in_flight`] instead.
+    /// The obligation is [`Self::long_io_in_flight`] instead.
     #[allow(clippy::too_many_arguments)]
     fn long_io(
         &mut self,
@@ -2371,7 +2366,7 @@ impl Runner {
         data: &mut [u8],
     ) -> Result<LongInfo, Fault> {
         // A returned receipt is authoritative even for `Contract`
-        // (`03 §3.3`): feed it back before surfacing the fault, so the device
+        // Feed it back before surfacing the fault, so the device
         // settles from the confirmed prefix/effect and a later entry cannot
         // re-issue the cancelled operation.
         let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
@@ -2429,7 +2424,7 @@ enum HostResume {
 
 /// The host-data contract: the direction must match; a Data-In response may be
 /// shorter than the declared host capacity, while Data-Out and no-data must
-/// match exactly (`02-api.md §4.3`, A1).
+/// match exactly (`, A1).
 fn plan_contract(ctx: CommandContext, plan: DataPlan) -> bool {
     if plan.direction != ctx.host_direction {
         return true;
@@ -2539,7 +2534,7 @@ fn pending_host_buf<'a>(
     }
 }
 
-/// Sanitize an adapter receipt against the request it answers (`03 §3.4`).
+/// Sanitize an adapter receipt against the request it answers.
 ///
 /// `Ready(n > requested)` cannot be trusted: the previously confirmed prefix is
 /// kept (nothing new is accepted) and the remainder is recorded as unknown. A
@@ -2555,7 +2550,7 @@ fn sanitize_storage_receipt(req: IoReq, receipt: StorageReceipt) -> StorageRecei
     receipt
 }
 
-/// Clamp a returned host receipt to the request it answers (`03 §3.4`).
+/// Clamp a returned host receipt to the request it answers.
 ///
 /// The accepted/sent prefix can never exceed the request (a larger number is a
 /// contract violation and must not be over-reported). The runner stamps its own
@@ -3494,7 +3489,7 @@ mod tests {
         assert!(bench.slot.has_result());
 
         // A produced result is `awaiting_resource_take`: no new transaction may
-        // start before it is claimed (`§4.11` service_gate, `§3.6` AwaitTake).
+        // start before it is claimed (service_gate, AwaitTake).
         assert_eq!(
             bench.runner.service_gate(&bench.slot),
             Err(BoundaryReject::AwaitingResourceTake)

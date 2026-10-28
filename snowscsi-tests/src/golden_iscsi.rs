@@ -5,7 +5,7 @@
 //! the `Action`/`Event` protocol), renders the recorded trace and calls
 //! [`crate::golden::bless_or_check`] plus [`crate::golden::assert_well_formed`].
 //!
-//! The five scenarios (A–E, §5.1) are deterministic: a pinned `# config:`
+//! The five scenarios (A–E) are deterministic: a pinned `# config:`
 //! header, a fixed ISID/CmdSN/ITT seed and a fixed login negotiation text.
 //! Every script starts with the login exchange (the `kind=iscsi` guard requires
 //! the first host→device PDU to be a `LOGIN_REQUEST`) and every script ends by
@@ -14,7 +14,7 @@
 //!
 //! The BHS builders below are local copies of `crate::mock`'s (which are
 //! private to that module): the golden scenarios build raw wire bytes inline
-//! (§5.1) rather than depending on any library builder.
+//! rather than depending on any library builder.
 
 use snowscsi::common::store::StorePlane;
 use snowscsi::iscsi::pdu::{flag, op, stage, status, BHS_SIZE};

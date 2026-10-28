@@ -38,7 +38,7 @@ pub enum CtrlReq<A: CtrlAck, R: CtrlReply> {
     /// `Event::Reset` to the session before `ack.ack()` (BOT §3.1).
     BotReset { ack: A },
     /// Get Max LUN (bRequest 0xFE). Reply immediately with
-    /// `[session.max_lun()]`; never STALL this request (§4.3).
+    /// `[session.max_lun]`; never STALL this request.
     GetMaxLun { reply: R },
     /// Link-level event (bind / enable / disable) — equivalent to a reset.
     LinkReset,

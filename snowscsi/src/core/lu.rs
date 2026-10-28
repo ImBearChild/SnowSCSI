@@ -1,10 +1,5 @@
 //! The `Lu` slot seam and the single `LuImpl` device wrapper.
 //!
-//! Authority: `__ARCH__/design/02-api.md` §4.3 (trait shape) and §4.4
-//! (`PollStep`), `__ARCH__/design/02-api-core.md` §4.7 (management values),
-//! §4.10 (transaction order) and §4.12 (long-operation gate), and
-//! `__ARCH__/design/03-lifecycles.md` §3.3/§3.6.
-//!
 //! [`Lu`] is object-safe on purpose: the runtime path keeps
 //! `&mut dyn Lu<Pair = P>` slots, so every method takes concrete arguments,
 //! there are no GATs and no `async fn`s. The runner drives it; an application
@@ -15,7 +10,7 @@
 //! a dropped future: the prepared candidate, the resident result, the
 //! `needs_recovery` flag and the preserved old pair. It never stores a buffer,
 //! never allocates and never issues storage IO — `Device::commit` is a local
-//! metadata hook (`02-api.md` §4.1).
+//! metadata hook.
 
 use super::device::{
     Admission, CommandContext, Device, Feedback, InterruptReason, Pair, PollStep, TargetId,
@@ -33,11 +28,11 @@ use super::permit::{BoundaryPermit, CommandPermit, OwnerBindPermit};
 ///
 /// # Contract
 ///
-/// - `admit` runs **before** any medium/backing access (§4.12); a reject
+/// - `admit` runs **before** any medium/backing access; a reject
 ///   already carries its completion.
 /// - `prepare` starts a command; `resume` continues one whose future was
-///   dropped. Re-preparing an active command must fail with `Busy`, never
-///   replay it (`03 §3.3`).
+///   dropped. Re-preparing an active command must fail with `Busy`,
+///   never replay it.
 /// - `interrupt` is called only after the in-flight IO has settled and only
 ///   with the facts the runner actually observed; it performs at most one
 ///   bounded cleanup and never issues storage IO.
@@ -93,7 +88,7 @@ pub trait Lu {
 
     /// Read-only projection. It is **not** the authoritative boundary: the
     /// runner also owns required/speculative IO, retained input, an unconsumed
-    /// completion and the live execution borrow (§4.11).
+    /// completion and the live execution borrow.
     fn snapshot(&self) -> LuInfo;
 
     /// Settle an abnormal end after the in-flight IO has settled and the
@@ -135,7 +130,7 @@ pub trait Lu {
     /// Install a pair handed back by the application; returns it on failure.
     ///
     /// This is the second documented recovery path out of `needs_recovery`
-    /// (`02-api-core.md` §4.10, `03-lifecycles.md` §3.6). The AwaitTake barrier
+    /// The AwaitTake barrier
     /// is enforced one level up: `Runner::service_gate` refuses this entry (and
     /// `propose`/`advance`) while a management result is still resident, so a
     /// reinstall requires the application to `take` the candidate first. This
@@ -149,7 +144,7 @@ pub trait Lu {
     ) -> Result<(), (Self::Pair, Fault)>;
 
     /// Save a candidate change without touching the current pair. On failure
-    /// the original input is returned (§4.10).
+    /// the original input is returned.
     fn propose_rt(
         &mut self,
         permit: &BoundaryPermit,
@@ -243,7 +238,7 @@ impl<D: Device, B> LuImpl<D, B> {
         self.needs_recovery
     }
 
-    /// `long_settled` (§4.11): only `Idle`/`Settled` allow management or a
+    /// `long_settled`: only `Idle`/`Settled` allow management or a
     /// resource take.
     fn long_settled(&self) -> bool {
         matches!(
@@ -263,8 +258,8 @@ impl<D: Device, B> LuImpl<D, B> {
     }
 
     /// Store `pair` in `result` and report the local failure, so the
-    /// application's input is never lost (§4.10: a known failure terminates the
-    /// transaction and the candidate goes to `result`).
+    /// application's input is never lost: a known failure terminates the
+    /// transaction and the candidate goes to `result`.
     fn fail_advance(
         &mut self,
         pair: Option<Pair<D::Medium, B>>,
@@ -299,14 +294,14 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
     fn admit(&self, cdb: &[u8]) -> Admission {
         let opcode = cdb.first().copied().unwrap_or(0xFF);
         // No pair means no medium: media commands must not reach a stale
-        // adapter binding after Remove/host-eject (`03 §3.2`, `§4.12`). The
+        // adapter binding after Remove/host-eject. The
         // mandatory query set (INQUIRY/REQUEST SENSE/REPORT LUNS/…) stays
         // answerable on an empty slot (`§4.19`, SPC-3 6.21).
         if self.backing.is_none() && !admitted_during_foreground(opcode) {
             return Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT));
         }
         // A slot that failed to restore its old medium must not serve: its
-        // backing/adapter binding is stale (§4.10).
+        // backing/adapter binding is stale.
         if self.needs_recovery {
             return Admission::Reject(Completion::Check(NEEDS_RECOVERY));
         }
@@ -388,11 +383,11 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             long: self.device.long_info(),
             ready: self.backing.is_some() && !self.needs_recovery,
             // The PREVENT latches live in the device profile; this projection
-            // is the management view only (§4.7).
+            // is the management view only.
             prevent: locks.prevent,
             persistent_prevent: locks.persistent_prevent,
             // Command + long-operation projection only; the runner owns the
-            // authoritative conjunction (§4.11).
+            // authoritative conjunction.
             boundary: !self.device.active() && self.long_settled(),
         }
     }
@@ -407,7 +402,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             return Err(Fault::ForeignBoundary);
         }
         // Remember the facts so an emergency force can still report them after
-        // the device has settled (§4.10, force row).
+        // the device has settled (force row).
         self.last_known = known;
         self.device.interrupt(permit, reason, known)
     }
@@ -490,7 +485,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             pair: Some(Pair { medium, backing }),
             // Force deliberately did not commit: local success, with
             // `sync_durable = false` and any unknown write remainder reported
-            // as an effect — never as `Err(Fault::Commit)` (§4.10).
+            // as an effect — never as `Err(Fault::Commit)`.
             local: Ok(()),
             delivery: Delivery::NotApplicable,
             effects,
@@ -507,7 +502,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             return Err((pair, Fault::ForeignBoundary));
         }
         // A successful install is one of the two documented recovery paths
-        // (`§4.10`/`§3.6`: force **or** reinstall); the preserved old pair is
+        // (force **or** reinstall); the preserved old pair is
         // dropped only after the new medium is accepted.
         if self.device.active() || !self.long_settled() {
             return Err((pair, Fault::Contract));
@@ -571,8 +566,8 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
                 match self.device.install_medium(permit, medium) {
                     Ok(()) => {
                         self.backing = Some(backing);
-                        // Install has no old pair to hand back (`§4.10`: "no
-                        // old"), so no result is produced and `take` returns
+                        // Install has no old pair to hand back ("no old"),
+                        // so no result is produced and `take` returns
                         // `NothingToTake`.
                         self.result = None;
                         Ok(())
@@ -622,7 +617,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
                             local: Ok(()),
                             delivery: Delivery::NotApplicable,
                             // The local commit is metadata-only, not host
-                            // durable (`03 §3.6`).
+                            // durable.
                             effects: KnownEffects::NONE,
                         });
                         Ok(())
@@ -695,7 +690,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         if !self.permit_ok(permit) {
             return Err(Fault::ForeignBoundary);
         }
-        // `03 §3.6`: an empty slot, an unresolved candidate/result, an active
+        // An empty slot, an unresolved candidate/result, an active
         // command or a non-settled long operation is rejected before any
         // detach.
         if self.device.active() || !self.long_settled() {
@@ -724,7 +719,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         //    (never the persistent) PREVENT latch.
         self.device.host_eject_succeeded(permit);
         // `ChangeResult.delivery` is the delivery state **at the moment the
-        // result is produced** (§4.7). `03 §3.6` orders a host eject as
+        // result is produced**. A host eject is ordered as
         // commit → detach/result → send the full status → `ResourcesReady`, so
         // when this result appears the status has not been sent yet:
         // `Delivery::Pending` is the truthful snapshot. `NotApplicable` would
@@ -737,7 +732,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             local: Ok(()),
             delivery: Delivery::Pending,
             // Report the effects captured by an earlier abnormal settlement
-            // (never silently drop an unknown write remainder, §4.14).
+            // (never silently drop an unknown write remainder).
             effects: self.force_effects(),
         });
         Ok(())
@@ -906,7 +901,7 @@ mod tests {
         assert!(slot.needs_recovery());
 
         let permit = BoundaryPermit::new(owner);
-        // Reinstall is the other documented recovery path (§4.10/§3.6). The
+        // Reinstall is the other documented recovery path. The
         // preserved old pair is dropped only after the new medium is accepted.
         slot.backing = None;
         assert_eq!(slot.install_rt(&permit, pair(8)), Ok(()));

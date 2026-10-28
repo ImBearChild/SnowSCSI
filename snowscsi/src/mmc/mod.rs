@@ -1,8 +1,5 @@
 //! MMC profile: `MmcDrive` over an `MmcMedium`, plus the flat CD medium.
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §6 (MMC API) and §7
-//! (live/bundle are backing, not medium).
-//!
 //! [`drive::MmcDrive`] only decodes media commands, validates CDB fields and
 //! encodes the media-description responses. Public query commands (MODE SENSE,
 //! READ CAPACITY, GET CONFIGURATION, GET EVENT STATUS NOTIFICATION) are served

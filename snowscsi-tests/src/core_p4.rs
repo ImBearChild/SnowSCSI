@@ -1,7 +1,6 @@
 //! Long-operation and resident-query fixtures.
 //!
-//! Covered here (`__ARCH__/design/03-lifecycles.md` §3.7,
-//! `02-api-core.md` §4.12):
+//! Covered here:
 //!
 //! 1. a long entry uses the `scratch` bank only; a sentinel in `work` survives
 //!    the whole operation;
@@ -963,7 +962,7 @@ impl Storage for PendingStorage {
     }
 }
 
-/// §3.4/§3.5: the same MMC FORMAT script driven through a synchronous adapter
+/// The same MMC FORMAT script driven through a synchronous adapter
 /// and through one that yields `Pending` K times per operation must produce the
 /// same device trace (`Publish`/`Io` sequence with offsets and lengths), the
 /// same storage op trace (direction/offset/len order), the same final contents,
@@ -1316,7 +1315,7 @@ fn queries_use_work_while_the_foreground_fill_advances_from_scratch() {
 // Queries while a long IO token is actually Pending
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `03 §3.7`: a long-entry token is **not** a command-owned
+/// A long-entry token is **not** a command-owned
 /// `required_io` obligation. With the token still `Pending`, INQUIRY /
 /// REQUEST SENSE / REPORT LUNS start and complete from `work`, READ/WRITE/TUR
 /// stay device-gated with zero medium/backing calls, and the long entry then

@@ -81,12 +81,12 @@ pub const CBW_LEN: usize = 31;
 /// Command Status Wrapper size in bytes (BOT §5.2).
 pub const CSW_LEN: usize = 13;
 
-/// Mass Storage Class interface class code (USB MSC Overview v1.4 §4.1).
+/// Mass Storage Class interface class code (USB MSC Overview v1.4).
 pub const MSC_CLASS: u8 = 0x08;
 /// Subclass 0x06 = SCSI transparent command set (USB MSC Overview v1.4
 /// Table 1; SFF-8070i is 0x05 and obsolete).
 pub const MSC_SUBCLASS: u8 = 0x06;
-/// Protocol 0x50 = Bulk-Only Transport (USB MSC Overview v1.4 §4.2).
+/// Protocol 0x50 = Bulk-Only Transport (USB MSC Overview v1.4).
 pub const MSC_PROTOCOL: u8 = 0x50;
 
 /// Bulk-Only Mass Storage Reset class request (`bmRequestType` 0x21, BOT

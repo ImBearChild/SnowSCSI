@@ -12,7 +12,7 @@
 //! LinkReset arrive as [`Event::Reset`], Get Max LUN is a pure getter
 //! ([`BotSession::max_lun`]). There is no out-of-band state mutation.
 //!
-//! Design invariants (§4 / §3.7 / §3.8):
+//! Design invariants (/ /):
 //! - CBW (31B) accumulates into an internal buffer; CSW (13B) is assembled
 //!   in an internal buffer; the caller's `work` area holds only SCSI data.
 //! - STALL is used for invalid CBWs (both pipes, [`Action::StallBoth`]) and,
@@ -779,7 +779,7 @@ impl BotSession {
             core::str::from_utf8(crate::scsi::util::hex_of(&mut hx, cdb)).unwrap_or("?")
         );
 
-        // REPORT LUNS is served for any addressed LUN (§5.3).
+        // REPORT LUNS is served for any addressed LUN.
         if cdb.first() == Some(&scsi_op::REPORT_LUNS) {
             // SPC-3 Table 148: SELECT REPORT 00h/02h report the full
             // inventory here (all LUNs are peripheral/flat); 01h reports
@@ -804,7 +804,7 @@ impl BotSession {
         }
 
         if cbw.lun as usize >= devs.len() {
-            // Invalid LUN (§4.6): Failed CSW + REQUEST SENSE (ASC 0x25).
+            // Invalid LUN: Failed CSW + REQUEST SENSE (ASC 0x25).
             // SPC-3 §6.27: REQUEST SENSE to an unsupported LUN shall return
             // GOOD with sense ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED,
             // and shall do so on *every* REQUEST SENSE (not consume once).
@@ -833,7 +833,7 @@ impl BotSession {
             );
         }
 
-        // Valid LUN: unit-attention injection (§5.2). The UA is delivered
+        // Valid LUN: unit-attention injection. The UA is delivered
         // on the next TEST UNIT READY and cleared by REQUEST SENSE.
         if self.pending_ua.is_some() {
             match cdb.first() {
@@ -1364,7 +1364,7 @@ impl BotSession {
     }
 
     /// End a transaction, first resolving the data phase the CBW declared
-    /// (§6.7). `actual` is the number of Data-In bytes produced. A declared
+    /// `actual` is the number of Data-In bytes produced. A declared
     /// Data-Out phase is drained instead of left in the bulk-OUT fifo (the
     /// host will send `declared` bytes regardless of the outcome).
     fn finish_cmd<'a, D: ScsiDevice>(
@@ -1384,7 +1384,7 @@ impl BotSession {
     }
 
     /// Enter a Data-Out phase that writes nothing: receive and discard the
-    /// host's `declared` bytes so the next CBW is not corrupted (§3.8),
+    /// host's `declared` bytes so the next CBW is not corrupted,
     /// then send the CSW with `status`.
     fn start_data_out_drain<'a>(
         &'a mut self,

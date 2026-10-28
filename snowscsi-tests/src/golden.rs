@@ -350,7 +350,7 @@ fn parse_hex(s: &str) -> Vec<u8> {
 }
 
 /// Decode a rendered fixture back into its `(config, entries)` — the inverse of
-/// [`render`] for a well-formed fixture (§3 "fixture 编解码").
+/// [`render`] for a well-formed fixture ("fixture 编解码").
 ///
 /// Only the three [`TraceEntry`] kinds and the three known marker names are
 /// accepted; anything else is a test bug and panics. This is the strict

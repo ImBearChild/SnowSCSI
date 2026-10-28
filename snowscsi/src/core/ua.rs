@@ -1,9 +1,5 @@
 //! Unit-attention classes and the fixed-size pending UA set.
 //!
-//! Authority: `__ARCH__/design/04-protocols.md` §4.5 (fixed 7-class table,
-//! same-class merge, fixed priority) and `__ARCH__/design/02-api-core.md`
-//! §4.13.
-//!
 //! This module defines the vocabulary and the minimal merge/priority/clear
 //! behaviour.
 //! Transport/power-on/reset wiring that actually raises or consumes UA is

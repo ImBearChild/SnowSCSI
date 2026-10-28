@@ -329,7 +329,7 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
 
         // SPC-3 Table 171: byte1 = Self-Test Code(7:5) | PF(4=0x10) |
         // Reserved(3) | Self-Test(2=0x04) | DevOffL(1) | UnitOffL(0).
-        // §6.28: support default self-test (SELFTEST=1, param len 0) at minimum.
+        // Support default self-test (SELFTEST=1, param len 0) at minimum.
         SpcCommand::SendDiagnostic {
             self_test_code,
             pf,
@@ -340,7 +340,7 @@ pub fn execute_spc<D: SpcDevice>(dev: &mut D, cmd: SpcCommand, data: &mut [u8]) 
                 // Unsupported self-test code (only 000b default is supported).
                 cc(dev, SenseKey::IllegalRequest, asc::INVALID_FIELD)
             } else if self_test && param_list_len == 0 {
-                // Default self-test (§6.28 minimum requirement).
+                // Default self-test (minimum requirement).
                 CommandOutcome::Status
             } else if pf && !self_test {
                 // PF bit set, no self-test (vendor-specific diagnostic).

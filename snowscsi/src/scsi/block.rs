@@ -572,7 +572,7 @@ impl BlockDevice {
             if fmtpinfo != 0 {
                 return self.cc(SenseKey::IllegalRequest, asc::INVALID_FIELD);
             }
-            // CMPLST/LONGLIST are ignored when FMTDATA=0 (§5.3.1).
+            // CMPLST/LONGLIST are ignored when FMTDATA=0.
             // No-op format is sufficient for the block profile (RAM disk);
             // real hardware would zero or certify, but GOOD is compliant.
             return CommandOutcome::Status;

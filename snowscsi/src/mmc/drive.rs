@@ -1,7 +1,5 @@
 //! MMC drive: media-command decoding over an [`MmcMedium`].
 //!
-//! Authority: `__ARCH__/design/02-api-profiles.md` §6.1/§6.5.
-//!
 //! The drive decodes the media command table, validates CDB fields/reserved
 //! bits/allocation length and encodes the media-description responses
 //! (READ TOC, READ DISC INFORMATION, READ TRACK INFORMATION). It never matches

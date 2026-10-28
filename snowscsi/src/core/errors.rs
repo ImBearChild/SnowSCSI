@@ -1,8 +1,5 @@
 //! Errors, completions and sense vocabulary.
 //!
-//! Authority: `__ARCH__/design/02-api-core.md` §4.17 (the error → sense table
-//! is the only normative table) and `__ARCH__/design/02-api.md` §4.6.
-//!
 //! `Storage` adapters only produce [`Fault`]; the Device/profile converts a
 //! `Fault` into wire [`Sense`] through [`storage_fault_sense`]. `None` means
 //! "management/runner error, never a SCSI sense". [`commit_fault`] is the only
@@ -48,7 +45,7 @@ pub const INTERNAL_FAILURE: Sense = Sense::new(0x04, 0x44, 0x00);
 /// ABORTED COMMAND / OVERLAPPED COMMANDS ATTEMPTED (zero-progress writes).
 pub const COMMAND_ABORTED: Sense = Sense::new(0x0B, 0x45, 0x00);
 /// Fixed completion used when `Control::Abort` settles the active command
-/// (`02-api-core.md` §4.10). Same bytes as [`COMMAND_ABORTED`], separate name
+/// Same bytes as [`COMMAND_ABORTED`], separate name
 /// for the control path.
 pub const ABORTED_COMMAND: Sense = Sense::new(0x0B, 0x45, 0x00);
 /// HARDWARE ERROR / LOGICAL UNIT FAILED SELF-TEST (explicit needs-recovery end).
@@ -80,7 +77,7 @@ pub enum Completion {
 ///
 /// `Contract`, `CounterExhausted`, `Boundary` and `ForeignBoundary` are
 /// management/runner facts and never map to SCSI sense
-/// (`02-api-core.md` §4.17). `LunNotFound` is a wire-LUN fact and does map to
+/// `LunNotFound` is a wire-LUN fact and does map to
 /// `05/25/00`; `Commit` is produced only by [`commit_fault`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
@@ -125,9 +122,9 @@ pub enum IoContext {
     Prefetch,
 }
 
-/// Default storage-fault → sense mapping (`02-api-core.md` §4.17).
+/// Default storage-fault → sense mapping.
 ///
-/// The table in §4.17 is the only normative table and profiles may override
+/// The table in is the only normative table and profiles may override
 /// any entry explicitly; this helper is a default, not automatic behaviour.
 ///
 /// `IoContext::Sync`, `Format` and `Prefetch` carry no read/write direction, so
@@ -163,7 +160,7 @@ pub const fn storage_fault_sense(fault: Fault, ctx: IoContext) -> Option<Sense> 
 /// Convert a local-commit completion into a management fault.
 ///
 /// `Good → None`; every other completion → `Some(Fault::Commit)`. This is the
-/// only place that produces [`Fault::Commit`] (`02-api-core.md` §4.17); the
+/// only place that produces [`Fault::Commit`]; the
 /// commit's `Check(Sense)` itself never enters the SCSI sense table.
 #[must_use]
 pub const fn commit_fault(completion: Completion) -> Option<Fault> {

@@ -1,9 +1,5 @@
 //! `Target`: the single application entry over a slot set and its runner.
 //!
-//! Authority: `__ARCH__/design/02-api.md` §4.3 (signatures, LUN validation,
-//! pending-step semantics), `02-api-core.md` §4.9/§4.11/§4.20 and
-//! `03-lifecycles.md` §3.3.
-//!
 //! Two paths share one runner:
 //!
 //! - **runtime** ([`Target`] + [`RuntimeSet`]): `&mut [&mut dyn Lu]`-style
@@ -25,7 +21,7 @@
 //! real [`HostTransport`]. This is a compile-time-visible contract, not a
 //! zero-filled success.
 
-// The public signatures are frozen by `02-api.md` §4.3: the eight-argument
+// The public signatures are frozen by: the eight-argument
 // step entries and the nested `Change<…>` result types are normative, so the
 // generic clippy thresholds are deliberately waived here.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -52,7 +48,7 @@ pub struct Target<S: SlotSet> {
     runner: Runner,
     slots: S,
     /// Wire LUN of the single active command, if any. A step entry for another
-    /// LUN is `Fault::Contract` (`§4.3`: one command at a time).
+    /// LUN is `Fault::Contract` (one command at a time).
     active_lun: Option<usize>,
 }
 
@@ -111,7 +107,7 @@ impl<S: SlotSet> Target<S> {
     }
 
     /// Close new submission; the active command is drained by the next
-    /// `drive_step_*` (`03 §3.3`, **not** a cancel).
+    /// `drive_step_*` (**not** a cancel).
     pub fn stop(&mut self) {
         self.runner.request_stop();
     }
@@ -245,7 +241,7 @@ impl<S: RuntimeSet> Target<S> {
     ///
     /// # Operator eject is application policy, not a library entry
     ///
-    /// `02-api-core §4.14`/§4.20 name only the host-side success entries and a
+    /// / name only the host-side success entries and a
     /// closed public API list; the operator/control-plane eject (GUI/hardware
     /// button) belongs to the application. The application reads the latches
     /// from [`Self::snapshot_rt`], calls
@@ -278,7 +274,7 @@ impl<S: RuntimeSet> Target<S> {
             return Err(Fault::ForeignBoundary);
         }
         // Mark the transaction in flight: while it runs, `take` has nothing to
-        // hand back and new service is refused (`§4.11`).
+        // hand back and new service is refused.
         runner.begin_eject(lun).map_err(|_| Fault::Contract)?;
         match slot.eject_rt(&permit) {
             Ok(()) => runner.finish_eject(lun).map_err(|_| Fault::Contract),
@@ -373,8 +369,8 @@ impl<S: RuntimeSet> Target<S> {
     ///
     /// A force accepted while a result (on this or another LUN) or the global
     /// host-eject handback is resident detaches nothing yet: it arms a per-LUN
-    /// deferral that a later `take` completes (`02-api-core.md` §4.10,
-    /// `03-lifecycles.md` §3.6). The deferral set is an allocation-free `u64`
+    /// deferral that a later `take` completes. The deferral set is an
+    /// allocation-free `u64`
     /// mask (`no_std`), so **`lun >= 64` is rejected with `Fault::Contract`**
     /// before any slot state is touched (a LUN outside this target is
     /// `Fault::LunNotFound` first).
@@ -405,7 +401,7 @@ impl<S: RuntimeSet> Target<S> {
     /// **at most once**: a long operation may span several entries with one
     /// retained token, and the bank stays borrowed until it settles
     /// (`Ready`/`cancel`). A query command may use `work` while a long IO is in
-    /// flight (`03 §3.7`). A foreign LUN (another LUN's long operation owns the
+    /// flight. A foreign LUN (another LUN's long operation owns the
     /// slot) fails closed with `Fault::Boundary`.
     pub fn poll_long_entry_rt(
         &mut self,
@@ -621,7 +617,7 @@ pub trait StaticTarget<S: SlotSet> {
     /// long operation may span several entries with one retained token; the
     /// bank stays borrowed until it settles. A query command may use `work`
     /// while a long IO is in flight because the returned operation borrows only
-    /// `scratch` (`03 §3.7`).
+    /// `scratch`.
     fn poll_long_entry_static<I>(
         &mut self,
         storage: &mut dyn super::storage::Storage,
@@ -911,7 +907,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
     {
         let Self { runner, slots, .. } = self;
         // `work` belongs to the current command; the resident long operation
-        // uses `scratch` only (`03 §3.7`).
+        // uses `scratch` only.
         let _ = work;
         runner.poll_long_entry(I::INDEX, slots.slot_mut(), storage, scratch)
     }
