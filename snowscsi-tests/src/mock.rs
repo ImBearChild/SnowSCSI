@@ -886,8 +886,8 @@ mod tests {
 
         let mut tmfr = [0u8; 48];
         tmfr[0] = op::SCSI_TASK_REQ | 0x40;
-        tmfr[1] = 0x80;
-        tmfr[2] = tmf::ABORT_TASK;
+        /* Function in byte 1 (0x80 | function), byte 2 reserved (RFC 3720 §10.5). */
+        tmfr[1] = 0x80 | tmf::ABORT_TASK;
         tmfr[16..20].copy_from_slice(&be32(0x5555));
         tmfr[24..28].copy_from_slice(&be32(9));
         conn.feed(&tmfr, &[]);
@@ -918,7 +918,7 @@ mod tests {
 
         let mut tmfr = [0u8; 48];
         tmfr[0] = op::SCSI_TASK_REQ;
-        tmfr[2] = tmf::LOGICAL_UNIT_RESET;
+        tmfr[1] = 0x80 | tmf::LOGICAL_UNIT_RESET;
         tmfr[16..20].copy_from_slice(&be32(0x6666));
         tmfr[24..28].copy_from_slice(&be32(7));
         conn.feed(&tmfr, &[]);
@@ -949,7 +949,7 @@ mod tests {
 
         let mut tmfr = [0u8; 48];
         tmfr[0] = op::SCSI_TASK_REQ;
-        tmfr[2] = tmf::LOGICAL_UNIT_RESET;
+        tmfr[1] = 0x80 | tmf::LOGICAL_UNIT_RESET;
         tmfr[16..20].copy_from_slice(&be32(0x7777));
         tmfr[24..28].copy_from_slice(&be32(0));
         conn.feed(&tmfr, &[]);
@@ -1027,7 +1027,7 @@ mod tests {
         ] {
             let mut tmfr = [0u8; 48];
             tmfr[0] = op::SCSI_TASK_REQ | 0x40;
-            tmfr[2] = function;
+            tmfr[1] = 0x80 | function;
             tmfr[9] = 5; // out-of-range wire LUN
             tmfr[16..20].copy_from_slice(&be32(itt));
             conn.feed(&tmfr, &[]);
@@ -2233,8 +2233,7 @@ mod tests {
         // ABORT TASK (immediate, so it bypasses the CmdSN window).
         let mut tmf = [0u8; 48];
         tmf[0] = op::SCSI_TASK_REQ | 0x40;
-        tmf[1] = 0x80;
-        tmf[2] = tmf::ABORT_TASK;
+        tmf[1] = 0x80 | tmf::ABORT_TASK;
         tmf[16..20].copy_from_slice(&be32(0x0B0B));
         conn.feed(&tmf, &[]);
 
@@ -2359,8 +2358,7 @@ mod tests {
         conn.feed(&write10_bhs(0, 1, 0x0C0B, 0, 0), &[]);
         let mut tmf = [0u8; 48];
         tmf[0] = op::SCSI_TASK_REQ | 0x40;
-        tmf[1] = 0x80;
-        tmf[2] = tmf::ABORT_TASK;
+        tmf[1] = 0x80 | tmf::ABORT_TASK;
         tmf[16..20].copy_from_slice(&be32(0x0C0B));
         conn.feed(&tmf, &[]);
         conn.feed(&request_sense_bhs(18, 0x0C0C, 1), &[]);

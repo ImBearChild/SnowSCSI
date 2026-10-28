@@ -432,9 +432,13 @@ impl Bhs {
 
     // ── Task Management (RFC 3720 §10.5 / §10.6) ─────────────────
 
-    /// TMF Function, byte 2 (RFC 3720 §10.5.1).
+    /// TMF Function, byte 1 bits 0-6 (RFC 3720 §10.5).
+    ///
+    /// Byte 1 also carries the constant one in bit 7; the request's function
+    /// code sits in the low seven bits of that byte, not in the reserved
+    /// byte 2 (the response code lives in byte 2 of the *response* PDU).
     pub fn tmf_function(&self) -> u8 {
-        self.0[2] & 0x7F
+        self.0[1] & 0x7F
     }
 
     /// TMF Response, byte 2 (RFC 3720 §10.6.1).
@@ -779,14 +783,20 @@ mod tests {
     }
 
     #[test]
-    fn tmf_function_reads_byte2() {
+    fn tmf_function_reads_byte1() {
         let mut b = bhs();
-        b.0[2] = tmf::ABORT_TASK;
+        /* The wire form libiscsi and the kernel send: 0x80 | function. */
+        b.0[1] = 0x80 | tmf::ABORT_TASK;
         assert_eq!(b.tmf_function(), tmf::ABORT_TASK);
+        assert!(b.t_bit(), "bit 7 must not be part of the function");
 
-        /* byte 2 fully set: bit 7 is outside the 7-bit function field */
-        b.0[2] = tmf::LOGICAL_UNIT_RESET | 0x80;
+        b.0[1] = 0x80 | tmf::LOGICAL_UNIT_RESET;
         assert_eq!(b.tmf_function(), tmf::LOGICAL_UNIT_RESET);
+
+        /* Byte 2 is reserved in the request: it must not leak in. */
+        b.0[1] = 0x80 | tmf::ABORT_TASK;
+        b.0[2] = tmf::LOGICAL_UNIT_RESET;
+        assert_eq!(b.tmf_function(), tmf::ABORT_TASK);
     }
 
     #[test]
