@@ -1349,6 +1349,19 @@ impl IscsiSession {
             op::NOP_OUT => self.handle_nop(work, &pdu),
             op::LOGOUT_REQ => self.handle_logout(work, &pdu),
             op::TEXT_REQ => self.handle_text(work, &pdu),
+            // A Data-Out PDU with no receive phase waiting for it belongs to a
+            // task the target no longer owns — typically a burst still in
+            // flight when ABORT TASK settled the command. Its status is already
+            // on the wire, so the segment is dropped instead of tearing down a
+            // session the initiator is still using.
+            op::SCSI_DATA_OUT => {
+                crate::debug!(
+                    "discarding unsolicited Data-Out: itt=0x{:08X} len={}",
+                    pdu.bhs.itt(),
+                    dsl
+                );
+                self.expectation()
+            }
             _ => self.reject(work, reject::PROTOCOL_ERROR),
         }
     }
@@ -1366,13 +1379,18 @@ impl IscsiSession {
         let bhs = &pdu.bhs;
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
-        if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return Emit::Recv {
-                offset: 0,
-                len: BHS_SIZE,
-            };
+        // Only a non-immediate command consumes a CmdSN (RFC 3720 §10.4.10):
+        // an immediate one may carry a CmdSN outside the window and must not
+        // move ExpCmdSN, or the initiator's next command falls out of range.
+        if !immediate_flag {
+            if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
+                return Emit::Recv {
+                    offset: 0,
+                    len: BHS_SIZE,
+                };
+            }
+            self.cmd_sn = recv_cmd_sn;
         }
-        self.cmd_sn = recv_cmd_sn;
 
         let itt = bhs.itt();
         if !bhs.lun_is_single_level() {
@@ -1515,13 +1533,20 @@ impl IscsiSession {
         let recv_cmd_sn = bhs.cmd_sn();
         let immediate_flag = bhs.as_bytes()[0] & 0x40 != 0;
 
-        if !immediate_flag && recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-            return Emit::Recv {
-                offset: 0,
-                len: BHS_SIZE,
-            };
+        // RFC 3720 §10.4.10: ExpCmdSN is the next expected **non-immediate**
+        // command. An immediate TMF carries a CmdSN only to scope group
+        // functions, so it must not consume one — advancing here would make
+        // the initiator's next command fall outside `ExpCmdSN..MaxCmdSN` (and
+        // a conforming target silently drops it, wedging the session).
+        if !immediate_flag {
+            if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
+                return Emit::Recv {
+                    offset: 0,
+                    len: BHS_SIZE,
+                };
+            }
+            self.cmd_sn = recv_cmd_sn;
         }
-        self.cmd_sn = recv_cmd_sn;
 
         if !bhs.lun_is_single_level() {
             return self.reject(work, reject::INVALID_PDU_FIELD);
