@@ -614,9 +614,81 @@ mod tests {
     }
 
     #[test]
+    fn write_larger_than_the_bank_solicits_one_r2t_per_chunk() {
+        // The SCSI data area is 8192 bytes; 32 blocks = 16384 bytes streams in
+        // two Data-Out chunks. Every chunk gets its own R2T.
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+        login!(conn, session, work, scratch, target, storage);
+
+        let itt = 0xB200_0001;
+        let cmd = write10_bhs(0, 32, itt, 0, 0);
+        conn.feed_padded(&cmd, &[]);
+        let mut bo = 0u32;
+        let mut pattern = Vec::new();
+        for burst in 0..2u32 {
+            for dsn in 0..16u32 {
+                let fill = (burst * 16 + dsn) as u8;
+                let chunk = vec![fill; 512];
+                pattern.extend_from_slice(&chunk);
+                let dout = dataout_bhs(itt, 1, dsn, bo, 512);
+                conn.feed_padded(&dout, &chunk);
+                bo += 512;
+            }
+        }
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let r2t1 = conn.take_pdu().unwrap().0;
+        assert_eq!(r2t1[0] & 0x3F, op::R2T);
+        assert_eq!(&r2t1[36..40], &be32(0), "R2TSN");
+        assert_eq!(&r2t1[40..44], &be32(0), "BufferOffset");
+        assert_eq!(&r2t1[44..48], &be32(8192), "DesiredLen is one bank");
+        let r2t2 = conn.take_pdu().unwrap().0;
+        assert_eq!(r2t2[0] & 0x3F, op::R2T);
+        assert_eq!(&r2t2[36..40], &be32(1), "R2TSN continues");
+        assert_eq!(&r2t2[40..44], &be32(8192), "BufferOffset continues");
+        assert_eq!(&r2t2[44..48], &be32(8192));
+        let (resp, _) = conn.take_pdu().unwrap();
+        assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+        assert_eq!(resp[3], status::GOOD);
+
+        // Read the same range back through the session: byte-exact.
+        conn.feed(&read10_bhs(0, 32, 0xB200_0002, 1), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let mut readback = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                readback.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(readback, pattern, "the streamed write is byte-exact");
+    }
+
+    #[test]
     fn write_multi_r2t_bounded_by_max_burst() {
-        // 600 blocks = 307200 bytes > MaxBurstLength (262144); the whole
-        // transfer must fit the caller's bank.
+        // 600 blocks = 307200 bytes > MaxBurstLength (262144); the transfer is
+        // split into R2T bursts even when it fits the caller's bank.
         let mut ram = vec![0u8; 16 * 1024 * 1024];
         let mut backend = RamBackend::new(&mut ram);
         let mut slots = [TestLu::block(32768, 512, 0)];
@@ -1986,12 +2058,77 @@ mod tests {
         assert_eq!(collected, expected);
     }
 
-    // ── An over-size transfer is a target resource condition ───────
+    // ── MaxRecvDataSegmentLength floor ────────────────────────────
 
     #[test]
-    fn oversized_transfer_reports_a_resource_condition_and_keeps_the_session() {
+    fn login_clamps_max_recv_data_segment_to_the_rfc_floor() {
+        let mut ram = vec![0u8; 16 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "MaxRecvDataSegmentLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, "1");
+        let bhs = login_bhs(text.len() as u32);
+        conn.feed_padded(&bhs, text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&data, "MaxRecvDataSegmentLength"),
+            Some(b"512".as_slice()),
+            "a sub-512 declaration is clamped to the RFC floor"
+        );
+
+        // Every Data-In PDU stays within the clamped segment.
+        conn.feed(&read10_bhs(0, 4, 0x5151, 0), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let mut total = 0usize;
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                assert!(data.len() <= 512, "PDU exceeds the clamped segment");
+                total += data.len();
+            }
+        }
+        assert_eq!(total, 4 * 512);
+    }
+
+    // ── A transfer larger than the bank streams in chunks ──────────
+
+    #[test]
+    fn oversized_transfer_streams_in_bank_sized_chunks_and_keeps_the_session() {
         // `WORK_LEN` leaves an 8192-byte SCSI data area.
         let mut ram = vec![0u8; 16 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected = ram[..16384].to_vec();
         block_fixture!(
             ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
         );
@@ -2010,21 +2147,35 @@ mod tests {
             ),
             Outcome::Processed
         );
-        let (bhs, data) = conn.take_pdu().unwrap();
-        assert_eq!(bhs[0] & 0x3F, op::SCSI_RESP);
-        assert_eq!(bhs[3], status::CHECK_CONDITION);
-        assert_eq!(&bhs[16..20], &be32(0x8101));
-        assert_eq!(&data[0..2], &[0x00, 18]);
-        assert_eq!(data[2], 0x70);
+        let mut pdus = Vec::new();
+        while let Some(pdu) = conn.take_pdu() {
+            pdus.push(pdu);
+        }
+        let data_in: Vec<_> = pdus
+            .iter()
+            .filter(|(bhs, _)| bhs[0] & 0x3F == op::SCSI_DATA_IN)
+            .collect();
+        assert_eq!(data_in.len(), 2, "one Data-In PDU per bank-sized chunk");
+        let mut offset = 0u32;
+        let mut total = Vec::new();
+        for (index, (bhs, data)) in data_in.iter().enumerate() {
+            let bo = u32::from_be_bytes([bhs[40], bhs[41], bhs[42], bhs[43]]);
+            let dsn = u32::from_be_bytes([bhs[36], bhs[37], bhs[38], bhs[39]]);
+            assert_eq!(bo, offset, "contiguous BufferOffset");
+            assert_eq!(dsn, index as u32, "contiguous DataSN");
+            if index + 1 == data_in.len() {
+                assert_ne!(bhs[1] & flag::F_BIT, 0, "F only on the final PDU");
+                assert_ne!(bhs[1] & flag::S_BIT, 0, "the final PDU carries status");
+                assert_eq!(bhs[3], status::GOOD);
+            } else {
+                assert_eq!(bhs[1] & flag::F_BIT, 0, "intermediate PDU is not final");
+            }
+            offset += data.len() as u32;
+            total.extend_from_slice(data);
+        }
         assert_eq!(
-            data[4], 0x05,
-            "ILLEGAL REQUEST key, but the ASC names the shortage"
-        );
-        assert_eq!(data[14], 0x55, "SYSTEM RESOURCE FAILURE");
-        assert_eq!(data[15], 0x00);
-        assert!(
-            conn.take_pdu().is_none(),
-            "an unstaged transfer sends zero Data-In PDUs"
+            total, expected,
+            "the whole transfer is delivered byte-exactly"
         );
 
         // The connection stays usable for the next command.
@@ -2043,7 +2194,7 @@ mod tests {
         let (bhs, data) = conn.take_pdu().unwrap();
         assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
         assert_eq!(bhs[3], status::GOOD);
-        assert_eq!(data[0], 0x00, "block PDT after the failed READ");
+        assert_eq!(data[0], 0x00, "block PDT after the streamed READ");
     }
 
     // ── Undersized caller banks are caller bugs, not wire errors ──
@@ -2168,6 +2319,22 @@ mod tests {
             session.poll(
                 Event::Tick,
                 &mut short_work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Action::Error(TargetError::WorkBufTooSmall)
+        ));
+
+        // A non-4-aligned data area is rejected before any PDU is framed
+        // instead of relying on the padding invariant. 8241 - 48 = 8193, the
+        // bank whose 1-byte tail used to be rounded up to a 4-byte staging
+        // window and read past the end.
+        let mut misaligned_work = vec![0u8; MIN_DATA_LEN + BHS_SIZE + 1];
+        assert!(matches!(
+            session.poll(
+                Event::Tick,
+                &mut misaligned_work,
                 &mut scratch,
                 &mut target,
                 &mut storage

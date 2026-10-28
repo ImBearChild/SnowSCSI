@@ -167,9 +167,9 @@ struct ServeArgs {
     verbose: u8,
 
     /// Work buffer size in bytes (accepts K/M/G suffixes; default 1M).
-    /// It is one bank: the SCSI data area is this size minus the 48-byte iSCSI
-    /// BHS, and the whole host transfer must fit in it. A larger READ/WRITE is
-    /// answered with a target resource sense (05/55/00), not streamed.
+    /// It bounds one data chunk: the SCSI data area is this size minus the
+    /// 48-byte iSCSI BHS, and a larger READ/WRITE is streamed in
+    /// bank-sized chunks rather than rejected.
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
 }
@@ -223,6 +223,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
+        if let Err(msg) = check_iscsi_data_area(work_size) {
+            eprintln!("snowscsi: {msg}");
+            return ExitCode::FAILURE;
+        }
         return run_serve_iscsi(args, &specs, work_size);
     }
     #[cfg(target_os = "linux")]
@@ -1687,9 +1691,11 @@ fn init_logging(verbose: u8) {
 /// Resolve the work buffer size (default 1M), validating it against
 /// [`MIN_DATA_LEN`] plus the iSCSI PDU header.
 ///
-/// The buffer is one bank for the whole host transfer, with the 48-byte BHS
-/// prefix in front of the SCSI data area, so anything below that cannot serve
-/// an iSCSI connection at all.
+/// The buffer bounds one data chunk, with the 48-byte BHS prefix in front of
+/// the SCSI data area. The data area must be a multiple of 4 (every Data-In
+/// PDU is padded to a 4-byte boundary). A transfer larger than the area is
+/// streamed in bank-sized chunks, so this is a throughput/latency knob rather
+/// than a maximum transfer size.
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     let bytes = match s {
         None => DEFAULT_WORK_BUF_SIZE as u64,
@@ -1701,6 +1707,18 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
         return Err(format!("--work-buf-size {n} is below the minimum {min}"));
     }
     Ok(n)
+}
+
+/// The iSCSI data area behind the BHS must be a multiple of 4: the session
+/// rejects a misaligned area instead of relying on the padding invariant. BOT
+/// has no such header, so the check is scoped to the iSCSI transport.
+fn check_iscsi_data_area(n: usize) -> Result<(), String> {
+    if !(n - BHS_SIZE).is_multiple_of(4) {
+        return Err(format!(
+            "--work-buf-size {n} leaves a data area that is not a multiple of 4"
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a hexadecimal u16 (with optional `0x` prefix) for `--vid`/`--pid`.
@@ -1745,6 +1763,15 @@ mod tests {
             parse_work_size(Some("8240")).unwrap(),
             MIN_DATA_LEN + BHS_SIZE
         );
+        assert_eq!(
+            parse_work_size(Some("8241")).unwrap(),
+            MIN_DATA_LEN + BHS_SIZE + 1
+        );
+        assert!(
+            check_iscsi_data_area(8241).is_err(),
+            "the iSCSI data area must be a multiple of 4"
+        );
+        assert!(check_iscsi_data_area(MIN_DATA_LEN + BHS_SIZE).is_ok());
         assert!(parse_work_size(Some("bogus")).is_err());
     }
 

@@ -114,6 +114,9 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
     if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
         return Err(TargetError::WorkBufTooSmall);
     }
+    if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+        return Err(TargetError::WorkBufTooSmall);
+    }
     if scratch.len() < crate::MIN_DATA_LEN {
         return Err(TargetError::WorkBufTooSmall);
     }
@@ -174,6 +177,9 @@ pub fn serve<P>(
     read_timeout: Option<Duration>,
 ) -> Result<(), TargetError> {
     if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+        return Err(TargetError::WorkBufTooSmall);
+    }
+    if !(work.len() - BHS_SIZE).is_multiple_of(4) {
         return Err(TargetError::WorkBufTooSmall);
     }
     if scratch.len() < crate::MIN_DATA_LEN {

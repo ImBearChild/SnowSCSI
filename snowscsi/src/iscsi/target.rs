@@ -31,8 +31,9 @@
 //! `work` is the wire/PDU bank: `work.len() >= crate::MIN_DATA_LEN +
 //! pdu::BHS_SIZE`. The leading [`pdu::BHS_SIZE`] bytes carry the wire header;
 //! the remainder is the SCSI data area and the transport's [`HostTransport`]
-//! bank. `scratch` is the resident long-operation bank and must hold at least
-//! [`crate::MIN_DATA_LEN`] bytes.
+//! bank, which bounds one device data chunk (a larger transfer is streamed in
+//! chunks). `scratch` is the resident long-operation bank and must hold at
+//! least [`crate::MIN_DATA_LEN`] bytes.
 
 use core::cell::Cell;
 
@@ -104,8 +105,9 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetError {
     /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
-    /// `BHS_SIZE` (data area too small for the SCSI layer), or the scratch
-    /// bank is smaller than [`crate::MIN_DATA_LEN`].
+    /// `BHS_SIZE` (data area too small for the SCSI layer), its data area
+    /// (`work.len() - BHS_SIZE`) is not a multiple of 4, or the scratch bank
+    /// is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// Connection I/O failure (details logged by the transport).
     Io,
@@ -116,7 +118,9 @@ pub enum TargetError {
 impl core::fmt::Display for TargetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN + BHS_SIZE"),
+            Self::WorkBufTooSmall => {
+                write!(f, "work buffer below MIN_DATA_LEN + BHS_SIZE or misaligned")
+            }
             Self::Io => write!(f, "connection I/O failure"),
             Self::Internal => write!(f, "internal target error"),
         }
@@ -189,6 +193,8 @@ const DEFAULT_MAX_BURST: u32 = 262144;
 /// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
 /// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
 const HARD_CAP: usize = 0xFF_FFFF;
+/// RFC 3720 §12.12 floor for `MaxRecvDataSegmentLength`.
+const MIN_RECV_DATA_SEGMENT: u32 = 512;
 /// Largest login data segment accepted for negotiation.
 const LOGIN_MAX: usize = 4096;
 /// SCSI status BUSY (SPC-3); no constant exists in the PDU module.
@@ -379,12 +385,18 @@ struct SendPhase {
     total: u32,
     /// Bytes already handed to the wire.
     sent: u32,
-    /// DataSN of the next Data-In PDU.
+    /// DataSN of the next Data-In PDU (continues across device chunks).
     data_sn: u32,
-    /// Intermediate chunk staged by `poll_host`, not yet turned into a PDU.
-    staged: Option<(u32, u32)>,
-    /// Final chunk held back for the terminating Data-In (offset, length).
-    held: Option<(u32, u32)>,
+    /// First byte offset of the current device send chunk.
+    phase_base: u32,
+    /// Bytes requested by the current device send chunk.
+    phase_len: u32,
+    /// Chunk staged by `poll_host`, not yet turned into a PDU: PDU
+    /// BufferOffset, bank offset inside the current phase, length.
+    staged: Option<(u32, u32, u32)>,
+    /// Final chunk held back for the terminating Data-In (PDU BufferOffset,
+    /// bank offset, length).
+    held: Option<(u32, u32, u32)>,
 }
 
 /// Data-Out progress.
@@ -395,6 +407,14 @@ struct RecvPhase {
     total: u32,
     /// Bytes accepted so far (immediate data included).
     accepted: u32,
+    /// Bytes accounted to the device across completed chunks.
+    produced: u32,
+    /// First byte offset of the current device receive chunk.
+    chunk_base: u32,
+    /// Bytes requested by the current device receive chunk.
+    phase_len: u32,
+    /// End (exclusive) of the current device receive chunk.
+    phase_end: u32,
     /// Next R2TSN.
     r2t_sn: u32,
     /// DataSN expected in the next Data-Out PDU of the current burst.
@@ -539,9 +559,9 @@ impl IscsiSession {
     /// (`>= crate::MIN_DATA_LEN + BHS_SIZE`): incoming bytes land at the
     /// offset the previous action requested, the 48-byte BHS at
     /// `work[..BHS_SIZE]`, and the SCSI data area at `work[BHS_SIZE..]`.
-    /// The whole host transfer of a command must fit in that data area
-    /// (`work.len() - BHS_SIZE`); a larger transfer is answered with a
-    /// target-side resource sense instead of being streamed.
+    /// The data area bounds one device data chunk (`work.len() - BHS_SIZE`);
+    /// a larger transfer is streamed in bank-sized chunks, and each Data-In
+    /// PDU still carries at most `MaxRecvDataSegmentLength` bytes.
     /// `scratch` is the resident long-operation bank (`>= MIN_DATA_LEN`).
     ///
     /// `target` owns the LUN slots, `storage` executes the device's storage
@@ -556,6 +576,13 @@ impl IscsiSession {
         storage: &'a mut dyn Storage,
     ) -> Action<'a> {
         if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return Action::Error(TargetError::WorkBufTooSmall);
+        }
+        // Every Data-In PDU is padded to a 4-byte boundary, and the padding
+        // may land on bytes that are still unsent when a chunk is staged.
+        // Require an aligned data area up front instead of trusting that
+        // callers always size the bank that way.
+        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
         if scratch.len() < crate::MIN_DATA_LEN {
@@ -607,12 +634,12 @@ impl IscsiSession {
                 len: total,
             },
             Session::OutData { dsl } => {
-                let accepted = match self.host {
-                    HostPhase::Recv(p) => p.accepted as usize,
+                let local = match self.host {
+                    HostPhase::Recv(p) => p.accepted.saturating_sub(p.chunk_base) as usize,
                     _ => 0,
                 };
                 Emit::Recv {
-                    offset: BHS_SIZE + accepted,
+                    offset: BHS_SIZE + local,
                     len: dsl,
                 }
             }
@@ -719,13 +746,17 @@ impl IscsiSession {
                 if dsl == 0 {
                     return self.finish_data_out(0, work, scratch, target, storage);
                 }
-                let end = BHS_SIZE + accepted as usize + dsl;
+                let local = match self.host {
+                    HostPhase::Recv(p) => accepted.saturating_sub(p.chunk_base),
+                    _ => 0,
+                };
+                let end = BHS_SIZE + local as usize + dsl;
                 if end > work.len() {
                     return Emit::Error(TargetError::WorkBufTooSmall);
                 }
                 self.session = Session::OutData { dsl };
                 Emit::Recv {
-                    offset: BHS_SIZE + accepted as usize,
+                    offset: BHS_SIZE + local as usize,
                     len: dsl,
                 }
             }
@@ -814,7 +845,7 @@ impl IscsiSession {
             }
             SendKind::DataIn => {
                 if let HostPhase::Send(p) = &mut self.host {
-                    if let Some((_, len)) = p.staged.take() {
+                    if let Some((_, _, len)) = p.staged.take() {
                         p.sent = p.sent.saturating_add(len);
                         p.data_sn = p.data_sn.wrapping_add(1);
                     }
@@ -909,6 +940,9 @@ impl IscsiSession {
         if dsl as u64 > p.burst_remaining as u64 {
             return Some(reject::INVALID_PDU_FIELD);
         }
+        if bhs.buffer_offset().saturating_add(dsl as u32) > p.phase_end {
+            return Some(reject::INVALID_PDU_FIELD);
+        }
         None
     }
 
@@ -969,7 +1003,7 @@ impl IscsiSession {
         match self.drive(target, storage, work) {
             Stepped::Pending => match self.host {
                 HostPhase::Send(p) => match p.staged {
-                    Some((offset, len)) => self.emit_data_in(work, offset, len),
+                    Some((offset, bank, len)) => self.emit_data_in(work, offset, bank, len),
                     None => Emit::Error(TargetError::Internal),
                 },
                 HostPhase::Recv(p) => {
@@ -1045,19 +1079,28 @@ impl IscsiSession {
         };
         let emit = match completion {
             Completion::Good => match held {
-                Some((offset, len)) => {
-                    self.emit_data_in_final(work, offset, len, data_sn, status::GOOD)
+                Some((offset, bank, len)) => {
+                    self.emit_data_in_final(work, offset, bank, len, data_sn, status::GOOD)
                 }
-                None if was_to_host => self.emit_data_in_final(work, 0, 0, data_sn, status::GOOD),
+                None if was_to_host => {
+                    self.emit_data_in_final(work, 0, 0, 0, data_sn, status::GOOD)
+                }
                 None => self.emit_response(work, itt, status::GOOD, None),
             },
             Completion::Check(sense) => {
-                if let Some((offset, len)) = held {
+                if let Some((offset, bank, len)) = held {
                     // Data already streamed: the last chunk terminates the
                     // transfer; no autosense field exists in a Data-In PDU.
-                    self.emit_data_in_final(work, offset, len, data_sn, status::CHECK_CONDITION)
+                    self.emit_data_in_final(
+                        work,
+                        offset,
+                        bank,
+                        len,
+                        data_sn,
+                        status::CHECK_CONDITION,
+                    )
                 } else if sent > 0 {
-                    self.emit_data_in_final(work, 0, 0, data_sn, status::CHECK_CONDITION)
+                    self.emit_data_in_final(work, 0, 0, 0, data_sn, status::CHECK_CONDITION)
                 } else {
                     // The completion frame carries the sense as autosense. The
                     // saved instance is consumed only when the status send is
@@ -1152,12 +1195,12 @@ impl IscsiSession {
     }
 
     /// Intermediate Data-In chunk: F=0, S=0, no status.
-    fn emit_data_in(&mut self, work: &mut [u8], offset: u32, len: u32) -> Emit {
+    fn emit_data_in(&mut self, work: &mut [u8], offset: u32, bank: u32, len: u32) -> Emit {
         let data_sn = match self.host {
             HostPhase::Send(p) => p.data_sn,
             _ => return Emit::Error(TargetError::Internal),
         };
-        let total = self.build_data_in(work, self.cmd_itt, offset, len, data_sn, false, 0);
+        let total = self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, false, 0);
         self.session = Session::Send {
             len: total,
             kind: SendKind::DataIn,
@@ -1170,12 +1213,14 @@ impl IscsiSession {
         &mut self,
         work: &mut [u8],
         offset: u32,
+        bank: u32,
         len: u32,
         data_sn: u32,
         status: u8,
     ) -> Emit {
         self.note_status(self.cmd_itt);
-        let total = self.build_data_in(work, self.cmd_itt, offset, len, data_sn, true, status);
+        let total =
+            self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, true, status);
         self.session = Session::Send {
             len: total,
             kind: SendKind::Status {
@@ -1192,14 +1237,17 @@ impl IscsiSession {
         work: &mut [u8],
         itt: u32,
         offset: u32,
+        bank: u32,
         len: u32,
         data_sn: u32,
         final_pdu: bool,
         scsi_status: u8,
     ) -> usize {
         let len = len as usize;
-        if offset > 0 && len > 0 {
-            let start = BHS_SIZE + offset as usize;
+        if bank > 0 && len > 0 {
+            // The device's send buffer for this chunk sits at the start of the
+            // SCSI data area; move it in front of the BHS.
+            let start = BHS_SIZE + bank as usize;
             let end = start + len;
             work.copy_within(start..end, BHS_SIZE);
         }
@@ -1218,13 +1266,9 @@ impl IscsiSession {
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let total = BHS_SIZE + len;
-        // Intermediate chunks are 4-aligned, so only a terminating PDU can
-        // need padding; its bytes follow the last data byte.
-        let pad = if final_pdu {
-            pdu_pad_len(len as u32) as usize
-        } else {
-            0
-        };
+        // Every Data-In PDU is padded to a 4-byte boundary, including
+        // intermediate chunks: an intermediate tail may be 1-3 bytes long.
+        let pad = pdu_pad_len(len as u32) as usize;
         if pad > 0 {
             work[total..total + pad].fill(0);
         }
@@ -1240,7 +1284,7 @@ impl IscsiSession {
             _ => return,
         };
         let desired = (u64::from(self.neg.max_burst_len))
-            .min(u64::from(p.total.saturating_sub(p.accepted)))
+            .min(u64::from(p.phase_end.saturating_sub(p.accepted)))
             .min(u64::from(u32::MAX)) as u32;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::R2T);
@@ -1506,7 +1550,7 @@ impl IscsiSession {
             // A Data-In carrying the fixed-format sense; the command is not
             // driven by any slot.
             self.note_status(itt);
-            let total = self.build_data_in(work, itt, 0, n as u32, 0, true, status::GOOD);
+            let total = self.build_data_in(work, itt, 0, 0, n as u32, 0, true, status::GOOD);
             self.session = Session::Send {
                 len: total,
                 kind: SendKind::Status {
@@ -1801,9 +1845,9 @@ impl IscsiSession {
         let t = req.t_bit();
 
         // The receive data-segment capability scales with the caller's work
-        // bank (data area = work minus BHS, 4-aligned, bounded by the 24-bit
-        // DataSegmentLength field). Negotiation then clamps the initiator's
-        // declared value to this cap.
+        // bank (data area = work minus BHS; the session entry guarantees it is
+        // 4-aligned, and it is bounded by the 24-bit DataSegmentLength field).
+        // Negotiation then clamps the initiator's declared value to this cap.
         self.max_recv_data_segment =
             crate::scsi::device::data_capacity(work.len() - BHS_SIZE).min(HARD_CAP) as u32;
 
@@ -1986,6 +2030,11 @@ impl IscsiSession {
         match key {
             "MaxRecvDataSegmentLength" => {
                 if let Some(v) = parse_u32(val) {
+                    // RFC 3720 §12.12: the valid range starts at 512. Treat a
+                    // smaller declaration as outside the protocol and clamp it
+                    // up, so the target never sends a PDU larger than the
+                    // value it acts on.
+                    let v = v.max(MIN_RECV_DATA_SEGMENT);
                     self.max_recv_data_segment = v.min(self.max_recv_data_segment);
                 }
             }
@@ -2049,41 +2098,85 @@ impl HostTransport for IscsiSession {
 
     fn begin_recv(&mut self, req: HostReq) -> HostToken {
         let token = self.next_token();
-        // The core always receives the whole published plan; a chunked device
-        // request would need a per-chunk offset that the wire does not carry.
-        if req.dir != Direction::FromHost || u64::from(req.len) != self.plan.bytes {
+        if req.dir != Direction::FromHost {
             return HostToken::new(u8::MAX, 0);
         }
-        let total = req.len;
-        let accepted = self.immediate.min(total);
-        let done = accepted >= total;
-        self.host = HostPhase::Recv(RecvPhase {
-            token,
-            total,
-            accepted,
-            r2t_sn: 0,
-            data_sn: 0,
-            burst_remaining: 0,
-            r2t_pending: !done,
-            consumed: false,
-            done,
-        });
+        let total = u32::try_from(self.plan.bytes).unwrap_or(u32::MAX);
+        // A second (or later) device chunk continues the same plan; only the
+        // first one starts from zero and consumes the immediate data.
+        let mut p = match self.host {
+            HostPhase::Recv(p) if p.produced < p.total => p,
+            _ => RecvPhase {
+                token,
+                total,
+                accepted: self.immediate.min(total),
+                produced: 0,
+                chunk_base: 0,
+                phase_len: 0,
+                phase_end: 0,
+                r2t_sn: 0,
+                data_sn: 0,
+                burst_remaining: 0,
+                r2t_pending: false,
+                consumed: false,
+                done: false,
+            },
+        };
+        if p.produced >= p.total {
+            p.token = token;
+            p.chunk_base = 0;
+            p.phase_len = req.len;
+            p.done = true;
+            self.host = HostPhase::Recv(p);
+            return token;
+        }
+        if req.len == 0 || u64::from(req.len) > u64::from(p.total - p.produced) {
+            return HostToken::new(u8::MAX, 0);
+        }
+        let base = p.produced;
+        p.token = token;
+        p.chunk_base = base;
+        p.phase_len = req.len;
+        p.phase_end = base + req.len;
+        p.data_sn = 0;
+        p.burst_remaining = 0;
+        p.r2t_pending = p.accepted < p.phase_end;
+        p.consumed = false;
+        p.done = false;
+        self.host = HostPhase::Recv(p);
         token
     }
 
     fn begin_send(&mut self, req: HostReq) -> HostToken {
         let token = self.next_token();
-        if req.dir != Direction::ToHost || u64::from(req.len) != self.plan.bytes {
+        if req.dir != Direction::ToHost {
             return HostToken::new(u8::MAX, 0);
         }
-        self.host = HostPhase::Send(SendPhase {
-            token,
-            total: req.len,
-            sent: 0,
-            data_sn: 0,
-            staged: None,
-            held: None,
-        });
+        let total = u32::try_from(self.plan.bytes).unwrap_or(u32::MAX);
+        // A second (or later) device chunk continues the same Data-In stream:
+        // DataSN and BufferOffset keep counting across chunks.
+        let mut p = match self.host {
+            HostPhase::Send(p) if p.sent < p.total => p,
+            _ => SendPhase {
+                token,
+                total,
+                sent: 0,
+                data_sn: 0,
+                phase_base: 0,
+                phase_len: 0,
+                staged: None,
+                held: None,
+            },
+        };
+        if req.len == 0 || u64::from(req.len) > u64::from(p.total - p.sent) {
+            return HostToken::new(u8::MAX, 0);
+        }
+        p.token = token;
+        p.phase_base = p.sent;
+        p.phase_len = req.len;
+        p.staged = None;
+        p.held = None;
+        self.host = HostPhase::Send(p);
         token
     }
 
@@ -2097,65 +2190,91 @@ impl HostTransport for IscsiSession {
         match phase {
             Phase::Send(mut p) => {
                 let buf = match buf {
-                    HostBuf::Send(buf) if buf.len() == p.total as usize => buf,
+                    HostBuf::Send(buf) if buf.len() == p.phase_len as usize => buf,
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 };
-                let remaining = p.total.saturating_sub(p.sent);
+                let remaining = (p.phase_base + p.phase_len).saturating_sub(p.sent);
                 if remaining == 0 {
                     self.host = HostPhase::Send(p);
-                    return Poll::Ready(HostReceipt::from_adapter(p.sent as usize, None));
+                    return Poll::Ready(HostReceipt::from_adapter(p.phase_len as usize, None));
                 }
                 let bank = buf.len() as u32;
                 let cap = remaining.min(self.max_recv_data_segment).min(bank);
                 if cap == 0 {
                     return Poll::Ready(HostReceipt::from_adapter(
-                        p.sent as usize,
+                        p.sent.saturating_sub(p.phase_base) as usize,
                         Some(Fault::Contract),
                     ));
                 }
+                let last_of_plan = p.sent + cap >= p.total;
+                let local = p.sent.saturating_sub(p.phase_base);
                 if cap < remaining {
-                    // Intermediate chunk: keep it 4-aligned so the padding of
-                    // this PDU never overwrites unsent data.
-                    let chunk = (cap & !3).max(4);
-                    p.staged = Some((p.sent, chunk));
+                    // Intermediate PDU: stage a 4-aligned prefix so its
+                    // padding never lands on bytes that are still unsent.
+                    let chunk = cap & !3;
+                    if chunk == 0 {
+                        // Not reachable with an aligned bank and the
+                        // MaxRecvDataSegmentLength floor; fail closed.
+                        return Poll::Ready(HostReceipt::from_adapter(
+                            local as usize,
+                            Some(Fault::Contract),
+                        ));
+                    }
+                    p.staged = Some((p.sent, local, chunk));
                     self.host = HostPhase::Send(p);
                     return Poll::Pending;
                 }
-                // Last chunk: hold it back for the terminating Data-In, which
-                // also carries the fixed status. The wire cost is zero: the
-                // caller's bank still holds the bytes.
-                let pad = pdu_pad_len(remaining) as usize;
-                if remaining as usize + pad > self.bank_len {
-                    // Keep a 4-aligned prefix and leave the (<=4-byte) tail
-                    // for a second PDU whose padding fits.
-                    let tail = remaining & 3;
-                    let split = remaining.saturating_sub(tail);
-                    if split > 0 && split < remaining {
-                        p.staged = Some((p.sent, split));
-                        self.host = HostPhase::Send(p);
-                        return Poll::Pending;
+                if last_of_plan {
+                    // Last PDU of the last chunk: hold it back for the
+                    // terminating Data-In, which also carries the fixed status.
+                    let pad = pdu_pad_len(remaining) as usize;
+                    if remaining as usize + pad > self.bank_len {
+                        // Keep a 4-aligned prefix and leave the tail for a
+                        // second PDU whose padding fits.
+                        let tail = remaining & 3;
+                        let split = remaining.saturating_sub(tail);
+                        if split > 0 && split < remaining {
+                            p.staged = Some((p.sent, local, split));
+                            self.host = HostPhase::Send(p);
+                            return Poll::Pending;
+                        }
                     }
+                    p.held = Some((p.sent, local, remaining));
+                    let accepted = p.phase_len;
+                    self.host = HostPhase::Send(p);
+                    return Poll::Ready(HostReceipt::from_adapter(accepted as usize, None));
                 }
-                p.held = Some((p.sent, remaining));
-                let accepted = p.sent.saturating_add(remaining);
+                // Last PDU of an intermediate chunk: F stays clear and the
+                // next chunk's staging resumes after it is sent. Stage
+                // exactly the bytes that remain (a 1-3 byte tail is padded,
+                // never rounded up into the next chunk).
+                p.staged = Some((p.sent, local, remaining));
                 self.host = HostPhase::Send(p);
-                Poll::Ready(HostReceipt::from_adapter(accepted as usize, None))
+                Poll::Pending
             }
             Phase::Recv(mut p) => {
                 match buf {
-                    HostBuf::Recv(buf) if buf.len() == p.total as usize => {}
+                    HostBuf::Recv(buf) if buf.len() == p.phase_len as usize => {}
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 }
                 if p.done {
                     self.host = HostPhase::Recv(p);
-                    return Poll::Ready(HostReceipt::from_adapter(p.accepted as usize, None));
+                    return Poll::Ready(HostReceipt::from_adapter(p.phase_len as usize, None));
+                }
+                if p.accepted >= p.phase_end {
+                    // The chunk was already covered by immediate data.
+                    p.produced = p.phase_end;
+                    let accepted = p.phase_len;
+                    self.host = HostPhase::Recv(p);
+                    return Poll::Ready(HostReceipt::from_adapter(accepted as usize, None));
                 }
                 if p.consumed {
                     p.consumed = false;
-                    if p.accepted >= p.total {
-                        p.done = true;
+                    if p.accepted >= p.phase_end {
+                        p.produced = p.phase_end;
+                        let accepted = p.phase_len;
                         self.host = HostPhase::Recv(p);
-                        return Poll::Ready(HostReceipt::from_adapter(p.accepted as usize, None));
+                        return Poll::Ready(HostReceipt::from_adapter(accepted as usize, None));
                     }
                     if p.burst_remaining == 0 {
                         p.r2t_pending = true;
@@ -2412,5 +2531,68 @@ mod tests {
                 "0x{opcode:02X} must not be Data-In"
             );
         }
+    }
+
+    /// The 1-3 byte tail at the end of a device chunk is staged exactly, never
+    /// rounded up to a 4-byte word that would read past the bank.
+    #[test]
+    fn send_staging_never_passes_the_chunk_remainder() {
+        use core::task::Poll;
+
+        let mut session = IscsiSession::new();
+        session.cmd_itt = 1;
+        session.max_recv_data_segment = 8192;
+        session.bank_len = 8193;
+        session.plan = DataPlan {
+            direction: Direction::ToHost,
+            bytes: 16385,
+        };
+        let bank = vec![0u8; 8193];
+        let token = session.begin_send(HostReq {
+            len: 8193,
+            dir: Direction::ToHost,
+        });
+        assert!(token.is_valid());
+
+        // First PDU: a full segment.
+        assert!(matches!(
+            session.poll_host(token, HostBuf::Send(&bank)),
+            Poll::Pending
+        ));
+        let staged = match &mut session.host {
+            HostPhase::Send(p) => {
+                let staged = p.staged.take().expect("first segment staged");
+                p.sent = p.sent.saturating_add(staged.2);
+                p.data_sn = p.data_sn.wrapping_add(1);
+                staged
+            }
+            other => panic!("expected a send phase, got {other:?}"),
+        };
+        assert_eq!(staged.2, 8192);
+
+        // Second PDU: the chunk's last byte, exactly one byte long.
+        assert!(matches!(
+            session.poll_host(token, HostBuf::Send(&bank)),
+            Poll::Pending
+        ));
+        let staged = match &mut session.host {
+            HostPhase::Send(p) => p.staged.expect("tail staged"),
+            other => panic!("expected a send phase, got {other:?}"),
+        };
+        assert_eq!(staged.2, 1, "the tail is not rounded up");
+        assert!(
+            staged.1 as usize + staged.2 as usize <= bank.len(),
+            "staging must stay inside the bank"
+        );
+    }
+
+    #[test]
+    fn every_data_in_pdu_is_padded_even_when_intermediate() {
+        let mut session = IscsiSession::new();
+        session.cmd_itt = 1;
+        let mut work = vec![0xAAu8; BHS_SIZE + 8];
+        let total = session.build_data_in(&mut work, 1, 0, 0, 1, 0, false, 0);
+        assert_eq!(total, BHS_SIZE + 1 + 3);
+        assert_eq!(&work[BHS_SIZE + 1..BHS_SIZE + 4], &[0, 0, 0]);
     }
 }

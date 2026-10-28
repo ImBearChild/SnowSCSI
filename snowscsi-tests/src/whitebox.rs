@@ -57,9 +57,8 @@ const LAST_LBA: u32 = 32767;
 /// blocks). `MaxBurstLength` is 256 KiB, so the target must solicit four R2T
 /// bursts and the command is still in flight after the first one — that is
 /// what makes the mid-transfer drop/abort deterministic. Each test sizes its
-/// `work` bank to `write_len + BHS_SIZE` so the whole transfer fits the
-/// target's command bank (the session never streams a plan larger than the
-/// bank).
+/// `work` bank to `write_len + BHS_SIZE`, so the transfer fits in one device
+/// chunk.
 const LARGE_XFER: usize = 1024 * 1024;
 
 /// R2T-roundtrip transfer: 2 MiB = 4096 blocks. `MaxBurstLength` is 256 KiB,
@@ -732,7 +731,7 @@ fn bundle_scattered_writes_over_iscsi() {
     let handle = thread::spawn(move || {
         let (stream, _peer) = listener.accept().expect("target accept");
         let mut conn = TcpConn::new(stream, Some(DEFAULT_READ_TIMEOUT)).expect("tcp conn");
-        // A 4 MiB WRITE(10) must fit the command bank in one transfer.
+        // A 4 MiB WRITE(10) with a 4 MiB command bank (no chunking needed).
         let mut work = vec![0u8; 4 * 1024 * 1024 + BHS_SIZE];
         let mut session = IscsiSession::new();
         let mut bundle = FlatBundle::new(
@@ -1037,7 +1036,7 @@ fn abort_task_settles_in_flight_write() {
 /// The read-back must be byte-exact.
 #[test]
 fn forced_r2t_write_read_roundtrip() {
-    // The whole plan must fit the target's single command bank.
+    // A command bank large enough for the whole plan (no device chunking).
     let (port, server) = start_target_serving(1, R2T_XFER + BHS_SIZE);
     let iscsi = connect_forced_r2t(port);
 

@@ -360,14 +360,19 @@ impl Runner {
         require_long_settled: bool,
         reject_long_io: bool,
     ) -> Result<(), BoundaryReject> {
+        // A speculative prefetch is an optional read-ahead: it never blocks
+        // command service, but the management boundary must see it before the
+        // command-active projection (a prefetch exists only inside a command).
+        // The model reports `CommandActive` first; this order is deliberate so
+        // the in-flight prefetch stays observable at the boundary.
+        if self.speculative_io.get() {
+            return Err(BoundaryReject::SpeculativeIoInFlight);
+        }
         if self.command_active.get() || slot.active() {
             return Err(BoundaryReject::CommandActive);
         }
         if self.required_io.get() {
             return Err(BoundaryReject::RequiredIoInFlight);
-        }
-        if self.speculative_io.get() {
-            return Err(BoundaryReject::SpeculativeIoInFlight);
         }
         // The resident long operation's retained token is an IO obligation too,
         // but it is **not** the command-owned `required_io` flag: queries must
@@ -1055,7 +1060,12 @@ impl Runner {
                                 self.note_required_io(false);
                             }
                             state.pending = None;
-                            match self.absorb_io(&mut state, req, IoSettlement::Ready(receipt)) {
+                            match self.absorb_io(
+                                &mut state,
+                                req,
+                                IoSettlement::Ready(receipt),
+                                prefetch,
+                            ) {
                                 IoAbsorb::Retained => {}
                                 IoAbsorb::Contract(known) => {
                                     self.settle_contract(lu, known);
@@ -1183,7 +1193,7 @@ impl Runner {
                     let buf_offset = slice_offset(work_start, work_len, buf);
                     let settlement =
                         self.exec_io(storage, req, IoBuf::Read(buf), buf_offset, false);
-                    if self.advance_io(lu, &mut state, req, settlement)? {
+                    if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
                         self.drive_state.set(Some(state));
@@ -1204,7 +1214,7 @@ impl Runner {
                     let buf_offset = slice_offset(work_start, work_len, buf);
                     let settlement =
                         self.exec_io(storage, req, IoBuf::Write(buf), buf_offset, false);
-                    if self.advance_io(lu, &mut state, req, settlement)? {
+                    if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
                         self.drive_state.set(Some(state));
@@ -1219,7 +1229,7 @@ impl Runner {
                         dir: Direction::None,
                     };
                     let settlement = self.exec_io(storage, req, IoBuf::None, Some(0), false);
-                    if self.advance_io(lu, &mut state, req, settlement)? {
+                    if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
                         self.drive_state.set(Some(state));
@@ -1241,7 +1251,7 @@ impl Runner {
                     };
                     let buf_offset = slice_offset(work_start, work_len, buf);
                     let settlement = self.exec_io(storage, req, IoBuf::Read(buf), buf_offset, true);
-                    if self.advance_io(lu, &mut state, req, settlement)? {
+                    if self.advance_io(lu, &mut state, req, settlement, true)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
                         self.drive_state.set(Some(state));
@@ -1446,14 +1456,25 @@ impl Runner {
         state: &mut DriveState,
         req: IoReq,
         settlement: IoSettlement,
+        prefetch: bool,
     ) -> IoAbsorb {
         match settlement {
             IoSettlement::Pending(pending) => {
                 state.pending = Some(pending);
                 IoAbsorb::Pending
             }
+            IoSettlement::Unissued if prefetch => {
+                // A speculative read that never reached the adapter is just a
+                // failed prefetch: report it to the device, which re-reads the
+                // range as a normal read.
+                state.feedback = Feedback::io_done(IoReceipt::from_storage(
+                    StorageReceipt::failed(Fault::Contract, 0, Effect::Known),
+                    self.owner,
+                ));
+                IoAbsorb::Retained
+            }
             IoSettlement::Unissued => IoAbsorb::Unissued,
-            IoSettlement::Ready(raw) if raw.error == Some(Fault::Contract) => {
+            IoSettlement::Ready(raw) if raw.error == Some(Fault::Contract) && !prefetch => {
                 // The adapter answered (the receipt is a returned fact): keep
                 // its confirmed prefix and effect instead of treating the
                 // operation as an unreported cancel.
@@ -1462,7 +1483,9 @@ impl Runner {
             }
             IoSettlement::Ready(raw) => {
                 // A receipt-level contract violation is never mapped to SCSI
-                // sense; only real facts reach the device.
+                // sense; only real facts reach the device. A failed prefetch
+                // is reported to the device even when the adapter flagged the
+                // (optional) read as a contract breach.
                 let receipt = sanitize_storage_receipt(req, raw);
                 state.feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
                 IoAbsorb::Retained
@@ -1478,8 +1501,9 @@ impl Runner {
         state: &mut DriveState,
         req: IoReq,
         settlement: IoSettlement,
+        prefetch: bool,
     ) -> Result<bool, Fault> {
-        match self.absorb_io(state, req, settlement) {
+        match self.absorb_io(state, req, settlement, prefetch) {
             IoAbsorb::Pending => Ok(true),
             IoAbsorb::Retained => Ok(false),
             IoAbsorb::Unissued => {
@@ -2653,6 +2677,7 @@ mod tests {
         Publish(DataPlan),
         Read { len: usize },
         Write { len: usize },
+        Prefetch { len: usize },
         Sync,
         Send { len: usize },
         Receive { len: usize },
@@ -2741,6 +2766,11 @@ mod tests {
                     resource: 1,
                     offset: 0,
                     buf: &data[..len],
+                }),
+                Script::Prefetch { len } => PollStep::Prefetch(PrefetchOp::Read {
+                    resource: 1,
+                    offset: 0,
+                    buf: &mut data[..len],
                 }),
                 Script::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
                 Script::Send { len } => PollStep::Send(&data[..len]),
@@ -3020,6 +3050,12 @@ mod tests {
     struct HoldStorage {
         inner: BlockingStorage<Recorder>,
         pending_polls: usize,
+        /// Return `Pending` on the first poll of the `n`-th `begin_exec`
+        /// operation (1-based); the token is retained across entries.
+        pending_op: Option<usize>,
+        pending_op_left: usize,
+        /// Fail the `n`-th `begin_exec` operation (1-based) once.
+        fail_op: Option<(usize, Fault)>,
         begins: usize,
         cancels: usize,
         buf_tags: [u8; 8],
@@ -3031,11 +3067,25 @@ mod tests {
             Self {
                 inner: BlockingStorage::new(Recorder::default()),
                 pending_polls,
+                pending_op: None,
+                pending_op_left: 0,
+                fail_op: None,
                 begins: 0,
                 cancels: 0,
                 buf_tags: [0u8; 8],
                 buf_count: 0,
             }
+        }
+
+        fn with_pending_op(mut self, op: usize) -> Self {
+            self.pending_op = Some(op);
+            self.pending_op_left = 1;
+            self
+        }
+
+        fn with_fail_op(mut self, op: usize, fault: Fault) -> Self {
+            self.fail_op = Some((op, fault));
+            self
         }
 
         fn recorder(&self) -> &Recorder {
@@ -3065,6 +3115,16 @@ mod tests {
             if self.pending_polls > 0 {
                 self.pending_polls -= 1;
                 return Poll::Pending;
+            }
+            if self.pending_op == Some(self.begins) && self.pending_op_left > 0 {
+                self.pending_op_left -= 1;
+                return Poll::Pending;
+            }
+            if let Some((op, fault)) = self.fail_op {
+                if op == self.begins {
+                    self.fail_op = None;
+                    return Poll::Ready(StorageReceipt::failed(fault, 0, Effect::Known));
+                }
             }
             self.inner.poll_exec(token, buf)
         }
@@ -3194,6 +3254,18 @@ mod tests {
                 work: [0u8; BANK],
                 scratch: [0u8; BANK],
             }
+        }
+
+        /// Retain the `op`-th storage operation (1-based) across an entry, so a
+        /// speculative prefetch can be observed while it is in flight.
+        fn with_pending_op(mut self, op: usize) -> Self {
+            self.storage = self.storage.with_pending_op(op);
+            self
+        }
+
+        fn with_fail_op(mut self, op: usize, fault: Fault) -> Self {
+            self.storage = self.storage.with_fail_op(op, fault);
+            self
         }
 
         fn start(&mut self, ctx: CommandContext) -> Result<(), Fault> {
@@ -3996,6 +4068,96 @@ mod tests {
         );
         assert_eq!(err, Err(Fault::Contract));
         assert_eq!(bench.storage.cancels, 1);
+    }
+
+    fn prefetch_script() -> [Option<Script>; SCRIPT_LEN] {
+        [
+            Some(Script::Publish(DataPlan {
+                direction: Direction::ToHost,
+                bytes: 16,
+            })),
+            Some(Script::Read { len: 8 }),
+            Some(Script::Send { len: 8 }),
+            Some(Script::Prefetch { len: 8 }),
+            Some(Script::Send { len: 8 }),
+            Some(Script::Complete(Completion::Good)),
+            None,
+            None,
+        ]
+    }
+
+    /// Drive until the speculative prefetch token is retained.
+    fn bench_until_prefetch_pending(bench: &mut Bench) {
+        bench.start(ctx(Direction::ToHost, 16)).expect("start");
+        // One entry publishes, reads chunk 1 normally and sends it, then
+        // retains the prefetch of chunk 2.
+        assert_eq!(bench.step(), Ok(DriveStep::Pending));
+        assert_eq!(
+            bench.storage.begins, 2,
+            "one normal read plus the retained prefetch"
+        );
+    }
+
+    #[test]
+    fn a_retained_prefetch_blocks_the_management_boundary_until_it_settles() {
+        let mut bench = Bench::new(prefetch_script(), 0).with_pending_op(2);
+        bench_until_prefetch_pending(&mut bench);
+        assert_eq!(
+            bench.runner.boundary(&bench.slot),
+            Err(BoundaryReject::SpeculativeIoInFlight)
+        );
+        assert_eq!(
+            bench.runner.take_rt(0, &mut bench.slot),
+            Err(BoundaryReject::SpeculativeIoInFlight)
+        );
+        assert_eq!(
+            bench.runner.propose_rt(&mut bench.slot, Change::Remove),
+            Err((Change::Remove, Fault::Boundary))
+        );
+        // Let the prefetch settle and the command finish.
+        assert_eq!(bench.step(), Ok(DriveStep::Done(Completion::Good)));
+        assert_eq!(bench.runner.boundary(&bench.slot), Ok(()));
+        assert_eq!(
+            bench.runner.take_rt(0, &mut bench.slot),
+            Err(BoundaryReject::NothingToTake)
+        );
+        assert_eq!(
+            bench.runner.propose_rt(&mut bench.slot, Change::Remove),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_contract_failed_prefetch_does_not_settle_the_command() {
+        let mut bench = Bench::new(prefetch_script(), 0).with_fail_op(2, Fault::Contract);
+        bench.start(ctx(Direction::ToHost, 16)).expect("start");
+        assert_eq!(
+            bench.step(),
+            Ok(DriveStep::Done(Completion::Good)),
+            "a failed prefetch is optional and never changes the completion"
+        );
+        assert_eq!(bench.runner.boundary(&bench.slot), Ok(()));
+        assert_eq!(bench.storage.cancels, 0);
+    }
+
+    #[test]
+    fn cancelling_a_retained_prefetch_clears_the_speculative_boundary() {
+        let mut bench = Bench::new(prefetch_script(), 0).with_pending_op(2);
+        bench_until_prefetch_pending(&mut bench);
+        assert_eq!(
+            bench.runner.boundary(&bench.slot),
+            Err(BoundaryReject::SpeculativeIoInFlight)
+        );
+        bench
+            .runner
+            .request_control(Control::Abort)
+            .expect("queue abort");
+        assert_eq!(
+            bench.step(),
+            Ok(DriveStep::Done(Completion::Check(ABORTED_COMMAND)))
+        );
+        assert_eq!(bench.storage.cancels, 1);
+        assert_eq!(bench.runner.boundary(&bench.slot), Ok(()));
     }
 
     #[test]

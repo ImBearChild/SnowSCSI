@@ -32,6 +32,8 @@ struct Plane {
     count: usize,
     data: [u8; 4096],
     fail_io_prefix: Option<usize>,
+    /// Fail the next read at this byte offset with `Fault::Io`.
+    fail_read_offset: Option<u64>,
 }
 
 impl Plane {
@@ -41,6 +43,7 @@ impl Plane {
             count: 0,
             data: [0u8; 4096],
             fail_io_prefix: None,
+            fail_read_offset: None,
         }
     }
 
@@ -79,6 +82,10 @@ impl SyncStorage for Plane {
                     offset: req.offset,
                     len: bytes.len(),
                 });
+                if self.fail_read_offset == Some(req.offset) {
+                    self.fail_read_offset = None;
+                    return StorageReceipt::failed(Fault::Io, 0, Effect::Known);
+                }
                 let at = req.offset as usize;
                 let take = bytes.len().min(self.data.len().saturating_sub(at));
                 bytes[..take].copy_from_slice(&self.data[at..at + take]);
@@ -108,6 +115,9 @@ struct TestHost {
     recv_accepts: Option<usize>,
     events: [Option<HostEvent>; 8],
     count: usize,
+    /// Bytes actually sent to the host by the device, in order.
+    sent_data: [u8; 4096],
+    sent_len: usize,
 }
 
 impl TestHost {
@@ -117,6 +127,8 @@ impl TestHost {
             recv_accepts: None,
             events: [None; 8],
             count: 0,
+            sent_data: [0u8; 4096],
+            sent_len: 0,
         }
     }
 
@@ -153,9 +165,16 @@ impl SyncHost for TestHost {
         }
     }
 
-    fn send(&mut self, req: HostReq, _buf: HostBuf<'_>) -> HostReceipt {
+    fn send(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         let len = req.len as usize;
         let accepted = self.read_accepts.unwrap_or(len).min(len);
+        if let HostBuf::Send(bytes) = buf {
+            let end = self.sent_len + accepted;
+            if end <= self.sent_data.len() {
+                self.sent_data[self.sent_len..end].copy_from_slice(&bytes[..accepted]);
+                self.sent_len = end;
+            }
+        }
         self.push(HostEvent::Sent(accepted));
         HostReceipt::from_adapter(accepted, None)
     }
@@ -723,4 +742,122 @@ fn runtime_take_and_reinstall_round_trip() {
         })
     );
     assert_eq!(target.install_rt(0, old.pair.expect("pair")), Ok(()));
+}
+
+/// A READ larger than the caller's bank streams: one normal read, then a
+/// speculative prefetch per following chunk, with byte-exact host data.
+#[test]
+fn read_larger_than_the_bank_streams_with_prefetch() {
+    let mut target = Target::new(cons(slot(1), Nil));
+    let mut plane = Plane::new();
+    for (i, byte) in plane.data.iter_mut().enumerate() {
+        *byte = (i & 0xFF) as u8;
+    }
+    let mut storage = BlockingStorage::new(plane);
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(0, Direction::ToHost, 2048),
+            &read_cdb(0, 4),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device.io_issues(),
+        1,
+        "only the first chunk is a normal read"
+    );
+    assert_eq!(device.prefetch_issues(), 3, "chunks - 1 prefetches");
+    assert_eq!(
+        &host.inner().sent_data[..host.inner().sent_len],
+        &storage.inner().data[..2048],
+        "the streamed data is byte-exact"
+    );
+}
+
+/// A failed speculative read falls back to a normal read of the same range;
+/// the completion stays GOOD and the data is complete.
+#[test]
+fn a_failed_prefetch_falls_back_without_changing_the_completion() {
+    let mut target = Target::new(cons(slot(1), Nil));
+    let mut plane = Plane::new();
+    for (i, byte) in plane.data.iter_mut().enumerate() {
+        *byte = (i & 0xFF) as u8;
+    }
+    plane.fail_read_offset = Some(512);
+    let mut storage = BlockingStorage::new(plane);
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(0, Direction::ToHost, 1024),
+            &read_cdb(0, 2),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.io_issues(), 2, "first chunk + fallback re-read");
+    assert_eq!(device.prefetch_issues(), 1);
+    assert_eq!(
+        &host.inner().sent_data[..host.inner().sent_len],
+        &storage.inner().data[..1024]
+    );
+}
+
+/// A WRITE larger than the bank commits every chunk, byte-exact.
+#[test]
+fn write_larger_than_the_bank_commits_every_chunk() {
+    let mut target = Target::new(cons(slot(1), Nil));
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(0, Direction::FromHost, 1536),
+            &write_cdb(0, 3),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert!(storage.inner().data[..1536].iter().all(|b| *b == 0xa5));
+    assert_eq!(
+        slot0(&target).device_ref().known_effects().confirmed_write,
+        1536
+    );
+    assert_eq!(
+        storage.inner().ops(),
+        &[
+            Some(LegalOp::Write {
+                offset: 0,
+                len: 512
+            }),
+            Some(LegalOp::Write {
+                offset: 512,
+                len: 512
+            }),
+            Some(LegalOp::Write {
+                offset: 1024,
+                len: 512
+            }),
+        ]
+    );
 }

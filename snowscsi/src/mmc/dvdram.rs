@@ -19,7 +19,7 @@ use crate::core::storage::StorageOp;
 use crate::core::{
     storage_fault_sense, Completion, DataPlan, Direction, Effect, Fault, Feedback, FeedbackKind,
     InterruptReason, IoContext, KnownEffects, PollStep, COMMAND_ABORTED, INTERNAL_FAILURE,
-    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR,
+    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, RESOURCE_FAILURE,
 };
 
 /// DVD-RAM data block length.
@@ -34,8 +34,8 @@ pub enum DvdRamState {
     Publish,
     /// READ: the backing read is being issued.
     ReadIo,
-    /// READ: the data is being sent to the host.
-    SendData,
+    /// READ: a speculative read of the next chunk is being issued.
+    PrefetchIo,
     /// READ: waiting for the host send to complete.
     Deliver,
     /// WRITE: waiting for the host data.
@@ -68,6 +68,8 @@ pub struct DvdRamMedium {
     attrs: MmcAttrs,
     op: Option<Op>,
     phase: DvdRamState,
+    /// Bytes of the current read/write already transferred.
+    progress: u32,
 }
 
 impl DvdRamMedium {
@@ -86,6 +88,7 @@ impl DvdRamMedium {
             },
             op: None,
             phase: DvdRamState::Idle,
+            progress: 0,
         }
     }
 
@@ -118,6 +121,62 @@ impl DvdRamMedium {
     fn reset(&mut self) {
         self.op = None;
         self.phase = DvdRamState::Idle;
+        self.progress = 0;
+    }
+
+    /// Total bytes selected by the admitted operation.
+    fn total_bytes(&self) -> usize {
+        match self.op {
+            Some(Op::Read { bytes, .. } | Op::Write { bytes, .. }) => bytes as usize,
+            _ => 0,
+        }
+    }
+
+    /// Bytes of the next chunk, bounded by the caller's bank.
+    fn next_chunk(&self, bank_len: usize) -> usize {
+        self.total_bytes()
+            .saturating_sub(self.progress as usize)
+            .min(bank_len)
+    }
+
+    /// Byte offset of the next chunk inside the backing.
+    fn next_offset(&self) -> u64 {
+        match self.op {
+            Some(Op::Read { offset, .. } | Op::Write { offset, .. }) => {
+                offset + u64::from(self.progress)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Issue the normal read of the current chunk.
+    fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if self.total_bytes() > 0 && len == 0 {
+            return self.finish(Completion::Check(INVALID_FIELD));
+        }
+        self.phase = DvdRamState::ReadIo;
+        PollStep::Io(StorageOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
+    }
+
+    /// Issue the speculative read of the next chunk.
+    fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if len == 0 {
+            // No usable bank while bytes remain: a zero-length speculative
+            // read cannot make progress, so fail like the required-read guard.
+            return self.finish(Completion::Check(RESOURCE_FAILURE));
+        }
+        self.phase = DvdRamState::PrefetchIo;
+        PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
     }
 
     /// Fix a terminal completion.
@@ -151,6 +210,7 @@ impl MmcMedium for DvdRamMedium {
         if self.active() {
             return Err(Completion::Busy);
         }
+        self.progress = 0;
         let action = match op {
             MmcOp::Read { lba, blocks } => {
                 let (offset, bytes) = self.range(lba, blocks)?;
@@ -198,13 +258,7 @@ impl MmcMedium for DvdRamMedium {
             self.reset();
             return PollStep::Complete(Completion::Good);
         }
-        let needed = match self.op {
-            Some(Op::Read { bytes, .. } | Op::Write { bytes, .. }) => bytes as usize,
-            _ => 0,
-        };
-        if data.len() < needed {
-            return self.finish(Completion::Check(INVALID_FIELD));
-        }
+        let total = self.total_bytes();
         match (self.phase, fb.kind()) {
             (DvdRamState::Publish, FeedbackKind::Begin) => match self.op {
                 Some(Op::Read { bytes, .. }) => {
@@ -230,73 +284,95 @@ impl MmcMedium for DvdRamMedium {
                 }
                 Some(Op::Format) | None => PollStep::Idle,
             },
-            (DvdRamState::ReadIo, FeedbackKind::PlanAccepted) => {
-                let Some(Op::Read { offset, bytes }) = self.op else {
-                    return self.finish(Completion::Check(INTERNAL_FAILURE));
-                };
-                self.phase = DvdRamState::SendData;
-                PollStep::Io(StorageOp::Read {
-                    resource: 0,
-                    offset,
-                    buf: &mut data[..bytes as usize],
-                })
-            }
-            (DvdRamState::SendData, FeedbackKind::IoDone) => {
+            (DvdRamState::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
+            (DvdRamState::ReadIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Read);
                 }
-                if receipt.confirmed() < needed {
+                if receipt.confirmed() < chunk {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = DvdRamState::Deliver;
-                PollStep::Send(&data[..needed])
+                PollStep::Send(&data[..chunk])
+            }
+            (DvdRamState::PrefetchIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
+                let failed = match fb.io() {
+                    Some(receipt) => receipt.error().is_some() || receipt.confirmed() < chunk,
+                    None => true,
+                };
+                if failed {
+                    // Speculative data is optional: re-read the same range as a
+                    // required read; the command outcome is unchanged.
+                    return self.read_chunk(data);
+                }
+                self.phase = DvdRamState::Deliver;
+                PollStep::Send(&data[..chunk])
             }
             (DvdRamState::Deliver, FeedbackKind::HostSent) => {
+                let chunk = self.next_chunk(data.len());
                 let (accepted, failed) = match fb.host() {
-                    Some(receipt) => (receipt.accepted().min(needed), receipt.error().is_some()),
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
                     None => (0, true),
                 };
-                if failed || accepted < needed {
-                    self.finish(Completion::Check(COMMAND_ABORTED))
-                } else {
-                    self.finish(Completion::Good)
+                if failed || accepted < chunk {
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if (self.progress as usize) < total {
+                    return self.prefetch_chunk(data);
+                }
+                self.finish(Completion::Good)
             }
             (DvdRamState::WriteRecv, FeedbackKind::PlanAccepted) => {
-                PollStep::Receive(&mut data[..needed])
+                let chunk = self.next_chunk(data.len());
+                if total > 0 && chunk == 0 {
+                    return self.finish(Completion::Check(INVALID_FIELD));
+                }
+                PollStep::Receive(&mut data[..chunk])
             }
             (DvdRamState::WriteRecv, FeedbackKind::HostReceived) => {
+                let chunk = self.next_chunk(data.len());
                 let (accepted, failed) = match fb.host() {
-                    Some(receipt) => (receipt.accepted().min(needed), receipt.error().is_some()),
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
                     None => (0, true),
                 };
-                if failed || accepted < needed {
+                if failed || accepted < chunk {
                     // A short Data-Out is not a partial write: do not write a
                     // prefix, so no host byte is silently promoted to success.
                     return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
-                let Some(Op::Write { offset, .. }) = self.op else {
-                    return self.finish(Completion::Check(INTERNAL_FAILURE));
-                };
                 self.phase = DvdRamState::WriteIo;
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
-                    offset,
-                    buf: &data[..needed],
+                    offset: self.next_offset(),
+                    buf: &data[..accepted],
                 })
             }
             (DvdRamState::WriteIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Write);
                 }
-                if receipt.confirmed() < needed || receipt.effect() != Effect::Known {
+                if receipt.confirmed() < chunk || receipt.effect() != Effect::Known {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
+                }
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if (self.progress as usize) < total {
+                    // More host data: start the next chunk's receive phase.
+                    let next = self.next_chunk(data.len());
+                    if next == 0 {
+                        return self.finish(Completion::Check(RESOURCE_FAILURE));
+                    }
+                    self.phase = DvdRamState::WriteRecv;
+                    return PollStep::Receive(&mut data[..next]);
                 }
                 self.finish(Completion::Good)
             }
@@ -545,5 +621,136 @@ mod tests {
         assert_eq!(info.status, DiscStatus::Finalized);
         assert_eq!(info.last_session_lba, 15);
         assert!(info.writable);
+    }
+
+    #[test]
+    fn read_larger_than_the_bank_streams_byte_exactly() {
+        let mut m = medium(4);
+        let mut backing = vec![0u8; 4 * BLOCK_LEN as usize];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut data = [0u8; 1024];
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
+        match m.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => {
+                assert_eq!(plan.direction, Direction::ToHost);
+                assert_eq!(plan.bytes, backing.len() as u64);
+            }
+            other => panic!("expected publish, got {other:?}"),
+        }
+
+        let mut collected = Vec::new();
+        let mut step = m.poll(Feedback::plan_accepted(), &mut data);
+        loop {
+            match step {
+                PollStep::Io(StorageOp::Read { offset, buf, .. })
+                | PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+                    offset, buf, ..
+                }) => {
+                    let offset = offset as usize;
+                    buf.copy_from_slice(&backing[offset..offset + buf.len()]);
+                    let len = buf.len();
+                    step = m.poll(
+                        Feedback::io_done(IoReceipt::test(len, None, Effect::Known)),
+                        &mut data,
+                    );
+                }
+                PollStep::Send(bytes) => {
+                    collected.extend_from_slice(bytes);
+                    let len = bytes.len();
+                    step = m.poll(Feedback::host_sent(HostReceipt::test(len, None)), &mut data);
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(collected, backing, "the streamed read is byte-exact");
+        assert!(!m.active());
+    }
+
+    #[test]
+    fn write_larger_than_the_bank_commits_byte_exactly() {
+        let mut m = medium(4);
+        let payload: Vec<u8> = (0..4 * BLOCK_LEN as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut backing = vec![0u8; payload.len()];
+        let mut data = [0u8; 1024];
+        assert_eq!(m.begin(MmcOp::Write { lba: 0, blocks: 4 }), Ok(()));
+        match m.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => {
+                assert_eq!(plan.direction, Direction::FromHost);
+                assert_eq!(plan.bytes, payload.len() as u64);
+            }
+            other => panic!("expected publish, got {other:?}"),
+        }
+
+        let mut received = 0usize;
+        let mut written = 0usize;
+        let mut step = m.poll(Feedback::plan_accepted(), &mut data);
+        loop {
+            match step {
+                PollStep::Receive(buf) => {
+                    let len = buf.len();
+                    buf.copy_from_slice(&payload[received..received + len]);
+                    received += len;
+                    step = m.poll(
+                        Feedback::host_received(HostReceipt::test(len, None)),
+                        &mut data,
+                    );
+                }
+                PollStep::Io(StorageOp::Write { offset, buf, .. }) => {
+                    let offset = offset as usize;
+                    assert_eq!(offset, written, "writes are contiguous");
+                    backing[offset..offset + buf.len()].copy_from_slice(buf);
+                    let len = buf.len();
+                    written += len;
+                    step = m.poll(
+                        Feedback::io_done(IoReceipt::test(len, None, Effect::Known)),
+                        &mut data,
+                    );
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(received, payload.len(), "every host byte was received");
+        assert_eq!(backing, payload, "the streamed write is byte-exact");
+        assert!(!m.active());
+    }
+
+    #[test]
+    fn a_zero_length_prefetch_bank_reports_resource_failure() {
+        let mut m = medium(4);
+        let mut data = [0u8; 16];
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
+        assert!(matches!(
+            m.poll(Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            m.poll(Feedback::plan_accepted(), &mut data),
+            PollStep::Io(StorageOp::Read { .. })
+        ));
+        assert!(matches!(
+            m.poll(
+                Feedback::io_done(IoReceipt::test(16, None, Effect::Known)),
+                &mut data
+            ),
+            PollStep::Send(_)
+        ));
+        // The first chunk drains, but the next prefetch has no bank to land in.
+        let mut empty = [0u8; 0];
+        assert!(matches!(
+            m.poll(Feedback::host_sent(HostReceipt::test(16, None)), &mut empty),
+            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
+        ));
     }
 }

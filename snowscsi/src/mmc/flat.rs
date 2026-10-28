@@ -18,7 +18,7 @@ use crate::core::storage::StorageOp;
 use crate::core::{
     storage_fault_sense, Completion, DataPlan, Direction, Effect, Feedback, FeedbackKind,
     InterruptReason, IoContext, KnownEffects, PollStep, COMMAND_ABORTED, INTERNAL_FAILURE,
-    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, WRITE_PROTECTED,
+    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, RESOURCE_FAILURE, WRITE_PROTECTED,
 };
 
 /// CD data block length.
@@ -33,8 +33,8 @@ pub enum FlatState {
     Publish,
     /// READ: the backing read is being issued.
     ReadIo,
-    /// READ: the data is being sent to the host.
-    SendData,
+    /// READ: a speculative read of the next chunk is being issued.
+    PrefetchIo,
     /// READ: waiting for the host send to complete.
     Deliver,
     /// COMMIT: the sync is being issued.
@@ -59,6 +59,8 @@ pub struct FlatCdMedium {
     attrs: MmcAttrs,
     op: Option<Op>,
     phase: FlatState,
+    /// Bytes of the read already delivered to the host.
+    progress: u32,
 }
 
 impl FlatCdMedium {
@@ -84,6 +86,7 @@ impl FlatCdMedium {
             },
             op: None,
             phase: FlatState::Idle,
+            progress: 0,
         }
     }
 
@@ -112,6 +115,60 @@ impl FlatCdMedium {
     fn reset(&mut self) {
         self.op = None;
         self.phase = FlatState::Idle;
+        self.progress = 0;
+    }
+
+    /// Total bytes selected by the admitted operation.
+    fn total_bytes(&self) -> usize {
+        match self.op {
+            Some(Op::Read { bytes, .. }) => bytes as usize,
+            _ => 0,
+        }
+    }
+
+    /// Bytes of the next chunk, bounded by the caller's bank.
+    fn next_chunk(&self, bank_len: usize) -> usize {
+        self.total_bytes()
+            .saturating_sub(self.progress as usize)
+            .min(bank_len)
+    }
+
+    /// Byte offset of the next chunk inside the backing.
+    fn next_offset(&self) -> u64 {
+        match self.op {
+            Some(Op::Read { offset, .. }) => offset + u64::from(self.progress),
+            _ => 0,
+        }
+    }
+
+    /// Issue the normal read of the current chunk.
+    fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if self.total_bytes() > 0 && len == 0 {
+            return self.finish(Completion::Check(INVALID_FIELD));
+        }
+        self.phase = FlatState::ReadIo;
+        PollStep::Io(StorageOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
+    }
+
+    /// Issue the speculative read of the next chunk.
+    fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if len == 0 {
+            // No usable bank while bytes remain: a zero-length speculative
+            // read cannot make progress, so fail like the required-read guard.
+            return self.finish(Completion::Check(RESOURCE_FAILURE));
+        }
+        self.phase = FlatState::PrefetchIo;
+        PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
     }
 
     /// Fix a terminal completion.
@@ -145,6 +202,7 @@ impl MmcMedium for FlatCdMedium {
         if self.active() {
             return Err(Completion::Busy);
         }
+        self.progress = 0;
         let action = match op {
             MmcOp::Read { lba, blocks } => self.read_op(lba, blocks)?,
             MmcOp::ReadSectors { lba, blocks, kind } => match kind {
@@ -169,13 +227,7 @@ impl MmcMedium for FlatCdMedium {
     }
 
     fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
-        let needed = match self.op {
-            Some(Op::Read { bytes, .. }) => bytes as usize,
-            _ => 0,
-        };
-        if data.len() < needed {
-            return self.finish(Completion::Check(INVALID_FIELD));
-        }
+        let total = self.total_bytes();
         match (self.phase, fb.kind()) {
             (FlatState::Publish, FeedbackKind::Begin) => match self.op {
                 Some(Op::Read { bytes, .. }) => {
@@ -194,42 +246,52 @@ impl MmcMedium for FlatCdMedium {
                 }
                 None => PollStep::Idle,
             },
-            (FlatState::ReadIo, FeedbackKind::PlanAccepted) => {
-                let Some(Op::Read { offset, bytes }) = self.op else {
-                    return self.finish(Completion::Check(INTERNAL_FAILURE));
-                };
-                self.phase = FlatState::SendData;
-                PollStep::Io(StorageOp::Read {
-                    resource: 0,
-                    offset,
-                    buf: &mut data[..bytes as usize],
-                })
-            }
-            (FlatState::SendData, FeedbackKind::IoDone) => {
+            (FlatState::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
+            (FlatState::ReadIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Read);
                 }
-                if receipt.confirmed() < needed {
+                if receipt.confirmed() < chunk {
                     // A short read is not success; a read has no write effect
                     // to preserve.
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = FlatState::Deliver;
-                PollStep::Send(&data[..needed])
+                PollStep::Send(&data[..chunk])
+            }
+            (FlatState::PrefetchIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
+                let failed = match fb.io() {
+                    Some(receipt) => receipt.error().is_some() || receipt.confirmed() < chunk,
+                    None => true,
+                };
+                if failed {
+                    // Speculative data is optional: re-read the same range as a
+                    // required read; the command outcome is unchanged.
+                    return self.read_chunk(data);
+                }
+                self.phase = FlatState::Deliver;
+                PollStep::Send(&data[..chunk])
             }
             (FlatState::Deliver, FeedbackKind::HostSent) => {
+                let chunk = self.next_chunk(data.len());
                 let (accepted, failed) = match fb.host() {
-                    Some(receipt) => (receipt.accepted().min(needed), receipt.error().is_some()),
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
                     None => (0, true),
                 };
-                if failed || accepted < needed {
-                    self.finish(Completion::Check(COMMAND_ABORTED))
-                } else {
-                    self.finish(Completion::Good)
+                if failed || accepted < chunk {
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if (self.progress as usize) < total {
+                    // Read the next chunk ahead while the host drains this one.
+                    return self.prefetch_chunk(data);
+                }
+                self.finish(Completion::Good)
             }
             (FlatState::SyncIo, FeedbackKind::PlanAccepted) => {
                 self.phase = FlatState::SyncWait;
@@ -490,14 +552,94 @@ mod tests {
     }
 
     #[test]
-    fn short_bank_is_invalid_field() {
+    fn read_larger_than_the_bank_streams_in_chunks() {
         let mut m = medium(4);
         let mut data = [0u8; 16];
-        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 1 }), Ok(()));
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
+        match m.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 8192),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        let mut offset = 0u64;
+        let mut prefetches = 0;
+        match m.poll(Feedback::plan_accepted(), &mut data) {
+            PollStep::Io(StorageOp::Read {
+                offset: at, buf, ..
+            }) => {
+                assert_eq!(at, 0);
+                assert_eq!(buf.len(), 16);
+            }
+            other => panic!("expected read IO, got {other:?}"),
+        }
+        loop {
+            // Feed a full read receipt, then react to the returned step.
+            match m.poll(
+                Feedback::io_done(IoReceipt::test(16, None, Effect::Known)),
+                &mut data,
+            ) {
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), 16);
+                    offset += 16;
+                }
+                PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+                    offset: at,
+                    buf,
+                    ..
+                }) => {
+                    prefetches += 1;
+                    assert_eq!(at, offset);
+                    assert_eq!(buf.len(), 16);
+                    continue;
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("expected send/prefetch, got {other:?}"),
+            }
+            match m.poll(Feedback::host_sent(HostReceipt::test(16, None)), &mut data) {
+                PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+                    offset: at,
+                    buf,
+                    ..
+                }) => {
+                    prefetches += 1;
+                    assert_eq!(at, offset);
+                    assert_eq!(buf.len(), 16);
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+        }
+        assert_eq!(prefetches, 8192 / 16 - 1);
+        assert!(!m.active());
+    }
+
+    #[test]
+    fn a_zero_length_prefetch_bank_reports_resource_failure() {
+        let mut m = medium(4);
+        let mut data = [0u8; 16];
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
         assert!(matches!(
             m.poll(Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Check(INVALID_FIELD))
+            PollStep::Publish(_)
         ));
-        assert!(!m.active());
+        assert!(matches!(
+            m.poll(Feedback::plan_accepted(), &mut data),
+            PollStep::Io(StorageOp::Read { .. })
+        ));
+        assert!(matches!(
+            m.poll(io_receipt(16, None), &mut data),
+            PollStep::Send(_)
+        ));
+        // The first chunk drains, but the next prefetch has no bank to land in.
+        let mut empty = [0u8; 0];
+        assert!(matches!(
+            m.poll(Feedback::host_sent(HostReceipt::test(16, None)), &mut empty),
+            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
+        ));
     }
 }

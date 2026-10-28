@@ -15,7 +15,7 @@
 //! [`Storage`]: crate::core::storage::Storage
 
 use crate::block::BlockAttrs;
-use crate::core::storage::StorageOp;
+use crate::core::storage::{PrefetchOp, StorageOp};
 use crate::core::{
     storage_fault_sense, BoundaryPermit, Capacity, CommandContext, CommandPermit, Completion,
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
@@ -77,6 +77,8 @@ enum Stage {
     ReadIo,
     /// READ: send the data after the read receipt.
     Send,
+    /// READ: speculative read of the next chunk, not yet settled.
+    Prefetch,
     /// WRITE: receive host data.
     WriteRecv,
     /// WRITE: issue the backing write.
@@ -100,7 +102,10 @@ pub struct BlockDevice {
     blocks: u16,
     /// Requested byte count (`blocks * block_len`, or 0).
     bytes: u32,
-    /// Host bytes actually accepted, used for the write receipt comparison.
+    /// Bytes already transferred (sent to / written from) in this command.
+    progress: u32,
+    /// Host bytes actually accepted in the current chunk, used for the write
+    /// receipt comparison.
     accepted: u32,
     /// The current command requested FUA (force unit access).
     fua: bool,
@@ -110,6 +115,7 @@ pub struct BlockDevice {
     effects: KnownEffects,
     delivery: Delivery,
     io_issues: u32,
+    prefetch_issues: u32,
 }
 
 impl BlockDevice {
@@ -124,6 +130,7 @@ impl BlockDevice {
             offset: 0,
             blocks: 0,
             bytes: 0,
+            progress: 0,
             accepted: 0,
             fua: false,
             host_error: None,
@@ -131,6 +138,7 @@ impl BlockDevice {
             effects: KnownEffects::NONE,
             delivery: Delivery::NotApplicable,
             io_issues: 0,
+            prefetch_issues: 0,
         }
     }
 
@@ -152,6 +160,14 @@ impl BlockDevice {
     #[must_use]
     pub const fn io_issues(&self) -> u32 {
         self.io_issues
+    }
+
+    /// Number of speculative prefetch operations issued (probe counter, not a
+    /// business API).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn prefetch_issues(&self) -> u32 {
+        self.prefetch_issues
     }
 
     /// Confirmed effects observed from receipts (not a success flag).
@@ -367,10 +383,46 @@ impl BlockDevice {
         Ok(())
     }
 
-    /// Byte count for the current command, bounded by the caller's bank.
-    fn slice_len(&self, bank_len: usize) -> Option<usize> {
-        let len = self.bytes as usize;
-        (len <= bank_len).then_some(len)
+    /// Byte count of the next chunk, bounded by the caller's bank.
+    ///
+    /// A transfer larger than the bank is streamed: every step addresses the
+    /// remaining bytes from `progress` and never asks for more than one bank.
+    fn next_chunk(&self, bank_len: usize) -> usize {
+        let remaining = (self.bytes - self.progress) as usize;
+        remaining.min(bank_len)
+    }
+
+    /// Byte offset of the next chunk inside the backing.
+    fn next_offset(&self) -> u64 {
+        self.offset + u64::from(self.progress)
+    }
+
+    /// Issue the normal read of the current chunk.
+    fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if self.bytes > 0 && len == 0 {
+            return self.finish(Completion::Check(RESOURCE_FAILURE));
+        }
+        self.io_issues = self.io_issues.saturating_add(1);
+        PollStep::Io(StorageOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
+    }
+
+    /// Issue the speculative read of the next chunk.
+    fn issue_prefetch<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        if len == 0 {
+            return self.finish(Completion::Good);
+        }
+        self.prefetch_issues = self.prefetch_issues.saturating_add(1);
+        PollStep::Prefetch(PrefetchOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
     }
 }
 
@@ -404,6 +456,7 @@ impl Device for BlockDevice {
         self.offset = 0;
         self.blocks = 0;
         self.bytes = 0;
+        self.progress = 0;
         self.accepted = 0;
         self.fua = false;
         self.host_error = None;
@@ -440,10 +493,6 @@ impl Device for BlockDevice {
         fb: Feedback,
         data: &'a mut [u8],
     ) -> PollStep<'a> {
-        let Some(len) = self.slice_len(data.len()) else {
-            // The CDB is valid; the target's bank cannot stage the transfer.
-            return self.finish(Completion::Check(RESOURCE_FAILURE));
-        };
         match (self.stage, fb.kind()) {
             (Stage::Publish, FeedbackKind::Begin) => {
                 let plan = DataPlan {
@@ -457,16 +506,11 @@ impl Device for BlockDevice {
                 };
                 PollStep::Publish(plan)
             }
-            // READ: issue the backing read once the plan is accepted.
-            (Stage::ReadIo, FeedbackKind::PlanAccepted) => {
-                self.io_issues = self.io_issues.saturating_add(1);
-                PollStep::Io(StorageOp::Read {
-                    resource: 0,
-                    offset: self.offset,
-                    buf: &mut data[..len],
-                })
-            }
+            // READ: issue the backing read of the next chunk once the plan is
+            // accepted.
+            (Stage::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
             (Stage::ReadIo, FeedbackKind::IoDone) => {
+                let len = self.next_chunk(data.len());
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
@@ -482,20 +526,48 @@ impl Device for BlockDevice {
                 PollStep::Send(&data[..len])
             }
             (Stage::Send, FeedbackKind::HostSent) => {
+                let len = self.next_chunk(data.len());
                 let (accepted, failed) = host_facts(fb, len);
-                self.effects.host_prefix = accepted as u64;
+                self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
                 if failed || accepted < len {
-                    self.finish(Completion::Check(COMMAND_ABORTED))
-                } else {
-                    self.finish(Completion::Good)
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                self.progress = self.progress.saturating_add(len as u32);
+                if self.progress >= self.bytes {
+                    return self.finish(Completion::Good);
+                }
+                // The next chunk is read ahead while the host drains this one.
+                self.stage = Stage::Prefetch;
+                self.issue_prefetch(data)
+            }
+            (Stage::Prefetch, FeedbackKind::IoDone) => {
+                let len = self.next_chunk(data.len());
+                let failed = match fb.io() {
+                    Some(receipt) => receipt.error().is_some() || receipt.confirmed() != len,
+                    None => true,
+                };
+                if failed {
+                    // Speculative data is not required: fall back to a normal
+                    // read of the same range. The completion is unchanged.
+                    self.stage = Stage::ReadIo;
+                    return self.read_chunk(data);
+                }
+                self.stage = Stage::Send;
+                PollStep::Send(&data[..len])
             }
             // WRITE: receive host data, then write the accepted prefix.
-            (Stage::WriteRecv, FeedbackKind::PlanAccepted) => PollStep::Receive(&mut data[..len]),
+            (Stage::WriteRecv, FeedbackKind::PlanAccepted) => {
+                let len = self.next_chunk(data.len());
+                if self.bytes > 0 && len == 0 {
+                    return self.finish(Completion::Check(RESOURCE_FAILURE));
+                }
+                PollStep::Receive(&mut data[..len])
+            }
             (Stage::WriteRecv, FeedbackKind::HostReceived) => {
+                let len = self.next_chunk(data.len());
                 let (accepted, failed) = host_facts(fb, len);
                 self.accepted = accepted as u32;
-                self.effects.host_prefix = accepted as u64;
+                self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
                 if accepted == 0 {
                     // Zero progress: nothing to write, and the command fails.
                     return self.finish(Completion::Check(COMMAND_ABORTED));
@@ -509,7 +581,7 @@ impl Device for BlockDevice {
                 self.io_issues = self.io_issues.saturating_add(1);
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
-                    offset: self.offset,
+                    offset: self.next_offset(),
                     buf: &data[..accepted],
                 })
             }
@@ -535,18 +607,32 @@ impl Device for BlockDevice {
                     self.effects.unknown_remainder = true;
                 }
                 let short = receipt.confirmed() < self.accepted as usize;
-                if self.fua && self.host_error.is_none() && !short {
+                if self.host_error.is_none() && !short {
+                    self.progress = self.progress.saturating_add(receipt.confirmed() as u32);
+                }
+                if self.fua && self.host_error.is_none() && !short && self.progress >= self.bytes {
                     // FUA write: flush before reporting GOOD. The adapter owns
                     // whether the flush really reaches non-volatile storage.
                     self.stage = Stage::PostSync;
                     self.io_issues = self.io_issues.saturating_add(1);
                     return PollStep::Io(StorageOp::Sync { resource: 0 });
                 }
-                match self.host_error.take() {
-                    Some(completion) => self.finish(completion),
-                    None if short => self.finish(Completion::Check(WRITE_ERROR)),
-                    None => self.finish(Completion::Good),
+                if let Some(completion) = self.host_error.take() {
+                    return self.finish(completion);
                 }
+                if short {
+                    return self.finish(Completion::Check(WRITE_ERROR));
+                }
+                if self.progress < self.bytes {
+                    // More host data: start the next chunk's receive phase.
+                    let len = self.next_chunk(data.len());
+                    if len == 0 {
+                        return self.finish(Completion::Check(RESOURCE_FAILURE));
+                    }
+                    self.stage = Stage::WriteRecv;
+                    return PollStep::Receive(&mut data[..len]);
+                }
+                self.finish(Completion::Good)
             }
             (Stage::PostSync, FeedbackKind::IoDone) => {
                 let Some(receipt) = fb.io() else {
@@ -624,6 +710,7 @@ impl Device for BlockDevice {
         self.stage = Stage::Idle;
         self.direction = Direction::None;
         self.bytes = 0;
+        self.progress = 0;
         self.accepted = 0;
         self.fua = false;
         self.host_error = None;
@@ -851,6 +938,182 @@ mod tests {
         ));
         assert!(!dev.active());
         assert_eq!(dev.last_completion(), Some(Completion::Good));
+    }
+
+    #[test]
+    fn read_larger_than_bank_streams_with_one_normal_read_and_prefetches() {
+        let mut dev = device();
+        let permit = permit();
+        let mut data = [0u8; 512];
+        dev.prepare(&permit, ctx(Direction::ToHost, 2048), &cdb10(READ_10, 0, 4))
+            .expect("prepare");
+        match dev.poll(&permit, Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2048),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        // Chunk 1 is a normal (required) read.
+        match dev.poll(&permit, Feedback::plan_accepted(), &mut data) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(buf.len(), 512);
+            }
+            other => panic!("expected read IO, got {other:?}"),
+        }
+        assert_eq!(dev.io_issues(), 1);
+        assert_eq!(dev.prefetch_issues(), 0);
+        assert!(matches!(
+            dev.poll(&permit, io_receipt(512, None), &mut data),
+            PollStep::Send(bytes) if bytes.len() == 512
+        ));
+        // Each following chunk is a speculative read followed by a send.
+        for (chunk, offset) in [(1u32, 512u64), (2, 1024), (3, 1536)] {
+            match dev.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data,
+            ) {
+                PollStep::Prefetch(PrefetchOp::Read {
+                    offset: at, buf, ..
+                }) => {
+                    assert_eq!(at, offset, "prefetch chunk {chunk} offset");
+                    assert_eq!(buf.len(), 512);
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+            assert!(matches!(
+                dev.poll(&permit, io_receipt(512, None), &mut data),
+                PollStep::Send(bytes) if bytes.len() == 512
+            ));
+        }
+        assert_eq!(dev.prefetch_issues(), 3, "chunks - 1");
+        assert_eq!(dev.io_issues(), 1, "only the first chunk is a normal read");
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(
+            dev.known_effects().host_prefix,
+            2048,
+            "the host prefix accumulates across chunks"
+        );
+    }
+
+    #[test]
+    fn single_chunk_read_never_prefetches() {
+        let mut dev = device();
+        let permit = permit();
+        let mut data = [0u8; 512];
+        dev.prepare(&permit, ctx(Direction::ToHost, 512), &cdb10(READ_10, 0, 1))
+            .expect("prepare");
+        dev.poll(&permit, Feedback::begin(), &mut data);
+        dev.poll(&permit, Feedback::plan_accepted(), &mut data);
+        dev.poll(&permit, io_receipt(512, None), &mut data);
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(dev.prefetch_issues(), 0);
+        assert_eq!(dev.io_issues(), 1);
+    }
+
+    #[test]
+    fn failed_prefetch_falls_back_to_a_normal_read() {
+        let mut dev = device();
+        let permit = permit();
+        let mut data = [0u8; 512];
+        dev.prepare(&permit, ctx(Direction::ToHost, 1024), &cdb10(READ_10, 0, 2))
+            .expect("prepare");
+        dev.poll(&permit, Feedback::begin(), &mut data);
+        dev.poll(&permit, Feedback::plan_accepted(), &mut data);
+        dev.poll(&permit, io_receipt(512, None), &mut data);
+        match dev.poll(
+            &permit,
+            Feedback::host_sent(HostReceipt::test(512, None)),
+            &mut data,
+        ) {
+            PollStep::Prefetch(_) => {}
+            other => panic!("expected prefetch, got {other:?}"),
+        }
+        // The speculative read failed: the device re-reads the same range as a
+        // normal read, and the completion stays GOOD with complete data.
+        match dev.poll(&permit, io_receipt(0, Some(Fault::Io)), &mut data) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 512);
+                assert_eq!(buf.len(), 512);
+            }
+            other => panic!("expected fallback read, got {other:?}"),
+        }
+        assert_eq!(dev.io_issues(), 2, "first chunk + fallback re-read");
+        assert_eq!(dev.prefetch_issues(), 1);
+        assert!(matches!(
+            dev.poll(&permit, io_receipt(512, None), &mut data),
+            PollStep::Send(bytes) if bytes.len() == 512
+        ));
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+    }
+
+    #[test]
+    fn write_larger_than_bank_streams_receive_write_phases() {
+        let mut dev = device();
+        let permit = permit();
+        let mut data = [0u8; 512];
+        dev.prepare(
+            &permit,
+            ctx(Direction::FromHost, 1536),
+            &cdb10(WRITE_10, 0, 3),
+        )
+        .expect("prepare");
+        dev.poll(&permit, Feedback::begin(), &mut data);
+        match dev.poll(&permit, Feedback::plan_accepted(), &mut data) {
+            PollStep::Receive(bytes) => assert_eq!(bytes.len(), 512),
+            other => panic!("expected receive, got {other:?}"),
+        }
+        for (chunk, offset) in [(0u32, 0u64), (1, 512), (2, 1024)] {
+            match dev.poll(
+                &permit,
+                Feedback::host_received(HostReceipt::test(512, None)),
+                &mut data,
+            ) {
+                PollStep::Io(StorageOp::Write {
+                    offset: at, buf, ..
+                }) => {
+                    assert_eq!(at, offset, "write chunk {chunk} offset");
+                    assert_eq!(buf.len(), 512);
+                }
+                other => panic!("expected write IO, got {other:?}"),
+            }
+            if chunk == 2 {
+                assert!(matches!(
+                    dev.poll(&permit, io_receipt(512, None), &mut data),
+                    PollStep::Complete(Completion::Good)
+                ));
+            } else {
+                // The next receive phase is issued in the same step that
+                // settles the previous write.
+                match dev.poll(&permit, io_receipt(512, None), &mut data) {
+                    PollStep::Receive(bytes) => assert_eq!(bytes.len(), 512),
+                    other => panic!("expected next receive, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(dev.io_issues(), 3);
+        assert_eq!(dev.known_effects().confirmed_write, 1536);
+        assert_eq!(dev.known_effects().host_prefix, 1536);
     }
 
     #[test]

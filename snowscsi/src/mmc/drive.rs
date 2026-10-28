@@ -192,6 +192,10 @@ pub struct MmcDrive<M: MmcMedium> {
     published: bool,
     /// Resident zero-fill operation shared by FORMAT UNIT and BLANK.
     long: LongOp,
+    /// Required storage operations issued by the medium (probe counter).
+    io_issues: u32,
+    /// Speculative prefetch operations issued by the medium (probe counter).
+    prefetch_issues: u32,
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
@@ -204,7 +208,25 @@ impl<M: MmcMedium> MmcDrive<M> {
             len: 0,
             published: false,
             long: LongOp::Idle,
+            io_issues: 0,
+            prefetch_issues: 0,
         }
+    }
+
+    /// Number of required storage operations issued (probe counter, not a
+    /// business API).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn io_issues(&self) -> u32 {
+        self.io_issues
+    }
+
+    /// Number of speculative prefetch operations issued (probe counter, not a
+    /// business API).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn prefetch_issues(&self) -> u32 {
+        self.prefetch_issues
     }
 
     /// Borrow the installed medium.
@@ -867,7 +889,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         match self.query {
             Query::None => PollStep::Idle,
             Query::Media {
-                bytes,
+                bytes: _,
                 fua,
                 syncing,
             } => {
@@ -888,24 +910,24 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                         Completion::Check(WRITE_ERROR)
                     });
                 }
-                if data.len() < bytes as usize {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // transfer. Drop the admitted medium operation so the
-                    // medium is not left half-active.
-                    if let Some(medium) = self.medium.as_mut() {
-                        medium.interrupt(InterruptReason::TransportRestriction, KnownEffects::NONE);
-                    }
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
                 let Some(medium) = self.medium.as_mut() else {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                match medium.poll(fb, data) {
+                let step = medium.poll(fb, data);
+                match &step {
+                    PollStep::Io(_) => {
+                        self.io_issues = self.io_issues.saturating_add(1);
+                    }
+                    PollStep::Prefetch(_) => {
+                        self.prefetch_issues = self.prefetch_issues.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                match step {
                     PollStep::Complete(Completion::Good) if fua => {
                         self.query = Query::Media {
-                            bytes,
+                            bytes: 0,
                             fua,
                             syncing: true,
                         };
@@ -3096,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn short_bank_is_rejected() {
+    fn read_larger_than_the_bank_streams_from_the_medium() {
         let mut dev = drive(100);
         let permit = permit();
         assert_eq!(
@@ -3104,12 +3126,41 @@ mod tests {
             Ok(())
         );
         let mut data = [0u8; 16];
-        assert!(matches!(
-            dev.poll(&permit, Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
-        ));
+        match dev.poll(&permit, Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2048),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        let mut fb = Feedback::plan_accepted();
+        let mut prefetches = 0;
+        let mut ios = 0;
+        loop {
+            match dev.poll(&permit, fb, &mut data) {
+                PollStep::Io(StorageOp::Read { buf, .. }) => {
+                    assert_eq!(buf.len(), 16);
+                    ios += 1;
+                    fb = Feedback::io_done(IoReceipt::test(16, None, Effect::Known));
+                }
+                PollStep::Prefetch(crate::core::storage::PrefetchOp::Read { buf, .. }) => {
+                    assert_eq!(buf.len(), 16);
+                    prefetches += 1;
+                    fb = Feedback::io_done(IoReceipt::test(16, None, Effect::Known));
+                }
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), 16);
+                    fb = Feedback::host_sent(HostReceipt::test(16, None));
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(ios, 1, "only the first chunk is a normal read");
+        assert_eq!(prefetches, 2048 / 16 - 1);
+        assert_eq!(dev.io_issues(), 1);
+        assert_eq!(dev.prefetch_issues(), 2048 / 16 - 1);
         assert!(!dev.active());
-        assert!(!dev.medium().expect("medium").active());
     }
 
     #[test]

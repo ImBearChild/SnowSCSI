@@ -29,14 +29,10 @@
 //!
 //! `work` is **one** data bank: the leading [`pdu::BHS_SIZE`] bytes carry the
 //! wire header, so the usable SCSI data area is exactly `work.len() -
-//! pdu::BHS_SIZE`. A command's whole host transfer must fit in that area: the
-//! core device publishes a single [`DataPlan`](crate::core::DataPlan) and the
-//! transport sends (or receives) it in that one bank, so a transfer larger than
-//! the bank is **not** streamed in chunks. Such a command is answered with a
-//! target-side resource condition
-//! ([`RESOURCE_FAILURE`](crate::core::RESOURCE_FAILURE): `05/55/00`) and the
-//! connection stays usable — it is not a CDB error. Size `work` for the largest
-//! transfer the initiator will issue (plus the 48-byte BHS).
+//! pdu::BHS_SIZE`. That area must be a multiple of 4 (every Data-In PDU is
+//! padded to a 4-byte boundary) and bounds one device data chunk: a command
+//! whose transfer is larger is streamed in bank-sized chunks (Data-In PDUs or
+//! per-chunk R2Ts), so the bank no longer has to hold the whole transfer.
 //!
 //! # Example
 //!

@@ -29,6 +29,8 @@ pub struct MockBotIo {
     pub stall_in_available: bool,
     /// Number of zero-length bulk-IN sends (ZLPs) observed.
     pub zero_in_count: u32,
+    /// Number of non-zero bulk-IN sends observed (data chunks + CSWs).
+    pub in_sends: u32,
 }
 
 impl MockBotIo {
@@ -80,6 +82,8 @@ impl BotIo for MockBotIo {
     fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
         if buf.is_empty() {
             self.zero_in_count += 1;
+        } else {
+            self.in_sends += 1;
         }
         self.in_.extend_from_slice(buf);
         Ok(())

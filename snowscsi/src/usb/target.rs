@@ -30,12 +30,11 @@
 //!
 //! # Work-buffer contract
 //!
-//! `work` is the transport's data bank: it must hold the whole transfer the
-//! device stages (the core slices its I/O to `work.len()`; a larger transfer is
-//! finished with `RESOURCE FAILURE`). The data-in wire stream is chunked at
-//! [`WIRE_CHUNK`] bytes independently of the bank size. `scratch` is the
-//! resident long-operation bank and must hold at least [`crate::MIN_DATA_LEN`]
-//! bytes.
+//! `work` is the transport's data bank: it bounds one device data chunk (the
+//! core streams a larger transfer in bank-sized chunks). The data-in wire
+//! stream is additionally chunked at [`WIRE_CHUNK`] bytes independently of the
+//! bank size. `scratch` is the resident long-operation bank and must hold at
+//! least [`crate::MIN_DATA_LEN`] bytes.
 //!
 //! # Data-In shortfall policy ([`ShortfallPolicy`])
 //!
@@ -297,34 +296,44 @@ enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SendPhase {
     token: HostToken,
-    /// Device plan D (relevant bytes).
+    /// Device plan D (relevant bytes, total across chunks).
     plan: u32,
-    /// Relevant bytes to put on the wire: `min(D, H)`.
-    limit: u32,
-    /// Wire bytes staged so far (relevant + any merged pad fill).
+    /// Relevant bytes already staged on the wire.
+    produced: u32,
+    /// Total wire bytes staged (relevant + any fill) across chunks.
     wire: u32,
-    /// Wire target of this phase (`min(pad_target, work.len())`).
-    stage_limit: u32,
     /// Total wire target including fill (`min(H, D + MAX_PAD)` for `Pad`).
     pad_target: u32,
-    /// Chunk staged and awaiting `Event::HostSent`.
-    staged: Option<u32>,
+    /// Relevant bytes of the current device chunk.
+    chunk_len: u32,
+    /// Relevant bytes accepted by the device for the current chunk.
+    chunk_accept: u32,
+    /// Wire target of the current chunk (end of the relevant data, or the pad
+    /// target when the chunk completes the plan).
+    chunk_wire_end: u32,
+    /// Wire total when the current chunk started.
+    phase_wire_base: u32,
+    /// Chunk staged and awaiting `Event::HostSent`: bank offset and length.
+    staged: Option<(u32, u32)>,
 }
 
 /// Data-Out progress (the device's receive stream).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecvPhase {
     token: HostToken,
-    /// Device plan D.
+    /// Device plan D (total across chunks).
     plan: u32,
     /// Bytes the device accepts: `min(D, H)`.
     limit: u32,
-    /// Wire bytes received into the bank.
+    /// Wire bytes received into the bank (total across chunks).
     received: u32,
-    /// Prefix the device confirmed to the host seam (the `HostReceipt` the
-    /// runner fed back), or 0 while no receipt exists yet.
+    /// Prefix the device confirmed to the host seam (total across chunks).
     accepted: u32,
-    /// Wire bytes this phase must receive before the device may consume them.
+    /// Wire offset where the current device chunk starts.
+    chunk_base: u32,
+    /// Bytes requested by the current device chunk.
+    chunk_len: u32,
+    /// Wire target for the current chunk (`min(H, chunk_base + chunk_len)`).
     wire_target: u32,
     /// The BOT layer finished the wire receive; `poll_host` may answer Ready.
     wire_done: bool,
@@ -335,6 +344,8 @@ struct RecvPhase {
 struct Gate {
     /// A plan was published.
     seen: bool,
+    /// Published device plan length (relevant bytes).
+    plan_bytes: u32,
     /// The plan is a phase error (case 7 / case 13).
     phase_error: bool,
     /// The transport rejected the plan; the runner settles the command.
@@ -344,6 +355,7 @@ struct Gate {
 impl Gate {
     const EMPTY: Gate = Gate {
         seen: false,
+        plan_bytes: 0,
         phase_error: false,
         rejected: false,
     };
@@ -652,20 +664,21 @@ impl BotSession {
                         return Action::Error(BotTargetError::Internal);
                     };
                     let cap = work.len() as u32;
-                    let wire_target = p.wire_target.min(cap);
-                    let remaining = wire_target.saturating_sub(p.received);
+                    let local_received = p.received.saturating_sub(p.chunk_base);
+                    let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
+                    let remaining = local_target.saturating_sub(local_received);
                     if len as u32 > remaining {
                         stray = true;
                         false
                     } else {
-                        if p.received > 0 && len > 0 {
+                        if local_received > 0 && len > 0 {
                             // The shell always lands a receive at `work[0..]`;
                             // move the chunk to its final place in the bank.
-                            let start = p.received as usize;
+                            let start = local_received as usize;
                             work.copy_within(0..len, start);
                         }
                         p.received = p.received.saturating_add(len as u32);
-                        let done = p.received >= wire_target;
+                        let done = p.received >= p.wire_target;
                         if done {
                             p.wire_done = true;
                         }
@@ -1298,14 +1311,15 @@ impl BotSession {
             },
             Stage::Exec => match self.phase {
                 Phase::Send(p) => {
-                    let start = p.wire as usize;
-                    let end = start + p.staged.unwrap_or(0) as usize;
+                    let (bank_offset, len) = p.staged.unwrap_or((0, 0));
+                    let start = bank_offset as usize;
+                    let end = start + len as usize;
                     if end > work.len() || start >= end {
                         return Action::Error(BotTargetError::Internal);
                     }
-                    // Fill bytes beyond the device's plan are zeros, never
-                    // stale bank contents.
-                    let plan = p.plan as usize;
+                    // Fill bytes beyond the device's relevant bytes are zeros,
+                    // never stale bank contents.
+                    let plan = p.chunk_len as usize;
                     if end > plan {
                         work[plan.max(start)..end].fill(0);
                     }
@@ -1315,10 +1329,11 @@ impl BotSession {
                 }
                 Phase::Recv(p) => {
                     let cap = work.len() as u32;
-                    let wire_target = p.wire_target.min(cap);
-                    if p.received < wire_target {
+                    let local_received = p.received.saturating_sub(p.chunk_base);
+                    let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
+                    if local_received < local_target {
                         Action::HostRecv {
-                            len: (wire_target - p.received) as usize,
+                            len: (local_target - local_received) as usize,
                             probe: false,
                         }
                     } else {
@@ -1477,6 +1492,7 @@ fn data_out_opcode(opcode: u8) -> bool {
 impl HostTransport for BotSession {
     fn publish(&mut self, plan: DataPlan) -> Result<(), Fault> {
         self.gate.seen = true;
+        self.gate.plan_bytes = u32::try_from(plan.bytes).unwrap_or(u32::MAX);
         let declared = self.declared;
         let reject = |gate: &mut Gate| {
             gate.phase_error = true;
@@ -1522,45 +1538,116 @@ impl HostTransport for BotSession {
 
     fn begin_recv(&mut self, req: HostReq) -> HostToken {
         let token = self.next_token();
-        if req.dir != Direction::FromHost {
+        if req.dir != Direction::FromHost || req.len == 0 {
             return HostToken::invalid();
         }
-        let plan = req.len;
-        let limit = plan.min(self.declared.min(u64::from(u32::MAX)) as u32);
-        self.phase = Phase::Recv(RecvPhase {
-            token,
-            plan,
-            limit,
-            received: 0,
-            accepted: 0,
-            wire_target: self.declared.min(u64::from(u32::MAX)) as u32,
-            wire_done: false,
-        });
+        let total = self.gate.plan_bytes;
+        let declared = self.declared.min(u64::from(u32::MAX)) as u32;
+        // The wire phase already consumed everything the host declared while
+        // the device still has plan bytes to go (Host out < Device out at an
+        // exact phase boundary). The host cannot send more, so keep the counts
+        // and answer the next device chunk with a zero receipt: the device
+        // short-accepts, aborts, and finish() reports the phase error instead
+        // of waiting for a chunk that will never arrive.
+        if let Phase::Recv(p) = self.phase {
+            if p.received >= declared && p.accepted < p.plan {
+                let mut p = p;
+                p.token = token;
+                p.chunk_base = p.received;
+                p.chunk_len = req.len;
+                p.wire_target = p.received;
+                p.wire_done = true;
+                self.phase = Phase::Recv(p);
+                return token;
+            }
+        }
+        // A later device chunk continues the same wire data phase.
+        let continuing =
+            matches!(self.phase, Phase::Recv(p) if p.received > 0 && p.received < declared);
+        let mut p = match self.phase {
+            Phase::Recv(p) if continuing => p,
+            _ => RecvPhase {
+                token,
+                plan: total,
+                limit: total.min(declared),
+                received: 0,
+                accepted: 0,
+                chunk_base: 0,
+                chunk_len: 0,
+                wire_target: 0,
+                wire_done: false,
+            },
+        };
+        if req.len > total.saturating_sub(p.accepted) {
+            return HostToken::invalid();
+        }
+        p.token = token;
+        p.chunk_base = p.received;
+        p.chunk_len = req.len;
+        // A chunk that completes the plan on the first receive keeps the
+        // original whole-declared phase (the remaining H bytes are drained
+        // after the device consumes D). A chunked transfer reads one chunk per
+        // data phase so the bank never has to hold the whole transfer.
+        let completes_plan = p.received.saturating_add(req.len) >= total;
+        p.wire_target = if completes_plan && p.received == 0 {
+            declared
+        } else {
+            declared.min(p.received.saturating_add(req.len))
+        };
+        p.wire_done = false;
+        self.phase = Phase::Recv(p);
         token
     }
 
     fn begin_send(&mut self, req: HostReq) -> HostToken {
         let token = self.next_token();
-        if req.dir != Direction::ToHost {
+        if req.dir != Direction::ToHost || req.len == 0 {
             return HostToken::invalid();
         }
-        let plan = req.len;
+        let total = self.gate.plan_bytes;
         let declared = self.declared.min(u64::from(u32::MAX)) as u32;
-        let limit = plan.min(declared);
-        let pad_target = if self.shortfall == ShortfallPolicy::Pad && plan < declared {
-            declared.min(plan.saturating_add(MAX_PAD as u32))
+        let limit = total.min(declared);
+        let pad_target = if self.shortfall == ShortfallPolicy::Pad && total < declared {
+            declared.min(total.saturating_add(MAX_PAD as u32))
         } else {
             limit
         };
-        self.phase = Phase::Send(SendPhase {
-            token,
-            plan,
-            limit,
-            wire: 0,
-            stage_limit: pad_target,
-            pad_target,
-            staged: None,
-        });
+        // A later device chunk continues the same Data-In stream.
+        let continuing = matches!(self.phase, Phase::Send(p) if p.produced < p.plan);
+        let mut p = match self.phase {
+            Phase::Send(p) if continuing => p,
+            _ => SendPhase {
+                token,
+                plan: total,
+                produced: 0,
+                wire: 0,
+                pad_target,
+                chunk_len: 0,
+                chunk_accept: 0,
+                chunk_wire_end: 0,
+                phase_wire_base: 0,
+                staged: None,
+            },
+        };
+        if req.len > total.saturating_sub(p.produced) {
+            return HostToken::invalid();
+        }
+        let relevant_end = p.produced.saturating_add(req.len).min(limit);
+        // The send phase is bounded by `limit`, not by the device plan total:
+        // bytes beyond the host's declared length are never put on the wire.
+        // The final relevant chunk also carries any `Pad` fill.
+        let chunk_wire_end = if relevant_end >= p.plan {
+            p.pad_target
+        } else {
+            relevant_end
+        };
+        p.token = token;
+        p.chunk_len = req.len;
+        p.chunk_accept = relevant_end.saturating_sub(p.produced);
+        p.chunk_wire_end = chunk_wire_end;
+        p.phase_wire_base = p.wire;
+        p.staged = None;
+        self.phase = Phase::Send(p);
         token
     }
 
@@ -1570,43 +1657,52 @@ impl HostTransport for BotSession {
                 let HostBuf::Send(b) = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
-                if b.len() != p.plan as usize {
+                if b.len() != p.chunk_len as usize {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 }
-                let Some(chunk) = p.staged.take() else {
+                if p.chunk_accept == 0 {
+                    // The host's declared length is exhausted while the device
+                    // still has plan bytes to send (case 7 at an exact phase
+                    // boundary). There is no relevant byte in this chunk, so
+                    // accept zero: the device short-accepts, aborts, and
+                    // finish() reports the phase error instead of asking for a
+                    // staged chunk that can never exist.
+                    self.phase = Phase::Send(p);
+                    return Poll::Ready(HostReceipt::from_adapter(0, None));
+                }
+                let Some((_, len)) = p.staged.take() else {
                     // First poll: the BOT layer has not staged a chunk yet;
                     // the device must keep waiting.
                     self.phase = Phase::Send(p);
                     return Poll::Pending;
                 };
-                p.wire = p.wire.saturating_add(chunk);
-                // The stage limit is capped to the bank by the caller before
-                // it stages.
-                if p.wire < p.stage_limit {
+                p.wire = p.wire.saturating_add(len);
+                if p.wire < p.chunk_wire_end {
                     self.phase = Phase::Send(p);
                     Poll::Pending
                 } else {
-                    let accepted = p.wire.min(p.plan);
+                    p.produced = p.produced.saturating_add(p.chunk_accept);
                     self.phase = Phase::Send(p);
-                    Poll::Ready(HostReceipt::from_adapter(accepted as usize, None))
+                    Poll::Ready(HostReceipt::from_adapter(p.chunk_accept as usize, None))
                 }
             }
             Phase::Recv(p) if p.token == token => {
                 let HostBuf::Recv(b) = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
-                if b.len() != p.plan as usize {
+                if b.len() != p.chunk_len as usize {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 }
                 if !p.wire_done {
                     self.phase = Phase::Recv(p);
                     return Poll::Pending;
                 }
-                let accepted = p.received.min(p.plan).min(p.limit);
-                // Record the device-confirmed prefix: `finish` must not infer
-                // Data-Out progress from the wire byte count.
+                // The receipt covers this chunk only; the transport keeps the
+                // running total so residue is computed from the whole plan.
+                let end = p.received.min(p.plan).min(p.limit);
+                let accepted = end.saturating_sub(p.accepted);
                 let mut p = p;
-                p.accepted = accepted;
+                p.accepted = end;
                 self.phase = Phase::Recv(p);
                 Poll::Ready(HostReceipt::from_adapter(accepted as usize, None))
             }
@@ -1640,18 +1736,23 @@ impl BotSession {
     /// Stage the next Data-In chunk inside `work` (the caller's bank).
     fn stage_send(&mut self, work_len: usize) {
         if let Phase::Send(p) = &mut self.phase {
-            if p.staged.is_some() {
+            if p.staged.is_some() || p.wire >= p.chunk_wire_end {
                 return;
             }
-            // Cap the wire phase to the bank; anything beyond it is fill the
-            // `Pad` stage emits from the zero source.
-            let cap = work_len.min(u32::MAX as usize) as u32;
-            if p.stage_limit > cap {
-                p.stage_limit = cap;
+            // The bank holds one phase at a time; any fill beyond it is the
+            // `Pad` stage's zero source.
+            let bank_end = p
+                .phase_wire_base
+                .saturating_add(work_len.min(u32::MAX as usize) as u32);
+            if p.chunk_wire_end > bank_end {
+                p.chunk_wire_end = bank_end;
             }
-            if p.wire < p.stage_limit {
-                let n = (p.stage_limit - p.wire).min(WIRE_CHUNK as u32);
-                p.staged = Some(n);
+            let start = p.wire.saturating_sub(p.phase_wire_base);
+            let cap = (work_len.min(u32::MAX as usize) as u32).saturating_sub(start);
+            let remaining = p.chunk_wire_end.saturating_sub(p.wire);
+            let n = remaining.min(WIRE_CHUNK as u32).min(cap);
+            if n > 0 {
+                p.staged = Some((start, n));
             }
         }
     }

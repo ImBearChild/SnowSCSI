@@ -1981,3 +1981,174 @@ fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (2, 0, 0x00));
 }
+
+// ── Multi-chunk host data phases ────────────────────────────────────
+
+/// A READ larger than the bank is delivered in several bulk-IN phases with a
+/// zero residue; a larger WRITE commits every chunk byte-exactly.
+#[test]
+fn transfers_larger_than_the_bank_stream_in_chunks() {
+    let mut ram = vec![0u8; 64 * 1024];
+    for (i, b) in ram.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    // The bank is 8192 bytes: a 32-block transfer is two chunks.
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // READ 32 blocks (16384 bytes) → two bulk-IN data phases.
+    let cdb = rw10(0x28, 0, 32);
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x21, 16384, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 16384 + CSW_LEN);
+    assert_eq!(csw_fields(&sent), (0x21, 0, 0x00), "zero residue");
+    assert!(
+        io.in_sends >= 3,
+        "two data phases plus the CSW (got {})",
+        io.in_sends
+    );
+    let mut check = vec![0u8; 16384];
+    plane_read(&mut storage, 0, &mut check);
+    assert_eq!(&sent[..16384], check.as_slice(), "byte-exact read");
+
+    // WRITE the same 16384 bytes back at LBA 32, feeding two Data-Out chunks.
+    let payload: Vec<u8> = (0..16384u32)
+        .map(|i| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
+    let cdb = rw10(0x2A, 32, 32);
+    io.feed_out(&raw_cbw(0x22, 16384, 0x00, 0, &cdb));
+    io.feed_out(&payload);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (0x22, 0, 0x00), "zero residue");
+    let mut check = vec![0u8; 16384];
+    plane_read(&mut storage, 32 * 512, &mut check);
+    assert_eq!(check, payload, "byte-exact commit");
+}
+
+/// Case (13) Ho < Do at an exact chunk boundary: the first device chunk
+/// consumes the host's whole declared length. No second waiting phase may be
+/// opened; the device aborts and the Phase Error CSW carries the declared
+/// residue.
+#[test]
+fn case_13_at_a_chunk_boundary_terminates_with_a_phase_error() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN]; // 8192-byte bank
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // WRITE 32 blocks = 16384 device bytes; the host declares 8192, exactly
+    // one bank-sized chunk.
+    let cdb = rw10(0x2A, 0, 32);
+    io.feed_out(&raw_cbw(0x31, 8192, 0x00, 0, &cdb));
+    io.feed_out(&[0xA5u8; 8192]);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(
+        csw_fields(&sent),
+        (0x31, 8192, 0x02),
+        "Phase Error, no declared byte confirmed"
+    );
+
+    // The session is still usable.
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x32, 0, 0x00, 0, &[0x00; 6]),
+    );
+    assert_eq!(r, Drive::Processed);
+    assert_eq!(csw_fields(&io.take_sent()), (0x32, 0, 0x00));
+}
+
+/// Case (7) Hi < Di at an exact chunk boundary: the device's next chunk has
+/// no relevant bytes left. It must short-accept, abort, and emit the Phase
+/// Error CSW instead of tearing down the serve loop.
+#[test]
+fn case_07_at_a_chunk_boundary_reports_a_phase_error_and_keeps_the_session() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN]; // 8192-byte bank
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // READ 32 blocks = 16384 device bytes; the host declares 8192, exactly one
+    // bank-sized chunk.
+    let cdb = rw10(0x28, 0, 32);
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x41, 8192, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 8192 + CSW_LEN, "only the host's H bytes go out");
+    assert_eq!(
+        csw_fields(&sent),
+        (0x41, 0, 0x02),
+        "all declared bytes were relevant; Phase Error"
+    );
+
+    // The session is still usable.
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x42, 0, 0x00, 0, &[0x00; 6]),
+    );
+    assert_eq!(r, Drive::Processed);
+    assert_eq!(csw_fields(&io.take_sent()), (0x42, 0, 0x00));
+}
