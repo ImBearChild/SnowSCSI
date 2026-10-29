@@ -53,17 +53,34 @@ pub mod iscsi;
 #[cfg(feature = "usb")]
 pub mod usb;
 
-/// Minimum data-area size for `ScsiDevice::do_cmd`: 8192 bytes.
+/// Minimum SCSI data area accepted by the USB BOT transport: 512 bytes.
 ///
-/// Every command-processing entry point (`do_cmd`, `poll`) takes a
-/// caller-provided scratch buffer and rejects smaller ones at runtime with
-/// `WorkBufTooSmall`. Total RAM budget for one transport + LUN set:
+/// Matches the minimum SCSI logical block length; BOT itself has no larger
+/// minimum (its CBW is 31 bytes). A transfer larger than the area is streamed
+/// in bank-sized chunks, so this is the protocol floor, not a performance
+/// target. iSCSI keeps [`MIN_DATA_LEN`] plus its 48-byte BHS header as the bank
+/// floor: RFC 3720 §6.1 applies the default `MaxRecvDataSegmentLength` (8192)
+/// during Login, so a conformant first Login Request may carry up to 8192 bytes
+/// of text and the bank must be able to stage it.
+pub const MIN_DATA_AREA: usize = 512;
+
+/// Legacy `ScsiDevice` data-area requirement and iSCSI/`scratch` basis:
+/// 8192 bytes.
+///
+/// The legacy `ScsiDevice` command-processing entry points (`do_cmd`, `poll`)
+/// **require** this size and reject smaller buffers with `WorkBufTooSmall`.
+/// The core iSCSI transport sizes its `work` bank as this plus the 48-byte BHS
+/// (the Login text above must fit) and both core transports require this size
+/// for the resident long-operation `scratch` bank. USB BOT accepts any `work`
+/// data area down to [`MIN_DATA_AREA`]. Total RAM budget for one transport +
+/// LUN set:
 ///
 /// | Component | Size |
 /// |-----------|------|
-/// | SCSI data area (`data` / work buffer data region) | ≥ [`MIN_DATA_LEN`] |
+/// | SCSI data area (`data` / work buffer data region) | ≥ [`MIN_DATA_AREA`] (USB BOT), ≥ [`MIN_DATA_LEN`] (iSCSI, legacy `ScsiDevice`) |
 /// | iSCSI: PDU header prefix in front of the data area | `BHS_SIZE` (48 B) |
-/// | USB BOT: single time-multiplexed `work` buffer | ≥ [`MIN_DATA_LEN`] |
+/// | USB BOT: single time-multiplexed `work` buffer | ≥ [`MIN_DATA_AREA`] |
+/// | Resident long-operation `scratch` (iSCSI, USB BOT) | ≥ [`MIN_DATA_LEN`] |
 /// | Session state (`IscsiSession` / `BotSession`) | few hundred bytes each |
 ///
 /// See `ScsiDevice` for the full contract.

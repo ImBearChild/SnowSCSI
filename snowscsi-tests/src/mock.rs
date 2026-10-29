@@ -2370,6 +2370,116 @@ mod tests {
         assert_eq!(sizes, vec![512; 4], "one PDU per declared segment");
     }
 
+    /// The iSCSI floor bank: the data area is `MIN_DATA_LEN`, so the Login
+    /// Response declares `MaxRecvDataSegmentLength = 8192` (the default that
+    /// applies during Login, RFC 3720 §6.1) and a two-block READ completes.
+    #[test]
+    fn default_bank_declares_8192_and_streams_data_in() {
+        const READ_LEN: usize = 2 * 512;
+        let mut ram = vec![0u8; 16 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected = ram[..READ_LEN].to_vec();
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(32, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "MaxRecvDataSegmentLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, "8192");
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&data, "MaxRecvDataSegmentLength"),
+            Some(b"8192".as_slice()),
+            "the floor bank declares the Login default, never less"
+        );
+
+        conn.feed(&read10_bhs(0, 2, 0x5454, 0), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let mut collected = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                collected.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(collected, expected, "the read is byte-exact");
+    }
+
+    /// A bank larger than the cap still declares 8192: the Login Response value
+    /// is the protocol maximum, never the caller's buffer size.
+    #[test]
+    fn a_large_bank_keeps_the_8192_declaration() {
+        let mut ram = vec![0u8; 16 * 1024];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(32768, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; 1024 * 1024 + BHS_SIZE];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+
+        let text = REQ_TEXT.as_bytes();
+        conn.feed_padded(&login_bhs(text.len() as u32), text);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&data, "MaxRecvDataSegmentLength"),
+            Some(b"8192".as_slice()),
+            "the declaration is capped at 8192 regardless of the bank size"
+        );
+    }
+
     #[test]
     fn data_out_above_our_recv_segment_is_rejected() {
         let mut ram = vec![0u8; 16 * 1024];
@@ -2991,8 +3101,10 @@ mod tests {
         let mut work = vec![0u8; WORK_LEN];
         let mut scratch = vec![0u8; MIN_DATA_LEN];
 
-        // The data area must be `MIN_DATA_LEN` plus the BHS.
-        let mut short_work = vec![0u8; MIN_DATA_LEN];
+        // The data area must be `MIN_DATA_LEN` plus the BHS: a smaller bank
+        // cannot stage a Login Request carrying the default
+        // `MaxRecvDataSegmentLength` bytes of text (RFC 3720 §6.1).
+        let mut short_work = vec![0u8; MIN_DATA_LEN + BHS_SIZE - 1];
         assert!(matches!(
             session.poll(
                 Event::Tick,

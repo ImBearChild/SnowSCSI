@@ -13,8 +13,8 @@
 //! and the shell's storage adapter executes the device's I/O.
 //!
 //! The data area handed to the SCSI device layer is a pure data region
-//! ([`crate::MIN_DATA_LEN`]); CBWs and CSWs live in `BotSession`'s internal
-//! buffers, so protocol frames never share memory with SCSI data.
+//! ([`crate::MIN_DATA_AREA`] minimum); CBWs and CSWs live in `BotSession`'s
+//! internal buffers, so protocol frames never share memory with SCSI data.
 //!
 //! # Example: driving one BOT transaction
 //!

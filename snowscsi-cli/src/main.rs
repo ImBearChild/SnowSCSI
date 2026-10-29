@@ -58,7 +58,7 @@ use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{FlatCdMedium, MmcDrive};
 use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
-use snowscsi::MIN_DATA_LEN;
+use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
 use stack::{CliLu, CliMedium, CliPair, CliStorage};
 
@@ -166,10 +166,11 @@ struct ServeArgs {
     #[arg(long, short, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Work buffer size in bytes (accepts K/M/G suffixes; default 1M).
-    /// It bounds one data chunk: the SCSI data area is this size minus the
-    /// 48-byte iSCSI BHS, and a larger READ/WRITE is streamed in
-    /// bank-sized chunks rather than rejected.
+    /// Work buffer size in bytes (accepts K/M/G suffixes; minimum 8240 for
+    /// iSCSI, 512 for USB; default 1M). It bounds one data chunk, not the
+    /// transfer: the SCSI data area is this size minus the 48-byte iSCSI BHS,
+    /// and a larger READ/WRITE is streamed in bank-sized chunks rather than
+    /// rejected.
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
 }
@@ -223,7 +224,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
-        if let Err(msg) = check_iscsi_data_area(work_size) {
+        if let Err(msg) = check_iscsi_work_size(work_size) {
             eprintln!("snowscsi: {msg}");
             return ExitCode::FAILURE;
         }
@@ -231,6 +232,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     {
+        if let Err(msg) = check_usb_work_size(work_size) {
+            eprintln!("snowscsi: {msg}");
+            return ExitCode::FAILURE;
+        }
         let selector = args.usb.as_deref().unwrap_or("auto");
         return run_serve_usb(&args, &specs, work_size, selector);
     }
@@ -481,7 +486,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> E
     }
 
     let mut work = vec![0u8; work_size];
-    let mut scratch = vec![0u8; work_size];
+    let mut scratch = vec![0u8; scratch_size(work_size)];
     log::info!("listening on {bound} with {} LUN(s)", table.len());
 
     let auto_handle = if is_auto {
@@ -1152,7 +1157,7 @@ fn run_serve_usb(
     let lun_count = table.len();
     let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
     let mut work = vec![0u8; work_size];
-    let mut scratch = vec![0u8; work_size];
+    let mut scratch = vec![0u8; scratch_size(work_size)];
     let mut target = snowscsi::core::Target::new(&mut table[..]);
 
     log::info!("serving {} LUN(s) over USB", lun_count);
@@ -1688,34 +1693,63 @@ fn init_logging(verbose: u8) {
     let _ = builder.try_init();
 }
 
-/// Resolve the work buffer size (default 1M), validating it against
-/// [`MIN_DATA_LEN`] plus the iSCSI PDU header.
+/// Resolve the work buffer size (default 1M): the raw parse plus the absolute
+/// floor both transports share ([`MIN_DATA_AREA`]).
 ///
-/// The buffer bounds one data chunk, with the 48-byte BHS prefix in front of
-/// the SCSI data area. The data area must be a multiple of 4 (every Data-In
-/// PDU is padded to a 4-byte boundary). A transfer larger than the area is
-/// streamed in bank-sized chunks, so this is a throughput/latency knob rather
-/// than a maximum transfer size.
+/// Each transport then enforces its own minimum:
+/// [`check_iscsi_work_size`] (BHS + Login text) or [`check_usb_work_size`].
+/// A transfer larger than the buffer is streamed in bank-sized chunks, so this
+/// is a throughput/latency knob rather than a maximum transfer size.
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     let bytes = match s {
         None => DEFAULT_WORK_BUF_SIZE as u64,
         Some(v) => spec::parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
     };
     let n = usize::try_from(bytes).map_err(|_| format!("--work-buf-size {bytes} is too large"))?;
-    let min = MIN_DATA_LEN + BHS_SIZE;
-    if n < min {
-        return Err(format!("--work-buf-size {n} is below the minimum {min}"));
+    if n < MIN_DATA_AREA {
+        return Err(format!(
+            "--work-buf-size {n} is below the minimum {MIN_DATA_AREA}"
+        ));
     }
     Ok(n)
 }
 
-/// The iSCSI data area behind the BHS must be a multiple of 4: the session
-/// rejects a misaligned area instead of relying on the padding invariant. BOT
-/// has no such header, so the check is scoped to the iSCSI transport.
-fn check_iscsi_data_area(n: usize) -> Result<(), String> {
+/// Resident long-operation bank size: never below [`MIN_DATA_LEN`], and never
+/// smaller than the PDU bank it runs beside.
+///
+/// A `--work-buf-size` at the USB floor is legal for `work`, but the
+/// long-operation bank still needs [`MIN_DATA_LEN`] bytes.
+fn scratch_size(work_size: usize) -> usize {
+    work_size.max(MIN_DATA_LEN)
+}
+
+/// iSCSI `work` floor: [`MIN_DATA_LEN`] plus the 48-byte BHS, and a data area
+/// that is a multiple of 4 (every Data-In PDU is padded to a 4-byte boundary).
+///
+/// The floor covers a Login Request carrying the default
+/// `MaxRecvDataSegmentLength` (RFC 3720 §6.1) bytes of text; a smaller bank
+/// could not stage a conformant first Login Request.
+fn check_iscsi_work_size(n: usize) -> Result<(), String> {
+    let min = MIN_DATA_LEN + BHS_SIZE;
+    if n < min {
+        return Err(format!(
+            "--work-buf-size {n} is below the iSCSI minimum {min}"
+        ));
+    }
     if !(n - BHS_SIZE).is_multiple_of(4) {
         return Err(format!(
             "--work-buf-size {n} leaves a data area that is not a multiple of 4"
+        ));
+    }
+    Ok(())
+}
+
+/// USB BOT `work` floor: [`MIN_DATA_AREA`], with no header prefix and no
+/// alignment requirement.
+fn check_usb_work_size(n: usize) -> Result<(), String> {
+    if n < MIN_DATA_AREA {
+        return Err(format!(
+            "--work-buf-size {n} is below the USB minimum {MIN_DATA_AREA}"
         ));
     }
     Ok(())
@@ -1754,25 +1788,47 @@ mod tests {
     fn parse_work_size_defaults_and_validation() {
         assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
         assert_eq!(parse_work_size(Some("128K")).unwrap(), 128 * 1024);
-        assert!(parse_work_size(Some("1000")).is_err()); // far below the minimum
-        assert!(
-            parse_work_size(Some("8192")).is_err(),
-            "the 48-byte iSCSI BHS must fit in front of the data area"
-        );
+        assert!(parse_work_size(Some("511")).is_err()); // below the USB floor
+        assert_eq!(parse_work_size(Some("512")).unwrap(), MIN_DATA_AREA);
+        assert!(parse_work_size(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn work_size_minimums_are_transport_specific() {
+        // iSCSI: MIN_DATA_LEN + BHS (the Login text must fit) and a 4-aligned
+        // data area.
         assert_eq!(
-            parse_work_size(Some("8240")).unwrap(),
-            MIN_DATA_LEN + BHS_SIZE
-        );
-        assert_eq!(
-            parse_work_size(Some("8241")).unwrap(),
-            MIN_DATA_LEN + BHS_SIZE + 1
+            check_iscsi_work_size(MIN_DATA_LEN + BHS_SIZE),
+            Ok(()),
+            "8240 is the iSCSI floor"
         );
         assert!(
-            check_iscsi_data_area(8241).is_err(),
+            check_iscsi_work_size(MIN_DATA_LEN + BHS_SIZE - 1).is_err(),
+            "8239 cannot stage the Login text"
+        );
+        assert!(
+            check_iscsi_work_size(560).is_err(),
+            "a 560-byte bank is below the iSCSI floor"
+        );
+        assert!(
+            check_iscsi_work_size(MIN_DATA_LEN + BHS_SIZE + 1).is_err(),
             "the iSCSI data area must be a multiple of 4"
         );
-        assert!(check_iscsi_data_area(MIN_DATA_LEN + BHS_SIZE).is_ok());
-        assert!(parse_work_size(Some("bogus")).is_err());
+
+        // USB: the 512-byte data area needs neither a header prefix nor
+        // alignment.
+        assert_eq!(check_usb_work_size(MIN_DATA_AREA), Ok(()));
+        assert!(check_usb_work_size(MIN_DATA_AREA - 1).is_err());
+        assert_eq!(check_usb_work_size(513), Ok(()));
+
+        // The long-operation bank keeps its own 8192-byte requirement.
+        assert_eq!(scratch_size(MIN_DATA_AREA), MIN_DATA_LEN);
+        assert_eq!(
+            scratch_size(MIN_DATA_LEN + BHS_SIZE),
+            MIN_DATA_LEN + BHS_SIZE,
+            "above the floor the scratch bank tracks the PDU bank"
+        );
+        assert_eq!(scratch_size(DEFAULT_WORK_BUF_SIZE), DEFAULT_WORK_BUF_SIZE);
     }
 
     #[test]

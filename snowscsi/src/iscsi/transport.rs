@@ -392,4 +392,92 @@ mod tests {
             handle.join().unwrap();
         });
     }
+
+    /// A connection whose peer is already gone: every read returns EOF.
+    struct Eof;
+
+    impl embedded_io::ErrorType for Eof {
+        type Error = std::io::Error;
+    }
+
+    impl embedded_io::Read for Eof {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Ok(0)
+        }
+    }
+
+    impl embedded_io::Write for Eof {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// `MIN_DATA_LEN` + BHS is accepted, one byte less is rejected before any
+    /// wire read.
+    #[test]
+    fn serve_conn_checks_the_bank_floor_before_reading() {
+        let mut slot = LuImpl::new(Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))), 0u8);
+        let mut table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 1] = [&mut slot];
+        let mut storage = BlockingStorage::new(Sink);
+        let mut session = IscsiSession::new();
+        let mut target = Target::new(&mut table[..]);
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+
+        let mut short = vec![0u8; MIN_DATA_LEN + BHS_SIZE - 1];
+        let mut conn = Eof;
+        assert_eq!(
+            serve_conn(
+                &mut conn,
+                &mut short,
+                &mut scratch,
+                &mut session,
+                &mut target,
+                &mut storage
+            ),
+            Err(TargetError::WorkBufTooSmall)
+        );
+
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut conn = Eof;
+        assert_eq!(
+            serve_conn(
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut session,
+                &mut target,
+                &mut storage
+            ),
+            Ok(()),
+            "the floor bank is accepted; the peer EOF closes the connection"
+        );
+    }
+
+    /// The accept-loop entry applies the same floor before accepting.
+    #[test]
+    fn serve_checks_the_bank_floor_before_accepting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE - 1];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        let mut slot = LuImpl::new(Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))), 0u8);
+        let mut table: [&mut dyn Lu<Pair = Pair<NoMedium, u8>>; 1] = [&mut slot];
+        let mut storage = BlockingStorage::new(Sink);
+        assert_eq!(
+            serve(
+                listener,
+                &stop,
+                &mut work,
+                &mut scratch,
+                &mut table,
+                &mut storage,
+                None
+            ),
+            Err(TargetError::WorkBufTooSmall)
+        );
+    }
 }

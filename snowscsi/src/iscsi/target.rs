@@ -34,8 +34,10 @@
 //! pdu::BHS_SIZE`. The leading [`pdu::BHS_SIZE`] bytes carry the wire header;
 //! the remainder is the SCSI data area and the transport's [`HostTransport`]
 //! bank, which bounds one device data chunk (a larger transfer is streamed in
-//! chunks). `scratch` is the resident long-operation bank and must hold at
-//! least [`crate::MIN_DATA_LEN`] bytes.
+//! chunks). Its size also fixes this target's declared
+//! `MaxRecvDataSegmentLength` for the connection (RFC 3720 §12.12). `scratch`
+//! is the resident long-operation bank and must hold at least
+//! [`crate::MIN_DATA_LEN`] bytes.
 
 use core::cell::Cell;
 
@@ -107,9 +109,9 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetError {
     /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
-    /// `BHS_SIZE` (data area too small for the SCSI layer), its data area
-    /// (`work.len() - BHS_SIZE`) is not a multiple of 4, or the scratch bank
-    /// is smaller than [`crate::MIN_DATA_LEN`].
+    /// `BHS_SIZE` (data area too small for the SCSI layer and the Login text),
+    /// its data area (`work.len() - BHS_SIZE`) is not a multiple of 4, or the
+    /// scratch bank is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// Connection I/O failure (details logged by the transport).
     Io,
@@ -121,7 +123,10 @@ impl core::fmt::Display for TargetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::WorkBufTooSmall => {
-                write!(f, "work buffer below MIN_DATA_LEN + BHS_SIZE or misaligned")
+                write!(
+                    f,
+                    "work buffer below MIN_DATA_LEN + BHS_SIZE, scratch below MIN_DATA_LEN, or misaligned"
+                )
             }
             Self::Io => write!(f, "connection I/O failure"),
             Self::Internal => write!(f, "internal target error"),
@@ -198,13 +203,20 @@ const DEFAULT_MAX_BURST: u32 = 262144;
 const HARD_CAP: u32 = 0xFF_FFFF;
 /// RFC 3720 §12.12 floor for `MaxRecvDataSegmentLength`.
 const MIN_RECV_DATA_SEGMENT: u32 = 512;
-/// The largest data segment this target can receive in one PDU.
+/// Upper cap for the `MaxRecvDataSegmentLength` this target accepts.
 ///
 /// This is our own receive capability (RFC 3720 §12.12 is declarative and per
 /// direction): it bounds incoming Data-Out segments and is what the Login
-/// Response declares, independently of what the initiator offered. The work
-/// bank guarantees a data area of at least [`crate::MIN_DATA_LEN`], so 8192 is
-/// always receivable; the value can be raised later without affecting Data-In
+/// Response declares, independently of what the initiator offered. The value is
+/// derived from the work bank at the first entry
+/// (`clamp(data_area, 512, 8192)`) and stays fixed for the connection.
+///
+/// The bank floor is [`crate::MIN_DATA_LEN`] + `BHS_SIZE`, so the derivation
+/// settles at 8192 rather than at the protocol minimum of 512: RFC 3720 §6.1
+/// applies the default `MaxRecvDataSegmentLength` (8192) during Login, before
+/// any negotiation, so a conformant first Login Request may carry up to 8192
+/// bytes of text. The bank must be able to stage it; a smaller declared value
+/// only becomes safe once the Login text is streamed. It never bounds Data-In
 /// (that direction is bounded by the initiator's declaration).
 const OUR_RECV_MDSL: u32 = 8192;
 /// SCSI status BUSY (SPC-3); no constant exists in the PDU module.
@@ -454,6 +466,9 @@ pub struct IscsiSession {
     /// Largest data segment this target accepts (our own capability); bounds
     /// incoming Data-Out and is declared in the Login Response.
     our_recv_mdsl: u32,
+    /// `our_recv_mdsl` was derived from the work bank; the value is fixed for
+    /// the connection once the first entry has seen the bank.
+    recv_mdsl_fixed: bool,
     /// Largest data segment the initiator declared it can receive; bounds
     /// every Data-In PDU we send.
     peer_recv_mdsl: u32,
@@ -522,6 +537,7 @@ impl IscsiSession {
             stat_sn: Cell::new(0),
             stage: LoginStage::Security,
             our_recv_mdsl: OUR_RECV_MDSL,
+            recv_mdsl_fixed: false,
             // RFC 3720 §12.12 default until the initiator declares its own.
             peer_recv_mdsl: OUR_RECV_MDSL,
             neg: NegotiatedParams::default(),
@@ -582,6 +598,8 @@ impl IscsiSession {
     /// The data area bounds one device data chunk (`work.len() - BHS_SIZE`);
     /// a larger transfer is streamed in bank-sized chunks, and each Data-In
     /// PDU still carries at most `MaxRecvDataSegmentLength` bytes.
+    /// The data area also fixes the `MaxRecvDataSegmentLength` this target
+    /// declares for the connection (RFC 3720 §12.12).
     /// `scratch` is the resident long-operation bank (`>= MIN_DATA_LEN`).
     ///
     /// `target` owns the LUN slots, `storage` executes the device's storage
@@ -607,6 +625,20 @@ impl IscsiSession {
         }
         if scratch.len() < crate::MIN_DATA_LEN {
             return Action::Error(TargetError::WorkBufTooSmall);
+        }
+        // Our own receive capability is the bank's data area, clamped to the
+        // protocol range (RFC 3720 §12.12). The bank floor is
+        // `MIN_DATA_LEN + BHS_SIZE`, so this settles at the 8192 cap: the
+        // default MDSL applies during Login (RFC 3720 §6.1) and a conformant
+        // first Login Request may carry up to 8192 bytes of text, which the
+        // bank must be able to stage. Derive it before any PDU is framed, so
+        // the Login Response declares it, and never change it while the
+        // connection lives.
+        if !self.recv_mdsl_fixed {
+            self.our_recv_mdsl = (work.len() - BHS_SIZE)
+                .clamp(MIN_RECV_DATA_SEGMENT as usize, OUR_RECV_MDSL as usize)
+                as u32;
+            self.recv_mdsl_fixed = true;
         }
         let emit = self.entry(ev, work, scratch, target, storage);
         match emit {

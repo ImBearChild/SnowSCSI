@@ -1646,6 +1646,46 @@ fn mmc_vendor_read_larger_than_the_bank_streams_without_check() {
     );
 }
 
+/// The core floor is not block-granular: a 512-byte bank streams a 2048-byte
+/// logical block in 512-byte pieces, byte-exact.
+#[test]
+fn mmc_read_with_a_512_byte_bank_streams_byte_exact() {
+    const BANK: usize = 512;
+    const TOTAL: usize = 2 * 2048;
+
+    let mut target = mmc_flat_target(8);
+    let mut storage = BlockingStorage::new(Plane::new(16 * 1024));
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; BANK];
+    let mut scratch = [0u8; 64];
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(Direction::ToHost, TOTAL as u64),
+            &read10(0, 2),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(
+        host.inner().sent,
+        vec![0xEE; TOTAL],
+        "two 2048-byte blocks delivered in 512-byte pieces"
+    );
+    let reads = &storage.inner().reads;
+    assert_eq!(reads.len(), TOTAL / BANK);
+    for (i, read) in reads.iter().enumerate() {
+        assert_eq!(
+            *read,
+            ((i * BANK) as u64, BANK),
+            "read {i} is one 512-byte piece, not a whole logical block"
+        );
+    }
+}
+
 /// A fixed-length SPC response larger than the caller's bank is sent short: a
 /// legal Data-In underflow with no CHECK CONDITION, and the session stays
 /// usable for the next command.

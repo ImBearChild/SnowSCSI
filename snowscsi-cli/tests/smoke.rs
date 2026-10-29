@@ -143,6 +143,8 @@ fn serve_rejects_unknown_option() {
 
 #[test]
 fn serve_rejects_work_buf_too_small() {
+    // 560 is legal for USB but below the iSCSI floor (MIN_DATA_LEN + BHS): the
+    // process must fail fast with a clear error instead of binding and serving.
     let out = run(&[
         "serve",
         "--block",
@@ -150,7 +152,24 @@ fn serve_rejects_work_buf_too_small() {
         "--iscsi",
         "127.0.0.1:3260",
         "--work-buf-size",
-        "1000",
+        "560",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("iSCSI minimum 8240"),
+        "expected a clear iSCSI floor message, got: {err}"
+    );
+
+    // Below the absolute (USB) floor both transports reject it.
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:3260",
+        "--work-buf-size",
+        "511",
     ]);
     assert!(!out.status.success());
 }

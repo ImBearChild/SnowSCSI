@@ -15,8 +15,8 @@ use snowscsi::common::store::{StoreOp, StorePlane};
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
-    Action, BotIo, BotIoErr, BotSession, CtrlAck, CtrlReply, CtrlReq, Event, Gadget,
-    ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN, MAX_PAD,
+    Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
+    Gadget, ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN, MAX_PAD,
 };
 use std::sync::atomic::Ordering;
 
@@ -370,6 +370,110 @@ fn command_sequence_read_and_write_verify_backend() {
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(&sent[..512], payload.as_slice());
+}
+
+/// A 512-byte work bank (the transport floor) serves a two-block READ and
+/// WRITE byte-exactly: the data area is not block-granular.
+#[test]
+fn floor_work_bank_reads_and_writes_byte_exact() {
+    let mut ram = vec![0u8; 64 * 1024];
+    for (i, b) in ram.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_AREA];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // READ(10) LBA 0, 2 blocks → 1024 bytes through a 512-byte bank.
+    let cdb = rw10(0x28, 0, 2);
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x51, 1024, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), 1024 + CSW_LEN);
+    let mut expected = [0u8; 1024];
+    plane_read(&mut storage, 0, &mut expected);
+    assert_eq!(&sent[..1024], &expected[..], "the floor-bank read is exact");
+    assert_eq!(csw_fields(&sent), (0x51, 0, 0x00));
+
+    // WRITE(10) LBA 2, 2 blocks with a 1024-byte Data-Out phase.
+    let payload: Vec<u8> = (0..1024u32).map(|i| (i * 11 % 256) as u8).collect();
+    let cdb = rw10(0x2A, 2, 2);
+    let cbw = raw_cbw(0x52, 1024, 0x00, 0, &cdb);
+    io.feed_out(&cbw);
+    io.feed_out(&payload);
+    assert_eq!(
+        drive_until_done(
+            &mut s,
+            &mut io,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        ),
+        Drive::Processed
+    );
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (0x52, 0, 0x00));
+    let mut check = [0u8; 1024];
+    plane_read(&mut storage, 1024, &mut check);
+    assert_eq!(
+        &check[..],
+        payload.as_slice(),
+        "the floor-bank write is exact"
+    );
+}
+
+/// The work floor is 512 bytes; the long-operation bank keeps its 8192-byte
+/// requirement.
+#[test]
+fn work_bank_below_the_floor_and_short_scratch_are_rejected() {
+    let mut ram = vec![0u8; 4096];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(8, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+
+    let mut short_work = [0u8; snowscsi::MIN_DATA_AREA - 1];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    assert!(matches!(
+        s.poll(
+            Event::Tick,
+            &mut short_work,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
+        Action::Error(BotTargetError::WorkBufTooSmall)
+    ));
+
+    let mut work = [0u8; snowscsi::MIN_DATA_AREA];
+    let mut short_scratch = [0u8; snowscsi::MIN_DATA_LEN - 1];
+    assert!(matches!(
+        s.poll(
+            Event::Tick,
+            &mut work,
+            &mut short_scratch,
+            &mut target,
+            &mut storage
+        ),
+        Action::Error(BotTargetError::WorkBufTooSmall)
+    ));
 }
 
 #[test]

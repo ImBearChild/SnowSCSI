@@ -31,10 +31,11 @@
 //! # Work-buffer contract
 //!
 //! `work` is the transport's data bank: it bounds one device data chunk (the
-//! core streams a larger transfer in bank-sized chunks). The data-in wire
-//! stream is additionally chunked at [`WIRE_CHUNK`] bytes independently of the
-//! bank size. `scratch` is the resident long-operation bank and must hold at
-//! least [`crate::MIN_DATA_LEN`] bytes.
+//! core streams a larger transfer in bank-sized chunks) and must hold at least
+//! [`crate::MIN_DATA_AREA`] bytes. The data-in wire stream is additionally
+//! chunked at [`WIRE_CHUNK`] bytes independently of the bank size. `scratch` is
+//! the resident long-operation bank and must hold at least
+//! [`crate::MIN_DATA_LEN`] bytes.
 //!
 //! # Data-In shortfall policy ([`ShortfallPolicy`])
 //!
@@ -221,7 +222,7 @@ pub enum Event {
 /// Core-level error (no_std).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotTargetError {
-    /// The caller's `work` buffer is smaller than [`crate::MIN_DATA_LEN`], or
+    /// The caller's `work` buffer is smaller than [`crate::MIN_DATA_AREA`], or
     /// the scratch bank is smaller than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// I/O failure (reported through the shell).
@@ -233,7 +234,7 @@ pub enum BotTargetError {
 impl core::fmt::Display for BotTargetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_LEN"),
+            Self::WorkBufTooSmall => write!(f, "work buffer smaller than MIN_DATA_AREA"),
             Self::Io => write!(f, "bulk I/O failure"),
             Self::Internal => write!(f, "internal BOT state error"),
         }
@@ -507,7 +508,7 @@ impl BotSession {
         target: &'a mut Target<S>,
         storage: &'a mut dyn Storage,
     ) -> Action<'a> {
-        if work.len() < crate::MIN_DATA_LEN || scratch.len() < crate::MIN_DATA_LEN {
+        if work.len() < crate::MIN_DATA_AREA || scratch.len() < crate::MIN_DATA_LEN {
             return Action::Error(BotTargetError::WorkBufTooSmall);
         }
         self.num_luns = target.slot_count().clamp(1, 16) as u8;
@@ -705,7 +706,9 @@ impl BotSession {
                 csw,
             } => {
                 if probe {
-                    if len < DRAIN_CHUNK {
+                    // A full probe means the host may still have overrun bytes;
+                    // a short one proves the OUT pipe is empty.
+                    if len < DRAIN_CHUNK.min(work.len()) {
                         self.write_csw(csw);
                     } else {
                         self.stage = Stage::Drain {
@@ -1384,10 +1387,12 @@ impl BotSession {
                 remaining, probe, ..
             } => Action::HostRecv {
                 offset: 0,
+                // Every drain window is clipped to the caller's bank; the
+                // overrun probe must not ask for more than the bank holds.
                 len: if probe {
-                    DRAIN_CHUNK
+                    DRAIN_CHUNK.min(work.len())
                 } else {
-                    remaining.min(DRAIN_CHUNK as u64) as usize
+                    (remaining.min(DRAIN_CHUNK as u64) as usize).min(work.len())
                 },
                 probe,
             },
