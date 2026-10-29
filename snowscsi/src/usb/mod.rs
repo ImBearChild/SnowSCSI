@@ -76,7 +76,11 @@
 //!     &mut target,
 //!     &mut storage,
 //! ) {
-//!     Action::HostRecv { len, probe: false } => assert_eq!(len, CBW_LEN),
+//!     Action::HostRecv {
+//!         offset: 0,
+//!         len,
+//!         probe: false,
+//!     } => assert_eq!(len, CBW_LEN),
 //!     other => panic!("expected next CBW receive, got {other:?}"),
 //! }
 //! ```

@@ -31,6 +31,9 @@ pub struct MockBotIo {
     pub zero_in_count: u32,
     /// Number of non-zero bulk-IN sends observed (data chunks + CSWs).
     pub in_sends: u32,
+    /// Cap on one bulk-OUT read, mimicking one USB request. `None` delivers
+    /// everything the caller asked for at once (the historical behaviour).
+    pub max_out_per_read: Option<usize>,
 }
 
 impl MockBotIo {
@@ -62,7 +65,8 @@ impl MockBotIo {
         if self.out.is_empty() {
             return Err(BotIoErr::WouldBlock);
         }
-        let n = self.out.len().min(buf.len());
+        let cap = self.max_out_per_read.unwrap_or(usize::MAX);
+        let n = self.out.len().min(buf.len()).min(cap);
         for (i, b) in self.out.drain(..n).enumerate() {
             buf[i] = b;
         }

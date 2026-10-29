@@ -73,8 +73,14 @@ enum Drive {
 /// The pending [`Action`], with every borrow dropped so the driver can touch
 /// `work` again before the next `poll`.
 enum Step {
-    Recv { len: usize, probe: bool },
-    Sent { is_csw: bool },
+    Recv {
+        offset: usize,
+        len: usize,
+        probe: bool,
+    },
+    Sent {
+        is_csw: bool,
+    },
     StallBoth,
     StallIn,
 }
@@ -99,7 +105,7 @@ fn next_step<S: RuntimeSet>(
     io: &mut MockBotIo,
 ) -> Step {
     match session.poll(ev, work, scratch, target, storage) {
-        Action::HostRecv { len, probe } => Step::Recv { len, probe },
+        Action::HostRecv { offset, len, probe } => Step::Recv { offset, len, probe },
         Action::HostSend { bytes } => {
             let is_csw = bytes.len() == CSW_LEN;
             io.send_in(bytes).unwrap();
@@ -127,18 +133,18 @@ fn drive_until_done<S: RuntimeSet>(
     let mut stalled = false;
     loop {
         match next_step(session, ev, work, scratch, target, storage, io) {
-            Step::Recv { len, probe } => {
+            Step::Recv { offset, len, probe } => {
                 if csw_sent && len == CBW_LEN && !probe {
                     return Drive::Processed;
                 }
                 if probe {
-                    match io.try_recv_out(&mut work[..len]) {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
                         Ok(n) => ev = Event::HostRecv { len: n },
                         Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
                         Err(_) => panic!("mock bulk-OUT I/O error"),
                     }
                 } else {
-                    match io.try_recv_out(&mut work[..len]) {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
                         Ok(n) if n > 0 => ev = Event::HostRecv { len: n },
                         Err(BotIoErr::WouldBlock) if stalled => return Drive::Stalled,
                         _ => panic!("mock out-queue ran dry on a blocking receive"),
@@ -217,6 +223,7 @@ fn assert_command_boundary<S: RuntimeSet>(
 ) {
     match session.poll(Event::Tick, work, scratch, target, storage) {
         Action::HostRecv {
+            offset: 0,
             len: CBW_LEN,
             probe: false,
         } => {}
@@ -894,7 +901,14 @@ fn bot_reset_interrupts_data_phase() {
         &mut target,
         &mut storage,
     ) {
-        Action::HostRecv { len, probe: false } => len,
+        Action::HostRecv {
+            offset,
+            len,
+            probe: false,
+        } => {
+            assert_eq!(offset, 0, "a CBW lands at the start of the bank");
+            len
+        }
         _ => panic!("expected a CBW receive"),
     };
     assert_eq!(len, CBW_LEN);
@@ -908,6 +922,7 @@ fn bot_reset_interrupts_data_phase() {
         &mut storage,
     ) {
         Action::HostRecv {
+            offset: 0,
             len: 512,
             probe: false,
         } => {}
@@ -916,7 +931,7 @@ fn bot_reset_interrupts_data_phase() {
 
     // Partial data received: the session moves it and asks for the rest.
     io.feed_out(&[0xAA; 128]);
-    let n = io.try_recv_out(&mut work[..512]).unwrap();
+    let n = io.try_recv_out(&mut work[128..512]).unwrap();
     assert_eq!(n, 128);
     match s.poll(
         Event::HostRecv { len: n },
@@ -926,6 +941,7 @@ fn bot_reset_interrupts_data_phase() {
         &mut storage,
     ) {
         Action::HostRecv {
+            offset: 128,
             len: 384,
             probe: false,
         } => {}
@@ -1185,18 +1201,18 @@ fn drive_short<S: RuntimeSet>(
     let mut stalled_once = false;
     loop {
         match next_step(session, ev, work, scratch, target, storage, io) {
-            Step::Recv { len, probe } => {
+            Step::Recv { offset, len, probe } => {
                 if csw_sent && len == CBW_LEN && !probe {
                     return Some(Drive::Processed);
                 }
                 if probe {
-                    match io.try_recv_out(&mut work[..len]) {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
                         Ok(n) => ev = Event::HostRecv { len: n },
                         Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
                         Err(_) => panic!("mock bulk-OUT I/O error"),
                     }
                 } else {
-                    match io.try_recv_out(&mut work[..len]) {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
                         Ok(n) if n > 0 => ev = Event::HostRecv { len: n },
                         _ => panic!("mock out-queue ran dry on a blocking receive"),
                     }
@@ -1706,6 +1722,7 @@ fn cbw_accumulates_across_partial_receives() {
         &mut storage,
     ) {
         Action::HostRecv {
+            offset: 0,
             len: 11,
             probe: false,
         } => {}
@@ -1720,6 +1737,7 @@ fn cbw_accumulates_across_partial_receives() {
         &mut storage,
     ) {
         Action::HostRecv {
+            offset: 0,
             len: 11,
             probe: false,
         } => {}
@@ -1935,15 +1953,23 @@ fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
             &mut storage,
             &mut io,
         ) {
-            Step::Recv { len, probe: false } => {
-                let n = io.try_recv_out(&mut work[..len]).unwrap();
+            Step::Recv {
+                offset,
+                len,
+                probe: false,
+            } => {
+                let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
                 ev = Event::HostRecv { len: n };
             }
-            Step::Recv { len, probe: true } => {
+            Step::Recv {
+                offset,
+                len,
+                probe: true,
+            } => {
                 // The core is in the storage-only step; a stray host byte
                 // arrives where only a one-byte probe was expected.
                 io.feed_out(&[0xEE]);
-                let n = io.try_recv_out(&mut work[..len]).unwrap();
+                let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
                 assert_eq!(n, 1);
                 match s.poll(
                     Event::HostRecv { len: n },
@@ -2047,6 +2073,45 @@ fn transfers_larger_than_the_bank_stream_in_chunks() {
     assert_eq!(csw_fields(&sent), (0x22, 0, 0x00), "zero residue");
     let mut check = vec![0u8; 16384];
     plane_read(&mut storage, 32 * 512, &mut check);
+    assert_eq!(check, payload, "byte-exact commit");
+}
+
+/// A WRITE whose data arrives in USB-request-sized reads (not one big
+/// buffer) must still commit every byte and terminate. This mirrors what the
+/// real FunctionFS bridge returns: one completion per host request.
+#[test]
+fn a_write_received_in_request_sized_reads_commits_every_byte() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = vec![0u8; 64 * 1024];
+    let mut scratch = vec![0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+    io.max_out_per_read = Some(512);
+
+    let payload: Vec<u8> = (0..65536u32)
+        .map(|i| (i.wrapping_mul(11) % 251) as u8)
+        .collect();
+    let cdb = rw10(0x2A, 0, 128);
+    io.feed_out(&raw_cbw(0x77, 65536, 0x00, 0, &cdb));
+    io.feed_out(&payload);
+    let r = drive_until_done(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (0x77, 0, 0x00), "zero residue");
+    let mut check = vec![0u8; 65536];
+    plane_read(&mut storage, 0, &mut check);
     assert_eq!(check, payload, "byte-exact commit");
 }
 

@@ -287,6 +287,7 @@ mod tests {
             &mut storage2,
         ) {
             snowscsi::usb::Action::HostRecv {
+                offset: 0,
                 len: CBW_LEN,
                 probe: false,
             } => {}

@@ -199,10 +199,14 @@ where
         // `StallBoth` / `Error` is executed here (re-fetching via `Tick` would
         // lose it); the next completion is carried in `ev`.
         match session.poll(ev, work, scratch, target, storage) {
-            Action::HostRecv { len, probe } => {
+            Action::HostRecv { offset, len, probe } => {
+                let end = offset + len;
+                if end > work.len() {
+                    return Err(ServeError::Internal);
+                }
                 if probe {
                     // Non-blocking overrun drain: one try, then HostIdle ends it.
-                    ev = match io.try_recv_out(&mut work[..len]) {
+                    ev = match io.try_recv_out(&mut work[offset..end]) {
                         Ok(0) => return Err(ServeError::Closed),
                         Ok(n) => Event::HostRecv { len: n },
                         Err(BotIoErr::WouldBlock) => Event::HostIdle,
@@ -210,7 +214,7 @@ where
                         Err(BotIoErr::Io) => return Err(ServeError::Closed),
                     };
                 } else {
-                    ev = match io.recv_out(&mut work[..len], Some(BOT_POLL_GRANULARITY)) {
+                    ev = match io.recv_out(&mut work[offset..end], Some(BOT_POLL_GRANULARITY)) {
                         Ok(0) => return Err(ServeError::Closed),
                         Ok(n) => Event::HostRecv { len: n },
                         // Timeout: re-check the control plane and stop flag.
@@ -311,9 +315,13 @@ where
             // 2) Feed the carried event, execute the returned action, and
             // carry the completion in `ev`.
             match session.poll(ev, work, scratch, target, storage) {
-                Action::HostRecv { len, probe } => {
+                Action::HostRecv { offset, len, probe } => {
+                    let end = offset + len;
+                    if end > work.len() {
+                        return Err(ServeError::Internal);
+                    }
                     if probe {
-                        ev = match recv.recv_probe(&mut work[..len]).await {
+                        ev = match recv.recv_probe(&mut work[offset..end]).await {
                             Ok(0) => return Err(ServeError::Closed),
                             Ok(n) => Event::HostRecv { len: n },
                             Err(BotIoErr::WouldBlock) => Event::HostIdle,
@@ -322,7 +330,10 @@ where
                         };
                     } else {
                         ev = match recv
-                            .recv(&mut work[..len], RecvMode::Until(CTRL_POLL_GRANULARITY))
+                            .recv(
+                                &mut work[offset..end],
+                                RecvMode::Until(CTRL_POLL_GRANULARITY),
+                            )
                             .await
                         {
                             Ok(0) => return Err(ServeError::Closed),

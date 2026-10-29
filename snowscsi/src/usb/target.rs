@@ -172,11 +172,17 @@ pub enum ShortfallPolicy {
 /// (`StallBoth`/`StallIn`/`Error`).
 #[derive(Debug)]
 pub enum Action<'a> {
-    /// Receive `len` bytes into `work[0..len]`. `probe` marks a non-blocking
-    /// drain receive (Data-Out overrun): the shell should try once; a
-    /// WouldBlock result ends the data phase and should be fed back as
-    /// [`Event::HostIdle`].
-    HostRecv { len: usize, probe: bool },
+    /// Receive up to `len` bytes into `work[offset..offset + len]`. The offset
+    /// is the position this segment occupies in the caller's bank, so a data
+    /// phase that arrives in several USB requests never overwrites what it has
+    /// already accumulated. `probe` marks a non-blocking drain receive
+    /// (Data-Out overrun): the shell should try once; a WouldBlock result ends
+    /// the data phase and should be fed back as [`Event::HostIdle`].
+    HostRecv {
+        offset: usize,
+        len: usize,
+        probe: bool,
+    },
     /// Send `bytes` on the bulk-IN pipe.
     HostSend { bytes: &'a [u8] },
     /// Invalid CBW (BOT §6.6.1): STALL both bulk endpoints. The core has
@@ -671,12 +677,8 @@ impl BotSession {
                         stray = true;
                         false
                     } else {
-                        if local_received > 0 && len > 0 {
-                            // The shell always lands a receive at `work[0..]`;
-                            // move the chunk to its final place in the bank.
-                            let start = local_received as usize;
-                            work.copy_within(0..len, start);
-                        }
+                        // The shell wrote this segment straight at its final
+                        // bank offset, so no move is needed here.
                         p.received = p.received.saturating_add(len as u32);
                         let done = p.received >= p.wire_target;
                         if done {
@@ -1306,6 +1308,7 @@ impl BotSession {
         let stage = self.stage;
         match stage {
             Stage::Command { got } => Action::HostRecv {
+                offset: 0,
                 len: CBW_LEN - got,
                 probe: false,
             },
@@ -1333,6 +1336,7 @@ impl BotSession {
                     let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
                     if local_received < local_target {
                         Action::HostRecv {
+                            offset: local_received as usize,
                             len: (local_target - local_received) as usize,
                             probe: false,
                         }
@@ -1341,12 +1345,14 @@ impl BotSession {
                         // wire phase; probe so the shell loops back with a
                         // `HostIdle` and the next entry drives it again.
                         Action::HostRecv {
+                            offset: 0,
                             len: 1,
                             probe: true,
                         }
                     }
                 }
                 Phase::Idle => Action::HostRecv {
+                    offset: 0,
                     len: 1,
                     probe: true,
                 },
@@ -1377,6 +1383,7 @@ impl BotSession {
             Stage::Drain {
                 remaining, probe, ..
             } => Action::HostRecv {
+                offset: 0,
                 len: if probe {
                     DRAIN_CHUNK
                 } else {
