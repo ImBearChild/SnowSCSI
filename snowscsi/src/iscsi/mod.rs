@@ -24,11 +24,16 @@
 //!
 //! All calls share two caller-provided banks: `work` (PDU + command data,
 //! `len >= crate::MIN_DATA_LEN + pdu::BHS_SIZE`) and `scratch` (the resident
-//! long-operation bank, `len >= crate::MIN_DATA_LEN`). The `work` floor keeps
-//! room for a Login Request carrying the RFC 3720 §6.1 default
-//! `MaxRecvDataSegmentLength` (8192) bytes of text, which a conformant
-//! initiator may send before any negotiation. Undersized banks are rejected
-//! with [`target::TargetError::WorkBufTooSmall`].
+//! long-operation bank). The `work` floor keeps room for a Login Request
+//! carrying the RFC 3720 §6.1 default `MaxRecvDataSegmentLength` (8192) bytes
+//! of text, which a conformant initiator may send before any negotiation.
+//! An **empty** `scratch` selects the shared bank: `work` also serves the long
+//! operation, the session advances it only on `Event::Tick`, and the shell
+//! defers input while a long token is in flight (a query waits at most one
+//! long-operation chunk). A **non-empty** `scratch` must be at least
+//! [`crate::MIN_DATA_LEN`] and selects the split mode, where queries stay
+//! serviceable while a long IO runs. Undersized banks are rejected with
+//! [`target::TargetError::WorkBufTooSmall`].
 //!
 //! `work` is **one** data bank: the leading [`pdu::BHS_SIZE`] bytes carry the
 //! wire header, so the usable SCSI data area is exactly `work.len() -

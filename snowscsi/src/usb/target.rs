@@ -500,23 +500,30 @@ impl BotSession {
     /// the LUN slots and `storage` executes the device's storage operations;
     /// the session itself implements the [`HostTransport`] data seam and
     /// performs at most one command step per entry.
-    pub fn poll<'a, S: RuntimeSet>(
+    pub fn poll<'a, 'b, S: RuntimeSet>(
         &'a mut self,
         ev: Event,
         work: &'a mut [u8],
         scratch: &'a mut [u8],
-        target: &'a mut Target<S>,
-        storage: &'a mut dyn Storage,
+        target: &'b mut Target<S>,
+        storage: &'b mut dyn Storage,
     ) -> Action<'a> {
-        if work.len() < crate::MIN_DATA_AREA || scratch.len() < crate::MIN_DATA_LEN {
+        if work.len() < crate::MIN_DATA_AREA
+            || (!scratch.is_empty() && scratch.len() < crate::MIN_DATA_LEN)
+        {
             return Action::Error(BotTargetError::WorkBufTooSmall);
         }
         self.num_luns = target.slot_count().clamp(1, 16) as u8;
 
         // Every entry that starts at a command boundary advances the resident
-        // long operation once: one poll per entry.
+        // long operation once: one poll per entry. With an empty `scratch` the
+        // long operation shares `work` with the wire, so it may only advance on
+        // a `Tick` entry: a `HostRecv`/`HostSent` entry may hold a staged
+        // CBW/response in that buffer.
+        let shared = scratch.is_empty();
         if !self.cmd_active
             && matches!(self.stage, Stage::Command { .. })
+            && (!shared || matches!(ev, Event::Tick))
             && self.idle_entry(work, scratch, target, storage)
         {
             return Action::Error(BotTargetError::Io);
@@ -534,7 +541,38 @@ impl BotSession {
                 self.pending(work)
             }
             Event::Tick => self.pending(work),
-            Event::HostSent => self.on_sent(work, scratch, target, storage),
+            Event::HostSent => {
+                // Split mode keeps the original path exactly.
+                if !shared || !matches!(self.stage, Stage::Csw) {
+                    return self.on_sent(work, scratch, target, storage);
+                }
+                // Shared bank: a completed CSW send returns to the command
+                // boundary and frees `work`. Advance the resident long
+                // operation once here: a fill armed by an Immed FORMAT/BLANK
+                // completes without storage IO, so this is where its first IO
+                // is issued. The pre-event rule is unchanged: a
+                // `HostRecv`/`HostSent` entry never runs `idle_entry` at the
+                // top in shared mode.
+                match self.on_sent(work, scratch, target, storage) {
+                    // At the CSW boundary the handler re-emits the next
+                    // receive; that is the only outcome the idle step may
+                    // replace.
+                    Action::HostRecv { .. } => {}
+                    // A staged send cannot occur at the CSW boundary; the
+                    // bytes would also be clobbered by the idle step.
+                    Action::HostSend { .. } => return Action::Error(BotTargetError::Internal),
+                    Action::StallBoth => return Action::StallBoth,
+                    Action::StallIn => return Action::StallIn,
+                    Action::Error(e) => return Action::Error(e),
+                }
+                if !self.cmd_active
+                    && matches!(self.stage, Stage::Command { .. })
+                    && self.idle_entry(work, scratch, target, storage)
+                {
+                    return Action::Error(BotTargetError::Io);
+                }
+                self.pending(work)
+            }
             Event::HostRecv { len } => self.on_recv(len, work, scratch, target, storage),
             Event::HostIdle => self.on_idle(work, scratch, target, storage),
         }
@@ -543,6 +581,10 @@ impl BotSession {
     /// Advance a resident long operation and the target lifecycle once per
     /// idle entry. Returns `true` when the target reported its terminal
     /// outcome.
+    ///
+    /// With an empty `scratch` the long operation shares `work` as its data
+    /// bank: `poll_long_entry_rt` ignores its `work` argument, so the empty
+    /// slice goes there and `work` is the bank.
     fn idle_entry<S: RuntimeSet>(
         &mut self,
         work: &mut [u8],
@@ -551,7 +593,13 @@ impl BotSession {
         storage: &mut dyn Storage,
     ) -> bool {
         if let Some(lun) = self.long_lun {
-            match target.poll_long_entry_rt(lun, storage, work, scratch) {
+            let mut empty = [0u8; 0];
+            let polled = if scratch.is_empty() {
+                target.poll_long_entry_rt(lun, storage, &mut empty, work)
+            } else {
+                target.poll_long_entry_rt(lun, storage, work, scratch)
+            };
+            match polled {
                 Ok(info) => {
                     if !matches!(info.phase, LongPhase::Foreground | LongPhase::Background) {
                         self.long_lun = None;

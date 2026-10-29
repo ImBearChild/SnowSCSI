@@ -600,18 +600,22 @@ impl IscsiSession {
     /// PDU still carries at most `MaxRecvDataSegmentLength` bytes.
     /// The data area also fixes the `MaxRecvDataSegmentLength` this target
     /// declares for the connection (RFC 3720 §12.12).
-    /// `scratch` is the resident long-operation bank (`>= MIN_DATA_LEN`).
+    /// `scratch` is the resident long-operation bank: an **empty** `scratch`
+    /// selects the shared bank (`work` serves both paths, and the long
+    /// operation only advances on [`Event::Tick`]); a non-empty one must be at
+    /// least [`crate::MIN_DATA_LEN`] and keeps the split mode, where queries
+    /// stay serviceable while a long IO is in flight.
     ///
     /// `target` owns the LUN slots, `storage` executes the device's storage
     /// operations; the session itself implements the [`HostTransport`] data
     /// seam and performs at most one command step per entry.
-    pub fn poll<'a, S: RuntimeSet>(
+    pub fn poll<'a, 'b, S: RuntimeSet>(
         &'a mut self,
         ev: Event,
         work: &'a mut [u8],
         scratch: &'a mut [u8],
-        target: &'a mut Target<S>,
-        storage: &'a mut dyn Storage,
+        target: &'b mut Target<S>,
+        storage: &'b mut dyn Storage,
     ) -> Action<'a> {
         if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
             return Action::Error(TargetError::WorkBufTooSmall);
@@ -623,7 +627,7 @@ impl IscsiSession {
         if !(work.len() - BHS_SIZE).is_multiple_of(4) {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
-        if scratch.len() < crate::MIN_DATA_LEN {
+        if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
         // Our own receive capability is the bank's data area, clamped to the
@@ -661,8 +665,15 @@ impl IscsiSession {
         storage: &mut dyn Storage,
     ) -> Emit {
         // Every entry that starts at a PDU boundary and owns no command also
-        // advances the resident long operation once: one poll per entry.
-        if self.session == Session::RecvPdu && !self.cmd_active {
+        // advances the resident long operation once: one poll per entry. With
+        // an empty `scratch` the long operation shares `work` with the wire, so
+        // it may only advance on a `Tick` entry: a `HostRecv`/`HostSent` entry
+        // can hold a staged PDU in that buffer.
+        let shared = scratch.is_empty();
+        if self.session == Session::RecvPdu
+            && !self.cmd_active
+            && (!shared || matches!(ev, Event::Tick))
+        {
             if let Some(out) = self.idle_entry(work, scratch, target, storage) {
                 return out;
             }
@@ -670,7 +681,29 @@ impl IscsiSession {
         match ev {
             Event::Tick => self.expectation(),
             Event::HostRecv { len } => self.on_recv(len, work, scratch, target, storage),
-            Event::HostSent => self.on_sent(work, scratch, target, storage),
+            Event::HostSent => {
+                let emit = self.on_sent(work, scratch, target, storage);
+                if !shared {
+                    // Split mode keeps the original path exactly.
+                    return emit;
+                }
+                // Shared bank: the response bytes have already been written to
+                // the wire, so a `HostSent` handler that returns to the PDU
+                // boundary with no active command may advance the resident
+                // long operation once. This is where a fill armed by an Immed
+                // FORMAT/BLANK gets its first storage IO (such a command
+                // completes without any). The pre-event rule is unchanged: in
+                // shared mode `idle_entry` is never run at the top of a
+                // `HostRecv`/`HostSent` entry.
+                if self.session == Session::RecvPdu && !self.cmd_active {
+                    if let Some(out) = self.idle_entry(work, scratch, target, storage) {
+                        if matches!(out, Emit::Closed | Emit::Error(_)) {
+                            return out;
+                        }
+                    }
+                }
+                emit
+            }
         }
     }
 
@@ -706,6 +739,10 @@ impl IscsiSession {
 
     /// Advance a resident long operation and the target lifecycle once per
     /// idle entry.
+    ///
+    /// With an empty `scratch` the long operation shares `work` as its data
+    /// bank: `poll_long_entry_rt` ignores its `work` argument, so the empty
+    /// slice goes there and `work` is the bank.
     fn idle_entry<S: RuntimeSet>(
         &mut self,
         work: &mut [u8],
@@ -714,7 +751,13 @@ impl IscsiSession {
         storage: &mut dyn Storage,
     ) -> Option<Emit> {
         if let Some(lun) = self.long_lun {
-            match target.poll_long_entry_rt(lun, storage, work, scratch) {
+            let mut empty = [0u8; 0];
+            let polled = if scratch.is_empty() {
+                target.poll_long_entry_rt(lun, storage, &mut empty, work)
+            } else {
+                target.poll_long_entry_rt(lun, storage, work, scratch)
+            };
+            match polled {
                 Ok(info) => {
                     if !matches!(info.phase, LongPhase::Foreground | LongPhase::Background) {
                         self.long_lun = None;
@@ -954,9 +997,17 @@ impl IscsiSession {
                     }
                 }
             }
-        } else if let Some(out) = self.idle_entry(work, scratch, target, storage) {
-            out
+        } else if !scratch.is_empty() {
+            if let Some(out) = self.idle_entry(work, scratch, target, storage) {
+                out
+            } else {
+                self.expectation()
+            }
         } else {
+            // Shared bank (empty `scratch`): reached from `on_sent` after the
+            // response was written to the wire. Progress is deferred to the
+            // post-`HostSent` step in `entry`, which advances the resident long
+            // operation once with `work` as its bank.
             self.expectation()
         }
     }

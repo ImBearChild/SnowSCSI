@@ -173,6 +173,20 @@ struct ServeArgs {
     /// rejected.
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
+
+    /// Allocate a separate long-operation buffer (split mode).
+    ///
+    /// By default one buffer is shared: a query waits at most one
+    /// long-operation chunk. With this flag the resident long operation gets
+    /// its own bank (rounded up to at least 8192 bytes, default 1M), so
+    /// queries stay serviceable while it runs.
+    #[arg(
+        long = "scratch-buffer",
+        value_name = "BYTES",
+        num_args = 0..=1,
+        default_missing_value = "1M"
+    )]
+    scratch_buffer: Option<String>,
 }
 
 /// Arguments for `snowscsi mkisofs`: build an ISO9660/Joliet image from a
@@ -211,6 +225,15 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `None` = one buffer (shared mode); `Some` = the separate long-operation
+    // bank of the split mode.
+    let scratch_len = match parse_scratch_size(args.scratch_buffer.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("snowscsi: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The device pipeline is shared by both transports: parse the specs,
     // validate sources, allocate RAM disks and build the LUN list.
@@ -228,7 +251,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             eprintln!("snowscsi: {msg}");
             return ExitCode::FAILURE;
         }
-        return run_serve_iscsi(args, &specs, work_size);
+        return run_serve_iscsi(args, &specs, work_size, scratch_len);
     }
     #[cfg(target_os = "linux")]
     {
@@ -237,11 +260,11 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
         let selector = args.usb.as_deref().unwrap_or("auto");
-        return run_serve_usb(&args, &specs, work_size, selector);
+        return run_serve_usb(&args, &specs, work_size, scratch_len, selector);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = work_size;
+        let _ = (work_size, scratch_len);
         eprintln!("snowscsi: --usb is only supported on Linux");
         ExitCode::FAILURE
     }
@@ -410,7 +433,12 @@ fn build_core_slots<'a>(
 
 /// `snowscsi serve --iscsi`: bind the portal, build the core target and drive
 /// the session shell until shutdown.
-fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> ExitCode {
+fn run_serve_iscsi(
+    args: ServeArgs,
+    specs: &[DeviceSpec],
+    work_size: usize,
+    scratch_len: Option<usize>,
+) -> ExitCode {
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
@@ -486,7 +514,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], work_size: usize) -> E
     }
 
     let mut work = vec![0u8; work_size];
-    let mut scratch = vec![0u8; scratch_size(work_size)];
+    let mut scratch = split_bank(scratch_len);
     log::info!("listening on {bound} with {} LUN(s)", table.len());
 
     let auto_handle = if is_auto {
@@ -1064,6 +1092,7 @@ fn run_serve_usb(
     args: &ServeArgs,
     specs: &[DeviceSpec],
     work_size: usize,
+    scratch_len: Option<usize>,
     selector: &str,
 ) -> ExitCode {
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
@@ -1157,7 +1186,7 @@ fn run_serve_usb(
     let lun_count = table.len();
     let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
     let mut work = vec![0u8; work_size];
-    let mut scratch = vec![0u8; scratch_size(work_size)];
+    let mut scratch = split_bank(scratch_len);
     let mut target = snowscsi::core::Target::new(&mut table[..]);
 
     log::info!("serving {} LUN(s) over USB", lun_count);
@@ -1714,13 +1743,32 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     Ok(n)
 }
 
-/// Resident long-operation bank size: never below [`MIN_DATA_LEN`], and never
-/// smaller than the PDU bank it runs beside.
+/// Resolve the optional split-mode long-operation bank.
 ///
-/// A `--work-buf-size` at the USB floor is legal for `work`, but the
-/// long-operation bank still needs [`MIN_DATA_LEN`] bytes.
-fn scratch_size(work_size: usize) -> usize {
-    work_size.max(MIN_DATA_LEN)
+/// `None` (flag absent) selects the shared bank: `work` serves both the command
+/// path and the resident long operation, so a query waits at most one
+/// long-operation chunk. `Some` allocates the separate bank of the split mode,
+/// rounded up to [`MIN_DATA_LEN`].
+fn parse_scratch_size(s: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(v) = s else {
+        return Ok(None);
+    };
+    let bytes = spec::parse_size(v).ok_or_else(|| format!("invalid --scratch-buffer: {v}"))?;
+    let n = usize::try_from(bytes).map_err(|_| format!("--scratch-buffer {bytes} is too large"))?;
+    Ok(Some(scratch_size(n)))
+}
+
+/// Split-mode long-operation bank size: never below [`MIN_DATA_LEN`].
+fn scratch_size(requested: usize) -> usize {
+    requested.max(MIN_DATA_LEN)
+}
+
+/// Allocate the long-operation bank: an empty vector selects the shared mode.
+fn split_bank(requested: Option<usize>) -> Vec<u8> {
+    match requested {
+        Some(n) => vec![0u8; n],
+        None => Vec::new(),
+    }
 }
 
 /// iSCSI `work` floor: [`MIN_DATA_LEN`] plus the 48-byte BHS, and a data area
@@ -1821,14 +1869,52 @@ mod tests {
         assert!(check_usb_work_size(MIN_DATA_AREA - 1).is_err());
         assert_eq!(check_usb_work_size(513), Ok(()));
 
-        // The long-operation bank keeps its own 8192-byte requirement.
+        // The split-mode bank keeps its own 8192-byte requirement.
         assert_eq!(scratch_size(MIN_DATA_AREA), MIN_DATA_LEN);
         assert_eq!(
             scratch_size(MIN_DATA_LEN + BHS_SIZE),
-            MIN_DATA_LEN + BHS_SIZE,
-            "above the floor the scratch bank tracks the PDU bank"
+            MIN_DATA_LEN + BHS_SIZE
         );
         assert_eq!(scratch_size(DEFAULT_WORK_BUF_SIZE), DEFAULT_WORK_BUF_SIZE);
+    }
+
+    #[test]
+    fn scratch_buffer_flag_selects_the_split_mode() {
+        // Absent: no split bank at all, so the transports run in shared mode.
+        assert_eq!(parse_scratch_size(None), Ok(None));
+        assert!(split_bank(None).is_empty());
+
+        // Present with a value: the split bank, rounded up to the floor.
+        assert_eq!(parse_scratch_size(Some("512")), Ok(Some(MIN_DATA_LEN)));
+        assert_eq!(parse_scratch_size(Some("16K")), Ok(Some(16 * 1024)));
+        assert_eq!(split_bank(Some(16 * 1024)).len(), 16 * 1024);
+        assert!(parse_scratch_size(Some("bogus")).is_err());
+
+        // Present without a value: the 1M default.
+        assert_eq!(parse_scratch_size(Some("1M")), Ok(Some(1024 * 1024)));
+    }
+
+    #[test]
+    fn scratch_buffer_flag_is_optional_in_the_cli() {
+        let base = [
+            "snowscsi",
+            "serve",
+            "--block",
+            "ram=1M",
+            "--iscsi",
+            "127.0.0.1:3260",
+        ];
+        let Cli::Serve(args) = Cli::try_parse_from(base).expect("parse") else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.scratch_buffer, None, "one buffer by default");
+
+        let mut with = base.to_vec();
+        with.push("--scratch-buffer");
+        let Cli::Serve(args) = Cli::try_parse_from(with).expect("parse") else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.scratch_buffer.as_deref(), Some("1M"));
     }
 
     #[test]

@@ -12,11 +12,16 @@ mod tests {
     use embedded_io::Read as _;
     use snowscsi::common::seekable_storage::RamBackend;
     use snowscsi::common::store::{StoreOp, StorePlane};
-    use snowscsi::core::{Delivery, Lu, RuntimeSet, Target};
+    use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
+    use snowscsi::core::{Delivery, Direction, Lu, RuntimeSet, Target};
     use snowscsi::iscsi::conn::write_all;
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowscsi::iscsi::target::{Action, Event, IscsiSession, LoginStage, TargetError};
+    use snowscsi::iscsi::transport::serve_conn;
     use snowscsi::MIN_DATA_LEN;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::Poll;
 
     /// iSCSI target scratch buffer: BHS header + data area.
     const WORK_LEN: usize = MIN_DATA_LEN + BHS_SIZE;
@@ -3601,5 +3606,281 @@ mod tests {
             })
             .unwrap();
         assert!(check.iter().all(|&b| b == 0));
+    }
+
+    /// One buffer: an empty `scratch` is accepted; a `HostRecv` entry never
+    /// advances the resident fill, while the approved post-`HostSent` step and
+    /// a `Tick` entry do.
+    #[test]
+    fn shared_scratch_advances_the_resident_fill_on_send_and_tick() {
+        let mut ram = vec![0xA5u8; 4 * 2048];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::dvdram(4, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; WORK_LEN];
+        // One buffer: `work` also serves the resident long operation.
+        let mut scratch = Vec::new();
+        login!(conn, session, work, scratch, target, storage);
+
+        // BLANK with IMMED=1 starts the zero-fill and answers GOOD at once.
+        let mut blank = [0u8; 48];
+        blank[0] = op::SCSI_CMD;
+        blank[1] = 0x40;
+        blank[16..20].copy_from_slice(&be32(0x0F0F));
+        blank[32] = 0xA1; // BLANK
+        blank[33] = 0x20; // IMMED=1
+        conn.feed(&blank, &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        assert_eq!(
+            target.snapshot_rt(0).expect("slot 0").long.progress,
+            Some(0)
+        );
+
+        // A HostRecv entry stages the TUR PDU but must not touch the fill.
+        work[..BHS_SIZE].copy_from_slice(&tur_bhs(0x0E0E, 1));
+        match session.poll(
+            Event::HostRecv { len: BHS_SIZE },
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        ) {
+            Action::HostSend { .. } => {}
+            other => panic!("expected the TUR response, got {other:?}"),
+        }
+        assert_eq!(
+            target.snapshot_rt(0).expect("slot 0").long.progress,
+            Some(0),
+            "a HostRecv entry must not advance the long operation"
+        );
+
+        // The status send returns to the PDU boundary, so the post-`HostSent`
+        // step advances the fill exactly once.
+        let _ = session.poll(
+            Event::HostSent,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
+        assert_ne!(
+            target.snapshot_rt(0).expect("slot 0").long.progress,
+            Some(0),
+            "a completed send advances the resident fill once"
+        );
+
+        // Tick entries drive it: one storage step per entry, to completion.
+        let mut settled = false;
+        for _ in 0..8 {
+            let _ = session.poll(
+                Event::Tick,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage,
+            );
+            let info = target.snapshot_rt(0).expect("slot 0").long;
+            if matches!(info.phase, snowscsi::core::LongPhase::Settled) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "Tick entries advance the fill to completion");
+
+        let mut check = vec![0u8; 4 * 2048];
+        storage
+            .exec_raw(StoreOp::Read {
+                off: 0,
+                buf: &mut check,
+            })
+            .unwrap();
+        assert!(check.iter().all(|&b| b == 0), "the fill is byte-exact");
+    }
+
+    // ── One buffer end-to-end through the iSCSI shell ──────────────
+
+    /// Connection wrapper that records any read attempted while the target's
+    /// long operation holds a retained adapter token.
+    struct GatedConn {
+        inner: MockConn,
+        in_flight: Arc<AtomicBool>,
+        violated: Arc<AtomicBool>,
+    }
+
+    impl embedded_io::ErrorType for GatedConn {
+        type Error = core::convert::Infallible;
+    }
+
+    impl embedded_io::Read for GatedConn {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            if self.in_flight.load(Ordering::SeqCst) {
+                self.violated.store(true, Ordering::SeqCst);
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl embedded_io::Write for GatedConn {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Storage wrapper: the fill's durability sync stays pending once, so the
+    /// shell has a real token window; every write is synchronous so one chunk
+    /// retires per command.
+    struct PendingSync<'a> {
+        inner: PlaneSet<'a>,
+        in_flight: Arc<AtomicBool>,
+        writes: usize,
+        armed: bool,
+    }
+
+    impl Storage for PendingSync<'_> {
+        fn select_lun(&mut self, lun: usize) {
+            self.inner.select_lun(lun);
+        }
+
+        fn begin_exec(&mut self, req: IoReq) -> IoToken {
+            self.armed = req.dir == Direction::None;
+            if req.dir == Direction::FromHost {
+                self.writes += 1;
+            }
+            self.inner.begin_exec(req)
+        }
+
+        fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+            if self.armed && matches!(buf, IoBuf::None) {
+                self.armed = false;
+                self.in_flight.store(true, Ordering::SeqCst);
+                return Poll::Pending;
+            }
+            let receipt = self.inner.poll_exec(token, buf);
+            self.in_flight.store(false, Ordering::SeqCst);
+            receipt
+        }
+
+        fn cancel(&mut self, token: IoToken) {
+            self.in_flight.store(false, Ordering::SeqCst);
+            self.inner.cancel(token);
+        }
+    }
+
+    /// One buffer over the real iSCSI shell: `BLANK` with IMMED=1 leaves a
+    /// resident fill, and the post-`HostSent` idle step starts it even though
+    /// the shell then blocks on the next PDU. Each following TUR is answered
+    /// (FORMAT IN PROGRESS), the fill advances one chunk per command, the
+    /// zero-fill is byte-exact, and no read happens while the token is in
+    /// flight.
+    #[test]
+    fn shared_bank_formats_end_to_end_through_the_iscsi_shell() {
+        const SECTORS: u64 = 16; // 32 KiB → 4 chunks of 8 KiB
+        let mut ram = vec![0xA5u8; SECTORS as usize * 2048];
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let violated = Arc::new(AtomicBool::new(false));
+        let mut conn = GatedConn {
+            inner: MockConn::new(),
+            in_flight: Arc::clone(&in_flight),
+            violated: Arc::clone(&violated),
+        };
+
+        // Login, then BLANK IMMED=1 (no data phase) and three TURs.
+        let text = REQ_TEXT.as_bytes();
+        conn.inner.feed_padded(&login_bhs(text.len() as u32), text);
+        let mut blank = [0u8; 48];
+        blank[0] = op::SCSI_CMD;
+        blank[1] = 0x40;
+        blank[16..20].copy_from_slice(&be32(0x0F0F));
+        blank[32] = 0xA1; // BLANK
+        blank[33] = 0x20; // IMMED=1
+        conn.inner.feed(&blank, &[]);
+        conn.inner.feed(&tur_bhs(0x0E01, 1), &[]);
+        conn.inner.feed(&tur_bhs(0x0E02, 2), &[]);
+        conn.inner.feed(&tur_bhs(0x0E03, 3), &[]);
+        conn.inner.feed(&tur_bhs(0x0E04, 4), &[]);
+
+        let mut slots = [TestLu::dvdram(SECTORS, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        // One buffer at the iSCSI floor.
+        let mut work = vec![0u8; WORK_LEN];
+        let mut scratch = Vec::new();
+        let mut session = IscsiSession::default();
+        let writes;
+        {
+            let mut backend = RamBackend::new(&mut ram);
+            let mut storage = PendingSync {
+                inner: PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+                in_flight: Arc::clone(&in_flight),
+                writes: 0,
+                armed: false,
+            };
+            let result = serve_conn(
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut session,
+                &mut target,
+                &mut storage,
+            );
+            assert_eq!(result, Ok(()), "the scripted host closes the connection");
+            writes = storage.writes;
+        }
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "the shell read the wire while the long token was in flight"
+        );
+        // 32 KiB in ~8 KiB chunks (the shared bank is 8240 bytes): exactly one
+        // chunk retires per command CSW.
+        assert_eq!(writes, 4, "the fill is issued one chunk at a time");
+
+        let mut responses = Vec::new();
+        while let Some((bhs, data)) = conn.inner.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_RESP {
+                responses.push((bhs, data));
+            }
+        }
+        assert_eq!(responses.len(), 5, "BLANK plus four TURs answered");
+        assert_eq!(responses[0].0[3], status::GOOD, "BLANK completes at once");
+        for (i, (bhs, data)) in responses[1..].iter().enumerate() {
+            assert_eq!(bhs[3], status::CHECK_CONDITION, "TUR {i} during the fill");
+            // Autosense: 2-byte SenseLength + fixed-format sense.
+            assert_eq!(&data[0..2], &[0x00, 18]);
+            assert_eq!(data[2], 0x70, "fixed-format response code");
+            assert_eq!(data[4], 0x02, "sense key NOT READY");
+            assert_eq!(data[14], 0x04, "ASC FORMAT IN PROGRESS");
+            assert_eq!(data[15], 0x04, "ASCQ FORMAT IN PROGRESS");
+        }
+
+        let info = target.snapshot_rt(0).expect("slot 0").long;
+        assert!(
+            matches!(info.phase, snowscsi::core::LongPhase::Settled),
+            "the resident fill completed, got {info:?}"
+        );
+        assert!(ram.iter().all(|&b| b == 0), "the zero-fill is byte-exact");
     }
 }

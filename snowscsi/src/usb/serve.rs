@@ -128,7 +128,10 @@ where
 /// [`CtrlReq::LinkReset`] ⇒ [`Event::Reset`] + ack; [`CtrlReq::GetMaxLun`] ⇒
 /// reply `session.max_lun()`), then executes the pending [`Action`] once.
 /// `work` is the transport data bank (see [`BotSession::poll`]); `scratch` is
-/// the long-operation bank. `target` owns the LUN slots and `storage` executes
+/// the long-operation bank, and an **empty** `scratch` selects the shared
+/// bank: the loop drives the long operation one `Tick` step per turn and
+/// defers bulk and control input while its token is in flight (at most one
+/// long-operation chunk). `target` owns the LUN slots and `storage` executes
 /// the device's storage operations.
 ///
 /// `Action::StallBoth` (invalid CBW) STALLs both endpoints and keeps receiving:
@@ -184,9 +187,28 @@ where
     // is "nothing new" (a stall, a receive timeout) carries `Tick` and the
     // next `poll` re-emits the pending action.
     let mut ev = Event::Tick;
+    let shared = scratch.is_empty();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+
+        // Shared bank: while the resident long operation holds an adapter
+        // token, `work` is its data bank. Drive it one step per turn and defer
+        // every input (control requests included) until it settles; the
+        // deferral is bounded by one long-operation chunk.
+        if shared && target.long_io_in_flight() {
+            match session.poll(Event::Tick, work, scratch, target, storage) {
+                // Nothing is staged in `work`; the framing action is re-emitted
+                // once the token settles.
+                Action::HostRecv { .. } => continue,
+                // Data or a stall response is staged in `work`, which the long
+                // token owns: dropping it would lose or corrupt output.
+                Action::HostSend { .. } | Action::StallBoth | Action::StallIn => {
+                    return Err(ServeError::Core(BotTargetError::Internal))
+                }
+                Action::Error(e) => return Err(ServeError::Core(e)),
+            }
         }
 
         // 1) Control plane first (arrives at any time, even mid data phase).
@@ -199,6 +221,20 @@ where
         // `StallBoth` / `Error` is executed here (re-fetching via `Tick` would
         // lose it); the next completion is carried in `ev`.
         match session.poll(ev, work, scratch, target, storage) {
+            Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
+                // The step above started the resident long operation; its token
+                // now owns `work`. The receive is re-emitted on the next entry,
+                // so drop it and drive the long operation first.
+                ev = Event::Tick;
+                continue;
+            }
+            Action::HostSend { .. } | Action::StallBoth | Action::StallIn
+                if shared && target.long_io_in_flight() =>
+            {
+                // The output bytes live in `work`, which the long token is
+                // using; this state must not be reached.
+                return Err(ServeError::Core(BotTargetError::Internal));
+            }
             Action::HostRecv { offset, len, probe } => {
                 let end = offset + len;
                 if end > work.len() {
@@ -294,9 +330,27 @@ where
 
     let result = async {
         let mut ev = Event::Tick;
+        let shared = scratch.is_empty();
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+
+            // Shared bank: drive the resident long operation one step per turn
+            // and defer every input (control requests included) until its token
+            // settles. The deferral is bounded by one long-operation chunk.
+            if shared && target.long_io_in_flight() {
+                match session.poll(Event::Tick, work, scratch, target, storage) {
+                    // Nothing is staged in `work`; the framing action is
+                    // re-emitted once the token settles.
+                    Action::HostRecv { .. } => continue,
+                    // Data or a stall response is staged in `work`, which the
+                    // long token owns: dropping it would lose or corrupt output.
+                    Action::HostSend { .. } | Action::StallBoth | Action::StallIn => {
+                        return Err(ServeError::Core(BotTargetError::Internal))
+                    }
+                    Action::Error(e) => return Err(ServeError::Core(e)),
+                }
             }
 
             // 1) Control plane first (arrives at any time, even mid data phase).
@@ -315,6 +369,20 @@ where
             // 2) Feed the carried event, execute the returned action, and
             // carry the completion in `ev`.
             match session.poll(ev, work, scratch, target, storage) {
+                Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
+                    // The step above started the resident long operation; its
+                    // token now owns `work`. The receive is re-emitted on the
+                    // next entry, so drop it and drive the long operation first.
+                    ev = Event::Tick;
+                    continue;
+                }
+                Action::HostSend { .. } | Action::StallBoth | Action::StallIn
+                    if shared && target.long_io_in_flight() =>
+                {
+                    // The output bytes live in `work`, which the long token is
+                    // using; this state must not be reached.
+                    return Err(ServeError::Core(BotTargetError::Internal));
+                }
                 Action::HostRecv { offset, len, probe } => {
                     let end = offset + len;
                     if end > work.len() {

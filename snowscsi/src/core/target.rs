@@ -92,6 +92,15 @@ impl<S: SlotSet> Target<S> {
         &self.runner
     }
 
+    /// Whether the resident long operation holds a retained adapter token.
+    ///
+    /// This is a projection, **not** a boundary: a query may still start while
+    /// a long IO is in flight (split mode). A shell whose `work` bank is shared
+    /// with the long operation uses it to defer input until the token settles.
+    pub fn long_io_in_flight(&self) -> bool {
+        self.runner.long_io_in_flight()
+    }
+
     /// Application control entry.
     ///
     /// `Nop` requires a complete boundary on every resident slot; `Abort` may

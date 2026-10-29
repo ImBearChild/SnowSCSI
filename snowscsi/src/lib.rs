@@ -27,6 +27,22 @@
 //! [`usb::BotSession`] (the two transports). Each subsystem's module docs
 //! carry runnable examples: [`iscsi`], [`usb`], and — behind the `cdrom`
 //! feature — [`cdrom`].
+//!
+//! # One buffer or two (resident long operations)
+//!
+//! Both transports take a `work` bank and a `scratch` bank. An **empty**
+//! `scratch` selects the shared mode: `work` serves the command path and the
+//! resident long operation (a FORMAT/BLANK fill) in turn, so the application
+//! allocates one buffer. The transport shells never read input while a long
+//! token is in flight; the long operation advances one storage step per
+//! [`usb::Event::Tick`]/[`iscsi::target::Event::Tick`] entry, so a query that
+//! arrives meanwhile waits at most one long-operation chunk.
+//!
+//! A **non-empty** `scratch` (at least [`MIN_DATA_LEN`]) selects the split
+//! mode: the long operation owns its own bank and queries stay serviceable
+//! while it runs. The two paths never need a buffer at the same time inside one
+//! poll; this slice is strictly sequential and does not overlap storage with
+//! the wire.
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]

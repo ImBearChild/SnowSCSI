@@ -12,13 +12,18 @@
 use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowscsi::common::store::{StoreOp, StorePlane};
+use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
-    Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
+    serve, Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
     Gadget, ShortfallPolicy, CBW_LEN, CBW_SIGNATURE, CSW_LEN, MAX_PAD,
 };
-use std::sync::atomic::Ordering;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
 
 /// Read `buf.len()` bytes at `off` through the storage plane (the test
 /// stand-in for the driver reading the backing store).
@@ -474,6 +479,275 @@ fn work_bank_below_the_floor_and_short_scratch_are_rejected() {
         ),
         Action::Error(BotTargetError::WorkBufTooSmall)
     ));
+}
+
+// ── Shared bank (one buffer) ───────────────────────────────────────
+
+/// Bulk driver for one shared-bank transaction.
+///
+/// Records any bulk read issued while the long-operation token is in flight,
+/// and stops the shell once the scripted closing CSW was sent (and, for a
+/// FORMAT scenario, the fill completed).
+struct SharedBankIo {
+    out: Arc<Mutex<VecDeque<u8>>>,
+    in_: Vec<u8>,
+    in_flight: Arc<AtomicBool>,
+    fill_done: Arc<AtomicBool>,
+    violated: Arc<AtomicBool>,
+    stop_tag: u32,
+    need_fill_done: bool,
+    saw_close_csw: bool,
+    stop: Arc<AtomicBool>,
+}
+
+impl SharedBankIo {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+        if self.in_flight.load(Ordering::SeqCst) {
+            self.violated.store(true, Ordering::SeqCst);
+        }
+        let mut q = self.out.lock().unwrap();
+        if q.is_empty() {
+            let filled = !self.need_fill_done || self.fill_done.load(Ordering::SeqCst);
+            if self.saw_close_csw && filled {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            return Err(BotIoErr::WouldBlock);
+        }
+        let n = q.len().min(buf.len());
+        for (i, b) in q.drain(..n).enumerate() {
+            buf[i] = b;
+        }
+        Ok(n)
+    }
+}
+
+impl BotIo for SharedBankIo {
+    fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+        self.read(buf)
+    }
+
+    fn recv_out(&mut self, buf: &mut [u8], _timeout: Option<Duration>) -> Result<usize, BotIoErr> {
+        self.read(buf)
+    }
+
+    fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+        if buf.len() == CSW_LEN && &buf[..4] == b"USBS" {
+            let tag = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            if tag == self.stop_tag {
+                self.saw_close_csw = true;
+            }
+        }
+        self.in_.extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn stall_both(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn stall_in(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn can_stall_in(&self) -> bool {
+        true
+    }
+}
+
+/// Storage wrapper: keeps the first long-operation write pending and injects
+/// the queued TUR CBW at that moment, so the input arrives exactly while the
+/// token is in flight. `fill_done` tracks the format's final durability sync.
+struct SharedPlan<'a> {
+    inner: PlaneSet<'a>,
+    out: Arc<Mutex<VecDeque<u8>>>,
+    in_flight: Arc<AtomicBool>,
+    fill_done: Arc<AtomicBool>,
+    inject: Option<Vec<u8>>,
+}
+
+impl Storage for SharedPlan<'_> {
+    fn select_lun(&mut self, lun: usize) {
+        self.inner.select_lun(lun);
+    }
+
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.inner.begin_exec(req)
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        if let Some(bytes) = self.inject.take() {
+            self.in_flight.store(true, Ordering::SeqCst);
+            self.out.lock().unwrap().extend(bytes);
+            return Poll::Pending;
+        }
+        let sync = matches!(buf, IoBuf::None);
+        let receipt = self.inner.poll_exec(token, buf);
+        if sync {
+            self.fill_done.store(true, Ordering::SeqCst);
+        }
+        self.in_flight.store(false, Ordering::SeqCst);
+        receipt
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        self.in_flight.store(false, Ordering::SeqCst);
+        self.inner.cancel(token);
+    }
+}
+
+const FORMAT_TAG: u32 = 0x51;
+const TUR_TAG: u32 = 0x52;
+
+/// One buffer: a FORMAT UNIT fill starts as the resident long operation, the
+/// host's TUR CBW arrives while its token is in flight, and the shell serves
+/// the TUR only after the token settles. The fill is byte-exact.
+#[test]
+fn shared_bank_defers_the_tur_until_the_long_token_settles() {
+    let mut ram = vec![0xEEu8; 64 * 1024];
+    let out = Arc::new(Mutex::new(VecDeque::new()));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let fill_done = Arc::new(AtomicBool::new(false));
+    let violated = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // FORMAT UNIT (FmtData=1, Format Code 1) with Immed=1 in the Format List
+    // Header: the command completes GOOD and leaves a resident fill.
+    let mut params = [0u8; 12];
+    params[1] = 0x02; // Immed (MMC-6 Table 240)
+    params[2..4].copy_from_slice(&8u16.to_be_bytes());
+    params[8] = 0x00; // Format Type 0 (full format)
+    let tur = raw_cbw(TUR_TAG, 0, 0x80, 0, &[0x00, 0, 0, 0, 0, 0]);
+    {
+        let mut q = out.lock().unwrap();
+        q.extend(raw_cbw(FORMAT_TAG, 12, 0x00, 0, &[0x04, 0x11, 0, 0, 0, 0]));
+        q.extend(params);
+    }
+
+    let mut io = SharedBankIo {
+        out: Arc::clone(&out),
+        in_: Vec::new(),
+        in_flight: Arc::clone(&in_flight),
+        fill_done: Arc::clone(&fill_done),
+        violated: Arc::clone(&violated),
+        stop_tag: TUR_TAG,
+        need_fill_done: true,
+        saw_close_csw: false,
+        stop: Arc::clone(&stop),
+    };
+    let mut gadget = MockGadget::new();
+    let mut session = BotSession::new();
+    // One allocation at the USB floor: the empty scratch selects the shared
+    // bank.
+    let mut work = vec![0u8; snowscsi::MIN_DATA_AREA];
+    let mut scratch = Vec::new();
+
+    let mut slots = [TestLu::dvdram(1, 0)];
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    {
+        let mut backend = RamBackend::new(&mut ram);
+        let mut storage = SharedPlan {
+            inner: PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+            out: Arc::clone(&out),
+            in_flight: Arc::clone(&in_flight),
+            fill_done: Arc::clone(&fill_done),
+            inject: Some(tur.to_vec()),
+        };
+        let result = serve(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &stop,
+        );
+        assert_eq!(result, Ok(()), "the scripted host ends the session");
+    }
+
+    assert!(
+        !violated.load(Ordering::SeqCst),
+        "the shell read bulk input while the long token was in flight"
+    );
+    assert!(io.saw_close_csw, "the TUR was serviced");
+    assert!(
+        ram[..2048].iter().all(|b| *b == 0),
+        "the FORMAT fill is byte-exact over the shared bank"
+    );
+}
+
+/// The 512-byte USB floor with one buffer: a 2 MiB READ streams through the
+/// shared bank in 512-byte chunks, byte-exact.
+#[test]
+fn shared_bank_512_streams_a_two_mib_read() {
+    const BLOCKS: u16 = 4096; // 2 MiB at 512-byte blocks
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const READ_TAG: u32 = 0x61;
+
+    let mut ram = vec![0u8; 4 * 1024 * 1024];
+    for (i, b) in ram.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected = ram[..TOTAL].to_vec();
+
+    let out = Arc::new(Mutex::new(VecDeque::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let fill_done = Arc::new(AtomicBool::new(false));
+    let violated = Arc::new(AtomicBool::new(false));
+    out.lock().unwrap().extend(raw_cbw(
+        READ_TAG,
+        TOTAL as u32,
+        0x80,
+        0,
+        &rw10(0x28, 0, BLOCKS),
+    ));
+
+    let mut io = SharedBankIo {
+        out: Arc::clone(&out),
+        in_: Vec::new(),
+        in_flight: Arc::clone(&in_flight),
+        fill_done: Arc::clone(&fill_done),
+        violated: Arc::clone(&violated),
+        stop_tag: READ_TAG,
+        need_fill_done: false,
+        saw_close_csw: false,
+        stop: Arc::clone(&stop),
+    };
+    let mut gadget = MockGadget::new();
+    let mut session = BotSession::new();
+    let mut work = vec![0u8; snowscsi::MIN_DATA_AREA]; // 512-byte floor
+    let mut scratch = Vec::new();
+
+    let mut slots = [TestLu::block(8192, 512, 0)];
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    {
+        let mut backend = RamBackend::new(&mut ram);
+        let mut storage = SharedPlan {
+            inner: PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+            out: Arc::clone(&out),
+            in_flight: Arc::clone(&in_flight),
+            fill_done: Arc::clone(&fill_done),
+            inject: None,
+        };
+        let result = serve(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &stop,
+        );
+        assert_eq!(result, Ok(()), "the scripted host ends the session");
+    }
+
+    assert!(!violated.load(Ordering::SeqCst));
+    assert_eq!(io.in_.len(), TOTAL + CSW_LEN, "data plus one CSW");
+    assert_eq!(&io.in_[..TOTAL], &expected[..], "the read is byte-exact");
 }
 
 #[test]

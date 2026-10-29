@@ -542,7 +542,7 @@ impl Runner {
     /// the command-owned [`Runner`] flag, because queries must stay serviceable
     /// while a long IO is pending; see
     /// [`Self::command_boundary_of`].
-    const fn long_io_in_flight(&self) -> bool {
+    pub(crate) const fn long_io_in_flight(&self) -> bool {
         self.long_pending.is_some()
     }
 

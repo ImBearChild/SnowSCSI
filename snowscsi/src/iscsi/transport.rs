@@ -86,6 +86,11 @@ impl embedded_io::Write for TcpConn {
 ///
 /// Returns `Ok(())` when the session closes the connection or the peer hangs
 /// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
+///
+/// `scratch` is the resident long-operation bank: an **empty** `scratch`
+/// selects the shared bank (`work` serves both paths), and the loop drives the
+/// long operation one `Tick` step per turn instead of reading the wire while
+/// its token is in flight.
 pub fn serve_conn<C: Conn, S: RuntimeSet>(
     conn: &mut C,
     work: &mut [u8],
@@ -117,12 +122,40 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
     if !(work.len() - BHS_SIZE).is_multiple_of(4) {
         return Err(TargetError::WorkBufTooSmall);
     }
-    if scratch.len() < crate::MIN_DATA_LEN {
+    if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
         return Err(TargetError::WorkBufTooSmall);
     }
+    let shared = scratch.is_empty();
     let mut ev = Event::Tick;
     loop {
+        // Shared bank: while the resident long operation holds an adapter
+        // token, `work` is its data bank. Drive it one step per turn and never
+        // read the wire until it settles, so a staged PDU is never clobbered.
+        if shared && target.long_io_in_flight() {
+            match session.poll(Event::Tick, work, scratch, target, storage) {
+                // Nothing is staged in `work`; the framing action is re-emitted
+                // once the token settles.
+                Action::HostRecv { .. } => continue,
+                // A response is staged in `work`, which the long token owns:
+                // dropping it (or sending it) would lose or corrupt output.
+                Action::HostSend { .. } => return Err(TargetError::Internal),
+                Action::Closed => return Ok(()),
+                Action::Error(e) => return Err(e),
+            }
+        }
         match session.poll(ev, work, scratch, target, storage) {
+            Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
+                // The step above started the resident long operation; its token
+                // now owns `work`. The receive is re-emitted on the next entry,
+                // so drop it and drive the long operation first.
+                ev = Event::Tick;
+                continue;
+            }
+            Action::HostSend { .. } if shared && target.long_io_in_flight() => {
+                // The response lives in `work`, which the long token is using;
+                // this state must not be reached.
+                return Err(TargetError::Internal);
+            }
             Action::HostRecv { offset, len } => {
                 if offset.checked_add(len).is_none_or(|end| end > work.len()) {
                     return Err(TargetError::Internal);
@@ -182,7 +215,7 @@ pub fn serve<P>(
     if !(work.len() - BHS_SIZE).is_multiple_of(4) {
         return Err(TargetError::WorkBufTooSmall);
     }
-    if scratch.len() < crate::MIN_DATA_LEN {
+    if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
         return Err(TargetError::WorkBufTooSmall);
     }
     loop {

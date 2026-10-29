@@ -16,6 +16,17 @@
 //! ([`crate::MIN_DATA_AREA`] minimum); CBWs and CSWs live in `BotSession`'s
 //! internal buffers, so protocol frames never share memory with SCSI data.
 //!
+//! # One buffer or two
+//!
+//! An **empty** `scratch` selects the shared bank: `work` serves the command
+//! path and the resident long operation in turn, the session advances the long
+//! operation only on [`Event::Tick`](crate::usb::Event::Tick), and
+//! [`serve`](crate::usb::serve::serve) defers bulk/control input while a long
+//! token is in flight (a query or control request waits at most one
+//! long-operation chunk). A **non-empty** `scratch` (at least
+//! [`crate::MIN_DATA_LEN`]) selects the split mode, where queries stay
+//! serviceable while a long IO runs.
+//!
 //! # Example: driving one BOT transaction
 //!
 //! The shell feeds bulk events in; the session hands back the next action.
