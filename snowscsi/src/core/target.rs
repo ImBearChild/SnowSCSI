@@ -210,7 +210,25 @@ impl<S: RuntimeSet> Target<S> {
         if self.active_lun != Some(lun) {
             return Err(Fault::Contract);
         }
+        // The adapter must know the LUN before any step work, including the
+        // empty-bank rejection below: settling a retained token cancels it
+        // through the adapter, and a multi-LUN adapter cancels the operation of
+        // the *selected* LUN.
         storage.select_lun(lun);
+        if work.is_empty() {
+            // The bank is the staging capacity: a bank that cannot make
+            // progress at all is a caller contract violation, never a SCSI
+            // condition. `scratch` is deliberately not checked (callers may
+            // pass an empty one). Settle the active command so the slot is not
+            // left wedged behind it.
+            let Self { runner, slots, .. } = self;
+            let fault = match slots.get(lun) {
+                Some(slot) => runner.reject_empty_bank(slot, storage, host),
+                None => Fault::LunNotFound,
+            };
+            self.active_lun = None;
+            return Err(fault);
+        }
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
         let result = runner.step_command(slot, storage, host, work, scratch)?;
@@ -760,9 +778,19 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         if self.active_lun != Some(I::INDEX) {
             return Err(Fault::Contract);
         }
-        // A static target may still carry several LUNs (`Cons<Nil>`), so the
-        // adapter needs the same per-entry LUN selection as the runtime path.
+        // The adapter is told the wire LUN before any step work (the empty-bank
+        // rejection below settles through the adapter).
         storage.select_lun(I::INDEX);
+        if work.is_empty() {
+            // Same empty-bank contract as the runtime entry: the bank is the
+            // staging capacity, so a bank that cannot make progress is a
+            // caller contract violation, and the active command is settled
+            // rather than left wedged behind it.
+            let Self { runner, slots, .. } = self;
+            let fault = runner.reject_empty_bank(slots.slot_mut(), storage, host);
+            self.active_lun = None;
+            return Err(fault);
+        }
         let Self { runner, slots, .. } = self;
         let result = runner.step_command(slots.slot_mut(), storage, host, work, scratch)?;
         if matches!(result, DriveStep::Done(_)) {
@@ -1390,6 +1418,136 @@ mod tests {
         assert_eq!(
             target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
             Ok(DriveStep::Done(Completion::Good))
+        );
+    }
+
+    #[test]
+    fn empty_work_bank_is_a_contract_fault_and_settles_the_command() {
+        let mut slots = [slot(1)];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BlockingHost::new(RecordingHost);
+        let mut scratch = [0u8; 512];
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        let mut empty: [u8; 0] = [];
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut empty, &mut scratch),
+            Err(Fault::Contract),
+            "a bank that cannot make progress is a caller contract violation"
+        );
+        // The command was settled, not left wedged behind an unsteppable bank.
+        target
+            .drive_start_rt(0, ctx(0, Direction::None, 0), &sync_cdb())
+            .expect("the slot accepts a new command");
+        let mut work = [0u8; 512];
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+            Ok(DriveStep::Done(Completion::Good))
+        );
+    }
+
+    #[test]
+    fn empty_work_bank_on_the_static_entry_is_a_contract_fault_and_settles() {
+        let mut target = Target::new(cons(slot(1), Nil));
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BlockingHost::new(RecordingHost);
+        let mut scratch = [0u8; 512];
+        target
+            .drive_start_static::<Here>(ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        let mut empty: [u8; 0] = [];
+        assert_eq!(
+            target.drive_step_static::<Here>(&mut storage, &mut host, &mut empty, &mut scratch),
+            Err(Fault::Contract),
+            "a bank that cannot make progress is a caller contract violation"
+        );
+        // The command was settled, not left wedged behind an unsteppable bank.
+        target
+            .drive_start_static::<Here>(ctx(0, Direction::None, 0), &sync_cdb())
+            .expect("the slot accepts a new command");
+        let mut work = [0u8; 512];
+        assert_eq!(
+            target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+            Ok(DriveStep::Done(Completion::Good))
+        );
+    }
+
+    /// Adapter probe: records the `select_lun` / `cancel` order and retains the
+    /// first issued token (the first poll answers `Pending`).
+    struct OrderProbe {
+        log: Vec<&'static str>,
+        polls: u32,
+    }
+
+    impl crate::core::storage::Storage for OrderProbe {
+        fn select_lun(&mut self, _lun: usize) {
+            self.log.push("select");
+        }
+
+        fn begin_exec(&mut self, _req: IoReq) -> crate::core::storage::IoToken {
+            crate::core::storage::IoToken::new(0, 1)
+        }
+
+        fn poll_exec(
+            &mut self,
+            _token: crate::core::storage::IoToken,
+            buf: IoBuf<'_>,
+        ) -> core::task::Poll<StorageReceipt> {
+            self.polls += 1;
+            if self.polls == 1 {
+                return core::task::Poll::Pending;
+            }
+            let len = match &buf {
+                IoBuf::None => 0,
+                IoBuf::Read(b) => b.len(),
+                IoBuf::Write(b) => b.len(),
+            };
+            core::task::Poll::Ready(StorageReceipt::ok(len))
+        }
+
+        fn cancel(&mut self, _token: crate::core::storage::IoToken) {
+            self.log.push("cancel");
+        }
+    }
+
+    #[test]
+    fn empty_work_bank_selects_the_lun_before_cancelling_the_retained_token() {
+        let mut slots = [slot(1), slot(2)];
+        let (head, tail) = slots.split_at_mut(1);
+        let table: [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>; 2] =
+            [&mut head[0], &mut tail[0]];
+        let mut target = Target::new(table);
+        let mut storage = OrderProbe {
+            log: Vec::new(),
+            polls: 0,
+        };
+        let mut host = BlockingHost::new(RecordingHost);
+        let mut work = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+            Ok(DriveStep::Pending),
+            "the in-flight read retains its adapter token"
+        );
+        assert_eq!(storage.log, vec!["select"], "one selection per step entry");
+
+        let mut empty: [u8; 0] = [];
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut empty, &mut scratch),
+            Err(Fault::Contract)
+        );
+        assert_eq!(
+            storage.log,
+            vec!["select", "select", "cancel"],
+            "the adapter is told the LUN before the retained token is cancelled"
         );
     }
 

@@ -19,7 +19,7 @@ use crate::core::storage::StorageOp;
 use crate::core::{
     storage_fault_sense, Completion, DataPlan, Direction, Effect, Fault, Feedback, FeedbackKind,
     InterruptReason, IoContext, KnownEffects, PollStep, COMMAND_ABORTED, INTERNAL_FAILURE,
-    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, RESOURCE_FAILURE,
+    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR,
 };
 
 /// DVD-RAM data block length.
@@ -153,7 +153,11 @@ impl DvdRamMedium {
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
         if self.total_bytes() > 0 && len == 0 {
-            return self.finish(Completion::Check(INVALID_FIELD));
+            // A bank that cannot stage one chunk is the target's own inability
+            // to stage the transfer (HARDWARE ERROR / INTERNAL TARGET FAILURE),
+            // not a bad CDB. `Target::drive_step_*` rejects an empty bank before
+            // the medium is polled, so this only guards a direct caller.
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
         }
         self.phase = DvdRamState::ReadIo;
         PollStep::Io(StorageOp::Read {
@@ -166,11 +170,6 @@ impl DvdRamMedium {
     /// Issue the speculative read of the next chunk.
     fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
-        if len == 0 {
-            // No usable bank while bytes remain: a zero-length speculative
-            // read cannot make progress, so fail like the required-read guard.
-            return self.finish(Completion::Check(RESOURCE_FAILURE));
-        }
         self.phase = DvdRamState::PrefetchIo;
         PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
             resource: 0,
@@ -331,7 +330,11 @@ impl MmcMedium for DvdRamMedium {
             (DvdRamState::WriteRecv, FeedbackKind::PlanAccepted) => {
                 let chunk = self.next_chunk(data.len());
                 if total > 0 && chunk == 0 {
-                    return self.finish(Completion::Check(INVALID_FIELD));
+                    // Same staging rule as the read path: a bank that cannot
+                    // hold one chunk is the target's own inability to stage
+                    // (04/44/00), not a bad CDB. The step entries reject an
+                    // empty bank first.
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
                 }
                 PollStep::Receive(&mut data[..chunk])
             }
@@ -368,9 +371,6 @@ impl MmcMedium for DvdRamMedium {
                 if (self.progress as usize) < total {
                     // More host data: start the next chunk's receive phase.
                     let next = self.next_chunk(data.len());
-                    if next == 0 {
-                        return self.finish(Completion::Check(RESOURCE_FAILURE));
-                    }
                     self.phase = DvdRamState::WriteRecv;
                     return PollStep::Receive(&mut data[..next]);
                 }
@@ -724,33 +724,5 @@ mod tests {
         assert_eq!(received, payload.len(), "every host byte was received");
         assert_eq!(backing, payload, "the streamed write is byte-exact");
         assert!(!m.active());
-    }
-
-    #[test]
-    fn a_zero_length_prefetch_bank_reports_resource_failure() {
-        let mut m = medium(4);
-        let mut data = [0u8; 16];
-        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
-        assert!(matches!(
-            m.poll(Feedback::begin(), &mut data),
-            PollStep::Publish(_)
-        ));
-        assert!(matches!(
-            m.poll(Feedback::plan_accepted(), &mut data),
-            PollStep::Io(StorageOp::Read { .. })
-        ));
-        assert!(matches!(
-            m.poll(
-                Feedback::io_done(IoReceipt::test(16, None, Effect::Known)),
-                &mut data
-            ),
-            PollStep::Send(_)
-        ));
-        // The first chunk drains, but the next prefetch has no bank to land in.
-        let mut empty = [0u8; 0];
-        assert!(matches!(
-            m.poll(Feedback::host_sent(HostReceipt::test(16, None)), &mut empty),
-            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
-        ));
     }
 }

@@ -592,6 +592,29 @@ impl Runner {
 
     // ── command start / step ───────────────────────────────────────────
 
+    /// Reject a step whose caller bank cannot make progress at all.
+    ///
+    /// The bank is the staging capacity, so an empty bank is a caller contract
+    /// violation, never a device condition. A retained adapter token is
+    /// cancelled and the active command is settled through the bounded contract
+    /// path, so the slot is not wedged behind a command that can never step.
+    pub(crate) fn reject_empty_bank<L: Lu + ?Sized>(
+        &mut self,
+        lu: &mut L,
+        storage: &mut dyn Storage,
+        host: &mut dyn HostTransport,
+    ) -> Fault {
+        let Some(state) = self.drive_state.get() else {
+            return Fault::Contract;
+        };
+        if let Some(pending) = state.pending {
+            self.cancel_pending(pending, storage, host);
+        }
+        let known = Self::known_for_pending(state.pending);
+        self.settle_contract(lu, known);
+        Fault::Contract
+    }
+
     /// Start one command: admission and `prepare` only. All data/IO work happens
     /// in [`Runner::step_command`], which may return `Pending` across calls.
     #[allow(dead_code)] // `Target::drive_start_*`; driven by tests here

@@ -31,7 +31,7 @@ use super::device::{
 use super::eject::RemovalLocks;
 use super::errors::{
     Completion, Delivery, Effect, Fault, KnownEffects, Sense, FORMAT_IN_PROGRESS, INVALID_FIELD,
-    MEDIUM_NOT_PRESENT, RESOURCE_FAILURE, WRITE_ERROR,
+    MEDIUM_NOT_PRESENT, WRITE_ERROR,
 };
 use super::long::{LongInfo, LongPhase};
 use super::permit::{BoundaryPermit, CommandPermit};
@@ -727,25 +727,23 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                // The caller's bank is the staging capacity: a response that
+                // does not fit is sent short (a legal Data-In underflow the
+                // transport reports as residue), never as a CHECK CONDITION.
+                let send = self.len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: self.len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                if data.len() < self.len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
-                fill_report_luns(self.lun_count, data, self.len);
-                PollStep::Send(&data[..self.len])
+                fill_report_luns(self.lun_count, data, send);
+                PollStep::Send(&data[..send])
             }
             Query::ModeSense { ten, page, dbd, pc } => {
                 let len = self.len;
@@ -753,62 +751,55 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                let send = len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
-                }
-                if data.len() < len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 // The profile writes directly into the caller's bank; header
                 // lengths describe the complete, untruncated response.
                 let filled = self
                     .inner
                     .spc_profile()
-                    .and_then(|p| p.mode_sense(ten, page, dbd, pc, Some(&mut data[..len])));
+                    .and_then(|p| p.mode_sense(ten, page, dbd, pc, Some(&mut data[..send])));
                 if filled.is_none() {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..len])
+                PollStep::Send(&data[..send])
             }
             Query::ReadCapacity => {
-                let len = self.len;
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: len as u64,
+                        bytes: self.len.min(data.len()) as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                if data.len() < len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
                 let capacity = self.inner.spc_profile().and_then(|p| p.read_capacity());
                 let Some(capacity) = capacity else {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                data[..4].copy_from_slice(&capacity.last_lba.to_be_bytes());
-                data[4..8].copy_from_slice(&capacity.block_len.to_be_bytes());
-                PollStep::Send(&data[..len])
+                // Fixed 8-byte layout (SBC-3 5.16): write only the bytes that
+                // fit the bank.
+                let mut fixed = [0u8; READ_CAPACITY_LEN];
+                fixed[..4].copy_from_slice(&capacity.last_lba.to_be_bytes());
+                fixed[4..].copy_from_slice(&capacity.block_len.to_be_bytes());
+                let send = self.len.min(data.len()).min(READ_CAPACITY_LEN);
+                data[..send].copy_from_slice(&fixed[..send]);
+                PollStep::Send(&data[..send])
             }
             Query::GetConfiguration { rt, start_feature } => {
                 let len = self.len;
@@ -816,32 +807,27 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                let send = len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                if data.len() < len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
                 let filled = self
                     .inner
                     .spc_profile()
-                    .and_then(|p| p.get_configuration(rt, start_feature, Some(&mut data[..len])));
+                    .and_then(|p| p.get_configuration(rt, start_feature, Some(&mut data[..send])));
                 if filled.is_none() {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..len])
+                PollStep::Send(&data[..send])
             }
             Query::EventStatus { class } => {
                 let len = self.len;
@@ -849,57 +835,47 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                let send = len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                if data.len() < len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
                 let filled = self
                     .inner
                     .spc_profile()
-                    .and_then(|p| p.event_status(class, Some(&mut data[..len])));
+                    .and_then(|p| p.event_status(class, Some(&mut data[..send])));
                 if filled.is_none() {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..len])
+                PollStep::Send(&data[..send])
             }
             Query::Inquiry => {
                 if self.len == 0 {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                let send = self.len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: self.len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                if data.len() < self.len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-                }
-                fill_inquiry(self.inner.inquiry_data(), data, self.len);
-                PollStep::Send(&data[..self.len])
+                fill_inquiry(self.inner.inquiry_data(), data, send);
+                PollStep::Send(&data[..send])
             }
             Query::RequestSense => {
                 if self.len == 0 {
@@ -909,17 +885,18 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
+                let send = self.len.min(data.len());
                 if !self.published {
                     self.published = true;
                     return PollStep::Publish(DataPlan {
                         direction: Direction::ToHost,
-                        bytes: self.len as u64,
+                        bytes: send as u64,
                     });
                 }
                 if fb.kind() == FeedbackKind::HostSent {
                     let fully_sent = fb
                         .host()
-                        .map(|h| h.error().is_none() && h.accepted() == self.len)
+                        .map(|h| h.error().is_none() && h.accepted() == send)
                         .unwrap_or(false);
                     self.query = Query::None;
                     // A short/failed send does not consume the saved sense.
@@ -927,12 +904,6 @@ impl<D: Device> Device for Spc<D> {
                         self.saved_sense = None;
                     }
                     return PollStep::Complete(Completion::Good);
-                }
-                if data.len() < self.len {
-                    // The CDB is valid; the caller's bank cannot stage the
-                    // response.
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
                 }
                 let info = self.inner.long_info();
                 let sense = if info.phase == LongPhase::Foreground && info.progress.is_some() {
@@ -945,8 +916,8 @@ impl<D: Device> Device for Spc<D> {
                 } else {
                     None
                 };
-                fill_sense(sense, progress, data, self.len);
-                PollStep::Send(&data[..self.len])
+                fill_sense(sense, progress, data, send);
+                PollStep::Send(&data[..send])
             }
         }
     }
@@ -1171,6 +1142,38 @@ mod tests {
         spc.poll(&permit, Feedback::plan_accepted(), &mut data);
         assert_eq!(&data[0..4], &24u32.to_be_bytes());
         assert_eq!(&data[16..20], &[0x00, 1, 0, 0]);
+    }
+
+    #[test]
+    fn read_capacity_writes_only_the_bytes_that_fit() {
+        let mut spc = device();
+        let permit = permit();
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x25;
+        let mut data = [0u8; 4];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 8), &cdb),
+            Ok(())
+        );
+        match spc.poll(&permit, Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 4, "the plan matches the bank"),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
+            PollStep::Send(bytes) => {
+                assert_eq!(bytes.len(), 4);
+                assert_eq!(bytes, &15u32.to_be_bytes(), "last LBA fits exactly");
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(4, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
     }
 
     #[test]

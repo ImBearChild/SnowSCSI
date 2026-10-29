@@ -49,11 +49,16 @@ enum HostEvent {
 
 struct TestHost {
     events: Vec<HostEvent>,
+    /// Every byte handed to `send`, in delivery order.
+    sent: Vec<u8>,
 }
 
 impl TestHost {
     fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            sent: Vec::new(),
+        }
     }
 }
 
@@ -74,8 +79,12 @@ impl SyncHost for TestHost {
         }
     }
 
-    fn send(&mut self, req: HostReq, _buf: HostBuf<'_>) -> HostReceipt {
+    fn send(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         let accepted = req.len as usize;
+        if let HostBuf::Send(bytes) = buf {
+            self.sent
+                .extend_from_slice(&bytes[..accepted.min(bytes.len())]);
+        }
         self.events.push(HostEvent::Sent(accepted));
         HostReceipt::from_adapter(accepted, None)
     }
@@ -1576,6 +1585,140 @@ fn mmc_vendor_medium_uses_the_shared_spc_path() {
             &mut scratch,
         ),
         Ok(Completion::Check(WRITE_PROTECTED))
+    );
+}
+
+/// A vendor READ larger than the caller's bank streams byte-exact data
+/// through the shared path: more than one storage read, no CHECK CONDITION.
+#[test]
+fn mmc_vendor_read_larger_than_the_bank_streams_without_check() {
+    const BANK: usize = 8192;
+    const BLOCKS: u16 = 1024;
+    const TOTAL: usize = BLOCKS as usize * 2048;
+
+    let mut target = vendor_target(u64::from(BLOCKS));
+    let mut storage = BlockingStorage::new(Plane::new(TOTAL));
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = vec![0u8; BANK];
+    let mut scratch = vec![0u8; 64];
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(Direction::ToHost, TOTAL as u64),
+            &read10(0, BLOCKS),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good),
+        "a 2 MiB read through an 8 KiB bank is not a CHECK CONDITION"
+    );
+    let sent: usize = host
+        .inner()
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            HostEvent::Sent(len) => Some(*len),
+            HostEvent::Publish(_) => None,
+        })
+        .sum();
+    assert_eq!(sent, TOTAL, "every byte was delivered exactly once");
+    let reads = &storage.inner().reads;
+    assert_eq!(reads.len(), TOTAL / BANK);
+    for (i, read) in reads.iter().enumerate() {
+        assert_eq!(
+            *read,
+            ((i * BANK) as u64, BANK),
+            "read {i} is the next bank-sized chunk"
+        );
+    }
+    let drive = slot0(&target).device_ref().inner();
+    assert_eq!(
+        drive.io_issues(),
+        1,
+        "only the first chunk is a required read"
+    );
+    assert_eq!(
+        drive.prefetch_issues(),
+        (TOTAL / BANK - 1) as u32,
+        "each following chunk is a speculative read"
+    );
+}
+
+/// A fixed-length SPC response larger than the caller's bank is sent short: a
+/// legal Data-In underflow with no CHECK CONDITION, and the session stays
+/// usable for the next command.
+#[test]
+fn spc_fixed_response_short_bank_is_an_underflow_not_a_check() {
+    let alloc = 0xFFu8;
+    let mut storage = BlockingStorage::new(NoIo);
+    let mut scratch = [0u8; 64];
+
+    // Reference: the same response with a bank that holds it completely.
+    let mut full = mmc_flat_target(8);
+    let mut full_host = BlockingHost::new(TestHost::new());
+    let mut full_work = [0u8; 198];
+    assert_eq!(
+        full.drive_static_host::<Here>(
+            &mut storage,
+            &mut full_host,
+            ctx(Direction::ToHost, u64::from(alloc)),
+            &mode_sense_6(0x3F, 0, alloc),
+            &mut full_work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(full_host.inner().sent.len(), 198);
+
+    let mut target = mmc_flat_target(8);
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; 64];
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(Direction::ToHost, u64::from(alloc)),
+            &mode_sense_6(0x3F, 0, alloc),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good),
+        "a response that does not fit the bank is an underflow, not a CHECK"
+    );
+    assert_eq!(
+        host.inner().events,
+        vec![
+            HostEvent::Publish(DataPlan {
+                direction: Direction::ToHost,
+                bytes: 64,
+            }),
+            HostEvent::Sent(64),
+        ],
+        "the published plan matches the bytes actually sent"
+    );
+    assert_eq!(
+        host.inner().sent,
+        &full_host.inner().sent[..64],
+        "the whole 64-byte sent prefix matches the complete response"
+    );
+    assert_eq!(
+        work[0], 197,
+        "the header still declares the complete, untruncated response"
+    );
+
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(Direction::None, 0),
+            &tur_cdb(),
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good),
+        "the session is still usable after the short Data-In"
     );
 }
 

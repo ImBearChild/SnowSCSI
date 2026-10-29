@@ -21,7 +21,7 @@ use crate::core::{
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, NoMedium, PollStep, RemovalEncoding,
     SpcProfile, COMMAND_ABORTED, ILLEGAL_REQUEST, INTERNAL_FAILURE, INVALID_FIELD,
-    LBA_OUT_OF_RANGE, MEDIUM_ERROR, NEEDS_RECOVERY, RESOURCE_FAILURE, WRITE_ERROR, WRITE_PROTECTED,
+    LBA_OUT_OF_RANGE, MEDIUM_ERROR, NEEDS_RECOVERY, WRITE_ERROR, WRITE_PROTECTED,
 };
 
 /// Opcode TEST UNIT READY (SPC-3 6.33). Owned by the Block profile so the
@@ -400,9 +400,6 @@ impl BlockDevice {
     /// Issue the normal read of the current chunk.
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
-        if self.bytes > 0 && len == 0 {
-            return self.finish(Completion::Check(RESOURCE_FAILURE));
-        }
         self.io_issues = self.io_issues.saturating_add(1);
         PollStep::Io(StorageOp::Read {
             resource: 0,
@@ -558,9 +555,6 @@ impl Device for BlockDevice {
             // WRITE: receive host data, then write the accepted prefix.
             (Stage::WriteRecv, FeedbackKind::PlanAccepted) => {
                 let len = self.next_chunk(data.len());
-                if self.bytes > 0 && len == 0 {
-                    return self.finish(Completion::Check(RESOURCE_FAILURE));
-                }
                 PollStep::Receive(&mut data[..len])
             }
             (Stage::WriteRecv, FeedbackKind::HostReceived) => {
@@ -626,9 +620,6 @@ impl Device for BlockDevice {
                 if self.progress < self.bytes {
                     // More host data: start the next chunk's receive phase.
                     let len = self.next_chunk(data.len());
-                    if len == 0 {
-                        return self.finish(Completion::Check(RESOURCE_FAILURE));
-                    }
                     self.stage = Stage::WriteRecv;
                     return PollStep::Receive(&mut data[..len]);
                 }

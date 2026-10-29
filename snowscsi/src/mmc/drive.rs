@@ -25,8 +25,8 @@ use crate::core::{
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, LongPhase, PollStep, RemovalEncoding,
     Sense, SpcProfile, COMMAND_ABORTED, FORMAT_IN_PROGRESS, INTERNAL_FAILURE, INVALID_FIELD,
-    LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, RESOURCE_FAILURE,
-    WRITE_ERROR, WRITE_PROTECTED,
+    LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, WRITE_ERROR,
+    WRITE_PROTECTED,
 };
 
 /// TEST UNIT READY.
@@ -811,27 +811,26 @@ impl<M: MmcMedium> MmcDrive<M> {
             self.query = Query::None;
             return PollStep::Complete(Completion::Good);
         }
+        // The caller's bank is the staging capacity: a response that does not
+        // fit is sent short (a legal Data-In underflow the transport reports as
+        // residue), never as a CHECK CONDITION.
+        let send = len.min(data.len());
         if !self.published {
             self.published = true;
             return PollStep::Publish(DataPlan {
                 direction: Direction::ToHost,
-                bytes: len as u64,
+                bytes: send as u64,
             });
         }
         if fb.kind() == FeedbackKind::HostSent {
             self.query = Query::None;
             return PollStep::Complete(Completion::Good);
         }
-        if data.len() < len {
-            // The CDB is valid; the caller's bank cannot stage the response.
-            self.query = Query::None;
-            return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
-        }
-        if !fill(&mut data[..len]) {
+        if !fill(&mut data[..send]) {
             self.query = Query::None;
             return PollStep::Complete(Completion::Check(INVALID_FIELD));
         }
-        PollStep::Send(&data[..len])
+        PollStep::Send(&data[..send])
     }
 }
 
@@ -1012,11 +1011,16 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
             }
             Query::Format(cmd) => {
                 if cmd.params {
+                    // The 12-byte Format List is staged in the caller's bank.
+                    // The documented bank floor makes this guard unreachable
+                    // through a transport: it is the target's own inability to
+                    // stage its parameter list (HARDWARE ERROR / INTERNAL
+                    // TARGET FAILURE), not a bad CDB.
                     if !self.published {
                         if data.len() < FORMAT_PARAMS_LEN {
                             self.query = Query::None;
                             self.long = LongOp::Idle;
-                            return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
+                            return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
                         }
                         self.published = true;
                         return PollStep::Publish(DataPlan {
@@ -1029,7 +1033,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                             if data.len() < FORMAT_PARAMS_LEN {
                                 self.query = Query::None;
                                 self.long = LongOp::Idle;
-                                return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
+                                return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
                             }
                             PollStep::Receive(&mut data[..FORMAT_PARAMS_LEN])
                         }
@@ -1037,7 +1041,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                             if data.len() < FORMAT_PARAMS_LEN {
                                 self.query = Query::None;
                                 self.long = LongOp::Idle;
-                                return PollStep::Complete(Completion::Check(RESOURCE_FAILURE));
+                                return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
                             }
                             let (accepted, failed) = match fb.host() {
                                 Some(receipt) => (receipt.accepted(), receipt.error().is_some()),
@@ -2788,6 +2792,68 @@ mod tests {
             dev.prepare(&permit, ctx(Direction::FromHost, 0), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
+    }
+
+    #[test]
+    fn format_unit_parameters_reject_a_sub_list_bank_as_internal_failure() {
+        // A parameter list that cannot be staged is the target's own inability
+        // (HARDWARE ERROR / INTERNAL TARGET FAILURE), not a CDB problem, and
+        // never a caller-bank sense. The documented bank floor makes it
+        // unreachable through a transport.
+        let permit = permit();
+        let cdb = [FORMAT_UNIT, 0x11, 0, 0, 0, 0];
+        let mut small = [0u8; FORMAT_PARAMS_LEN - 4];
+
+        // Publish step.
+        let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 12), &cdb),
+            Ok(())
+        );
+        assert!(matches!(
+            dev.poll(&permit, Feedback::begin(), &mut small),
+            PollStep::Complete(Completion::Check(INTERNAL_FAILURE))
+        ));
+        assert!(!dev.active());
+        assert_eq!(dev.long_info().phase, LongPhase::Idle);
+
+        // PlanAccepted step.
+        let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
+        dev.prepare(&permit, ctx(Direction::FromHost, 12), &cdb)
+            .expect("prepare");
+        let mut big = [0u8; 4096];
+        assert!(matches!(
+            dev.poll(&permit, Feedback::begin(), &mut big),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            dev.poll(&permit, Feedback::plan_accepted(), &mut small),
+            PollStep::Complete(Completion::Check(INTERNAL_FAILURE))
+        ));
+        assert!(!dev.active());
+
+        // HostReceived step.
+        let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
+        dev.prepare(&permit, ctx(Direction::FromHost, 12), &cdb)
+            .expect("prepare");
+        assert!(matches!(
+            dev.poll(&permit, Feedback::begin(), &mut big),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            dev.poll(&permit, Feedback::plan_accepted(), &mut big),
+            PollStep::Receive(bytes) if bytes.len() == FORMAT_PARAMS_LEN
+        ));
+        assert!(matches!(
+            dev.poll(
+                &permit,
+                Feedback::host_received(HostReceipt::test(FORMAT_PARAMS_LEN, None)),
+                &mut small
+            ),
+            PollStep::Complete(Completion::Check(INTERNAL_FAILURE))
+        ));
+        assert!(!dev.active());
+        assert_eq!(dev.long_info().phase, LongPhase::Idle);
     }
 
     #[test]

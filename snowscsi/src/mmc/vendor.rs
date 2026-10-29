@@ -6,6 +6,11 @@
 //! INQUIRY/READ CAPACITY/READ through the same `Spc`/`MmcDrive` path as the flat
 //! CD. It is deliberately not feature gated.
 //!
+//! Reads stream in bank-sized chunks exactly like `FlatCdMedium`: the caller's
+//! bank is the staging capacity, so a read larger than the bank is sent in
+//! several chunks (with a speculative read of the next one) and never answers
+//! CHECK CONDITION for the shortfall.
+//!
 //! Writes and audio sectors are rejected in [`MmcMedium::begin`] with no IO.
 
 use super::attrs::{
@@ -30,11 +35,11 @@ pub enum VendorState {
     Idle,
     /// Admitted; the data plan has not been published yet.
     Publish,
-    /// The backing read is being issued.
+    /// READ: the backing read is being issued.
     ReadIo,
-    /// The data is being sent to the host.
-    SendData,
-    /// Waiting for the host send to complete.
+    /// READ: a speculative read of the next chunk is being issued.
+    PrefetchIo,
+    /// READ: waiting for the host send to complete.
     Deliver,
     /// COMMIT: the sync is being issued.
     SyncIo,
@@ -58,6 +63,8 @@ pub struct VendorMedium {
     attrs: MmcAttrs,
     op: Option<Op>,
     phase: VendorState,
+    /// Bytes of the read already delivered to the host.
+    progress: u32,
 }
 
 impl VendorMedium {
@@ -76,6 +83,7 @@ impl VendorMedium {
             },
             op: None,
             phase: VendorState::Idle,
+            progress: 0,
         }
     }
 
@@ -110,6 +118,52 @@ impl VendorMedium {
     fn reset(&mut self) {
         self.op = None;
         self.phase = VendorState::Idle;
+        self.progress = 0;
+    }
+
+    /// Total bytes selected by the admitted operation.
+    fn total_bytes(&self) -> usize {
+        match self.op {
+            Some(Op::Read { bytes, .. }) => bytes as usize,
+            _ => 0,
+        }
+    }
+
+    /// Bytes of the next chunk, bounded by the caller's bank.
+    fn next_chunk(&self, bank_len: usize) -> usize {
+        self.total_bytes()
+            .saturating_sub(self.progress as usize)
+            .min(bank_len)
+    }
+
+    /// Byte offset of the next chunk inside the backing.
+    fn next_offset(&self) -> u64 {
+        match self.op {
+            Some(Op::Read { offset, .. }) => offset + u64::from(self.progress),
+            _ => 0,
+        }
+    }
+
+    /// Issue the normal read of the current chunk.
+    fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        self.phase = VendorState::ReadIo;
+        PollStep::Io(StorageOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
+    }
+
+    /// Issue the speculative read of the next chunk.
+    fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.next_chunk(data.len());
+        self.phase = VendorState::PrefetchIo;
+        PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+            resource: 0,
+            offset: self.next_offset(),
+            buf: &mut data[..len],
+        })
     }
 
     /// Fix a terminal completion.
@@ -143,6 +197,7 @@ impl MmcMedium for VendorMedium {
         if self.active() {
             return Err(Completion::Busy);
         }
+        self.progress = 0;
         let action = match op {
             MmcOp::Read { lba, blocks } => self.read_op(lba, blocks)?,
             MmcOp::ReadSectors { lba, blocks, kind } => match kind {
@@ -166,13 +221,7 @@ impl MmcMedium for VendorMedium {
     }
 
     fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
-        let needed = match self.op {
-            Some(Op::Read { bytes, .. }) => bytes as usize,
-            _ => 0,
-        };
-        if data.len() < needed {
-            return self.finish(Completion::Check(INVALID_FIELD));
-        }
+        let total = self.total_bytes();
         match (self.phase, fb.kind()) {
             (VendorState::Publish, FeedbackKind::Begin) => match self.op {
                 Some(Op::Read { bytes, .. }) => {
@@ -191,40 +240,53 @@ impl MmcMedium for VendorMedium {
                 }
                 None => PollStep::Idle,
             },
-            (VendorState::ReadIo, FeedbackKind::PlanAccepted) => {
-                let Some(Op::Read { offset, bytes }) = self.op else {
-                    return self.finish(Completion::Check(INTERNAL_FAILURE));
-                };
-                self.phase = VendorState::SendData;
-                PollStep::Io(StorageOp::Read {
-                    resource: 0,
-                    offset,
-                    buf: &mut data[..bytes as usize],
-                })
-            }
-            (VendorState::SendData, FeedbackKind::IoDone) => {
+            (VendorState::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
+            (VendorState::ReadIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Read);
                 }
-                if receipt.confirmed() < needed {
+                if receipt.confirmed() < chunk {
+                    // A short read is not success; a read has no write effect
+                    // to preserve.
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = VendorState::Deliver;
-                PollStep::Send(&data[..needed])
+                PollStep::Send(&data[..chunk])
+            }
+            (VendorState::PrefetchIo, FeedbackKind::IoDone) => {
+                let chunk = self.next_chunk(data.len());
+                let failed = match fb.io() {
+                    Some(receipt) => receipt.error().is_some() || receipt.confirmed() < chunk,
+                    None => true,
+                };
+                if failed {
+                    // Speculative data is optional: re-read the same range as a
+                    // required read; the command outcome is unchanged.
+                    return self.read_chunk(data);
+                }
+                self.phase = VendorState::Deliver;
+                PollStep::Send(&data[..chunk])
             }
             (VendorState::Deliver, FeedbackKind::HostSent) => {
+                let chunk = self.next_chunk(data.len());
                 let (accepted, failed) = match fb.host() {
-                    Some(receipt) => (receipt.accepted().min(needed), receipt.error().is_some()),
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
                     None => (0, true),
                 };
-                if failed || accepted < needed {
-                    self.finish(Completion::Check(COMMAND_ABORTED))
-                } else {
-                    self.finish(Completion::Good)
+                if failed || accepted < chunk {
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if (self.progress as usize) < total {
+                    // Read the next chunk now so the following send does not
+                    // wait for storage.
+                    return self.prefetch_chunk(data);
+                }
+                self.finish(Completion::Good)
             }
             (VendorState::SyncIo, FeedbackKind::PlanAccepted) => {
                 self.phase = VendorState::SyncWait;
@@ -296,8 +358,18 @@ impl MmcMedium for VendorMedium {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::storage::{HostReceipt, IoReceipt};
+    use crate::core::storage::{HostReceipt, IoReceipt, PrefetchOp};
     use crate::core::Effect;
+
+    fn io_receipt(confirmed: usize) -> Feedback {
+        Feedback::io_done(IoReceipt::test(confirmed, None, Effect::Known))
+    }
+
+    fn fill_pattern(buf: &mut [u8], at: usize) {
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = ((at + i) & 0xFF) as u8;
+        }
+    }
 
     #[test]
     fn attrs_are_read_only_and_single_track() {
@@ -351,6 +423,189 @@ mod tests {
             m.poll(
                 Feedback::host_sent(HostReceipt::test(2048, None)),
                 &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+    }
+
+    /// A 2 MiB read through an 8 KiB bank returns every byte exactly once,
+    /// issues more than one required read only for the first chunk, and never
+    /// answers CHECK CONDITION for the shortfall.
+    #[test]
+    fn a_read_larger_than_the_bank_streams_byte_exact() {
+        const BANK: usize = 8192;
+        const BLOCKS: u16 = 1024;
+        const TOTAL: usize = BLOCKS as usize * 2048;
+
+        let mut m = VendorMedium::new(u64::from(BLOCKS));
+        let mut bank = [0u8; BANK];
+        assert_eq!(
+            m.begin(MmcOp::Read {
+                lba: 0,
+                blocks: BLOCKS
+            }),
+            Ok(())
+        );
+        match m.poll(Feedback::begin(), &mut bank) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, TOTAL as u64),
+            other => panic!("expected publish, got {other:?}"),
+        }
+
+        let mut reads = 0u32;
+        let mut prefetches = 0u32;
+        let mut delivered = 0usize;
+
+        match m.poll(Feedback::plan_accepted(), &mut bank) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(buf.len(), BANK);
+                fill_pattern(buf, 0);
+                reads += 1;
+            }
+            other => panic!("expected read IO, got {other:?}"),
+        }
+        loop {
+            match m.poll(io_receipt(BANK), &mut bank) {
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), BANK);
+                    for (i, byte) in bytes.iter().enumerate() {
+                        assert_eq!(*byte, ((delivered + i) & 0xFF) as u8);
+                    }
+                    delivered += bytes.len();
+                }
+                other => panic!("expected send, got {other:?}"),
+            }
+            if delivered == TOTAL {
+                break;
+            }
+            match m.poll(
+                Feedback::host_sent(HostReceipt::test(BANK, None)),
+                &mut bank,
+            ) {
+                PollStep::Prefetch(PrefetchOp::Read { offset, buf, .. }) => {
+                    assert_eq!(offset as usize, delivered);
+                    assert_eq!(buf.len(), BANK);
+                    fill_pattern(buf, delivered);
+                    prefetches += 1;
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(
+                m.poll(
+                    Feedback::host_sent(HostReceipt::test(BANK, None)),
+                    &mut bank
+                ),
+                PollStep::Complete(Completion::Good)
+            ),
+            "the streamed read completes GOOD"
+        );
+        assert_eq!(reads, 1, "only the first chunk is a required read");
+        assert_eq!(prefetches, (TOTAL / BANK - 1) as u32);
+        assert!(!m.active());
+    }
+
+    /// A 2 MiB read whose bank is larger than the transfer issues exactly one
+    /// backing read and no speculative one.
+    #[test]
+    fn a_read_that_fits_one_chunk_issues_one_read_without_prefetch() {
+        const BLOCKS: u16 = 1024;
+        const TOTAL: usize = BLOCKS as usize * 2048;
+
+        let mut m = VendorMedium::new(u64::from(BLOCKS));
+        let mut bank = vec![0u8; 2 * TOTAL];
+        assert_eq!(
+            m.begin(MmcOp::Read {
+                lba: 0,
+                blocks: BLOCKS,
+            }),
+            Ok(())
+        );
+        match m.poll(Feedback::begin(), &mut bank) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, TOTAL as u64),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match m.poll(Feedback::plan_accepted(), &mut bank) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(buf.len(), TOTAL);
+                fill_pattern(buf, 0);
+            }
+            other => panic!("expected read IO, got {other:?}"),
+        }
+        match m.poll(io_receipt(TOTAL), &mut bank) {
+            PollStep::Send(bytes) => {
+                assert_eq!(bytes.len(), TOTAL);
+                assert_eq!(bytes[TOTAL - 1], ((TOTAL - 1) & 0xFF) as u8);
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                m.poll(
+                    Feedback::host_sent(HostReceipt::test(TOTAL, None)),
+                    &mut bank
+                ),
+                PollStep::Complete(Completion::Good)
+            ),
+            "a transfer that fits one chunk must not prefetch"
+        );
+    }
+
+    /// A failed speculative read is re-read as a required read: the bytes stay
+    /// exact and the completion is unchanged.
+    #[test]
+    fn a_failed_prefetch_falls_back_without_changing_the_completion() {
+        let mut m = VendorMedium::new(8);
+        let mut bank = [0u8; 8192];
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 8 }), Ok(()));
+        match m.poll(Feedback::begin(), &mut bank) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 16384),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match m.poll(Feedback::plan_accepted(), &mut bank) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                fill_pattern(buf, 0);
+            }
+            other => panic!("expected read IO, got {other:?}"),
+        }
+        match m.poll(io_receipt(8192), &mut bank) {
+            PollStep::Send(bytes) => assert_eq!(bytes.len(), 8192),
+            other => panic!("expected send, got {other:?}"),
+        }
+        match m.poll(
+            Feedback::host_sent(HostReceipt::test(8192, None)),
+            &mut bank,
+        ) {
+            PollStep::Prefetch(PrefetchOp::Read { offset, .. }) => assert_eq!(offset, 8192),
+            other => panic!("expected prefetch, got {other:?}"),
+        }
+        // The speculative read fails; the same range is read again as required.
+        match m.poll(
+            Feedback::io_done(IoReceipt::test(0, Some(Fault::Io), Effect::Known)),
+            &mut bank,
+        ) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 8192);
+                assert_eq!(buf.len(), 8192);
+                fill_pattern(buf, 8192);
+            }
+            other => panic!("expected fallback read IO, got {other:?}"),
+        }
+        match m.poll(io_receipt(8192), &mut bank) {
+            PollStep::Send(bytes) => {
+                for (i, byte) in bytes.iter().enumerate() {
+                    assert_eq!(*byte, ((8192 + i) & 0xFF) as u8);
+                }
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert!(matches!(
+            m.poll(
+                Feedback::host_sent(HostReceipt::test(8192, None)),
+                &mut bank
             ),
             PollStep::Complete(Completion::Good)
         ));

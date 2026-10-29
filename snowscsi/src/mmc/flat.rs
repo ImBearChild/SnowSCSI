@@ -18,7 +18,7 @@ use crate::core::storage::StorageOp;
 use crate::core::{
     storage_fault_sense, Completion, DataPlan, Direction, Effect, Feedback, FeedbackKind,
     InterruptReason, IoContext, KnownEffects, PollStep, COMMAND_ABORTED, INTERNAL_FAILURE,
-    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, RESOURCE_FAILURE, WRITE_PROTECTED,
+    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, WRITE_PROTECTED,
 };
 
 /// CD data block length.
@@ -145,7 +145,11 @@ impl FlatCdMedium {
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
         if self.total_bytes() > 0 && len == 0 {
-            return self.finish(Completion::Check(INVALID_FIELD));
+            // A bank that cannot stage one chunk is the target's own inability
+            // to stage the transfer (HARDWARE ERROR / INTERNAL TARGET FAILURE),
+            // not a bad CDB. `Target::drive_step_*` rejects an empty bank before
+            // the medium is polled, so this only guards a direct caller.
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
         }
         self.phase = FlatState::ReadIo;
         PollStep::Io(StorageOp::Read {
@@ -158,11 +162,6 @@ impl FlatCdMedium {
     /// Issue the speculative read of the next chunk.
     fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
-        if len == 0 {
-            // No usable bank while bytes remain: a zero-length speculative
-            // read cannot make progress, so fail like the required-read guard.
-            return self.finish(Completion::Check(RESOURCE_FAILURE));
-        }
         self.phase = FlatState::PrefetchIo;
         PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
             resource: 0,
@@ -616,30 +615,5 @@ mod tests {
         }
         assert_eq!(prefetches, 8192 / 16 - 1);
         assert!(!m.active());
-    }
-
-    #[test]
-    fn a_zero_length_prefetch_bank_reports_resource_failure() {
-        let mut m = medium(4);
-        let mut data = [0u8; 16];
-        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 4 }), Ok(()));
-        assert!(matches!(
-            m.poll(Feedback::begin(), &mut data),
-            PollStep::Publish(_)
-        ));
-        assert!(matches!(
-            m.poll(Feedback::plan_accepted(), &mut data),
-            PollStep::Io(StorageOp::Read { .. })
-        ));
-        assert!(matches!(
-            m.poll(io_receipt(16, None), &mut data),
-            PollStep::Send(_)
-        ));
-        // The first chunk drains, but the next prefetch has no bank to land in.
-        let mut empty = [0u8; 0];
-        assert!(matches!(
-            m.poll(Feedback::host_sent(HostReceipt::test(16, None)), &mut empty),
-            PollStep::Complete(Completion::Check(RESOURCE_FAILURE))
-        ));
     }
 }
