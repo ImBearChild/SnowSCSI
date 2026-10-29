@@ -1490,7 +1490,6 @@ fn data_out_opcode(opcode: u8) -> bool {
             | 0x93 // WRITE SAME(16)
             | 0x4C // LOG SELECT
             | 0xBF // SEND DVD STRUCTURE
-            | 0xA1 // BLANK
     )
 }
 

@@ -2115,6 +2115,54 @@ fn a_write_received_in_request_sized_reads_commits_every_byte() {
     assert_eq!(check, payload, "byte-exact commit");
 }
 
+/// A no-data command whose CBW asks for Data-In is a legal underflow, not a
+/// phase error: the device answers CHECK CONDITION and the host gets the
+/// short data phase plus the real residue. Treating it as a phase error makes
+/// the host reset the port, stalling every queued command behind it.
+#[test]
+fn a_no_data_command_with_a_data_in_declaration_is_an_underflow() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = vec![0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = vec![0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // BLANK (0xA1) has no data phase; the host still declared 512 Data-In.
+    let cdb = [0xA1, 0x08, 0x2E, 0, 0x01, 0, 0, 0, 0, 0xEC, 0, 0];
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x51, 512, 0x80, 0, &cdb),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (0x51, 512, 0x01), "Failed, full residue");
+    assert_eq!(io.zero_in_count, 1, "the host's data phase ends with a ZLP");
+
+    // The session is still usable.
+    let r = run_command(
+        &mut s,
+        &mut io,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &raw_cbw(0x52, 0, 0x00, 0, &[0x00, 0, 0, 0, 0, 0]),
+    );
+    assert_eq!(r, Drive::Processed);
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (0x52, 0, 0x00), "TUR passes");
+}
+
 /// Case (13) Ho < Do at an exact chunk boundary: the first device chunk
 /// consumes the host's whole declared length. No second waiting phase may be
 /// opened; the device aborts and the Phase Error CSW carries the declared
