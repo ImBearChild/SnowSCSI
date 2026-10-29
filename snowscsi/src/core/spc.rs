@@ -922,6 +922,24 @@ impl<D: Device> Device for Spc<D> {
         }
     }
 
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        if self.query != Query::None {
+            // The wrapper's own query responses are single-bank.
+            return self.poll(permit, fb, data);
+        }
+        let step = self.inner.poll_with_alt(permit, fb, data, alt);
+        if let PollStep::Complete(Completion::Check(sense)) = &step {
+            self.saved_sense = Some(*sense);
+        }
+        step
+    }
+
     fn poll_long<'a>(
         &mut self,
         permit: &CommandPermit,

@@ -84,6 +84,19 @@ impl MmcMedium for CliMedium {
         }
     }
 
+    fn poll_with_alt<'a>(
+        &mut self,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        match self {
+            Self::Flat(m) => m.poll_with_alt(fb, data, alt),
+            #[cfg(feature = "dvdram")]
+            Self::DvdRam(m) => m.poll_with_alt(fb, data, alt),
+        }
+    }
+
     fn active(&self) -> bool {
         match self {
             Self::Flat(m) => m.active(),
@@ -139,6 +152,9 @@ pub type CliBlockLu = LuImpl<Spc<BlockDevice>, CliBacking>;
 pub type CliMmcLu = LuImpl<Spc<MmcDrive<CliMedium>>, CliBacking>;
 
 /// One runtime LUN over the two slot kinds, sharing [`CliPair`].
+// The two slot kinds are deliberately unboxed: the CLI builds one per LUN and
+// the size difference is a few hundred bytes, not a hot-path concern.
+#[allow(clippy::large_enum_variant)]
 pub enum CliLu {
     /// Block disk (PDT 0x00) or optical block profile.
     Block(CliBlockLu),
@@ -242,6 +258,19 @@ impl Lu for CliLu {
         match self {
             Self::Block(lu) => lu.poll(permit, feedback, data),
             Self::Mmc(lu) => lu.poll(permit, feedback, data),
+        }
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        match self {
+            Self::Block(lu) => lu.poll_with_alt(permit, feedback, data, alt),
+            Self::Mmc(lu) => lu.poll_with_alt(permit, feedback, data, alt),
         }
     }
 

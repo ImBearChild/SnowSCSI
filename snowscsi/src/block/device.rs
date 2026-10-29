@@ -116,6 +116,11 @@ pub struct BlockDevice {
     delivery: Delivery,
     io_issues: u32,
     prefetch_issues: u32,
+    /// The staged read chunk lives in the alternate caller bank (`alt`), so the
+    /// next `Send` must take it from there.
+    chunk_in_alt: bool,
+    /// Bytes of the staged read chunk, in the bank named by `chunk_in_alt`.
+    chunk_len: usize,
 }
 
 impl BlockDevice {
@@ -137,6 +142,8 @@ impl BlockDevice {
             last_completion: None,
             effects: KnownEffects::NONE,
             delivery: Delivery::NotApplicable,
+            chunk_in_alt: false,
+            chunk_len: 0,
             io_issues: 0,
             prefetch_issues: 0,
         }
@@ -400,6 +407,8 @@ impl BlockDevice {
     /// Issue the normal read of the current chunk.
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
+        self.chunk_in_alt = false;
+        self.chunk_len = len;
         self.io_issues = self.io_issues.saturating_add(1);
         PollStep::Io(StorageOp::Read {
             resource: 0,
@@ -409,17 +418,40 @@ impl BlockDevice {
     }
 
     /// Issue the speculative read of the next chunk.
-    fn issue_prefetch<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
-        let len = self.next_chunk(data.len());
+    ///
+    /// Consecutive read chunks alternate between the caller's two banks: the
+    /// chunk after the one just sent lands in the *other* bank, and the
+    /// following `Send` takes it from there. An empty `alt` keeps the
+    /// single-bank behaviour (prefetch into `data`, send from `data`).
+    fn issue_prefetch<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        let use_alt = !alt.is_empty() && !self.chunk_in_alt;
+        let (bank, in_alt) = if use_alt { (alt, true) } else { (data, false) };
+        let len = self.next_chunk(bank.len());
         if len == 0 {
-            return self.finish(Completion::Good);
+            // A bank that cannot stage one chunk while bytes remain is the
+            // target's own inability to stage the transfer (HARDWARE ERROR /
+            // INTERNAL TARGET FAILURE), never a silent GOOD with data still
+            // undelivered.
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
         }
+        self.chunk_in_alt = in_alt;
+        self.chunk_len = len;
         self.prefetch_issues = self.prefetch_issues.saturating_add(1);
         PollStep::Prefetch(PrefetchOp::Read {
             resource: 0,
             offset: self.next_offset(),
-            buf: &mut data[..len],
+            buf: &mut bank[..len],
         })
+    }
+
+    /// Send the staged read chunk from the bank that holds it.
+    fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.chunk_len;
+        if self.chunk_in_alt {
+            PollStep::Send(&alt[..len])
+        } else {
+            PollStep::Send(&data[..len])
+        }
     }
 }
 
@@ -486,9 +518,19 @@ impl Device for BlockDevice {
 
     fn poll<'a>(
         &mut self,
+        permit: &CommandPermit,
+        fb: Feedback,
+        data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        self.poll_with_alt(permit, fb, data, &mut [])
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
         _permit: &CommandPermit,
         fb: Feedback,
         data: &'a mut [u8],
+        alt: &'a mut [u8],
     ) -> PollStep<'a> {
         match (self.stage, fb.kind()) {
             (Stage::Publish, FeedbackKind::Begin) => {
@@ -507,7 +549,7 @@ impl Device for BlockDevice {
             // accepted.
             (Stage::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
             (Stage::ReadIo, FeedbackKind::IoDone) => {
-                let len = self.next_chunk(data.len());
+                let len = self.chunk_len;
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
@@ -520,10 +562,10 @@ impl Device for BlockDevice {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.stage = Stage::Send;
-                PollStep::Send(&data[..len])
+                self.send_chunk(data, alt)
             }
             (Stage::Send, FeedbackKind::HostSent) => {
-                let len = self.next_chunk(data.len());
+                let len = self.chunk_len;
                 let (accepted, failed) = host_facts(fb, len);
                 self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
                 if failed || accepted < len {
@@ -533,12 +575,12 @@ impl Device for BlockDevice {
                 if self.progress >= self.bytes {
                     return self.finish(Completion::Good);
                 }
-                // The next chunk is read ahead while the host drains this one.
+                // The next chunk is read ahead into the other bank.
                 self.stage = Stage::Prefetch;
-                self.issue_prefetch(data)
+                self.issue_prefetch(data, alt)
             }
             (Stage::Prefetch, FeedbackKind::IoDone) => {
-                let len = self.next_chunk(data.len());
+                let len = self.chunk_len;
                 let failed = match fb.io() {
                     Some(receipt) => receipt.error().is_some() || receipt.confirmed() != len,
                     None => true,
@@ -550,7 +592,7 @@ impl Device for BlockDevice {
                     return self.read_chunk(data);
                 }
                 self.stage = Stage::Send;
-                PollStep::Send(&data[..len])
+                self.send_chunk(data, alt)
             }
             // WRITE: receive host data, then write the accepted prefix.
             (Stage::WriteRecv, FeedbackKind::PlanAccepted) => {
@@ -1574,5 +1616,236 @@ mod tests {
         ));
         assert!(!dev.known_effects().sync_durable);
         assert!(dev.known_effects().unknown_remainder);
+    }
+    /// A 2 MiB READ with two 8 KiB banks: the required read lands in `data`,
+    /// every following chunk is prefetched into the bank that is *not* being
+    /// sent, and the bytes are exact.
+    #[test]
+    fn two_bank_read_prefetches_into_the_other_bank() {
+        const BANK: usize = 8192;
+        const TOTAL: usize = 2 * 1024 * 1024;
+        const BLOCKS: u16 = 4096;
+
+        let mut dev = BlockDevice::new(BlockAttrs::new(u64::from(BLOCKS), 512));
+        let permit = permit();
+        let mut data = [0u8; BANK];
+        let mut alt = [0u8; BANK];
+        let data_addr = data.as_ptr() as usize;
+        let alt_addr = alt.as_ptr() as usize;
+        let in_data = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= data_addr && p + buf.len() <= data_addr + BANK
+        };
+        let in_alt = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= alt_addr && p + buf.len() <= alt_addr + BANK
+        };
+        let fill = |buf: &mut [u8], at: usize| {
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = ((at + i) & 0xFF) as u8;
+            }
+        };
+        let pattern_at = |at: usize| (at & 0xFF) as u8;
+
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::ToHost, TOTAL as u64),
+                &cdb10(0x28, 0, BLOCKS)
+            ),
+            Ok(())
+        );
+        match dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, TOTAL as u64),
+            other => panic!("expected publish, got {other:?}"),
+        }
+
+        // The required read of the first chunk goes into `data`.
+        match dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(buf.len(), BANK);
+                assert!(in_data(buf), "the required read uses the work bank");
+                fill(buf, 0);
+            }
+            other => panic!("expected required read, got {other:?}"),
+        }
+
+        let mut delivered = 0usize;
+        let mut prefetches = 0usize;
+        let mut alt_prefetches = 0usize;
+        let mut chunk = BANK;
+        let mut sent_from_alt;
+        loop {
+            // Consume the read/prefetch receipt: the device sends that chunk.
+            match dev.poll_with_alt(&permit, io_receipt(chunk, None), &mut data, &mut alt) {
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), chunk);
+                    for (i, byte) in bytes.iter().enumerate() {
+                        assert_eq!(*byte, pattern_at(delivered + i), "byte {i} at {delivered}");
+                    }
+                    sent_from_alt = in_alt(bytes);
+                    assert!(
+                        sent_from_alt || in_data(bytes),
+                        "the send comes from one of the two banks"
+                    );
+                    delivered += bytes.len();
+                }
+                other => panic!("expected send, got {other:?}"),
+            }
+            chunk = (TOTAL - delivered).min(BANK);
+            if chunk == 0 {
+                // The last chunk was sent; the next completion is final.
+                match dev.poll_with_alt(
+                    &permit,
+                    Feedback::host_sent(HostReceipt::test(BANK, None)),
+                    &mut data,
+                    &mut alt,
+                ) {
+                    PollStep::Complete(completion) => {
+                        assert_eq!(completion, Completion::Good);
+                        break;
+                    }
+                    other => panic!("expected completion, got {other:?}"),
+                }
+            }
+            // Host drains the chunk: the next one is prefetched into the other
+            // bank.
+            match dev.poll_with_alt(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(BANK, None)),
+                &mut data,
+                &mut alt,
+            ) {
+                PollStep::Prefetch(PrefetchOp::Read { offset, buf, .. }) => {
+                    assert_eq!(offset as usize, delivered);
+                    assert_eq!(buf.len(), chunk);
+                    let from_alt = in_alt(buf);
+                    assert_ne!(
+                        from_alt, sent_from_alt,
+                        "a prefetch must use the bank that was not just sent"
+                    );
+                    if from_alt {
+                        alt_prefetches += 1;
+                    }
+                    fill(buf, delivered);
+                    prefetches += 1;
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+        }
+        assert_eq!(delivered, TOTAL, "every byte was delivered once");
+        assert_eq!(prefetches, TOTAL / BANK - 1, "one prefetch per later chunk");
+        assert!(alt_prefetches > 0, "the alternate bank carried chunks");
+    }
+    /// A READ whose length is not a multiple of the bank (3.5 banks): the final
+    /// short chunk is sent from the same alternating bank that the prefetch
+    /// filled, and every byte is exact.
+    #[test]
+    fn two_bank_read_handles_a_short_final_chunk() {
+        const BANK: usize = 8192;
+        const BLOCKS: u16 = 56; // 28672 bytes = 3.5 banks
+        const TOTAL: usize = BLOCKS as usize * 512;
+
+        let mut dev = BlockDevice::new(BlockAttrs::new(u64::from(BLOCKS), 512));
+        let permit = permit();
+        let mut data = [0u8; BANK];
+        let mut alt = [0u8; BANK];
+        let data_addr = data.as_ptr() as usize;
+        let alt_addr = alt.as_ptr() as usize;
+        let in_data = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= data_addr && p + buf.len() <= data_addr + BANK
+        };
+        let in_alt = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= alt_addr && p + buf.len() <= alt_addr + BANK
+        };
+        let fill = |buf: &mut [u8], at: usize| {
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = ((at + i) & 0xFF) as u8;
+            }
+        };
+
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::ToHost, TOTAL as u64),
+                &cdb10(0x28, 0, BLOCKS)
+            ),
+            Ok(())
+        );
+        match dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, TOTAL as u64),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert!(in_data(buf));
+                fill(buf, 0);
+            }
+            other => panic!("expected required read, got {other:?}"),
+        }
+
+        let mut delivered = 0usize;
+        let mut sizes = Vec::new();
+        let mut alt_prefetches = 0usize;
+        let mut sent_from_alt;
+        let mut expect_in_alt = false;
+        loop {
+            let chunk = (TOTAL - delivered).min(BANK);
+            match dev.poll_with_alt(&permit, io_receipt(chunk, None), &mut data, &mut alt) {
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), chunk, "chunk at {delivered}");
+                    assert_eq!(
+                        in_alt(bytes),
+                        expect_in_alt,
+                        "chunk at {delivered} comes from the prefetched bank"
+                    );
+                    for (i, byte) in bytes.iter().enumerate() {
+                        assert_eq!(*byte, ((delivered + i) & 0xFF) as u8);
+                    }
+                    sent_from_alt = in_alt(bytes);
+                    sizes.push(bytes.len());
+                    delivered += bytes.len();
+                }
+                other => panic!("expected send, got {other:?}"),
+            }
+            if delivered == TOTAL {
+                assert!(matches!(
+                    dev.poll_with_alt(
+                        &permit,
+                        Feedback::host_sent(HostReceipt::test(chunk, None)),
+                        &mut data,
+                        &mut alt
+                    ),
+                    PollStep::Complete(Completion::Good)
+                ));
+                break;
+            }
+            match dev.poll_with_alt(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(chunk, None)),
+                &mut data,
+                &mut alt,
+            ) {
+                PollStep::Prefetch(PrefetchOp::Read { offset, buf, .. }) => {
+                    assert_eq!(offset as usize, delivered);
+                    let from_alt = in_alt(buf);
+                    assert_ne!(from_alt, sent_from_alt, "prefetch into the other bank");
+                    if from_alt {
+                        alt_prefetches += 1;
+                    }
+                    expect_in_alt = from_alt;
+                    fill(buf, delivered);
+                    assert!(in_data(buf) || in_alt(buf));
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+        }
+        assert_eq!(sizes, vec![BANK, BANK, BANK, TOTAL - 3 * BANK]);
+        assert_eq!(alt_prefetches, 2);
+        assert_eq!(delivered, TOTAL);
     }
 }

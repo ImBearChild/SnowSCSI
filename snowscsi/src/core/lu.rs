@@ -76,6 +76,20 @@ pub trait Lu {
         data: &'a mut [u8],
     ) -> PollStep<'a>;
 
+    /// One step of the active command with an optional second caller bank.
+    ///
+    /// Default: ignore `alt` and behave exactly like [`Self::poll`].
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let _ = alt;
+        self.poll(permit, feedback, data)
+    }
+
     /// One step of the resident long operation (a second, independent context).
     fn poll_long<'a>(
         &mut self,
@@ -383,6 +397,19 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
         }
         self.device.poll(permit, feedback, data)
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        if !self.command_ok(permit) {
+            return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+        }
+        self.device.poll_with_alt(permit, feedback, data, alt)
     }
 
     fn poll_long<'a>(

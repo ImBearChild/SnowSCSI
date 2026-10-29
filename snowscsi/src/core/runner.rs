@@ -86,25 +86,35 @@ pub enum DriveStep {
 }
 
 /// One pending adapter operation. Tokens are metadata-only and `Copy`; the
-/// buffer is re-borrowed from the caller's `work` on every step, so
-/// `buf_offset` is relative to `work`.
+/// buffer is re-borrowed from the caller's banks on every step, so
+/// `buf_offset` is relative to `work`, or to the alternate bank when
+/// `buf_alt` is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingOp {
     Storage {
         token: IoToken,
         req: IoReq,
+        /// Offset inside the bank named by `buf_alt`.
         buf_offset: usize,
+        /// The retained window lives in the alternate bank.
+        buf_alt: bool,
         prefetch: bool,
     },
     HostRecv {
         token: HostToken,
         req: HostReq,
+        /// Offset inside the bank named by `buf_alt`.
         buf_offset: usize,
+        /// The retained window lives in the alternate bank.
+        buf_alt: bool,
     },
     HostSend {
         token: HostToken,
         req: HostReq,
+        /// Offset inside the bank named by `buf_alt`.
         buf_offset: usize,
+        /// The retained window lives in the alternate bank.
+        buf_alt: bool,
     },
 }
 
@@ -136,6 +146,10 @@ struct DriveState {
     /// the same bank (address and length) on every continuation.
     work_addr: usize,
     work_len: usize,
+    /// Alternate-bank identity pinned on the first `Pending`, same rule as
+    /// `work_addr`/`work_len` (an empty alternate bank has `alt_len == 0`).
+    alt_addr: usize,
+    alt_len: usize,
     /// Whether the single data plan has already been published.
     published: bool,
 }
@@ -644,6 +658,8 @@ impl Runner {
                     ctx,
                     work_addr: 0,
                     work_len: 0,
+                    alt_addr: 0,
+                    alt_len: 0,
                     published: false,
                 }));
                 return Ok(());
@@ -663,6 +679,8 @@ impl Runner {
                 ctx,
                 work_addr: 0,
                 work_len: 0,
+                alt_addr: 0,
+                alt_len: 0,
                 published: false,
             }));
             return Ok(());
@@ -675,6 +693,8 @@ impl Runner {
             ctx,
             work_addr: 0,
             work_len: 0,
+            alt_addr: 0,
+            alt_len: 0,
             published: false,
         }));
         Ok(())
@@ -817,6 +837,7 @@ impl Runner {
         storage: &mut dyn Storage,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         mut state: DriveState,
     ) -> Result<Option<DriveStep>, Fault> {
         let known = match state.pending {
@@ -824,14 +845,17 @@ impl Runner {
                 token,
                 req,
                 buf_offset,
+                buf_alt,
                 prefetch,
             }) => {
-                let polled =
-                    pending_io_buf(work, req, buf_offset).map(|buf| storage.poll_exec(token, buf));
+                let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
+                    .map(|buf| storage.poll_exec(token, buf));
                 match polled {
                     Some(Poll::Pending) => {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(Some(DriveStep::Pending));
                     }
@@ -869,19 +893,23 @@ impl Runner {
                 token,
                 req,
                 buf_offset,
+                buf_alt,
             })
             | Some(PendingOp::HostSend {
                 token,
                 req,
                 buf_offset,
+                buf_alt,
             }) => {
                 let is_recv = req.dir == Direction::FromHost;
-                let polled = pending_host_buf(work, req, buf_offset, is_recv)
+                let polled = pending_host_buf(work, alt, req, buf_offset, buf_alt, is_recv)
                     .map(|buf| host.poll_host(token, buf));
                 match polled {
                     Some(Poll::Pending) => {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(Some(DriveStep::Pending));
                     }
@@ -1007,18 +1035,28 @@ impl Runner {
         storage: &mut dyn Storage,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         _scratch: &mut [u8],
     ) -> Result<DriveStep, Fault> {
         let mut state = self.drive_state.get().ok_or(Fault::Contract)?;
 
-        // A `Pending` command must be continued with the *same* work bank
-        // A different address/length would reinterpret the retained
-        // token against the wrong bytes.
+        // A `Pending` command must be continued with the *same* banks. A
+        // different address/length would reinterpret the retained token
+        // against the wrong bytes.
         let work_addr = work.as_ptr() as usize;
         let work_len = work.len();
+        let alt_addr = alt.as_ptr() as usize;
+        let alt_len = alt.len();
+        // An empty alternate bank has no stable address; pinning it means
+        // "stays empty". A non-empty one is pinned by address and length.
+        let alt_changed = if state.alt_len == 0 || alt_len == 0 {
+            state.alt_len != alt_len
+        } else {
+            state.alt_addr != alt_addr || state.alt_len != alt_len
+        };
         if state.pending.is_some()
             && state.work_len != 0
-            && (state.work_addr != work_addr || state.work_len != work_len)
+            && (state.work_addr != work_addr || state.work_len != work_len || alt_changed)
         {
             if let Some(pending) = state.pending {
                 self.cancel_pending(pending, storage, host);
@@ -1043,7 +1081,7 @@ impl Runner {
                     ..
                 } => {
                     if self
-                        .drain_stop_active(lu, storage, host, work, state)?
+                        .drain_stop_active(lu, storage, host, work, alt, state)?
                         .is_some()
                     {
                         return Ok(DriveStep::Pending);
@@ -1070,9 +1108,10 @@ impl Runner {
                     token,
                     req,
                     buf_offset,
+                    buf_alt,
                     prefetch,
                 } => {
-                    let polled = pending_io_buf(work, req, buf_offset)
+                    let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
                         .map(|buf| storage.poll_exec(token, buf));
                     match polled {
                         Some(Poll::Pending) => return Ok(DriveStep::Pending),
@@ -1122,7 +1161,9 @@ impl Runner {
                     token,
                     req,
                     buf_offset,
-                } => match self.resume_host(host, work, token, req, buf_offset, true) {
+                    buf_alt,
+                } => match self.resume_host(host, work, alt, token, req, buf_offset, buf_alt, true)
+                {
                     HostResume::Pending => return Ok(DriveStep::Pending),
                     HostResume::Retained(raw) => {
                         state.pending = None;
@@ -1147,35 +1188,41 @@ impl Runner {
                     token,
                     req,
                     buf_offset,
-                } => match self.resume_host(host, work, token, req, buf_offset, false) {
-                    HostResume::Pending => return Ok(DriveStep::Pending),
-                    HostResume::Retained(raw) => {
-                        state.pending = None;
-                        if raw.error() == Some(Fault::Contract) {
-                            // The receipt was returned: keep its accepted prefix
-                            // and never invent an unknown remainder.
-                            self.settle_contract(lu, Self::known_from_host_receipt(raw));
+                    buf_alt,
+                } => {
+                    match self.resume_host(host, work, alt, token, req, buf_offset, buf_alt, false)
+                    {
+                        HostResume::Pending => return Ok(DriveStep::Pending),
+                        HostResume::Retained(raw) => {
+                            state.pending = None;
+                            if raw.error() == Some(Fault::Contract) {
+                                // The receipt was returned: keep its accepted prefix
+                                // and never invent an unknown remainder.
+                                self.settle_contract(lu, Self::known_from_host_receipt(raw));
+                                return Err(Fault::Contract);
+                            }
+                            if raw.error().is_some() {
+                                state.host_failed = true;
+                            }
+                            state.feedback = Feedback::host_sent(raw);
+                        }
+                        HostResume::Unaddressable => {
+                            host.cancel(token);
+                            self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
                             return Err(Fault::Contract);
                         }
-                        if raw.error().is_some() {
-                            state.host_failed = true;
-                        }
-                        state.feedback = Feedback::host_sent(raw);
                     }
-                    HostResume::Unaddressable => {
-                        host.cancel(token);
-                        self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
-                        return Err(Fault::Contract);
-                    }
-                },
+                }
             }
         }
 
         let permit = self.command_permit();
         let work_start = work.as_ptr() as usize;
         let work_len = work.len();
+        let alt_start = alt.as_ptr() as usize;
+        let alt_len = alt.len();
         loop {
-            let step = lu.poll(&permit, state.feedback, work);
+            let step = lu.poll_with_alt(&permit, state.feedback, work, alt);
             match step {
                 PollStep::Publish(plan) => {
                     if state.published {
@@ -1213,12 +1260,14 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::ToHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, buf);
+                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
                     let settlement =
                         self.exec_io(storage, req, IoBuf::Read(buf), buf_offset, false);
                     if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(DriveStep::Pending);
                     }
@@ -1234,12 +1283,14 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::FromHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, buf);
+                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
                     let settlement =
                         self.exec_io(storage, req, IoBuf::Write(buf), buf_offset, false);
                     if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(DriveStep::Pending);
                     }
@@ -1251,10 +1302,13 @@ impl Runner {
                         len: 0,
                         dir: Direction::None,
                     };
-                    let settlement = self.exec_io(storage, req, IoBuf::None, Some(0), false);
+                    let settlement =
+                        self.exec_io(storage, req, IoBuf::None, Some((0, false)), false);
                     if self.advance_io(lu, &mut state, req, settlement, false)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(DriveStep::Pending);
                     }
@@ -1272,11 +1326,13 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::ToHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, buf);
+                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
                     let settlement = self.exec_io(storage, req, IoBuf::Read(buf), buf_offset, true);
                     if self.advance_io(lu, &mut state, req, settlement, true)? {
                         state.work_addr = work.as_ptr() as usize;
                         state.work_len = work.len();
+                        state.alt_addr = alt.as_ptr() as usize;
+                        state.alt_len = alt.len();
                         self.drive_state.set(Some(state));
                         return Ok(DriveStep::Pending);
                     }
@@ -1292,7 +1348,7 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::FromHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, buf);
+                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
                     let token = host.begin_recv(req);
                     if !token.is_valid() {
                         self.settle_contract(lu, KnownEffects::NONE);
@@ -1300,14 +1356,17 @@ impl Runner {
                     }
                     match host.poll_host(token, HostBuf::Recv(buf)) {
                         Poll::Pending => match buf_offset {
-                            Some(offset) => {
+                            Some((offset, buf_alt)) => {
                                 state.pending = Some(PendingOp::HostRecv {
                                     token,
                                     req,
                                     buf_offset: offset,
+                                    buf_alt,
                                 });
                                 state.work_addr = work.as_ptr() as usize;
                                 state.work_len = work.len();
+                                state.alt_addr = alt.as_ptr() as usize;
+                                state.alt_len = alt.len();
                                 self.drive_state.set(Some(state));
                                 return Ok(DriveStep::Pending);
                             }
@@ -1348,7 +1407,7 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::ToHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, buf);
+                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
                     let token = host.begin_send(req);
                     if !token.is_valid() {
                         self.settle_contract(lu, KnownEffects::NONE);
@@ -1356,14 +1415,17 @@ impl Runner {
                     }
                     match host.poll_host(token, HostBuf::Send(buf)) {
                         Poll::Pending => match buf_offset {
-                            Some(offset) => {
+                            Some((offset, buf_alt)) => {
                                 state.pending = Some(PendingOp::HostSend {
                                     token,
                                     req,
                                     buf_offset: offset,
+                                    buf_alt,
                                 });
                                 state.work_addr = work.as_ptr() as usize;
                                 state.work_len = work.len();
+                                state.alt_addr = alt.as_ptr() as usize;
+                                state.alt_len = alt.len();
                                 self.drive_state.set(Some(state));
                                 return Ok(DriveStep::Pending);
                             }
@@ -1424,7 +1486,7 @@ impl Runner {
         storage: &mut dyn Storage,
         req: IoReq,
         buf: IoBuf<'_>,
-        buf_offset: Option<usize>,
+        buf_ref: Option<(usize, bool)>,
         prefetch: bool,
     ) -> IoSettlement {
         let token = storage.begin_exec(req);
@@ -1438,11 +1500,12 @@ impl Runner {
             self.note_required_io(true);
         }
         match storage.poll_exec(token, buf) {
-            Poll::Pending => match buf_offset {
-                Some(offset) => IoSettlement::Pending(PendingOp::Storage {
+            Poll::Pending => match buf_ref {
+                Some((offset, buf_alt)) => IoSettlement::Pending(PendingOp::Storage {
                     token,
                     req,
                     buf_offset: offset,
+                    buf_alt,
                     prefetch,
                 }),
                 None => {
@@ -1558,18 +1621,21 @@ impl Runner {
     }
 
     /// Resume a retained host phase for this step. The buffer is re-borrowed
-    /// from `work`; a window that is no longer addressable is reported so the
-    /// caller can cancel the token before settling.
+    /// from `work` (or `alt`); a window that is no longer addressable is
+    /// reported so the caller can cancel the token before settling.
+    #[allow(clippy::too_many_arguments)]
     fn resume_host(
         &self,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         token: HostToken,
         req: HostReq,
         buf_offset: usize,
+        buf_alt: bool,
         recv: bool,
     ) -> HostResume {
-        let polled = match pending_host_buf(work, req, buf_offset, recv) {
+        let polled = match pending_host_buf(work, alt, req, buf_offset, buf_alt, recv) {
             Some(buf) => host.poll_host(token, buf),
             None => return HostResume::Unaddressable,
         };
@@ -2217,8 +2283,9 @@ impl Runner {
             // An empty bank is a mismatch too: the retained window can never
             // be re-borrowed from it.
             let same_bank = self.long_data_addr == data_addr && self.long_data_len == data_len;
+            let mut empty = [0u8; 0];
             let buf = same_bank
-                .then(|| pending_io_buf(data, pending.req, pending.buf_offset))
+                .then(|| pending_io_buf(data, &mut empty, pending.req, pending.buf_offset, false))
                 .flatten();
             if let Some(buf) = buf {
                 match storage.poll_exec(pending.token, buf) {
@@ -2273,7 +2340,8 @@ impl Runner {
                     len: buf.len() as u32,
                     dir: Direction::ToHost,
                 };
-                let buf_offset = slice_offset(data_addr, data_len, buf);
+                // A long operation has one bank: no alternate window.
+                let buf_offset = slice_offset(data_addr, data_len, 0, 0, buf).map(|(off, _)| off);
                 self.long_io(
                     lun,
                     storage,
@@ -2349,8 +2417,9 @@ impl Runner {
             let data_addr = data.as_ptr() as usize;
             let data_len = data.len();
             let same_bank = self.long_data_addr == data_addr && self.long_data_len == data_len;
+            let mut empty = [0u8; 0];
             let buf = same_bank
-                .then(|| pending_io_buf(data, pending.req, pending.buf_offset))
+                .then(|| pending_io_buf(data, &mut empty, pending.req, pending.buf_offset, false))
                 .flatten();
             let Some(buf) = buf else {
                 // The drain cannot re-borrow its window: cancel and report the
@@ -2559,16 +2628,29 @@ fn plan_contract(ctx: CommandContext, plan: DataPlan) -> bool {
     }
 }
 
-/// Offset of `buf` inside the caller's `work` bank, when it is contained.
-fn slice_offset(work_start: usize, work_len: usize, buf: &[u8]) -> Option<usize> {
+/// Locate `buf` inside the caller's work bank or its alternate bank.
+///
+/// Returns `(offset, in_alt)`; an empty alternate bank never matches.
+fn slice_offset(
+    work_start: usize,
+    work_len: usize,
+    alt_start: usize,
+    alt_len: usize,
+    buf: &[u8],
+) -> Option<(usize, bool)> {
     let start = buf.as_ptr() as usize;
     let end = start.checked_add(buf.len())?;
     let work_end = work_start.checked_add(work_len)?;
     if start >= work_start && end <= work_end {
-        Some(start - work_start)
-    } else {
-        None
+        return Some((start - work_start, false));
     }
+    if alt_len != 0 {
+        let alt_end = alt_start.checked_add(alt_len)?;
+        if start >= alt_start && end <= alt_end {
+            return Some((start - alt_start, true));
+        }
+    }
+    None
 }
 
 /// Split one long-operation [`StorageOp`] into its metadata request, buffer and
@@ -2590,7 +2672,7 @@ fn split_long_op<'a>(
                 len: buf.len() as u32,
                 dir: Direction::ToHost,
             };
-            let buf_offset = slice_offset(data_addr, data_len, buf);
+            let buf_offset = slice_offset(data_addr, data_len, 0, 0, buf).map(|(off, _)| off);
             (req, IoBuf::Read(buf), buf_offset)
         }
         StorageOp::Write {
@@ -2604,7 +2686,7 @@ fn split_long_op<'a>(
                 len: buf.len() as u32,
                 dir: Direction::FromHost,
             };
-            let buf_offset = slice_offset(data_addr, data_len, buf);
+            let buf_offset = slice_offset(data_addr, data_len, 0, 0, buf).map(|(off, _)| off);
             (req, IoBuf::Write(buf), buf_offset)
         }
         StorageOp::Sync { resource } => (
@@ -2622,9 +2704,16 @@ fn split_long_op<'a>(
 
 /// Rebuild the storage buffer from metadata; `None` means the retained window
 /// is no longer addressable in `work`.
-fn pending_io_buf<'a>(work: &'a mut [u8], req: IoReq, offset: usize) -> Option<IoBuf<'a>> {
+fn pending_io_buf<'a>(
+    work: &'a mut [u8],
+    alt: &'a mut [u8],
+    req: IoReq,
+    offset: usize,
+    buf_alt: bool,
+) -> Option<IoBuf<'a>> {
     let len = req.len as usize;
     let end = offset.checked_add(len)?;
+    let bank: &'a mut [u8] = if buf_alt { alt } else { work };
     match req.dir {
         Direction::None => {
             if len == 0 {
@@ -2633,23 +2722,26 @@ fn pending_io_buf<'a>(work: &'a mut [u8], req: IoReq, offset: usize) -> Option<I
                 None
             }
         }
-        Direction::ToHost => work.get_mut(offset..end).map(IoBuf::Read),
-        Direction::FromHost => work.get(offset..end).map(IoBuf::Write),
+        Direction::ToHost => bank.get_mut(offset..end).map(IoBuf::Read),
+        Direction::FromHost => bank.get(offset..end).map(IoBuf::Write),
     }
 }
 
 /// Rebuild the host buffer from metadata.
 fn pending_host_buf<'a>(
     work: &'a mut [u8],
+    alt: &'a mut [u8],
     req: HostReq,
     offset: usize,
+    buf_alt: bool,
     recv: bool,
 ) -> Option<HostBuf<'a>> {
     let end = offset.checked_add(req.len as usize)?;
+    let bank: &'a mut [u8] = if buf_alt { alt } else { work };
     if recv {
-        work.get_mut(offset..end).map(HostBuf::Recv)
+        bank.get_mut(offset..end).map(HostBuf::Recv)
     } else {
-        work.get(offset..end).map(HostBuf::Send)
+        bank.get(offset..end).map(HostBuf::Send)
     }
 }
 
@@ -3264,6 +3356,7 @@ mod tests {
         storage: HoldStorage,
         host: HoldHost,
         work: [u8; BANK],
+        alt: [u8; 0],
         scratch: [u8; BANK],
     }
 
@@ -3275,6 +3368,7 @@ mod tests {
                 storage: HoldStorage::new(pending_polls),
                 host: HoldHost::new(),
                 work: [0u8; BANK],
+                alt: [0u8; 0],
                 scratch: [0u8; BANK],
             }
         }
@@ -3301,6 +3395,7 @@ mod tests {
                 &mut self.storage,
                 &mut self.host,
                 &mut self.work,
+                &mut self.alt,
                 &mut self.scratch,
             )
         }
@@ -4087,6 +4182,7 @@ mod tests {
             &mut bench.storage,
             &mut bench.host,
             &mut other,
+            &mut bench.alt,
             &mut bench.scratch,
         );
         assert_eq!(err, Err(Fault::Contract));

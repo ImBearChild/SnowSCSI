@@ -1633,7 +1633,7 @@ fn a_force_on_one_lun_leaves_the_active_command_on_another_lun_alone() {
 
     // …and it still completes normally instead of a `Contract` fault.
     assert_eq!(
-        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Good))
     );
     assert!(target.snapshot_rt(0).expect("slot 0").boundary);
@@ -1703,7 +1703,7 @@ fn a_repeated_deferred_force_does_not_settle_a_command_on_another_lun() {
 
     // LUN 0 still completes normally.
     assert_eq!(
-        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Good))
     );
 
@@ -1975,7 +1975,7 @@ fn abort_ends_the_command_without_detaching_the_medium() {
     );
     assert_eq!(target.request_control(Control::Abort), Ok(()));
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(ABORTED_COMMAND)))
     );
 
@@ -2666,7 +2666,7 @@ fn stop_drains_a_pending_write_and_merges_the_confirmed_prefix() {
         Ok(())
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 1, 0));
@@ -2678,7 +2678,7 @@ fn stop_drains_a_pending_write_and_merges_the_confirmed_prefix() {
         "a drain still in flight must not be reported as `Ended`"
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -2776,13 +2776,13 @@ fn stop_drains_a_failing_write_and_keeps_the_confirmed_prefix() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -2829,13 +2829,13 @@ fn stop_drains_a_contract_write_receipt_without_fabricating_an_unknown_remainder
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -2897,12 +2897,12 @@ fn stop_drains_a_contract_sync_receipt_without_durability_or_an_unknown_remainde
         .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -2937,12 +2937,12 @@ fn stop_drains_a_write_receipt_that_reports_an_unknown_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -2996,12 +2996,12 @@ fn stop_drains_an_errored_host_receive_keeping_the_host_prefix() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3060,12 +3060,12 @@ fn stop_drains_an_errored_read_without_fabricating_a_write_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3124,12 +3124,12 @@ fn stop_drains_a_pending_sync_into_a_durable_effect() {
         .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3185,20 +3185,20 @@ fn stop_drains_a_pending_host_receive_across_two_steps() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     assert_eq!((host.begins, host.polls, host.cancels), (1, 1, 0));
 
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending),
         "the drain keeps the same host token"
     );
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3254,12 +3254,12 @@ fn stop_drains_a_pending_host_send() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3296,7 +3296,7 @@ fn stop_with_no_io_in_flight_settles_with_no_effects() {
         .expect("start");
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3350,12 +3350,12 @@ fn stop_drains_a_speculative_prefetch_without_an_unknown_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Stopped,
             error: None,
@@ -3388,13 +3388,19 @@ fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     // A different work bank cannot re-borrow the retained window.
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut other, &mut scratch),
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut other,
+            &mut [],
+            &mut scratch
+        ),
         Err(Fault::Contract)
     );
     assert_eq!(storage.cancels, 1, "the token is cancelled before settling");
@@ -3425,7 +3431,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
@@ -3436,7 +3442,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
         "the settle is still owed, so the end is not reported yet"
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::TransportEnded,
             error: None,
@@ -3478,7 +3484,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
     );
     // A late event cannot act on a settled command or a new medium.
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!(storage.begins, 1);
@@ -3516,13 +3522,13 @@ fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     target.transport_ended();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::TransportEnded,
             error: None,
@@ -3574,14 +3580,14 @@ fn fatal_cancels_a_pending_host_token_before_the_interrupt() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     target.fatal(Fault::NeedsRecovery);
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Fatal,
             error: Some(Fault::NeedsRecovery),
@@ -3629,7 +3635,7 @@ fn fatal_cancels_a_pending_storage_write_before_the_interrupt() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
@@ -3640,7 +3646,7 @@ fn fatal_cancels_a_pending_storage_write_before_the_interrupt() {
         "the settle is still owed, so the end is not reported yet"
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Control(RunOutcome::Ended {
             reason: RunEnd::Fatal,
             error: Some(Fault::Io),
@@ -3702,13 +3708,13 @@ fn abort_of_a_pending_send_returns_aborted_command_without_detaching() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     assert_eq!(target.request_control(Control::Abort), Ok(()));
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(Sense::new(
             0x0B, 0x45, 0x00
         ))))
@@ -3743,7 +3749,7 @@ fn abort_of_a_pending_send_returns_aborted_command_without_detaching() {
     );
     // The abort was consumed; a late step has nothing to settle.
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!(slot0(&target).device_ref().interrupts, 1);
@@ -3764,12 +3770,12 @@ fn abort_of_a_pending_write_reports_the_unknown_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     assert_eq!(target.request_control(Control::Abort), Ok(()));
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(Sense::new(
             0x0B, 0x45, 0x00
         ))))
@@ -3803,7 +3809,7 @@ fn a_pool_exhausted_token_settles_without_an_adapter_operation() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!((storage.begins, storage.polls, storage.cancels), (1, 0, 0));
@@ -3858,11 +3864,11 @@ fn a_receipt_error_is_fed_back_once_and_never_replayed() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(WRITE_ERROR)))
     );
 
@@ -3918,7 +3924,7 @@ fn a_contract_receipt_settles_before_the_next_poll() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
 
@@ -3949,7 +3955,7 @@ fn a_contract_receipt_settles_before_the_next_poll() {
     assert_eq!(device.interrupts, 1, "exactly one bounded settle");
     // The command is gone: another step cannot replay the write.
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!((storage.begins, storage.polls), (1, 1), "no replay");
@@ -3975,7 +3981,7 @@ fn a_contract_receipt_with_an_unknown_effect_keeps_the_remainder_unknown() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
 
@@ -4027,7 +4033,7 @@ fn a_contract_receipt_from_a_read_never_fabricates_an_unknown_remainder() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
 
@@ -4079,11 +4085,11 @@ fn a_contract_host_send_receipt_keeps_the_accepted_prefix() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
 
@@ -4140,7 +4146,7 @@ fn an_inline_contract_host_receive_clamps_the_accepted_prefix() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
 
@@ -4166,7 +4172,7 @@ fn an_inline_contract_host_receive_clamps_the_accepted_prefix() {
     assert_eq!(device.deliveries, vec![Delivery::Failed]);
     // The command is settled: another step cannot replay the receive.
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!(host.begins, 1, "no replay");
@@ -4211,7 +4217,7 @@ fn a_sync_contract_violation_reports_no_durability() {
         .drive_start_static::<Here>(ctx_data(Direction::None, 0), &[0x35])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract)
     );
     assert_eq!(
@@ -4247,12 +4253,12 @@ fn a_failed_interrupt_settles_once_and_ends_the_service() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
     target.stop();
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::NeedsRecovery)
     );
 
@@ -4291,14 +4297,14 @@ fn a_failed_settle_does_not_overwrite_the_first_fatal_fault() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending)
     );
 
     // The root fault is recorded first, then the settle also fails.
     target.fatal(Fault::Io);
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::NeedsRecovery),
         "the step reports the settle fault it just observed"
     );
@@ -4329,7 +4335,7 @@ fn a_rejected_data_plan_starts_no_io() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Io)
     );
     assert_eq!(host.publishes, 1);
@@ -4370,7 +4376,7 @@ fn a_completion_fixed_before_the_send_starts_no_host_phase() {
         .drive_start_static::<Here>(ctx_data(Direction::ToHost, 512), &[0x28])
         .expect("start");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Good))
     );
     assert_eq!(host.publishes, 1);
@@ -4415,7 +4421,7 @@ fn stop_with_no_command_reports_ended_without_an_interrupt() {
     assert!(device.deliveries.is_empty());
     assert_eq!((storage.begins, host.begins), (0, 0));
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Err(Fault::Contract),
         "there is no active command to step"
     );
@@ -4444,7 +4450,7 @@ fn abort_with_no_active_command_is_a_no_op() {
         Ok(())
     );
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Good))
     );
 }
@@ -4485,7 +4491,7 @@ fn an_unconsumed_completion_blocks_the_next_command_until_it_is_reported() {
     ));
 
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(MEDIUM_NOT_PRESENT)))
     );
     // The completion was reported exactly once: management is admissible again.
@@ -4578,7 +4584,7 @@ fn a_live_command_blocks_the_long_entry_without_polling_its_adapter() {
         .drive_start_static::<Here>(ctx_data(Direction::FromHost, 512), &[0x2A])
         .expect("start the write");
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Pending),
         "the command owns a Pending storage token"
     );

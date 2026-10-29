@@ -106,6 +106,7 @@ impl MmcMedium for TestMedium {
 }
 
 /// One runtime test LUN over the block and MMC slot kinds.
+#[allow(clippy::large_enum_variant)]
 pub enum TestLu {
     /// Block profile.
     Block(LuImpl<Spc<BlockDevice>, TestBacking>),

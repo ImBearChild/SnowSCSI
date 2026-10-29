@@ -2069,7 +2069,7 @@ fn an_abort_while_a_fixed_completion_is_owed_is_a_no_op() {
     // Abort must be consumed as a no-op, not queued behind the owed Done.
     assert_eq!(target.request_control(Control::Abort), Ok(()));
     assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
         Ok(DriveStep::Done(Completion::Check(FORMAT_IN_PROGRESS)))
     );
     assert_eq!(target.tick(), RunOutcome::ServiceReady);

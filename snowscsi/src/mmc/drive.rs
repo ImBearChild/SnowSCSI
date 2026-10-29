@@ -832,58 +832,14 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         PollStep::Send(&data[..send])
     }
-}
 
-impl<M: MmcMedium> Device for MmcDrive<M> {
-    type Medium = M;
-
-    fn inquiry_data(&self) -> InquiryData {
-        InquiryData::cdrom()
-    }
-
-    fn removal_encoding(&self) -> RemovalEncoding {
-        RemovalEncoding::Mmc
-    }
-
-    fn spc_profile(&self) -> Option<&dyn SpcProfile> {
-        Some(self)
-    }
-
-    fn prepare(
+    /// Shared command step; `alt` is the optional second caller bank that a
+    /// medium may pre-read the next chunk into.
+    fn poll_step<'a>(
         &mut self,
-        _permit: &CommandPermit,
-        ctx: CommandContext,
-        cdb: &[u8],
-    ) -> Result<(), Completion> {
-        // MMC-6 §6.4.4.3 foreground gate: while the zero-fill is Foreground,
-        // every opcode that reaches the drive is rejected before the CDB is
-        // decoded and before the medium/backing is touched. REQUEST SENSE,
-        // INQUIRY, GET CONFIGURATION, GESN and REPORT LUNS are served by `Spc`
-        // and never reach this method.
-        if matches!(self.long, LongOp::Foreground { .. }) {
-            return Err(Completion::Check(FORMAT_IN_PROGRESS));
-        }
-        if self.query != Query::None {
-            return Err(Completion::Busy);
-        }
-        self.published = false;
-        self.len = 0;
-        self.decode(ctx, cdb)
-    }
-
-    fn active(&self) -> bool {
-        self.query != Query::None
-    }
-
-    fn resume(&mut self, _permit: &CommandPermit) -> Result<(), Completion> {
-        Ok(())
-    }
-
-    fn poll<'a>(
-        &mut self,
-        _permit: &CommandPermit,
         fb: Feedback,
         data: &'a mut [u8],
+        alt: &'a mut [u8],
     ) -> PollStep<'a> {
         match self.query {
             Query::None => PollStep::Idle,
@@ -913,7 +869,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                let step = medium.poll(fb, data);
+                let step = medium.poll_with_alt(fb, data, alt);
                 match &step {
                     PollStep::Io(_) => {
                         self.io_issues = self.io_issues.saturating_add(1);
@@ -1126,6 +1082,71 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
                 }
             }
         }
+    }
+}
+
+impl<M: MmcMedium> Device for MmcDrive<M> {
+    type Medium = M;
+
+    fn inquiry_data(&self) -> InquiryData {
+        InquiryData::cdrom()
+    }
+
+    fn removal_encoding(&self) -> RemovalEncoding {
+        RemovalEncoding::Mmc
+    }
+
+    fn spc_profile(&self) -> Option<&dyn SpcProfile> {
+        Some(self)
+    }
+
+    fn prepare(
+        &mut self,
+        _permit: &CommandPermit,
+        ctx: CommandContext,
+        cdb: &[u8],
+    ) -> Result<(), Completion> {
+        // MMC-6 §6.4.4.3 foreground gate: while the zero-fill is Foreground,
+        // every opcode that reaches the drive is rejected before the CDB is
+        // decoded and before the medium/backing is touched. REQUEST SENSE,
+        // INQUIRY, GET CONFIGURATION, GESN and REPORT LUNS are served by `Spc`
+        // and never reach this method.
+        if matches!(self.long, LongOp::Foreground { .. }) {
+            return Err(Completion::Check(FORMAT_IN_PROGRESS));
+        }
+        if self.query != Query::None {
+            return Err(Completion::Busy);
+        }
+        self.published = false;
+        self.len = 0;
+        self.decode(ctx, cdb)
+    }
+
+    fn active(&self) -> bool {
+        self.query != Query::None
+    }
+
+    fn resume(&mut self, _permit: &CommandPermit) -> Result<(), Completion> {
+        Ok(())
+    }
+
+    fn poll<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        fb: Feedback,
+        data: &'a mut [u8],
+    ) -> PollStep<'a> {
+        self.poll_step(fb, data, &mut [])
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        _permit: &CommandPermit,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        self.poll_step(fb, data, alt)
     }
 
     /// Advance the resident long operation.

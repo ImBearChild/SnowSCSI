@@ -1001,7 +1001,7 @@ impl BotSession {
         storage: &mut dyn Storage,
     ) {
         let lun = self.lun;
-        let result = target.drive_step_rt(lun, storage, self, work, scratch);
+        let result = target.drive_step_rt(lun, storage, self, work, &mut [], scratch);
         match result {
             Ok(crate::core::DriveStep::Pending) => {}
             Ok(crate::core::DriveStep::Done(completion)) => self.finish(completion),
@@ -1320,7 +1320,7 @@ impl BotSession {
             // Reset recovery keeps the command-abort path; no `Control::Nop`
             // is queued because the boundary is not clean by definition here.
             let _ = target.request_control(Control::Abort);
-            let _ = target.drive_step_rt(lun, storage, self, work, scratch);
+            let _ = target.drive_step_rt(lun, storage, self, work, &mut [], scratch);
         }
         self.stage = Stage::Command { got: 0 };
         self.phase = Phase::Idle;

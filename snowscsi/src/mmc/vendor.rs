@@ -65,6 +65,12 @@ pub struct VendorMedium {
     phase: VendorState,
     /// Bytes of the read already delivered to the host.
     progress: u32,
+    /// The staged chunk lives in the alternate caller bank (`alt`), so the
+    /// next `Send` must take it from there.
+    chunk_in_alt: bool,
+    /// Bytes of the chunk handed to the host, in the bank named by
+    /// `chunk_in_alt`.
+    chunk_len: usize,
 }
 
 impl VendorMedium {
@@ -84,6 +90,8 @@ impl VendorMedium {
             op: None,
             phase: VendorState::Idle,
             progress: 0,
+            chunk_in_alt: false,
+            chunk_len: 0,
         }
     }
 
@@ -119,6 +127,8 @@ impl VendorMedium {
         self.op = None;
         self.phase = VendorState::Idle;
         self.progress = 0;
+        self.chunk_in_alt = false;
+        self.chunk_len = 0;
     }
 
     /// Total bytes selected by the admitted operation.
@@ -148,6 +158,8 @@ impl VendorMedium {
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
         self.phase = VendorState::ReadIo;
+        self.chunk_in_alt = false;
+        self.chunk_len = len;
         PollStep::Io(StorageOp::Read {
             resource: 0,
             offset: self.next_offset(),
@@ -156,14 +168,40 @@ impl VendorMedium {
     }
 
     /// Issue the speculative read of the next chunk.
-    fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
-        let len = self.next_chunk(data.len());
+    ///
+    /// Consecutive chunks alternate between the caller's two banks: the chunk
+    /// after the one just sent lands in the *other* bank, and the following
+    /// `Send` takes it from there. An empty `alt` keeps the single-bank
+    /// behaviour (prefetch into `data`, send from `data`).
+    fn prefetch_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        let use_alt = !alt.is_empty() && !self.chunk_in_alt;
+        let (bank, in_alt) = if use_alt { (alt, true) } else { (data, false) };
+        let len = self.next_chunk(bank.len());
+        if len == 0 {
+            // A bank that cannot stage one chunk while bytes remain is the
+            // target's own inability to stage the transfer (HARDWARE ERROR /
+            // INTERNAL TARGET FAILURE), never a silent GOOD with data still
+            // undelivered.
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
+        }
+        self.chunk_in_alt = in_alt;
+        self.chunk_len = len;
         self.phase = VendorState::PrefetchIo;
         PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
             resource: 0,
             offset: self.next_offset(),
-            buf: &mut data[..len],
+            buf: &mut bank[..len],
         })
+    }
+
+    /// Send the staged chunk from the bank that holds it.
+    fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        let len = self.chunk_len;
+        if self.chunk_in_alt {
+            PollStep::Send(&alt[..len])
+        } else {
+            PollStep::Send(&data[..len])
+        }
     }
 
     /// Fix a terminal completion.
@@ -221,6 +259,15 @@ impl MmcMedium for VendorMedium {
     }
 
     fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
+        self.poll_with_alt(fb, data, &mut [])
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
         let total = self.total_bytes();
         match (self.phase, fb.kind()) {
             (VendorState::Publish, FeedbackKind::Begin) => match self.op {
@@ -242,7 +289,7 @@ impl MmcMedium for VendorMedium {
             },
             (VendorState::ReadIo, FeedbackKind::PlanAccepted) => self.read_chunk(data),
             (VendorState::ReadIo, FeedbackKind::IoDone) => {
-                let chunk = self.next_chunk(data.len());
+                let chunk = self.chunk_len;
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
@@ -255,10 +302,10 @@ impl MmcMedium for VendorMedium {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = VendorState::Deliver;
-                PollStep::Send(&data[..chunk])
+                self.send_chunk(data, alt)
             }
             (VendorState::PrefetchIo, FeedbackKind::IoDone) => {
-                let chunk = self.next_chunk(data.len());
+                let chunk = self.chunk_len;
                 let failed = match fb.io() {
                     Some(receipt) => receipt.error().is_some() || receipt.confirmed() < chunk,
                     None => true,
@@ -269,10 +316,10 @@ impl MmcMedium for VendorMedium {
                     return self.read_chunk(data);
                 }
                 self.phase = VendorState::Deliver;
-                PollStep::Send(&data[..chunk])
+                self.send_chunk(data, alt)
             }
             (VendorState::Deliver, FeedbackKind::HostSent) => {
-                let chunk = self.next_chunk(data.len());
+                let chunk = self.chunk_len;
                 let (accepted, failed) = match fb.host() {
                     Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
                     None => (0, true),
@@ -282,9 +329,9 @@ impl MmcMedium for VendorMedium {
                 }
                 self.progress = self.progress.saturating_add(chunk as u32);
                 if (self.progress as usize) < total {
-                    // Read the next chunk now so the following send does not
-                    // wait for storage.
-                    return self.prefetch_chunk(data);
+                    // Read the next chunk into the other bank now so the
+                    // following send does not wait for storage.
+                    return self.prefetch_chunk(data, alt);
                 }
                 self.finish(Completion::Good)
             }
@@ -609,5 +656,104 @@ mod tests {
             ),
             PollStep::Complete(Completion::Good)
         ));
+    }
+    /// A two-bank READ alternates the prefetch into the bank that was not just
+    /// sent, and delivers every byte exactly once. `data` starts the read; the
+    /// following chunks alternate with `alt`.
+    #[test]
+    fn two_bank_read_prefetches_into_the_alternate_bank() {
+        const BANK: usize = 8192;
+        const BLOCKS: u16 = 16; // 32 KiB: four chunks
+        let mut m = VendorMedium::new(u64::from(BLOCKS));
+        let mut data = [0u8; BANK];
+        let mut alt = [0u8; BANK];
+        let data_addr = data.as_ptr() as usize;
+        let alt_addr = alt.as_ptr() as usize;
+        let in_data = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= data_addr && p + buf.len() <= data_addr + BANK
+        };
+        let in_alt = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= alt_addr && p + buf.len() <= alt_addr + BANK
+        };
+        let fill = |buf: &mut [u8], at: usize| {
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = ((at + i) & 0xFF) as u8;
+            }
+        };
+
+        assert_eq!(
+            m.begin(MmcOp::Read {
+                lba: 0,
+                blocks: BLOCKS
+            }),
+            Ok(())
+        );
+        match m.poll_with_alt(Feedback::begin(), &mut data, &mut alt) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, u64::from(BLOCKS) * 2048),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        match m.poll_with_alt(Feedback::plan_accepted(), &mut data, &mut alt) {
+            PollStep::Io(StorageOp::Read { offset, buf, .. }) => {
+                assert_eq!(offset, 0);
+                assert!(in_data(buf), "the required read uses the work bank");
+                fill(buf, 0);
+            }
+            other => panic!("expected required read, got {other:?}"),
+        }
+
+        let mut delivered = 0usize;
+        let mut alt_prefetches = 0usize;
+        let mut sent_from_alt;
+        let mut prefetches = 0usize;
+        loop {
+            let chunk = BANK.min(BLOCKS as usize * 2048 - delivered);
+            match m.poll_with_alt(io_receipt(chunk), &mut data, &mut alt) {
+                PollStep::Send(bytes) => {
+                    assert_eq!(bytes.len(), chunk);
+                    for (i, byte) in bytes.iter().enumerate() {
+                        assert_eq!(*byte, ((delivered + i) & 0xFF) as u8);
+                    }
+                    sent_from_alt = in_alt(bytes);
+                    delivered += bytes.len();
+                }
+                other => panic!("expected send, got {other:?}"),
+            }
+            if delivered == BLOCKS as usize * 2048 {
+                assert!(matches!(
+                    m.poll_with_alt(
+                        Feedback::host_sent(HostReceipt::test(chunk, None)),
+                        &mut data,
+                        &mut alt
+                    ),
+                    PollStep::Complete(Completion::Good)
+                ));
+                break;
+            }
+            match m.poll_with_alt(
+                Feedback::host_sent(HostReceipt::test(chunk, None)),
+                &mut data,
+                &mut alt,
+            ) {
+                PollStep::Prefetch(crate::core::storage::PrefetchOp::Read {
+                    offset, buf, ..
+                }) => {
+                    assert_eq!(offset as usize, delivered);
+                    let from_alt = in_alt(buf);
+                    assert_ne!(from_alt, sent_from_alt, "prefetch into the other bank");
+                    if from_alt {
+                        alt_prefetches += 1;
+                    }
+                    fill(buf, delivered);
+                    prefetches += 1;
+                }
+                other => panic!("expected prefetch, got {other:?}"),
+            }
+        }
+        assert_eq!(delivered, BLOCKS as usize * 2048);
+        assert_eq!(prefetches, 3, "three later chunks");
+        assert_eq!(alt_prefetches, 2, "alternate bank carries the odd chunks");
+        assert!(!m.active());
     }
 }

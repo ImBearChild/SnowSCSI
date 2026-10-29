@@ -1117,7 +1117,7 @@ impl IscsiSession {
         let lun = self.cmd_lun;
         let bank = &mut work[BHS_SIZE..];
         self.bank_len = bank.len();
-        match target.drive_step_rt(lun, storage, self, bank, &mut []) {
+        match target.drive_step_rt(lun, storage, self, bank, &mut [], &mut []) {
             Ok(crate::core::DriveStep::Pending) => Stepped::Pending,
             Ok(crate::core::DriveStep::Done(completion)) => Stepped::Done(completion),
             Ok(crate::core::DriveStep::Control(outcome)) => Stepped::Control(outcome),

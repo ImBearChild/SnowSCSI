@@ -412,6 +412,23 @@ pub trait Device {
         data: &'a mut [u8],
     ) -> PollStep<'a>;
 
+    /// One step of the active command with an optional second caller bank.
+    ///
+    /// `alt` is a bank the profile may pre-read the next chunk into (a
+    /// `Prefetch` landing in `alt`, then sent from `alt`). The default ignores
+    /// it and behaves exactly like [`Self::poll`]; a caller that does not opt
+    /// in passes an empty slice.
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let _ = alt;
+        self.poll(permit, fb, data)
+    }
+
     /// One step of the resident long operation (if any).
     ///
     /// `data` is the caller's long-operation bank (`scratch`). The runner

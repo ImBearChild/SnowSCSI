@@ -210,6 +210,7 @@ impl<S: RuntimeSet> Target<S> {
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<DriveStep, Fault> {
         let count = self.slots.slot_count();
@@ -240,7 +241,7 @@ impl<S: RuntimeSet> Target<S> {
         }
         let Self { runner, slots, .. } = self;
         let slot = slots.get(lun).ok_or(Fault::LunNotFound)?;
-        let result = runner.step_command(slot, storage, host, work, scratch)?;
+        let result = runner.step_command(slot, storage, host, work, alt, scratch)?;
         if matches!(result, DriveStep::Done(_)) {
             runner.claim_long_feedback(lun, slot.long_info());
         }
@@ -267,7 +268,7 @@ impl<S: RuntimeSet> Target<S> {
         self.drive_start_rt(lun, ctx, cdb)?;
         let mut host = NoHostData;
         loop {
-            match self.drive_step_rt(lun, storage, &mut host, work, scratch)? {
+            match self.drive_step_rt(lun, storage, &mut host, work, &mut [], scratch)? {
                 DriveStep::Pending => {}
                 DriveStep::Done(completion) => return Ok(completion),
                 DriveStep::Control(_) => return Err(Fault::Cancelled),
@@ -288,7 +289,7 @@ impl<S: RuntimeSet> Target<S> {
     ) -> Result<Completion, Fault> {
         self.drive_start_rt(lun, ctx, cdb)?;
         loop {
-            match self.drive_step_rt(lun, storage, host, work, scratch)? {
+            match self.drive_step_rt(lun, storage, host, work, &mut [], scratch)? {
                 DriveStep::Pending => {}
                 DriveStep::Done(completion) => return Ok(completion),
                 DriveStep::Control(_) => return Err(Fault::Cancelled),
@@ -584,6 +585,7 @@ pub trait StaticTarget<S: SlotSet> {
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<DriveStep, Fault>
     where
@@ -777,6 +779,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
         work: &mut [u8],
+        alt: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<DriveStep, Fault>
     where
@@ -801,7 +804,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
             return Err(fault);
         }
         let Self { runner, slots, .. } = self;
-        let result = runner.step_command(slots.slot_mut(), storage, host, work, scratch)?;
+        let result = runner.step_command(slots.slot_mut(), storage, host, work, alt, scratch)?;
         if matches!(result, DriveStep::Done(_)) {
             runner.claim_long_feedback(I::INDEX, slots.slot_mut().long_info());
         }
@@ -827,7 +830,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         self.drive_start_static::<I>(ctx, cdb)?;
         let mut host = NoHostData;
         loop {
-            match self.drive_step_static::<I>(storage, &mut host, work, scratch)? {
+            match self.drive_step_static::<I>(storage, &mut host, work, &mut [], scratch)? {
                 DriveStep::Pending => {}
                 DriveStep::Done(completion) => return Ok(completion),
                 DriveStep::Control(_) => return Err(Fault::Cancelled),
@@ -851,7 +854,7 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
     {
         self.drive_start_static::<I>(ctx, cdb)?;
         loop {
-            match self.drive_step_static::<I>(storage, host, work, scratch)? {
+            match self.drive_step_static::<I>(storage, host, work, &mut [], scratch)? {
                 DriveStep::Pending => {}
                 DriveStep::Done(completion) => return Ok(completion),
                 DriveStep::Control(_) => return Err(Fault::Cancelled),
@@ -1421,11 +1424,11 @@ mod tests {
             .drive_start_rt(0, ctx(0, Direction::None, 0), &sync_cdb())
             .expect("start LUN 0");
         assert_eq!(
-            target.drive_step_rt(1, &mut storage, &mut host, &mut work, &mut scratch),
+            target.drive_step_rt(1, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
             Err(Fault::Contract)
         );
         assert_eq!(
-            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
             Ok(DriveStep::Done(Completion::Good))
         );
     }
@@ -1444,7 +1447,14 @@ mod tests {
             .expect("start READ");
         let mut empty: [u8; 0] = [];
         assert_eq!(
-            target.drive_step_rt(0, &mut storage, &mut host, &mut empty, &mut scratch),
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut empty,
+                &mut [],
+                &mut scratch
+            ),
             Err(Fault::Contract),
             "a bank that cannot make progress is a caller contract violation"
         );
@@ -1454,7 +1464,7 @@ mod tests {
             .expect("the slot accepts a new command");
         let mut work = [0u8; 512];
         assert_eq!(
-            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
             Ok(DriveStep::Done(Completion::Good))
         );
     }
@@ -1470,7 +1480,13 @@ mod tests {
             .expect("start READ");
         let mut empty: [u8; 0] = [];
         assert_eq!(
-            target.drive_step_static::<Here>(&mut storage, &mut host, &mut empty, &mut scratch),
+            target.drive_step_static::<Here>(
+                &mut storage,
+                &mut host,
+                &mut empty,
+                &mut [],
+                &mut scratch
+            ),
             Err(Fault::Contract),
             "a bank that cannot make progress is a caller contract violation"
         );
@@ -1480,7 +1496,13 @@ mod tests {
             .expect("the slot accepts a new command");
         let mut work = [0u8; 512];
         assert_eq!(
-            target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch),
+            target.drive_step_static::<Here>(
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut [],
+                &mut scratch
+            ),
             Ok(DriveStep::Done(Completion::Good))
         );
     }
@@ -1542,7 +1564,7 @@ mod tests {
             .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
             .expect("start READ");
         assert_eq!(
-            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut scratch),
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
             Ok(DriveStep::Pending),
             "the in-flight read retains its adapter token"
         );
@@ -1550,13 +1572,171 @@ mod tests {
 
         let mut empty: [u8; 0] = [];
         assert_eq!(
-            target.drive_step_rt(0, &mut storage, &mut host, &mut empty, &mut scratch),
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut empty,
+                &mut [],
+                &mut scratch
+            ),
             Err(Fault::Contract)
         );
         assert_eq!(
             storage.log,
             vec!["select", "select", "cancel"],
             "the adapter is told the LUN before the retained token is cancelled"
+        );
+    }
+
+    /// A host send that goes `Pending` must pin the alternate bank too: the
+    /// next continuation with the same two banks is not a contract violation.
+    struct PendingSendHost {
+        pending_once: bool,
+    }
+
+    impl HostTransport for PendingSendHost {
+        fn publish(&mut self, _plan: DataPlan) -> Result<(), Fault> {
+            Ok(())
+        }
+
+        fn begin_recv(&mut self, _req: HostReq) -> HostToken {
+            HostToken::invalid()
+        }
+
+        fn begin_send(&mut self, _req: HostReq) -> HostToken {
+            HostToken::new(0, 1)
+        }
+
+        fn poll_host(&mut self, _token: HostToken, _buf: HostBuf<'_>) -> Poll<HostReceipt> {
+            if self.pending_once {
+                self.pending_once = false;
+                return Poll::Pending;
+            }
+            Poll::Ready(HostReceipt::new(usize::MAX, None, TargetId::UNBOUND))
+        }
+
+        fn cancel(&mut self, _token: HostToken) {}
+
+        fn delivery(&self) -> Delivery {
+            Delivery::Complete
+        }
+    }
+
+    #[test]
+    fn a_pending_host_send_keeps_the_alternate_bank_pinned() {
+        let mut slots = [slot(1)];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = PendingSendHost { pending_once: true };
+        let mut work = [0u8; 512];
+        let mut alt = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Pending),
+            "the host send is retained"
+        );
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Done(Completion::Good)),
+            "the same banks continue without a spurious contract fault"
+        );
+    }
+
+    #[test]
+    fn a_changed_alternate_bank_mid_command_is_contract() {
+        let mut slots = [slot(1)];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = OrderProbe {
+            log: Vec::new(),
+            polls: 0,
+        };
+        let mut host = BlockingHost::new(RecordingHost);
+        let mut work = [0u8; 512];
+        let mut alt = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Pending),
+            "the read retains its adapter token"
+        );
+
+        // Same work bank, different alternate bank address.
+        let mut other = [0u8; 512];
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut other,
+                &mut scratch
+            ),
+            Err(Fault::Contract),
+            "the alternate bank is pinned for the command's duration"
+        );
+
+        // Same address, different length.
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = OrderProbe {
+            log: Vec::new(),
+            polls: 0,
+        };
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Pending)
+        );
+        let (short, _) = alt.split_at_mut(256);
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, short, &mut scratch),
+            Err(Fault::Contract),
+            "the pinned alternate length must not change"
         );
     }
 

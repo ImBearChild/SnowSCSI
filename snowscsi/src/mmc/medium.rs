@@ -33,6 +33,21 @@ pub trait MmcMedium {
     /// is re-borrowed on every poll.
     fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a>;
 
+    /// One step with an optional second caller bank.
+    ///
+    /// Default: ignore `alt` and behave exactly like [`Self::poll`]. A medium
+    /// that pre-reads the next chunk overrides this and lands the `Prefetch`
+    /// in `alt`.
+    fn poll_with_alt<'a>(
+        &mut self,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let _ = alt;
+        self.poll(fb, data)
+    }
+
     /// Whether an admitted operation is still unfinished.
     fn active(&self) -> bool;
 
