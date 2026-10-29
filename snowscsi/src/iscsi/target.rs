@@ -17,8 +17,10 @@
 //! SCSI command execution is delegated to the core [`Target`]: the session
 //! builds the [`CommandContext`] from the wire, starts the command and drives
 //! it one step per entry. Host data phases are implemented by this type as
-//! [`HostTransport`]: Data-In is chunked into `MaxRecvDataSegmentLength`
-//! PDUs, Data-Out is solicited with R2T and consumed one PDU at a time.
+//! [`HostTransport`]: Data-In is split into sequences bounded by
+//! `MaxBurstLength`, each PDU bounded by the initiator's declared
+//! `MaxRecvDataSegmentLength`; Data-Out is solicited with R2T and consumed one
+//! PDU at a time.
 //!
 //! Key protocol behaviour kept from the legacy implementation: CID read at
 //! byte 20-21 (from iscsi_pdu), Data-Out ITT/TTT/BufferOffset/DataSN validation
@@ -44,7 +46,7 @@ use crate::core::{
 };
 use crate::iscsi::pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
-    BHS_SIZE, MAX_DATA_SEGMENT,
+    BHS_SIZE,
 };
 use crate::scsi::scsi::{op as scsi_op, opcode_from_cdb, opcode_name};
 
@@ -187,16 +189,24 @@ const TARGET_NAME: &str = "iqn.1970-01.local.snowscsi:target";
 
 /// Target Transfer Tag for R2T — single outstanding transfer.
 const TTT: u32 = 1;
-/// RFC 3720 §12.14 suggested defaults (clamped when the initiator sends more).
+/// RFC 3720 §12.13/§12.14 suggested defaults (clamped when the initiator sends
+/// more).
 const DEFAULT_FIRST_BURST: u32 = 65536;
 const DEFAULT_MAX_BURST: u32 = 262144;
-/// Upper bound for the negotiated MaxRecvDataSegmentLength: the BHS
+/// Upper bound for a peer-declared `MaxRecvDataSegmentLength`: the BHS
 /// DataSegmentLength field is 24 bits (RFC 3720 §3.1).
-const HARD_CAP: usize = 0xFF_FFFF;
+const HARD_CAP: u32 = 0xFF_FFFF;
 /// RFC 3720 §12.12 floor for `MaxRecvDataSegmentLength`.
 const MIN_RECV_DATA_SEGMENT: u32 = 512;
-/// Largest login data segment accepted for negotiation.
-const LOGIN_MAX: usize = 4096;
+/// The largest data segment this target can receive in one PDU.
+///
+/// This is our own receive capability (RFC 3720 §12.12 is declarative and per
+/// direction): it bounds incoming Data-Out segments and is what the Login
+/// Response declares, independently of what the initiator offered. The work
+/// bank guarantees a data area of at least [`crate::MIN_DATA_LEN`], so 8192 is
+/// always receivable; the value can be raised later without affecting Data-In
+/// (that direction is bounded by the initiator's declaration).
+const OUR_RECV_MDSL: u32 = 8192;
 /// SCSI status BUSY (SPC-3); no constant exists in the PDU module.
 const STATUS_BUSY: u8 = 0x08;
 
@@ -387,13 +397,16 @@ struct SendPhase {
     sent: u32,
     /// DataSN of the next Data-In PDU (continues across device chunks).
     data_sn: u32,
+    /// Bytes already sent in the current sequence (reset when a PDU with F=1
+    /// is observed sent). Bounds every sequence by `MaxBurstLength`.
+    seq_bytes: u32,
     /// First byte offset of the current device send chunk.
     phase_base: u32,
     /// Bytes requested by the current device send chunk.
     phase_len: u32,
     /// Chunk staged by `poll_host`, not yet turned into a PDU: PDU
-    /// BufferOffset, bank offset inside the current phase, length.
-    staged: Option<(u32, u32, u32)>,
+    /// BufferOffset, bank offset inside the current phase, length, F bit.
+    staged: Option<(u32, u32, u32, bool)>,
     /// Final chunk held back for the terminating Data-In (PDU BufferOffset,
     /// bank offset, length).
     held: Option<(u32, u32, u32)>,
@@ -438,7 +451,12 @@ pub struct IscsiSession {
     cmd_sn: u32,
     stat_sn: Cell<u32>,
     stage: LoginStage,
-    max_recv_data_segment: u32,
+    /// Largest data segment this target accepts (our own capability); bounds
+    /// incoming Data-Out and is declared in the Login Response.
+    our_recv_mdsl: u32,
+    /// Largest data segment the initiator declared it can receive; bounds
+    /// every Data-In PDU we send.
+    peer_recv_mdsl: u32,
     neg: NegotiatedParams,
     is_discovery: bool,
     session: Session,
@@ -503,7 +521,9 @@ impl IscsiSession {
             cmd_sn: 0,
             stat_sn: Cell::new(0),
             stage: LoginStage::Security,
-            max_recv_data_segment: MAX_DATA_SEGMENT,
+            our_recv_mdsl: OUR_RECV_MDSL,
+            // RFC 3720 §12.12 default until the initiator declares its own.
+            peer_recv_mdsl: OUR_RECV_MDSL,
             neg: NegotiatedParams::default(),
             is_discovery: false,
             session: Session::RecvPdu,
@@ -697,6 +717,13 @@ impl IscsiSession {
                     return Emit::Error(TargetError::Internal);
                 }
                 self.bhs.copy_from_slice(&work[..BHS_SIZE]);
+                // Bound the declared segment before framing the remainder: a
+                // PDU above this target's receive capability is answered (and
+                // the connection closed) without consuming its payload.
+                let declared = Bhs::from_bytes(self.bhs).data_segment_len() as usize;
+                if declared > self.our_recv_mdsl as usize {
+                    return self.oversized_segment(work);
+                }
                 match self.pdu_remainder(work.len()) {
                     Ok(0) => self.dispatch(work, scratch, target, storage),
                     Ok(total) => {
@@ -845,9 +872,16 @@ impl IscsiSession {
             }
             SendKind::DataIn => {
                 if let HostPhase::Send(p) = &mut self.host {
-                    if let Some((_, _, len)) = p.staged.take() {
+                    if let Some((_, _, len, f_bit)) = p.staged.take() {
                         p.sent = p.sent.saturating_add(len);
                         p.data_sn = p.data_sn.wrapping_add(1);
+                        // DataSN keeps counting across sequences; only the
+                        // per-sequence byte budget restarts at an F=1 PDU.
+                        p.seq_bytes = if f_bit {
+                            0
+                        } else {
+                            p.seq_bytes.saturating_add(len)
+                        };
                     }
                 }
                 self.step(work, scratch, target, storage)
@@ -910,6 +944,22 @@ impl IscsiSession {
         Ok(total)
     }
 
+    /// Answer a PDU whose data segment exceeds [`OUR_RECV_MDSL`].
+    ///
+    /// During Login the response is a Login Response with a non-zero status
+    /// class (RFC 3720 §10.13.5); everywhere else it is a Reject carrying the
+    /// protocol-error reason. Both end the connection, so the oversized
+    /// payload is never read.
+    fn oversized_segment(&mut self, work: &mut [u8]) -> Emit {
+        let bhs = Bhs::from_bytes(self.bhs);
+        if self.stage != LoginStage::FullFeature && bhs.opcode() == op::LOGIN_REQ {
+            // Status-Class 2 (Initiator Error), Detail 0x0B (invalid request
+            // during login).
+            return self.login_error(work, 0x02, 0x0B);
+        }
+        self.reject(work, reject::PROTOCOL_ERROR)
+    }
+
     /// Data-Out length of the saved BHS (used after the padding read).
     fn bhs_data_out_len(&self) -> Option<u32> {
         let bhs = Bhs::from_bytes(self.bhs);
@@ -934,7 +984,7 @@ impl IscsiSession {
         if bhs.data_sn() != p.data_sn {
             return Some(reject::INVALID_PDU_FIELD);
         }
-        if dsl > self.max_recv_data_segment as usize {
+        if dsl > self.our_recv_mdsl as usize {
             return Some(reject::PROTOCOL_ERROR);
         }
         if dsl as u64 > p.burst_remaining as u64 {
@@ -1003,7 +1053,9 @@ impl IscsiSession {
         match self.drive(target, storage, work) {
             Stepped::Pending => match self.host {
                 HostPhase::Send(p) => match p.staged {
-                    Some((offset, bank, len)) => self.emit_data_in(work, offset, bank, len),
+                    Some((offset, bank, len, f_bit)) => {
+                        self.emit_data_in(work, offset, bank, len, f_bit)
+                    }
                     None => Emit::Error(TargetError::Internal),
                 },
                 HostPhase::Recv(p) => {
@@ -1194,13 +1246,21 @@ impl IscsiSession {
         total + pad
     }
 
-    /// Intermediate Data-In chunk: F=0, S=0, no status.
-    fn emit_data_in(&mut self, work: &mut [u8], offset: u32, bank: u32, len: u32) -> Emit {
+    /// Intermediate Data-In chunk: S=0, no status; F=1 only when the PDU ends
+    /// a sequence (RFC 3720 §10.7.1).
+    fn emit_data_in(
+        &mut self,
+        work: &mut [u8],
+        offset: u32,
+        bank: u32,
+        len: u32,
+        f_bit: bool,
+    ) -> Emit {
         let data_sn = match self.host {
             HostPhase::Send(p) => p.data_sn,
             _ => return Emit::Error(TargetError::Internal),
         };
-        let total = self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, false, 0);
+        let total = self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, f_bit, None);
         self.session = Session::Send {
             len: total,
             kind: SendKind::DataIn,
@@ -1219,8 +1279,16 @@ impl IscsiSession {
         status: u8,
     ) -> Emit {
         self.note_status(self.cmd_itt);
-        let total =
-            self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, true, status);
+        let total = self.build_data_in(
+            work,
+            self.cmd_itt,
+            offset,
+            bank,
+            len,
+            data_sn,
+            true,
+            Some(status),
+        );
         self.session = Session::Send {
             len: total,
             kind: SendKind::Status {
@@ -1240,8 +1308,8 @@ impl IscsiSession {
         bank: u32,
         len: u32,
         data_sn: u32,
-        final_pdu: bool,
-        scsi_status: u8,
+        f_bit: bool,
+        scsi_status: Option<u8>,
     ) -> usize {
         let len = len as usize;
         if bank > 0 && len > 0 {
@@ -1253,10 +1321,14 @@ impl IscsiSession {
         }
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
-        if final_pdu {
-            bhs.set_flags(flag::F_BIT | flag::S_BIT);
+        let mut flags = if f_bit { flag::F_BIT } else { 0 };
+        if let Some(scsi_status) = scsi_status {
+            // The S bit implies the final PDU of the whole transfer, so F is
+            // always set alongside it.
+            flags |= flag::F_BIT | flag::S_BIT;
             bhs.set_status(scsi_status);
         }
+        bhs.set_flags(flags);
         bhs.set_itt(itt);
         bhs.set_data_sn(data_sn);
         bhs.set_buffer_offset(offset);
@@ -1272,7 +1344,7 @@ impl IscsiSession {
         if pad > 0 {
             work[total..total + pad].fill(0);
         }
-        if final_pdu {
+        if scsi_status.is_some() {
             self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         }
         total + pad
@@ -1450,10 +1522,17 @@ impl IscsiSession {
             // response is sent.
             return self.emit_response(work, itt, STATUS_BUSY, None);
         }
-        if pdu.dsl > self.max_recv_data_segment as usize {
+        if pdu.dsl > self.our_recv_mdsl as usize {
             return self.reject(work, reject::PROTOCOL_ERROR);
         }
-        if pdu.dsl > 0 && !w_bit {
+        if pdu.dsl > 0 && (!w_bit || !self.neg.immediate_data) {
+            return self.reject(work, reject::PROTOCOL_ERROR);
+        }
+        // Unsolicited data is immediate data plus any unsolicited Data-Out
+        // (RFC 3720 §12.14). The target always requires an R2T, so the only
+        // unsolicited bytes are the command PDU's own data segment; it must
+        // not exceed FirstBurstLength.
+        if pdu.dsl as u32 > self.neg.first_burst_len {
             return self.reject(work, reject::PROTOCOL_ERROR);
         }
 
@@ -1550,7 +1629,7 @@ impl IscsiSession {
             // A Data-In carrying the fixed-format sense; the command is not
             // driven by any slot.
             self.note_status(itt);
-            let total = self.build_data_in(work, itt, 0, 0, n as u32, 0, true, status::GOOD);
+            let total = self.build_data_in(work, itt, 0, 0, n as u32, 0, true, Some(status::GOOD));
             self.session = Session::Send {
                 len: total,
                 kind: SendKind::Status {
@@ -1677,20 +1756,19 @@ impl IscsiSession {
         resp.set_opcode(op::NOP_IN);
         resp.set_flags(flag::F_BIT);
         resp.set_itt(itt);
-        // RFC 3720 §10.18.1: Target Transfer Tag is copied from the NOP-Out
-        // ("shall be copied"), so it is echoed — for the open-iscsi keepalive
-        // NOP-Out it is 0xFFFFFFFF, but a data-transfer-terminating NOP-Out
-        // legitimately carries a real TTT.
+        // RFC 3720 §10.19.1: a NOP-In answering a NOP-Out carries the reserved
+        // 0xffffffff tag, and one answering an earlier NOP-In (whose reply
+        // carries a valid tag) copies it back. Echoing the request tag covers
+        // both: a ping carries 0xffffffff.
         resp.set_ttt(bhs.ttt());
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        let dlen = if pdu.dsl <= MAX_DATA_SEGMENT as usize {
-            resp.set_data_segment_len(pdu.dsl as u32);
-            pdu.dsl
-        } else {
-            0
-        };
+        // RFC 3720 §10.19/§12.12: duplicate up to the first
+        // MaxRecvDataSegmentLength bytes of the ping data — bounded by what the
+        // peer declared it can receive, not by a fixed constant.
+        let dlen = pdu.dsl.min(self.peer_recv_mdsl as usize);
+        resp.set_data_segment_len(dlen as u32);
         work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
@@ -1771,16 +1849,33 @@ impl IscsiSession {
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         let dlen: u32 = if should_return {
+            // RFC 3720 §10.11.6: a Text Response must not exceed the
+            // initiator's declared receive segment; also stay inside this
+            // target's own segment bound and the work bank.
+            let cap = (work.len() - BHS_SIZE)
+                .min(self.our_recv_mdsl as usize)
+                .min(self.peer_recv_mdsl as usize);
             let txt = TARGET_NAME.as_bytes();
             let prefix = b"TargetName=";
             let needed = prefix.len() + txt.len() + 1;
-            if needed > work.len() - BHS_SIZE {
-                return Emit::Error(TargetError::WorkBufTooSmall);
+            if needed <= cap {
+                work[BHS_SIZE..BHS_SIZE + prefix.len()].copy_from_slice(prefix);
+                work[BHS_SIZE + prefix.len()..BHS_SIZE + prefix.len() + txt.len()]
+                    .copy_from_slice(txt);
+                work[BHS_SIZE + prefix.len() + txt.len()] = 0;
+                needed as u32
+            } else {
+                // The key cannot be delivered as requested; answer it as not
+                // understood (RFC 3720 §5.2) if even that does not fit, send
+                // an empty data segment.
+                let alt = b"TargetName=NotUnderstood\0";
+                if alt.len() <= cap {
+                    work[BHS_SIZE..BHS_SIZE + alt.len()].copy_from_slice(alt);
+                    alt.len() as u32
+                } else {
+                    0
+                }
             }
-            work[BHS_SIZE..BHS_SIZE + prefix.len()].copy_from_slice(prefix);
-            work[BHS_SIZE + prefix.len()..BHS_SIZE + prefix.len() + txt.len()].copy_from_slice(txt);
-            work[BHS_SIZE + prefix.len() + txt.len()] = 0;
-            needed as u32
         } else {
             0
         };
@@ -1813,58 +1908,28 @@ impl IscsiSession {
         // Version range check (RFC 3720 §10.13.5): we support 0x00 only.
         let req_min = req.version_min();
         if req_min > 0x00 {
-            let mut resp = Bhs::new();
-            resp.set_opcode(op::LOGIN_RESP);
-            resp.set_itt(req.itt());
-            resp.set_flags(req.csg() << flag::CSG_SHIFT);
-            resp.as_mut_bytes()[2] = 0x00; // Version-max
-            resp.as_mut_bytes()[3] = 0x00; // Version-active
-            resp.as_mut_bytes()[8..14].copy_from_slice(&req.as_bytes()[8..14]);
-            if req.tsih() == 0 {
-                resp.as_mut_bytes()[15] = 1;
-            } else {
-                resp.as_mut_bytes()[14..16].copy_from_slice(&req.as_bytes()[14..16]);
-            }
-            resp.set_data_segment_len(0);
-            resp.set_stat_sn(self.stat_sn.get());
-            resp.set_exp_cmd_sn(req.cmd_sn());
-            resp.set_max_cmd_sn(req.cmd_sn());
-            resp.as_mut_bytes()[36] = 0x02; // Initiator Error
-            resp.as_mut_bytes()[37] = 0x05; // Version not supported
-            work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
-            let pad = pdu_pad_len(0) as usize;
-            work[BHS_SIZE..BHS_SIZE + pad].fill(0);
-            self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
-            self.session = Session::Send {
-                len: BHS_SIZE + pad,
-                kind: SendKind::Close,
-            };
-            return Emit::Send(BHS_SIZE + pad);
+            // Initiator Error / Version not supported.
+            return self.login_error(work, 0x02, 0x05);
+        }
+        if pdu.dsl > self.our_recv_mdsl as usize || BHS_SIZE + pdu.dsl > work.len() {
+            // Initiator Error / Invalid during login.
+            return self.login_error(work, 0x02, 0x0B);
         }
         let req_csg = req.csg() & 0x03;
         let t = req.t_bit();
 
-        // The receive data-segment capability scales with the caller's work
-        // bank (data area = work minus BHS; the session entry guarantees it is
-        // 4-aligned, and it is bounded by the 24-bit DataSegmentLength field).
-        // Negotiation then clamps the initiator's declared value to this cap.
-        self.max_recv_data_segment =
-            crate::scsi::device::data_capacity(work.len() - BHS_SIZE).min(HARD_CAP) as u32;
+        // `our_recv_mdsl` is this target's own receive capability: it bounds
+        // incoming Data-Out segments and is what the Login Response declares.
+        // It does not depend on the initiator's declaration, and it never
+        // bounds Data-In (the initiator's value does).
 
-        // Negotiate: build the response text (updating `self.neg` alongside).
-        let resp_len = if pdu.dsl <= LOGIN_MAX {
-            let (head, tail) = work.split_at_mut(BHS_SIZE + pdu.dsl);
-            let Some(n) = self.negotiate(&head[BHS_SIZE..], tail) else {
-                return Emit::Error(TargetError::WorkBufTooSmall);
-            };
-            work.copy_within(BHS_SIZE + pdu.dsl..BHS_SIZE + pdu.dsl + n, BHS_SIZE);
-            n
-        } else {
-            let Some(n) = self.negotiate(&[], &mut work[BHS_SIZE..]) else {
-                return Emit::Error(TargetError::WorkBufTooSmall);
-            };
-            n
-        };
+        // Negotiate: build the response text (updating `self.neg` alongside)
+        // in the free tail, then move it in front of the BHS. `negotiate`
+        // never writes past the bounded response area, so a pathological
+        // request truncates cleanly instead of failing the session.
+        let (head, tail) = work.split_at_mut(BHS_SIZE + pdu.dsl);
+        let resp_len = self.negotiate(&head[BHS_SIZE..], tail);
+        work.copy_within(BHS_SIZE + pdu.dsl..BHS_SIZE + pdu.dsl + resp_len, BHS_SIZE);
 
         let nsg = if t {
             match req_csg {
@@ -1925,10 +1990,62 @@ impl IscsiSession {
         Emit::Send(total + pad)
     }
 
+    /// Login Response rejecting the request with the given Status-Class and
+    /// Status-Detail (RFC 3720 §10.13.5). A non-zero class ends the
+    /// connection.
+    fn login_error(&mut self, work: &mut [u8], status_class: u8, status_detail: u8) -> Emit {
+        let req = Bhs::from_bytes(self.bhs);
+        let mut resp = Bhs::new();
+        resp.set_opcode(op::LOGIN_RESP);
+        resp.set_itt(req.itt());
+        resp.set_flags(req.csg() << flag::CSG_SHIFT);
+        resp.as_mut_bytes()[2] = 0x00; // Version-max
+        resp.as_mut_bytes()[3] = 0x00; // Version-active
+        resp.as_mut_bytes()[8..14].copy_from_slice(&req.as_bytes()[8..14]);
+        if req.tsih() == 0 {
+            resp.as_mut_bytes()[15] = 1;
+        } else {
+            resp.as_mut_bytes()[14..16].copy_from_slice(&req.as_bytes()[14..16]);
+        }
+        resp.set_data_segment_len(0);
+        resp.set_stat_sn(self.stat_sn.get());
+        resp.set_exp_cmd_sn(req.cmd_sn());
+        resp.set_max_cmd_sn(req.cmd_sn());
+        resp.as_mut_bytes()[36] = status_class;
+        resp.as_mut_bytes()[37] = status_detail;
+        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let pad = pdu_pad_len(0) as usize;
+        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
+        self.session = Session::Send {
+            len: BHS_SIZE + pad,
+            kind: SendKind::Close,
+        };
+        Emit::Send(BHS_SIZE + pad)
+    }
+
     /// Parse initiator key=value text into a response, updating negotiated
-    /// parameters. Writes into `dst`, returns the response length or `None`
-    /// if `dst` is too small.
-    fn negotiate(&mut self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
+    /// parameters. Writes at most `min(dst, our_recv_mdsl, peer_recv_mdsl)`
+    /// bytes and returns the response length.
+    fn negotiate(&mut self, src: &[u8], dst: &mut [u8]) -> usize {
+        // A declaration in this request takes effect for its own response.
+        if let Some(v) = src_u32(src, b"MaxRecvDataSegmentLength") {
+            self.peer_recv_mdsl = v.clamp(MIN_RECV_DATA_SEGMENT, HARD_CAP);
+        }
+        // FirstBurstLength may only be answered once MaxBurstLength is known,
+        // regardless of the order the keys appear in the request (RFC 3720
+        // §12.14 integrity rule).
+        let burst_ceiling = src_u32(src, b"MaxBurstLength")
+            .map(clamp_max_burst)
+            .unwrap_or(self.neg.max_burst_len);
+        // Never emit more than the receiver declared or this target accepts,
+        // and never past the caller's bank (RFC 3720 §10.11.6/§12.12).
+        let cap = dst
+            .len()
+            .min(self.our_recv_mdsl as usize)
+            .min(self.peer_recv_mdsl as usize);
+        let dst = &mut dst[..cap];
+
         let mut w = 0usize;
         let mut sent = [false; LOGIN_TABLE.len()];
         let mut p = 0usize;
@@ -1954,59 +2071,51 @@ impl IscsiSession {
                     let result_yes = initiator_yes; // target offers Yes
                     self.neg.immediate_data = result_yes;
                     let out: &[u8] = if result_yes { b"Yes" } else { b"No" };
-                    if !append_kv(dst, &mut w, key, out) {
-                        return None;
-                    }
+                    append_key(dst, &mut w, key, out);
                 } else if key == b"InitialR2T" {
                     // RFC 3720 §12.10 Result function is OR, Default Yes.
                     let initiator_yes = val == b"Yes";
                     let result_yes = initiator_yes || true; // target offers Yes
                     self.neg.initial_r2t = result_yes;
                     let out: &[u8] = if result_yes { b"Yes" } else { b"No" };
-                    if !append_kv(dst, &mut w, key, out) {
-                        return None;
-                    }
+                    append_key(dst, &mut w, key, out);
                 } else if key == b"MaxBurstLength" {
-                    // RFC 3720 §12.14 Result function is Minimum.
-                    if let Some(v) = parse_u32(val) {
-                        let negotiated = v.min(DEFAULT_MAX_BURST);
-                        self.neg.max_burst_len = negotiated;
-                        if !append_kv_u32(dst, &mut w, key, negotiated) {
-                            return None;
-                        }
-                    } else if !append_kv(dst, &mut w, key, val) {
-                        return None;
-                    }
+                    // RFC 3720 §12.13 Result function is Minimum. A value
+                    // outside the valid range (or not numeric) keeps the
+                    // current/default figure.
+                    let negotiated = parse_u32(val)
+                        .map(clamp_max_burst)
+                        .unwrap_or(self.neg.max_burst_len);
+                    self.neg.max_burst_len = negotiated;
+                    append_key_u32(dst, &mut w, key, negotiated);
                 } else if key == b"FirstBurstLength" {
-                    // RFC 3720 §12.13 Result function is Minimum.
-                    if let Some(v) = parse_u32(val) {
-                        let negotiated = v.min(DEFAULT_FIRST_BURST);
-                        self.neg.first_burst_len = negotiated;
-                        if !append_kv_u32(dst, &mut w, key, negotiated) {
-                            return None;
-                        }
-                    } else if !append_kv(dst, &mut w, key, val) {
-                        return None;
-                    }
+                    // RFC 3720 §12.14 Result function is Minimum; the result
+                    // must stay within 512..=MaxBurstLength.
+                    let negotiated = parse_u32(val)
+                        .map(|v| clamp_first_burst(v, burst_ceiling))
+                        .unwrap_or_else(|| {
+                            clamp_first_burst(self.neg.first_burst_len, burst_ceiling)
+                        });
+                    self.neg.first_burst_len = negotiated;
+                    append_key_u32(dst, &mut w, key, negotiated);
                 } else if key == b"MaxRecvDataSegmentLength" {
-                    // Advertise the negotiated (buffer-derived) value,
-                    // not the raw initiator figure.
-                    self.apply_neg(LOGIN_TABLE[idx].key, val);
-                    if !append_kv_u32(dst, &mut w, key, self.max_recv_data_segment) {
-                        return None;
-                    }
+                    // Declarative and per direction (RFC 3720 §12.12): the
+                    // initiator's figure bounds the Data-In PDUs we send; the
+                    // response carries our own receive capability, unchanged
+                    // by the offer.
+                    append_key_u32(dst, &mut w, key, self.our_recv_mdsl);
                 } else {
                     self.apply_neg(LOGIN_TABLE[idx].key, val);
                     let out_val: &[u8] = match LOGIN_TABLE[idx].value {
                         Some(v) => v.as_bytes(),
                         None => val,
                     };
-                    if !append_kv(dst, &mut w, key, out_val) {
-                        return None;
-                    }
+                    append_key(dst, &mut w, key, out_val);
                 }
-            } else if !is_skip_key(key) && !append_kv(dst, &mut w, key, b"Reject") {
-                return None;
+            } else if !is_skip_key(key) {
+                // RFC 3720 §5.2: a key not understood is answered with
+                // NotUnderstood, never with Reject.
+                append_key(dst, &mut w, key, b"NotUnderstood");
             }
             p = if val_end < src.len() {
                 val_end + 1
@@ -2017,35 +2126,26 @@ impl IscsiSession {
         for (i, param) in LOGIN_TABLE.iter().enumerate() {
             if param.always && !sent[i] {
                 if let Some(v) = param.value {
-                    if !append_kv(dst, &mut w, param.key.as_bytes(), v.as_bytes()) {
-                        return None;
-                    }
+                    append_key(dst, &mut w, param.key.as_bytes(), v.as_bytes());
                 }
             }
         }
-        Some(w)
+        // Integrity rule after every parameter is known (RFC 3720 §5.2/§12.14).
+        self.neg.first_burst_len =
+            clamp_first_burst(self.neg.first_burst_len, self.neg.max_burst_len);
+        w
     }
 
     fn apply_neg(&mut self, key: &str, val: &[u8]) {
         match key {
-            "MaxRecvDataSegmentLength" => {
-                if let Some(v) = parse_u32(val) {
-                    // RFC 3720 §12.12: the valid range starts at 512. Treat a
-                    // smaller declaration as outside the protocol and clamp it
-                    // up, so the target never sends a PDU larger than the
-                    // value it acts on.
-                    let v = v.max(MIN_RECV_DATA_SEGMENT);
-                    self.max_recv_data_segment = v.min(self.max_recv_data_segment);
-                }
-            }
             "MaxBurstLength" => {
                 if let Some(v) = parse_u32(val) {
-                    self.neg.max_burst_len = v.min(DEFAULT_MAX_BURST);
+                    self.neg.max_burst_len = clamp_max_burst(v);
                 }
             }
             "FirstBurstLength" => {
                 if let Some(v) = parse_u32(val) {
-                    self.neg.first_burst_len = v.min(DEFAULT_FIRST_BURST);
+                    self.neg.first_burst_len = clamp_first_burst(v, self.neg.max_burst_len);
                 }
             }
             "ImmediateData" => self.neg.immediate_data = val == b"Yes",
@@ -2162,6 +2262,7 @@ impl HostTransport for IscsiSession {
                 total,
                 sent: 0,
                 data_sn: 0,
+                seq_bytes: 0,
                 phase_base: 0,
                 phase_len: 0,
                 staged: None,
@@ -2199,7 +2300,11 @@ impl HostTransport for IscsiSession {
                     return Poll::Ready(HostReceipt::from_adapter(p.phase_len as usize, None));
                 }
                 let bank = buf.len() as u32;
-                let cap = remaining.min(self.max_recv_data_segment).min(bank);
+                // Per-PDU bound: our device chunk remainder, the initiator's
+                // declared receive segment, the bank, and the room left in the
+                // current sequence (RFC 3720 §10.7.1).
+                let burst_left = self.neg.max_burst_len.saturating_sub(p.seq_bytes);
+                let cap = remaining.min(self.peer_recv_mdsl).min(bank).min(burst_left);
                 if cap == 0 {
                     return Poll::Ready(HostReceipt::from_adapter(
                         p.sent.saturating_sub(p.phase_base) as usize,
@@ -2220,7 +2325,8 @@ impl HostTransport for IscsiSession {
                             Some(Fault::Contract),
                         ));
                     }
-                    p.staged = Some((p.sent, local, chunk));
+                    let f_bit = send_ends_sequence(p.seq_bytes, chunk, self.neg.max_burst_len);
+                    p.staged = Some((p.sent, local, chunk, f_bit));
                     self.host = HostPhase::Send(p);
                     return Poll::Pending;
                 }
@@ -2234,7 +2340,9 @@ impl HostTransport for IscsiSession {
                         let tail = remaining & 3;
                         let split = remaining.saturating_sub(tail);
                         if split > 0 && split < remaining {
-                            p.staged = Some((p.sent, local, split));
+                            let f_bit =
+                                send_ends_sequence(p.seq_bytes, split, self.neg.max_burst_len);
+                            p.staged = Some((p.sent, local, split, f_bit));
                             self.host = HostPhase::Send(p);
                             return Poll::Pending;
                         }
@@ -2244,11 +2352,12 @@ impl HostTransport for IscsiSession {
                     self.host = HostPhase::Send(p);
                     return Poll::Ready(HostReceipt::from_adapter(accepted as usize, None));
                 }
-                // Last PDU of an intermediate chunk: F stays clear and the
-                // next chunk's staging resumes after it is sent. Stage
-                // exactly the bytes that remain (a 1-3 byte tail is padded,
-                // never rounded up into the next chunk).
-                p.staged = Some((p.sent, local, remaining));
+                // Last PDU of an intermediate chunk: stage exactly the bytes
+                // that remain (a 1-3 byte tail is padded, never rounded up
+                // into the next chunk). F is set only when this PDU closes a
+                // sequence.
+                let f_bit = send_ends_sequence(p.seq_bytes, remaining, self.neg.max_burst_len);
+                p.staged = Some((p.sent, local, remaining, f_bit));
                 self.host = HostPhase::Send(p);
                 Poll::Pending
             }
@@ -2400,6 +2509,52 @@ fn find_key(key: &[u8]) -> Option<usize> {
     LOGIN_TABLE.iter().position(|p| p.key.as_bytes() == key)
 }
 
+/// Negotiated `MaxBurstLength` (RFC 3720 §12.13): the minimum of the
+/// initiator's offer and our default, kept inside the protocol's valid range so
+/// a sequence can always make progress.
+fn clamp_max_burst(v: u32) -> u32 {
+    v.clamp(MIN_RECV_DATA_SEGMENT, DEFAULT_MAX_BURST)
+}
+
+/// Negotiated `FirstBurstLength` (RFC 3720 §12.14): at most our default and
+/// never above `MaxBurstLength`, with the protocol's 512-byte floor.
+fn clamp_first_burst(v: u32, max_burst_len: u32) -> u32 {
+    v.clamp(MIN_RECV_DATA_SEGMENT, DEFAULT_FIRST_BURST)
+        .min(max_burst_len.max(MIN_RECV_DATA_SEGMENT))
+}
+
+/// First numeric value offered for `key` in a login request, if any.
+fn src_u32(src: &[u8], key: &[u8]) -> Option<u32> {
+    let mut p = 0usize;
+    while p < src.len() {
+        let eq = p + src[p..].iter().position(|&b| b == b'=')?;
+        let val_end = src[eq + 1..]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(src.len(), |i| eq + 1 + i);
+        if &src[p..eq] == key {
+            return parse_u32(&src[eq + 1..val_end]);
+        }
+        p = if val_end < src.len() {
+            val_end + 1
+        } else {
+            src.len()
+        };
+    }
+    None
+}
+
+/// Whether a Data-In PDU of `len` bytes at `seq_bytes` into its sequence closes
+/// it.
+///
+/// A sequence ends when this PDU exhausts `MaxBurstLength`, or when the room
+/// left (1-3 bytes) could no longer hold another 4-aligned segment. Ending a
+/// little early is always allowed; exceeding the limit is not (RFC 3720
+/// §10.7.1).
+fn send_ends_sequence(seq_bytes: u32, len: u32, max_burst_len: u32) -> bool {
+    seq_bytes.saturating_add(len).saturating_add(3) >= max_burst_len
+}
+
 fn is_skip_key(key: &[u8]) -> bool {
     SKIP_KEYS.iter().any(|k| k.as_bytes() == key)
 }
@@ -2420,10 +2575,18 @@ fn append_kv(dst: &mut [u8], w: &mut usize, k: &[u8], v: &[u8]) -> bool {
     true
 }
 
-fn append_kv_u32(dst: &mut [u8], w: &mut usize, key: &[u8], v: u32) -> bool {
+fn append_key(dst: &mut [u8], w: &mut usize, k: &[u8], v: &[u8]) {
+    // A key whose normal answer does not fit is still answered, as
+    // NotUnderstood, when that shorter value fits (RFC 3720 §5.2).
+    if !append_kv(dst, w, k, v) {
+        let _ = append_kv(dst, w, k, b"NotUnderstood");
+    }
+}
+
+fn append_key_u32(dst: &mut [u8], w: &mut usize, key: &[u8], v: u32) {
     let mut buf = [0u8; 10];
     let digits = fmt_u32(v, &mut buf);
-    append_kv(dst, w, key, digits)
+    append_key(dst, w, key, digits);
 }
 
 fn fmt_u32(v: u32, buf: &mut [u8; 10]) -> &[u8] {
@@ -2461,11 +2624,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiate_rejects_a_tiny_response_bank() {
+    fn negotiate_never_writes_past_a_tiny_response_bank() {
         let mut session = IscsiSession::new();
         let src = b"InitiatorName=iqn.test\0TargetName=iqn.target\0";
         let mut tiny = [0u8; 10];
-        assert!(session.negotiate(src, &mut tiny).is_none());
+        let n = session.negotiate(src, &mut tiny);
+        assert!(n <= tiny.len(), "the response length stays inside the bank");
+        assert_eq!(n, 0, "no key fits, so the response is empty");
+    }
+
+    #[test]
+    fn negotiate_caps_the_response_at_our_receive_segment() {
+        // Many short unknown keys would expand far past one receive segment if
+        // each were answered in full.
+        let mut src = Vec::new();
+        for _ in 0..2000 {
+            src.extend_from_slice(b"a=\0");
+        }
+        let mut session = IscsiSession::new();
+        let mut dst = vec![0u8; 16 * 1024];
+        let n = session.negotiate(&src, &mut dst);
+        assert!(n <= OUR_RECV_MDSL as usize);
+        assert!(n > 0);
+        assert_eq!(dst[n - 1], 0, "the last entry is NUL-terminated");
+        let entries = dst[..n]
+            .split(|&b| b == 0)
+            .filter(|entry| !entry.is_empty());
+        assert!(entries.into_iter().all(|entry| entry == b"a=NotUnderstood"));
+    }
+
+    #[test]
+    fn peer_receive_segment_offer_above_the_wire_field_is_clamped() {
+        let mut session = IscsiSession::new();
+        let src = b"MaxRecvDataSegmentLength=16777216\0";
+        let mut dst = [0u8; 512];
+        let _ = session.negotiate(src, &mut dst);
+        assert_eq!(session.peer_recv_mdsl, HARD_CAP);
+    }
+
+    #[test]
+    fn non_numeric_offers_keep_their_defaults() {
+        let mut session = IscsiSession::new();
+        let src = b"MaxBurstLength=not-a-number\0FirstBurstLength=also-not\0MaxRecvDataSegmentLength=NaN\0";
+        let mut dst = [0u8; 512];
+        let n = session.negotiate(src, &mut dst);
+        assert_eq!(session.neg.max_burst_len, DEFAULT_MAX_BURST);
+        assert_eq!(session.neg.first_burst_len, DEFAULT_FIRST_BURST);
+        assert_eq!(session.peer_recv_mdsl, OUR_RECV_MDSL);
+        let data = &dst[..n];
+        assert!(contains_entry(data, b"MaxBurstLength=262144"));
+        assert!(contains_entry(data, b"FirstBurstLength=65536"));
+        assert!(contains_entry(data, b"MaxRecvDataSegmentLength=8192"));
+    }
+
+    #[test]
+    fn first_burst_offer_is_clamped_to_the_burst_range() {
+        let mut session = IscsiSession::new();
+        let src = b"MaxBurstLength=512\0FirstBurstLength=65536\0";
+        let mut dst = [0u8; 512];
+        let n = session.negotiate(src, &mut dst);
+        assert_eq!(session.neg.max_burst_len, 512);
+        assert_eq!(session.neg.first_burst_len, 512);
+        assert!(contains_entry(&dst[..n], b"FirstBurstLength=512"));
+
+        // A sub-floor offer is raised to 512.
+        let mut session = IscsiSession::new();
+        let src = b"FirstBurstLength=1\0";
+        let mut dst = [0u8; 512];
+        let n = session.negotiate(src, &mut dst);
+        assert_eq!(session.neg.first_burst_len, MIN_RECV_DATA_SEGMENT);
+        assert!(contains_entry(&dst[..n], b"FirstBurstLength=512"));
     }
 
     #[test]
@@ -2541,7 +2769,7 @@ mod tests {
 
         let mut session = IscsiSession::new();
         session.cmd_itt = 1;
-        session.max_recv_data_segment = 8192;
+        session.peer_recv_mdsl = 8192;
         session.bank_len = 8193;
         session.plan = DataPlan {
             direction: Direction::ToHost,
@@ -2569,6 +2797,7 @@ mod tests {
             other => panic!("expected a send phase, got {other:?}"),
         };
         assert_eq!(staged.2, 8192);
+        assert!(!staged.3, "the whole transfer fits one sequence");
 
         // Second PDU: the chunk's last byte, exactly one byte long.
         assert!(matches!(
@@ -2580,6 +2809,7 @@ mod tests {
             other => panic!("expected a send phase, got {other:?}"),
         };
         assert_eq!(staged.2, 1, "the tail is not rounded up");
+        assert!(!staged.3, "the chunk end alone does not close a sequence");
         assert!(
             staged.1 as usize + staged.2 as usize <= bank.len(),
             "staging must stay inside the bank"
@@ -2591,8 +2821,26 @@ mod tests {
         let mut session = IscsiSession::new();
         session.cmd_itt = 1;
         let mut work = vec![0xAAu8; BHS_SIZE + 8];
-        let total = session.build_data_in(&mut work, 1, 0, 0, 1, 0, false, 0);
+        let total = session.build_data_in(&mut work, 1, 0, 0, 1, 0, false, None);
         assert_eq!(total, BHS_SIZE + 1 + 3);
         assert_eq!(&work[BHS_SIZE + 1..BHS_SIZE + 4], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn sequence_boundary_is_the_burst_limit_not_the_chunk_end() {
+        // A 100-byte PDU at the end of a device chunk does not close the
+        // sequence while MaxBurstLength still has room.
+        assert!(!send_ends_sequence(0, 100, 262_144));
+        // The PDU that reaches the limit does.
+        assert!(send_ends_sequence(262_144 - 512, 512, 262_144));
+        // A non-4-multiple limit closes the sequence once fewer than 4 bytes
+        // remain, so the next aligned segment can never overflow it.
+        assert!(!send_ends_sequence(505, 4, 513));
+        assert!(send_ends_sequence(506, 4, 513));
+        assert!(send_ends_sequence(509, 4, 513));
+    }
+
+    fn contains_entry(data: &[u8], needle: &[u8]) -> bool {
+        data.split(|&b| b == 0).any(|entry| entry == needle)
     }
 }

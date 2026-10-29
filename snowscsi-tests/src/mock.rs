@@ -2025,43 +2025,206 @@ mod tests {
         let mut collected = Vec::new();
         let mut saw_data_in = 0;
         let mut last_bo = 0u32;
-        // The login negotiated `MaxRecvDataSegmentLength=262144`; 600 blocks
-        // are 307200 bytes, so the segmented transfer is exactly one full
-        // 262144-byte PDU plus the 45056-byte tail. Asserting the sizes pins
-        // the negotiated per-PDU segment (a 2048+2048 split must not pass).
+        let mut expected_dsn = 0u32;
+        let mut seq_bytes = 0usize;
+        let mut sequences = 0;
+        // The initiator declared `MaxRecvDataSegmentLength=262144`; 600 blocks
+        // are 307200 bytes, so each PDU may carry the full 262144-byte
+        // declaration. `MaxBurstLength` is also 262144, which splits the
+        // transfer into two sequences: one full PDU, then the 45056-byte tail
+        // that also carries S + status.
         const NEGOTIATED_SEGMENT: usize = 262144;
         while let Some((bhs, data)) = conn.take_pdu() {
             if bhs[0] & 0x3F == op::SCSI_DATA_IN {
                 let bo = u32::from_be_bytes([bhs[40], bhs[41], bhs[42], bhs[43]]);
                 assert_eq!(bo, last_bo, "BufferOffset must be contiguous");
+                let dsn = u32::from_be_bytes([bhs[36], bhs[37], bhs[38], bhs[39]]);
+                assert_eq!(dsn, expected_dsn, "DataSN must be contiguous");
                 last_bo += data.len() as u32;
+                expected_dsn += 1;
                 collected.extend_from_slice(&data);
                 saw_data_in += 1;
+                seq_bytes += data.len();
+                assert!(
+                    seq_bytes <= NEGOTIATED_SEGMENT,
+                    "a sequence must not exceed MaxBurstLength"
+                );
                 if bhs[1] & flag::F_BIT != 0 {
-                    assert_ne!(bhs[1] & flag::S_BIT, 0, "final Data-In must have S bit");
-                    assert_eq!(
-                        data.len(),
-                        600 * 512 - NEGOTIATED_SEGMENT,
-                        "final Data-In carries the transfer remainder"
-                    );
-                } else {
-                    assert_eq!(
-                        data.len(),
-                        NEGOTIATED_SEGMENT,
-                        "intermediate Data-In must use the negotiated segment length"
-                    );
+                    sequences += 1;
+                    seq_bytes = 0;
+                    if bhs[1] & flag::S_BIT != 0 {
+                        assert_eq!(
+                            data.len(),
+                            600 * 512 - NEGOTIATED_SEGMENT,
+                            "the last Data-In closes the sequence and carries the transfer remainder"
+                        );
+                    } else {
+                        assert_eq!(
+                            data.len(),
+                            NEGOTIATED_SEGMENT,
+                            "a sequence-ending Data-In exhausts MaxBurstLength"
+                        );
+                    }
                 }
             }
         }
         assert_eq!(saw_data_in, 2, "one full segment + one final Data-In");
+        assert_eq!(sequences, 2, "MaxBurstLength splits this transfer in two");
         assert_eq!(collected.len(), 600 * 512);
         assert_eq!(collected, expected);
     }
 
-    // ── MaxRecvDataSegmentLength floor ────────────────────────────
+    /// A 1 MiB read at the 256 KiB `MaxBurstLength`: four sequences, each
+    /// closed by an F=1 PDU, with the last one also carrying S + status. The
+    /// initiator's 64 KiB `MaxRecvDataSegmentLength` puts four PDUs in every
+    /// sequence, so DataSN and BufferOffset must stay contiguous across the
+    /// sequence boundaries.
+    #[test]
+    fn data_in_is_split_into_max_burst_length_sequences() {
+        const READ_LEN: usize = 1024 * 1024;
+        const MAX_BURST: usize = 256 * 1024;
+        const PEER_SEGMENT: usize = 64 * 1024;
+
+        let mut ram = vec![0u8; 2 * 1024 * 1024];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = ((i * 7) % 251) as u8;
+        }
+        let expected = ram[..READ_LEN].to_vec();
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(4096, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; 384 * 1024];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "MaxRecvDataSegmentLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, &PEER_SEGMENT.to_string());
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&data, "MaxBurstLength"),
+            Some(b"262144".as_slice())
+        );
+
+        // 2048 blocks x 512 = 1 MiB.
+        conn.feed(&read10_bhs(0, 2048, 0x6001, 0), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+
+        let mut collected = Vec::new();
+        let mut expected_bo = 0u32;
+        let mut expected_dsn = 0u32;
+        let mut seq_bytes = 0usize;
+        let mut seq_pdus = 0usize;
+        let mut sequences: Vec<(usize, usize, bool)> = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F != op::SCSI_DATA_IN {
+                continue;
+            }
+            let bo = u32::from_be_bytes([bhs[40], bhs[41], bhs[42], bhs[43]]);
+            let dsn = u32::from_be_bytes([bhs[36], bhs[37], bhs[38], bhs[39]]);
+            assert_eq!(bo, expected_bo, "BufferOffset must be contiguous");
+            assert_eq!(dsn, expected_dsn, "DataSN must be contiguous");
+            assert!(
+                data.len() <= PEER_SEGMENT,
+                "a Data-In PDU must not exceed the initiator's declared segment"
+            );
+            expected_bo += data.len() as u32;
+            expected_dsn += 1;
+            seq_bytes += data.len();
+            seq_pdus += 1;
+            assert!(
+                seq_bytes <= MAX_BURST,
+                "a sequence must not exceed MaxBurstLength"
+            );
+            collected.extend_from_slice(&data);
+            if bhs[1] & flag::F_BIT != 0 {
+                let has_status = bhs[1] & flag::S_BIT != 0;
+                if has_status {
+                    assert_eq!(bhs[3], status::GOOD);
+                }
+                sequences.push((seq_bytes, seq_pdus, has_status));
+                seq_bytes = 0;
+                seq_pdus = 0;
+            } else {
+                assert_eq!(bhs[1] & flag::S_BIT, 0, "S only on the final PDU");
+            }
+        }
+
+        assert_eq!(sequences.len(), 4, "four 256 KiB sequences");
+        for (bytes, pdus, _) in &sequences {
+            assert_eq!(*bytes, MAX_BURST, "every sequence exhausts MaxBurstLength");
+            assert!(
+                *pdus >= MAX_BURST / PEER_SEGMENT,
+                "a sequence needs at least four declared-segment PDUs"
+            );
+        }
+        assert!(
+            !sequences[0].2 && !sequences[1].2 && !sequences[2].2 && sequences[3].2,
+            "only the last sequence carries status"
+        );
+        assert_eq!(collected.len(), READ_LEN);
+        assert_eq!(collected, expected, "the read data must be byte-exact");
+        assert_eq!(expected_bo, READ_LEN as u32);
+        assert!(expected_dsn as usize >= 16, "16 PDUs at the minimum");
+
+        // The session is still usable: a one-block read completes.
+        conn.feed(&read10_bhs(0, 1, 0x6002, 1), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("short read after the sequences");
+        assert_eq!(bhs[0] & 0x3F, op::SCSI_DATA_IN);
+        assert_eq!(
+            bhs[1] & (flag::F_BIT | flag::S_BIT),
+            flag::F_BIT | flag::S_BIT
+        );
+        assert_eq!(bhs[3], status::GOOD);
+        assert_eq!(data, expected[..512].to_vec());
+    }
+
+    // ── MaxRecvDataSegmentLength per direction ────────────────────
 
     #[test]
-    fn login_clamps_max_recv_data_segment_to_the_rfc_floor() {
+    fn peer_declared_max_recv_data_segment_below_the_floor_is_clamped_up() {
         let mut ram = vec![0u8; 16 * 1024];
         for (i, b) in ram.iter_mut().enumerate() {
             *b = (i % 251) as u8;
@@ -2092,11 +2255,12 @@ mod tests {
         assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
         assert_eq!(
             resp_value(&data, "MaxRecvDataSegmentLength"),
-            Some(b"512".as_slice()),
-            "a sub-512 declaration is clamped to the RFC floor"
+            Some(b"8192".as_slice()),
+            "the response declares our own receive capability, not the offer"
         );
 
-        // Every Data-In PDU stays within the clamped segment.
+        // The clamp applies to what we send: every Data-In PDU stays within
+        // the (clamped-up) 512-byte peer declaration.
         conn.feed(&read10_bhs(0, 4, 0x5151, 0), &[]);
         assert_eq!(
             run_once(
@@ -2112,14 +2276,528 @@ mod tests {
         let mut total = 0usize;
         while let Some((bhs, data)) = conn.take_pdu() {
             if bhs[0] & 0x3F == op::SCSI_DATA_IN {
-                assert!(data.len() <= 512, "PDU exceeds the clamped segment");
+                assert!(data.len() <= 512, "PDU exceeds the peer declaration");
                 total += data.len();
             }
         }
         assert_eq!(total, 4 * 512);
     }
 
-    // ── A transfer larger than the bank streams in chunks ──────────
+    #[test]
+    fn data_in_uses_at_most_the_work_bank_when_the_peer_declares_more() {
+        // The initiator declares 262144, so Data-In may use up to the 8192-byte
+        // work bank; our own 8192 receive declaration plays no part here.
+        let mut ram = vec![0u8; 16 * 1024 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+        login!(conn, session, work, scratch, target, storage);
+
+        // 32 blocks = 16384 bytes = two full 8192-byte PDUs across two device
+        // chunks.
+        conn.feed(&read10_bhs(0, 32, 0x5252, 0), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let mut sizes = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                sizes.push(data.len());
+            }
+        }
+        assert_eq!(sizes, vec![8192, 8192], "the bank bounds each Data-In PDU");
+    }
+
+    #[test]
+    fn peer_declared_max_recv_data_segment_of_512_bounds_every_data_in_pdu() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "MaxRecvDataSegmentLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, "512");
+        let bhs = login_bhs(text.len() as u32);
+        conn.feed_padded(&bhs, text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&data, "MaxRecvDataSegmentLength"),
+            Some(b"8192".as_slice()),
+            "our declaration does not echo the initiator's value"
+        );
+
+        conn.feed(&read10_bhs(0, 4, 0x5353, 0), &[]);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let mut sizes = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
+            if bhs[0] & 0x3F == op::SCSI_DATA_IN {
+                sizes.push(data.len());
+            }
+        }
+        assert_eq!(sizes, vec![512; 4], "one PDU per declared segment");
+    }
+
+    #[test]
+    fn data_out_above_our_recv_segment_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(32768, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; 384 * 1024];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        login!(conn, session, work, scratch, target, storage);
+
+        let itt = 0xD400_0001;
+        let cmd = write10_bhs(0, 32, itt, 0, 0);
+        conn.feed_padded(&cmd, &[]);
+        // The big bank lets 16 KiB segments be framed, but our declared
+        // receive segment is 8192: one byte above it is a protocol error.
+        let oversized = vec![0x33u8; 8193];
+        let dout = dataout_bhs(itt, 1, 0, 0, 8193);
+        conn.feed_padded(&dout, &oversized);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (r2t, _) = conn.take_pdu().expect("R2T before the offending PDU");
+        assert_eq!(r2t[0] & 0x3F, op::R2T);
+        let (reject, _) = conn.take_pdu().expect("reject for the oversized segment");
+        assert_eq!(reject[0] & 0x3F, op::REJECT);
+        assert_eq!(reject[2], reject::PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn nop_in_echo_is_limited_by_the_peer_receive_segment() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "MaxRecvDataSegmentLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, "512");
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        conn.take_pdu().expect("login response");
+
+        // 2048 bytes of ping data, four times what the peer can receive.
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let mut nop = [0u8; 48];
+        nop[0] = op::NOP_OUT;
+        nop[5] = (payload.len() >> 16) as u8;
+        nop[6] = (payload.len() >> 8) as u8;
+        nop[7] = payload.len() as u8;
+        nop[16..20].copy_from_slice(&be32(0xABCD));
+        nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
+        conn.feed_padded(&nop, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("NOP-In response");
+        assert_eq!(bhs[0] & 0x3F, op::NOP_IN);
+        assert_eq!(
+            u32::from_be_bytes([bhs[4], bhs[5], bhs[6], bhs[7]]),
+            512,
+            "the echo is exactly the peer's declared segment"
+        );
+        assert_eq!(data, payload[..512].to_vec());
+    }
+
+    #[test]
+    fn nop_out_above_our_recv_segment_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+        login!(conn, session, work, scratch, target, storage);
+
+        let payload = vec![0x5Au8; 8193];
+        let mut nop = [0u8; 48];
+        nop[0] = op::NOP_OUT;
+        nop[5] = (payload.len() >> 16) as u8;
+        nop[6] = (payload.len() >> 8) as u8;
+        nop[7] = payload.len() as u8;
+        nop[16..20].copy_from_slice(&be32(0xBCDE));
+        nop[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
+        conn.feed_padded(&nop, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (reject_bhs, rejected) = conn.take_pdu().expect("reject for the oversized NOP");
+        assert_eq!(reject_bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(reject_bhs[2], reject::PROTOCOL_ERROR);
+        assert_eq!(rejected, nop.to_vec());
+    }
+
+    #[test]
+    fn text_request_above_our_recv_segment_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+        login!(conn, session, work, scratch, target, storage);
+
+        let mut payload = b"SendTargets=All\0".to_vec();
+        payload.resize(8193, 0);
+        let mut txt = [0u8; 48];
+        txt[0] = op::TEXT_REQ;
+        txt[1] = flag::F_BIT;
+        txt[5] = (payload.len() >> 16) as u8;
+        txt[6] = (payload.len() >> 8) as u8;
+        txt[7] = payload.len() as u8;
+        txt[16..20].copy_from_slice(&be32(0x3456));
+        txt[20..24].copy_from_slice(&be32(0xFFFF_FFFF));
+        txt[24..28].copy_from_slice(&be32(1));
+        conn.feed_padded(&txt, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (reject_bhs, rejected) = conn.take_pdu().expect("reject for the oversized text");
+        assert_eq!(reject_bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(reject_bhs[2], reject::PROTOCOL_ERROR);
+        assert_eq!(rejected, txt.to_vec());
+    }
+
+    #[test]
+    fn immediate_write_above_our_recv_segment_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(32768, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; 384 * 1024];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        login!(conn, session, work, scratch, target, storage);
+
+        let payload = vec![0x77u8; 8193];
+        let cmd = write10_bhs(0, 17, 0xE400_0001, 0, payload.len() as u32);
+        conn.feed_padded(&cmd, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (reject_bhs, rejected) = conn.take_pdu().expect("reject for the oversized command");
+        assert_eq!(reject_bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(reject_bhs[2], reject::PROTOCOL_ERROR);
+        assert_eq!(rejected, cmd.to_vec());
+    }
+
+    #[test]
+    fn immediate_write_above_first_burst_length_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let mut text = String::from(REQ_TEXT);
+        let key = "FirstBurstLength=";
+        let start = text.find(key).unwrap() + key.len();
+        let end = text[start..].find('\0').unwrap() + start;
+        text.replace_range(start..end, "512");
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (login_bhs, login_data) = conn.take_pdu().expect("login response");
+        assert_eq!(login_bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&login_data, "FirstBurstLength"),
+            Some(b"512".as_slice())
+        );
+
+        // 1024 bytes of immediate data, twice FirstBurstLength.
+        let payload = vec![0x99u8; 1024];
+        let cmd = write10_bhs(0, 2, 0xE500_0001, 0, payload.len() as u32);
+        conn.feed_padded(&cmd, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (reject_bhs, rejected) = conn.take_pdu().expect("reject for the unsolicited burst");
+        assert_eq!(reject_bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(reject_bhs[2], reject::PROTOCOL_ERROR);
+        assert_eq!(rejected, cmd.to_vec());
+    }
+
+    #[test]
+    fn immediate_data_without_negotiation_is_rejected() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let text = REQ_TEXT.replace("ImmediateData=Yes", "ImmediateData=No");
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (login_bhs, _) = conn.take_pdu().expect("login response");
+        assert_eq!(login_bhs[0] & 0x3F, op::LOGIN_RESP);
+
+        // ImmediateData=No forbids data in the command PDU.
+        let payload = vec![0x5Au8; 512];
+        let cmd = write10_bhs(0, 1, 0xE600_0001, 0, payload.len() as u32);
+        conn.feed_padded(&cmd, &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (reject_bhs, rejected) = conn.take_pdu().expect("reject for immediate data");
+        assert_eq!(reject_bhs[0] & 0x3F, op::REJECT);
+        assert_eq!(reject_bhs[2], reject::PROTOCOL_ERROR);
+        assert_eq!(rejected, cmd.to_vec());
+    }
+
+    #[test]
+    fn first_burst_offer_is_clamped_before_max_burst_is_seen() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        // FirstBurstLength precedes MaxBurstLength, so the clamp can only use
+        // the pre-scanned burst limit.
+        let text = REQ_TEXT.replace(
+            "MaxBurstLength=16776192\0FirstBurstLength=262144",
+            "FirstBurstLength=1024\0MaxBurstLength=512",
+        );
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (login_bhs, login_data) = conn.take_pdu().expect("login response");
+        assert_eq!(login_bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(
+            resp_value(&login_data, "FirstBurstLength"),
+            Some(b"512".as_slice())
+        );
+        assert_eq!(
+            resp_value(&login_data, "MaxBurstLength"),
+            Some(b"512".as_slice())
+        );
+    }
+
+    #[test]
+    fn login_request_above_our_recv_segment_is_rejected_with_a_login_status() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32768, work, scratch, slots, table, conn, session, target, storage
+        );
+
+        let payload = vec![0x41u8; 8193];
+        conn.feed_padded(&login_bhs(payload.len() as u32), &payload);
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Closed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login error response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(bhs[36], 0x02, "Initiator Error");
+        assert_eq!(bhs[37], 0x0B, "invalid during login");
+        assert_eq!(
+            u32::from_be_bytes([bhs[4], bhs[5], bhs[6], bhs[7]]),
+            0,
+            "a login error carries no parameters"
+        );
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn login_response_stays_within_the_receive_segment() {
+        let mut ram = vec![0u8; 16 * 1024];
+        let mut backend = RamBackend::new(&mut ram);
+        let mut slots = [TestLu::block(32768, 512, 0)];
+        let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+            .iter_mut()
+            .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+            .collect();
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+        let mut conn = MockConn::new();
+        let mut session = IscsiSession::default();
+        let mut work = vec![0u8; 384 * 1024];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+
+        // Short unknown keys expand when answered, so this response would be
+        // far larger than one receive segment without a bound.
+        let mut text = String::new();
+        for _ in 0..2000 {
+            text.push_str("a=\0");
+        }
+        conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+        assert_eq!(
+            run_once(
+                &mut session,
+                &mut conn,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Outcome::Processed
+        );
+        let (bhs, data) = conn.take_pdu().expect("login response");
+        assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+        assert_eq!(bhs[36], 0x00);
+        assert_eq!(
+            u32::from_be_bytes([bhs[4], bhs[5], bhs[6], bhs[7]]) as usize,
+            data.len()
+        );
+        assert!(
+            data.len() <= 8192,
+            "a login response never exceeds the receive segment"
+        );
+        assert_eq!(
+            data.last(),
+            Some(&0),
+            "the response ends on an entry boundary"
+        );
+        assert!(
+            data.windows(16).any(|w| w == b"a=NotUnderstood\0"),
+            "keys that do not fit are answered as not understood"
+        );
+    }
 
     #[test]
     fn oversized_transfer_streams_in_bank_sized_chunks_and_keeps_the_session() {

@@ -62,9 +62,8 @@ const LAST_LBA: u32 = 32767;
 const LARGE_XFER: usize = 1024 * 1024;
 
 /// R2T-roundtrip transfer: 2 MiB = 4096 blocks. `MaxBurstLength` is 256 KiB,
-/// and the target's advertised `MaxRecvDataSegmentLength` follows its command
-/// bank, so this needs eight R2T bursts of one Data-Out PDU each. Bank =
-/// `len + BHS_SIZE`.
+/// and the target declares an 8192-byte receive segment, so this needs eight
+/// R2T bursts, each carried by several Data-Out PDUs. Bank = `len + BHS_SIZE`.
 const R2T_XFER: usize = 2 * 1024 * 1024;
 
 /// Opaque libiscsi FFI surface. All handles are `*mut c_void`; struct access
@@ -1031,9 +1030,8 @@ fn abort_task_settles_in_flight_write() {
 /// `ImmediateData=No` forbids data in the command PDU and `InitialR2T=Yes`
 /// requires the target to solicit every byte, so the write can only complete
 /// through the R2T/Data-Out state machine: 2 MiB at the 256 KiB `MaxBurstLength`
-/// is eight solicited bursts, every one of them a separate Data-Out PDU
-/// because the target's `MaxRecvDataSegmentLength` tracks its command bank.
-/// The read-back must be byte-exact.
+/// is eight solicited bursts, each split into PDUs no larger than the target's
+/// declared receive segment. The read-back must be byte-exact.
 #[test]
 fn forced_r2t_write_read_roundtrip() {
     // A command bank large enough for the whole plan (no device chunking).
