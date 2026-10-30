@@ -43,6 +43,12 @@
 //! while it runs. The two paths never need a buffer at the same time inside one
 //! poll; this slice is strictly sequential and does not overlap storage with
 //! the wire.
+//!
+//! Both transports also offer an explicit **overlap** mode
+//! ([`usb::BotSession::with_overlap`], [`iscsi::target::IscsiSession::with_overlap`]):
+//! `work` is split into two equal banks and the resident long operation borrows
+//! one while the command uses the other. Overlap is never inferred from the
+//! buffer length.
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]

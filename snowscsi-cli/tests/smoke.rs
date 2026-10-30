@@ -205,26 +205,38 @@ fn run_with_timeout(args: &[&str], secs: u64) -> Output {
 }
 
 #[test]
-fn serve_rejects_overlap_with_iscsi_before_binding() {
-    // The rejection must happen before the portal is bound: the process exits
-    // on its own with a clear message (port 0 would otherwise serve forever).
-    let out = run_with_timeout(
-        &[
-            "serve",
-            "--block",
-            "ram=1M",
-            "--iscsi",
-            "127.0.0.1:0",
-            "--overlap",
-        ],
-        10,
-    );
+fn serve_rejects_iscsi_overlap_below_the_two_bank_floor() {
+    // One byte below 2 × 8240 is refused before the portal is bound.
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:0",
+        "--overlap",
+        "--work-buf-size",
+        "16479",
+    ]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("iSCSI overlap is not implemented"),
-        "expected a clear iSCSI overlap rejection, got: {err}"
+        err.contains("16479"),
+        "expected the rejected total in the message, got: {err}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_starts_with_iscsi_overlap() {
+    // The two-bank total is accepted and the portal starts serving.
+    run_serve_until_ready_then_sigint(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:0",
+        "--overlap",
+    ]);
 }
 
 #[cfg(target_os = "linux")]

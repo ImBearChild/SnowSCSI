@@ -37,8 +37,14 @@
 //! serviceable while a long IO runs. Undersized banks are rejected with
 //! [`target::TargetError::WorkBufTooSmall`].
 //!
-//! `work` is **one** data bank: the leading [`pdu::BHS_SIZE`] bytes carry the
-//! wire header, so the usable SCSI data area is exactly `work.len() -
+//! [`target::IscsiSession::with_overlap`] instead splits `work` into **two**
+//! equal banks (`BHS_SIZE + data area` each): the command owns one bank and may
+//! stage Data-In from the other, so the resident long operation can hold one
+//! bank while a command runs on the other. Overlap is explicit; it is never
+//! inferred from the length of `work`.
+//!
+//! `work` is otherwise **one** data bank: the leading [`pdu::BHS_SIZE`] bytes
+//! carry the wire header, so the usable SCSI data area is `bank.len() -
 //! pdu::BHS_SIZE`. That area must be a multiple of 4 (every Data-In PDU is
 //! padded to a 4-byte boundary) and bounds one device data chunk: a command
 //! whose transfer is larger is streamed in bank-sized chunks (Data-In PDUs or

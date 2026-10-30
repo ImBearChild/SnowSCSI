@@ -39,10 +39,18 @@
 //! declared `MaxRecvDataSegmentLength` for the connection (RFC 3720 §12.12).
 //! `scratch` is the resident long-operation bank and must hold at least
 //! [`crate::MIN_DATA_LEN`] bytes.
+//!
+//! With [`IscsiSession::with_overlap`] `work` is instead the **total** of two
+//! equal banks, each `BHS_SIZE + data area`. Command framing, Data-Out and
+//! responses stay in one bank; a Data-In chunk may be staged in either bank, so
+//! each deferred send carries the base of the bank that holds it. A resident
+//! long token owns one bank and commands run on the other.
 
 use core::cell::Cell;
 
-use crate::core::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage};
+use crate::core::storage::{
+    BankSide, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage,
+};
 use crate::core::{
     CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
     PendingKind, RuntimeSet, Sense, Target, UaClass, LUN_NOT_SUPPORTED,
@@ -117,8 +125,9 @@ pub enum TargetError {
     /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
     /// `BHS_SIZE` behind the PDU base (data area too small for the SCSI layer
     /// and the Login text), that data area (`work.len() - pdu_base -
-    /// BHS_SIZE`) is not a multiple of 4, or the scratch bank is smaller than
-    /// [`crate::MIN_DATA_LEN`].
+    /// BHS_SIZE`) is not a multiple of 4, an overlap total does not split into
+    /// two aligned banks of at least that size, or the scratch bank is smaller
+    /// than [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// Connection I/O failure (details logged by the transport).
     Io,
@@ -438,6 +447,9 @@ struct SendPhase {
     /// Final chunk held back for the terminating Data-In (PDU BufferOffset,
     /// bank offset, length).
     held: Option<(u32, u32, u32)>,
+    /// Physical bank holding the current device chunk (overlap only; always
+    /// `Work` for a single-bank session).
+    chunk_bank: BankSide,
 }
 
 /// Data-Out progress.
@@ -525,6 +537,19 @@ pub struct IscsiSession {
     abort_pending: bool,
     /// LUN whose resident long operation the idle entries advance.
     long_lun: Option<usize>,
+    /// Two-bank overlap mode (default off).
+    overlap: bool,
+    /// Physical bank holding command framing, Data-Out and the responses.
+    cmd_bank: BankSide,
+    /// Second bank the current command may prefetch into (overlap only).
+    cmd_alt: Option<BankSide>,
+    /// Physical bank lent to the resident long operation while its adapter
+    /// token is in flight.
+    long_bank: Option<BankSide>,
+    /// The command bank for the PDU at the current boundary was fixed.
+    bank_fixed: bool,
+    /// Length of one bank inside `work` (`work.len()` outside overlap).
+    bank_size: usize,
     /// Length of the SCSI data area handed to the core for the current step.
     bank_len: usize,
     /// Bank offset of the PDU currently being framed inside `work`.
@@ -584,8 +609,163 @@ impl IscsiSession {
             status_autosense: None,
             abort_pending: false,
             long_lun: None,
+            overlap: false,
+            cmd_bank: BankSide::Work,
+            cmd_alt: None,
+            long_bank: None,
+            bank_fixed: false,
+            bank_size: 0,
             bank_len: 0,
             pdu_base: 0,
+        }
+    }
+
+    /// Select the two-bank overlap mode (builder style; default off).
+    ///
+    /// In overlap mode [`poll`](Self::poll)'s `work` is the **total** of two
+    /// equal banks: its length must be even, each half at least
+    /// [`crate::MIN_DATA_LEN`] + [`BHS_SIZE`], and each half's data area a
+    /// multiple of four. Command framing, Data-Out and responses use one bank;
+    /// a Data-In chunk may be staged from either bank, so the core can read the
+    /// next device chunk into the other bank while the current PDU is on the
+    /// wire. Single-bank sessions keep the historical layout (`work` is one
+    /// bank).
+    pub fn with_overlap(mut self) -> Self {
+        self.overlap = true;
+        self
+    }
+
+    /// Whether the session uses two equal banks inside `work`.
+    pub fn overlap(&self) -> bool {
+        self.overlap
+    }
+
+    /// The bank currently lent to the resident long operation, if its storage
+    /// token is in flight. `None` when no long token is pending or the session
+    /// is not in overlap mode.
+    pub fn long_bank(&self) -> Option<BankSide> {
+        self.long_bank
+    }
+
+    /// Absolute offset of physical bank `side` inside `work`.
+    fn bank_base(&self, side: BankSide) -> usize {
+        if self.overlap && side == BankSide::Alt {
+            self.bank_size
+        } else {
+            0
+        }
+    }
+
+    /// The other one of the two banks.
+    const fn other_bank(bank: BankSide) -> BankSide {
+        match bank {
+            BankSide::Work => BankSide::Alt,
+            BankSide::Alt => BankSide::Work,
+        }
+    }
+
+    /// The bank that is not the command bank.
+    fn alternate_bank(&self) -> BankSide {
+        Self::other_bank(self.cmd_bank)
+    }
+
+    /// Map a runner-side bank (relative to the `work`/`alt` arguments) to the
+    /// physical half of the caller's `work`.
+    fn physical_bank(&self, side: BankSide) -> BankSide {
+        if !self.overlap {
+            BankSide::Work
+        } else {
+            match side {
+                BankSide::Work => self.cmd_bank,
+                BankSide::Alt => self.alternate_bank(),
+            }
+        }
+    }
+
+    /// Absolute base of the bank a staged PDU lives in.
+    fn send_base(&self, bank: BankSide) -> usize {
+        if self.overlap {
+            self.bank_base(bank)
+        } else {
+            self.pdu_base
+        }
+    }
+
+    /// Base offset of a PDU that no command owns (Login, Text, NOP, Logout,
+    /// task management, Reject).
+    ///
+    /// A single-bank session keeps the control bank at offset 0; an overlap
+    /// session frames the response in the command bank, which is never the bank
+    /// a resident long token holds.
+    fn control_base(&self) -> usize {
+        if self.overlap {
+            self.pdu_base
+        } else {
+            CONTROL_PDU_BASE
+        }
+    }
+
+    /// End of the bank that starts at `base` (the whole `work` in single-bank
+    /// mode). A PDU may never be assembled past this point.
+    fn bank_end(&self, work_len: usize, base: usize) -> usize {
+        if self.overlap {
+            let half = if self.bank_size != 0 {
+                self.bank_size
+            } else {
+                work_len / 2
+            };
+            base + half
+        } else {
+            work_len
+        }
+    }
+
+    /// Fix the command bank for the PDU beginning at this boundary.
+    ///
+    /// A resident long operation with an in-flight token holds one bank; the
+    /// command then gets the other bank and no alternate. With no token pending
+    /// the command gets bank A and bank B as its alternate.
+    fn fix_boundary(&mut self) {
+        if !self.overlap {
+            // Single-bank sessions have nothing to choose: the base stays where
+            // the session already framed it.
+            self.cmd_bank = BankSide::Work;
+            self.cmd_alt = None;
+            self.bank_fixed = true;
+            return;
+        }
+        match self.long_bank {
+            Some(long) => {
+                self.cmd_bank = Self::other_bank(long);
+                self.cmd_alt = None;
+            }
+            None => {
+                self.cmd_bank = BankSide::Work;
+                self.cmd_alt = Some(BankSide::Alt);
+            }
+        }
+        self.pdu_base = self.bank_base(self.cmd_bank);
+        self.bank_fixed = true;
+    }
+
+    /// Keep the command's alternate consistent with the long operation's bank:
+    /// it loses the alternate when the long token takes that bank and regains
+    /// it once the token has settled. A running command keeps the allocation
+    /// fixed for its duration.
+    fn refresh_command_alt(&mut self) {
+        if !self.overlap || !self.bank_fixed || self.cmd_active {
+            return;
+        }
+        self.cmd_alt = match self.long_bank {
+            Some(_) => None,
+            None => Some(self.alternate_bank()),
+        };
+    }
+
+    /// Forget the long bank once its adapter token has settled.
+    fn settle_long<S: RuntimeSet>(&mut self, target: &Target<S>) {
+        if !target.long_io_in_flight() {
+            self.long_bank = None;
         }
     }
 
@@ -631,6 +811,12 @@ impl IscsiSession {
     /// least [`crate::MIN_DATA_LEN`] and keeps the split mode, where queries
     /// stay serviceable while a long IO is in flight.
     ///
+    /// An overlap session ([`Self::with_overlap`]) treats `work` as the total
+    /// of two equal banks instead: the command bank is fixed at each PDU
+    /// boundary, the alternate bank may hold a Data-In chunk, and the resident
+    /// long operation borrows one bank while its token is in flight. Overlap
+    /// is explicit and never inferred from `work.len()`.
+    ///
     /// `target` owns the LUN slots, `storage` executes the device's storage
     /// operations; the session itself implements the [`HostTransport`] data
     /// seam and performs at most one command step per entry.
@@ -642,11 +828,25 @@ impl IscsiSession {
         target: &'b mut Target<S>,
         storage: &'b mut dyn Storage,
     ) -> Action<'a> {
-        let base = self.pdu_base;
-        if base > work.len() || work.len() - base < crate::MIN_DATA_LEN + BHS_SIZE {
-            return Action::Error(TargetError::WorkBufTooSmall);
-        }
-        let data_area = work.len() - base - BHS_SIZE;
+        let (data_area, bank_size) = if self.overlap {
+            let total = work.len();
+            if !total.is_multiple_of(2) {
+                return Action::Error(TargetError::WorkBufTooSmall);
+            }
+            let half = total / 2;
+            if half < crate::MIN_DATA_LEN + BHS_SIZE
+                || (self.pdu_base != 0 && self.pdu_base != half)
+            {
+                return Action::Error(TargetError::WorkBufTooSmall);
+            }
+            (half - BHS_SIZE, half)
+        } else {
+            let base = self.pdu_base;
+            if base > work.len() || work.len() - base < crate::MIN_DATA_LEN + BHS_SIZE {
+                return Action::Error(TargetError::WorkBufTooSmall);
+            }
+            (work.len() - base - BHS_SIZE, work.len())
+        };
         // Every Data-In PDU is padded to a 4-byte boundary, and the padding
         // may land on bytes that are still unsent when a chunk is staged.
         // Require an aligned data area up front instead of trusting that
@@ -654,6 +854,7 @@ impl IscsiSession {
         if !data_area.is_multiple_of(4) {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
+        self.bank_size = bank_size;
         if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
@@ -695,9 +896,25 @@ impl IscsiSession {
         // advances the resident long operation once: one poll per entry. With
         // an empty `scratch` the long operation shares `work` with the wire, so
         // it may only advance on a `Tick` entry: a `HostRecv`/`HostSent` entry
-        // can hold a staged PDU in that buffer.
-        let shared = scratch.is_empty();
-        if self.session == Session::RecvPdu
+        // can hold a staged PDU in that buffer. Overlap mode gives the long
+        // operation one of the two banks and lends it only on a `Tick` entry,
+        // so a command that is starting or finishing in the same entry never
+        // sees its alternate disappear underneath it.
+        let shared = scratch.is_empty() && !self.overlap;
+        if self.overlap {
+            if self.session == Session::RecvPdu && !self.cmd_active {
+                self.settle_long(target);
+                if matches!(ev, Event::Tick) {
+                    if !self.bank_fixed {
+                        self.fix_boundary();
+                    }
+                    if let Some(out) = self.overlap_idle_entry(work, target, storage) {
+                        return out;
+                    }
+                    self.refresh_command_alt();
+                }
+            }
+        } else if self.session == Session::RecvPdu
             && !self.cmd_active
             && (!shared || matches!(ev, Event::Tick))
         {
@@ -722,7 +939,7 @@ impl IscsiSession {
             Event::HostSent => {
                 let emit = self.on_sent(work, scratch, target, storage);
                 if !shared {
-                    // Split mode keeps the original path exactly.
+                    // Split and overlap modes keep their own path.
                     return emit;
                 }
                 // Shared bank: the response bytes have already been written to
@@ -745,8 +962,25 @@ impl IscsiSession {
         }
     }
 
+    /// Re-emit the BHS receive for the next PDU at the bank this boundary
+    /// already selected.
+    ///
+    /// Used when a PDU was consumed without starting a command (out-of-window
+    /// CmdSN, no-response NOP). The bank choice is kept so the shell's read
+    /// offset stays valid; a later boundary re-applies the selection.
+    fn boundary_recv(&mut self) -> Emit {
+        self.bank_fixed = true;
+        Emit::Recv {
+            offset: self.pdu_base,
+            len: BHS_SIZE,
+        }
+    }
+
     /// The action that re-emits the current position.
-    fn expectation(&self) -> Emit {
+    fn expectation(&mut self) -> Emit {
+        if self.session == Session::RecvPdu && !self.cmd_active && !self.bank_fixed {
+            self.fix_boundary();
+        }
         let base = self.pdu_base;
         match self.session {
             Session::RecvPdu | Session::OutBhs => Emit::Recv {
@@ -817,6 +1051,65 @@ impl IscsiSession {
         }
     }
 
+    /// Overlap-mode long entry: lend the resident long operation one bank of
+    /// `work` (the bank the command does not hold) and keep using that same
+    /// bank while its storage token is in flight.
+    fn overlap_idle_entry<S: RuntimeSet>(
+        &mut self,
+        work: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) -> Option<Emit> {
+        if let Some(lun) = self.long_lun {
+            let bank = match self.long_bank {
+                Some(bank) => bank,
+                // A live token must never be re-borrowed from a guessed bank.
+                None if target.long_io_in_flight() => {
+                    return match target.tick() {
+                        crate::core::RunOutcome::Ended { .. } => {
+                            self.session = Session::Closed;
+                            Some(Emit::Closed)
+                        }
+                        _ => None,
+                    };
+                }
+                None => self.alternate_bank(),
+            };
+            if bank == self.cmd_bank {
+                // The command bank must never be handed to the long operation.
+                return Some(Emit::Error(TargetError::Internal));
+            }
+            let (first, second) = work.split_at_mut(self.bank_size);
+            let long = match bank {
+                BankSide::Work => first,
+                BankSide::Alt => second,
+            };
+            let mut empty = [0u8; 0];
+            match target.poll_long_entry_rt(lun, storage, &mut empty, long) {
+                Ok(info) => {
+                    if matches!(info.phase, LongPhase::Foreground | LongPhase::Background) {
+                        self.long_bank = target.long_io_in_flight().then_some(bank);
+                    } else {
+                        self.long_lun = None;
+                        self.long_bank = None;
+                    }
+                }
+                Err(fault) => {
+                    self.long_lun = None;
+                    self.long_bank = None;
+                    target.fatal(fault);
+                }
+            }
+        }
+        match target.tick() {
+            crate::core::RunOutcome::Ended { .. } => {
+                self.session = Session::Closed;
+                Some(Emit::Closed)
+            }
+            _ => None,
+        }
+    }
+
     fn on_recv<S: RuntimeSet>(
         &mut self,
         len: usize,
@@ -832,6 +1125,9 @@ impl IscsiSession {
                     return Emit::Error(TargetError::Internal);
                 }
                 self.bhs.copy_from_slice(&work[base..base + BHS_SIZE]);
+                // This PDU has consumed the boundary it was framed for; the
+                // next PDU that asks for a BHS re-fixes the command bank.
+                self.bank_fixed = false;
                 // Bound the declared segment before framing the remainder: a
                 // PDU above this target's receive capability is answered (and
                 // the connection closed) without consuming its payload.
@@ -894,7 +1190,7 @@ impl IscsiSession {
                     _ => 0,
                 };
                 let end = base + BHS_SIZE + local as usize + dsl;
-                if end > work.len() {
+                if end > self.bank_end(work.len(), base) {
                     return Emit::Error(TargetError::WorkBufTooSmall);
                 }
                 self.session = Session::OutData { dsl };
@@ -1043,6 +1339,12 @@ impl IscsiSession {
                     }
                 }
             }
+        } else if self.overlap {
+            // The command bank for the next PDU is fixed by `expectation`,
+            // based on the long operation's bank. The long operation itself
+            // advances only on a `Tick` at a boundary.
+            self.settle_long(target);
+            self.expectation()
         } else if !scratch.is_empty() {
             if let Some(out) = self.idle_entry(work, scratch, target, storage) {
                 out
@@ -1063,14 +1365,21 @@ impl IscsiSession {
     /// The length of the current PDU's remainder (AHS + data + padding),
     /// computed from the saved BHS.
     ///
-    /// `work_len` is the whole bank; the room available to the remainder is
-    /// the data area of the current PDU base, never the area in front of it.
+    /// `work_len` is the whole caller allocation. In overlap mode the room is
+    /// one bank (`bank_size`), never the whole allocation; in single-bank mode
+    /// it is the whole `work`.
     fn pdu_remainder(&self, work_len: usize) -> Result<usize, TargetError> {
         let bhs = Bhs::from_bytes(self.bhs);
         let dsl = bhs.data_segment_len() as usize;
         let total =
             usize::from(bhs.total_ahs_length()) * 4 + dsl + pdu_pad_len(dsl as u32) as usize;
-        if BHS_SIZE + total > work_len.saturating_sub(self.pdu_base) {
+        // The PDU must fit inside its own bank, never the bank behind it.
+        let available = if self.overlap {
+            self.bank_size
+        } else {
+            work_len.saturating_sub(self.pdu_base)
+        };
+        if BHS_SIZE + total > available {
             return Err(TargetError::WorkBufTooSmall);
         }
         Ok(total)
@@ -1164,9 +1473,25 @@ impl IscsiSession {
         work: &mut [u8],
     ) -> Stepped {
         let lun = self.cmd_lun;
-        let bank = &mut work[self.pdu_base + BHS_SIZE..];
-        self.bank_len = bank.len();
-        match target.drive_step_rt(lun, storage, self, bank, &mut [], &mut []) {
+        let stepped = if self.overlap {
+            let (first, second) = work.split_at_mut(self.bank_size);
+            let (cmd_half, alt_half) = match self.cmd_bank {
+                BankSide::Work => (first, second),
+                BankSide::Alt => (second, first),
+            };
+            let cmd = &mut cmd_half[BHS_SIZE..];
+            self.bank_len = cmd.len();
+            let alt: &mut [u8] = match self.cmd_alt {
+                Some(_) => &mut alt_half[BHS_SIZE..],
+                None => &mut [],
+            };
+            target.drive_step_rt(lun, storage, self, cmd, alt, &mut [])
+        } else {
+            let bank = &mut work[self.pdu_base + BHS_SIZE..];
+            self.bank_len = bank.len();
+            target.drive_step_rt(lun, storage, self, bank, &mut [], &mut [])
+        };
+        match stepped {
             Ok(crate::core::DriveStep::Pending) => Stepped::Pending,
             Ok(crate::core::DriveStep::Done(completion)) => Stepped::Done(completion),
             Ok(crate::core::DriveStep::Control(outcome)) => Stepped::Control(outcome),
@@ -1259,17 +1584,29 @@ impl IscsiSession {
         let phase = self.host;
         self.cmd_active = false;
         self.host = HostPhase::Idle;
-        let (sent, data_sn, held) = match phase {
-            HostPhase::Send(p) => (p.sent, p.data_sn, p.held),
-            _ => (0, 0, None),
+        let (sent, data_sn, held, chunk_bank) = match phase {
+            HostPhase::Send(p) => (p.sent, p.data_sn, p.held, p.chunk_bank),
+            _ => (0, 0, None, BankSide::Work),
+        };
+        // A held chunk is framed in the bank that holds it; a zero-length
+        // terminating Data-In has no chunk and stays in the command bank.
+        let held_base = match held {
+            Some(_) => self.send_base(chunk_bank),
+            None => self.pdu_base,
         };
         let emit = match completion {
             Completion::Good => match held {
-                Some((offset, bank, len)) => {
-                    self.emit_data_in_final(work, offset, bank, len, data_sn, status::GOOD)
-                }
+                Some((offset, bank, len)) => self.emit_data_in_final(
+                    work,
+                    held_base,
+                    offset,
+                    bank,
+                    len,
+                    data_sn,
+                    status::GOOD,
+                ),
                 None if was_to_host => {
-                    self.emit_data_in_final(work, 0, 0, 0, data_sn, status::GOOD)
+                    self.emit_data_in_final(work, held_base, 0, 0, 0, data_sn, status::GOOD)
                 }
                 None => self.emit_response(work, itt, status::GOOD, None),
             },
@@ -1279,6 +1616,7 @@ impl IscsiSession {
                     // transfer; no autosense field exists in a Data-In PDU.
                     self.emit_data_in_final(
                         work,
+                        held_base,
                         offset,
                         bank,
                         len,
@@ -1286,7 +1624,15 @@ impl IscsiSession {
                         status::CHECK_CONDITION,
                     )
                 } else if sent > 0 {
-                    self.emit_data_in_final(work, 0, 0, 0, data_sn, status::CHECK_CONDITION)
+                    self.emit_data_in_final(
+                        work,
+                        held_base,
+                        0,
+                        0,
+                        0,
+                        data_sn,
+                        status::CHECK_CONDITION,
+                    )
                 } else {
                     // The completion frame carries the sense as autosense. The
                     // saved instance is consumed only when the status send is
@@ -1397,8 +1743,22 @@ impl IscsiSession {
             HostPhase::Send(p) => p.data_sn,
             _ => return Emit::Error(TargetError::Internal),
         };
-        let total = self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, f_bit, None);
-        let base = self.pdu_base;
+        let chunk_bank = match self.host {
+            HostPhase::Send(p) => p.chunk_bank,
+            _ => BankSide::Work,
+        };
+        let base = self.send_base(chunk_bank);
+        let total = self.build_data_in(
+            work,
+            base,
+            self.cmd_itt,
+            offset,
+            bank,
+            len,
+            data_sn,
+            f_bit,
+            None,
+        );
         self.session = Session::Send {
             len: total,
             base,
@@ -1408,9 +1768,11 @@ impl IscsiSession {
     }
 
     /// Terminating Data-In PDU (F=1, S=1) carrying the fixed status.
+    #[allow(clippy::too_many_arguments)]
     fn emit_data_in_final(
         &mut self,
         work: &mut [u8],
+        base: usize,
         offset: u32,
         bank: u32,
         len: u32,
@@ -1420,6 +1782,7 @@ impl IscsiSession {
         self.note_status(self.cmd_itt);
         let total = self.build_data_in(
             work,
+            base,
             self.cmd_itt,
             offset,
             bank,
@@ -1428,7 +1791,6 @@ impl IscsiSession {
             true,
             Some(status),
         );
-        let base = self.pdu_base;
         self.session = Session::Send {
             len: total,
             base,
@@ -1444,6 +1806,7 @@ impl IscsiSession {
     fn build_data_in(
         &mut self,
         work: &mut [u8],
+        base: usize,
         itt: u32,
         offset: u32,
         bank: u32,
@@ -1453,7 +1816,6 @@ impl IscsiSession {
         scsi_status: Option<u8>,
     ) -> usize {
         let len = len as usize;
-        let base = self.pdu_base;
         if bank > 0 && len > 0 {
             // The device's send buffer for this chunk sits at the start of the
             // SCSI data area; move it in front of the BHS.
@@ -1536,9 +1898,10 @@ impl IscsiSession {
             reason,
             reason
         );
-        // A Reject is a control PDU: it is framed at the control bank, never
-        // over the bank a running command owns.
-        let base = CONTROL_PDU_BASE;
+        // A Reject is a control PDU: it is framed in the command bank (or the
+        // control bank when there is only one), never over the bank a resident
+        // long token holds.
+        let base = self.control_base();
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::REJECT);
         bhs.set_flags(flag::F_BIT);
@@ -1650,10 +2013,7 @@ impl IscsiSession {
         // move ExpCmdSN, or the initiator's next command falls out of range.
         if !immediate_flag {
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-                return Emit::Recv {
-                    offset: self.pdu_base,
-                    len: BHS_SIZE,
-                };
+                return self.boundary_recv();
             }
             self.cmd_sn = recv_cmd_sn;
         }
@@ -1783,7 +2143,8 @@ impl IscsiSession {
             // A Data-In carrying the fixed-format sense; the command is not
             // driven by any slot.
             self.note_status(itt);
-            let total = self.build_data_in(work, itt, 0, 0, n as u32, 0, true, Some(status::GOOD));
+            let total =
+                self.build_data_in(work, base, itt, 0, 0, n as u32, 0, true, Some(status::GOOD));
             self.session = Session::Send {
                 len: total,
                 base,
@@ -1818,10 +2179,7 @@ impl IscsiSession {
         // a conforming target silently drops it, wedging the session).
         if !immediate_flag {
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-                return Emit::Recv {
-                    offset: self.pdu_base,
-                    len: BHS_SIZE,
-                };
+                return self.boundary_recv();
             }
             self.cmd_sn = recv_cmd_sn;
         }
@@ -1867,7 +2225,7 @@ impl IscsiSession {
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        let base = CONTROL_PDU_BASE;
+        let base = self.control_base();
         work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
         work[base + BHS_SIZE..base + BHS_SIZE + pad].fill(0);
@@ -1894,20 +2252,14 @@ impl IscsiSession {
             if !immediate_flag {
                 return self.reject(work, reject::PROTOCOL_ERROR);
             }
-            return Emit::Recv {
-                offset: self.pdu_base,
-                len: BHS_SIZE,
-            };
+            return self.boundary_recv();
         }
 
         // RFC 3720 §3.2.2.1: non-immediate commands advance CmdSN.
         if !immediate_flag {
             let recv_cmd_sn = bhs.cmd_sn();
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
-                return Emit::Recv {
-                    offset: self.pdu_base,
-                    len: BHS_SIZE,
-                };
+                return self.boundary_recv();
             }
             self.cmd_sn = recv_cmd_sn;
         }
@@ -1930,7 +2282,7 @@ impl IscsiSession {
         let dlen = pdu.dsl.min(self.peer_recv_mdsl as usize);
         resp.set_data_segment_len(dlen as u32);
         let source = self.pdu_base;
-        let base = CONTROL_PDU_BASE;
+        let base = self.control_base();
         work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         if source != base && dlen > 0 {
             // The echoed ping data was received in the request's bank; move it
@@ -1961,7 +2313,7 @@ impl IscsiSession {
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        let base = CONTROL_PDU_BASE;
+        let base = self.control_base();
         work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
         work[base + BHS_SIZE..base + BHS_SIZE + pad].fill(0);
@@ -1982,7 +2334,11 @@ impl IscsiSession {
         // F=0 (continuation) and non-0xFFFFFFFF TTT are not supported (no
         // fragmentation); the handler stays lenient for a minimal text BHS.
         let source = self.pdu_base;
-        if pdu.dsl > work.len().saturating_sub(source + BHS_SIZE) {
+        if pdu.dsl
+            > self
+                .bank_end(work.len(), source)
+                .saturating_sub(source + BHS_SIZE)
+        {
             return Emit::Error(TargetError::WorkBufTooSmall);
         }
         let data = &work[source + BHS_SIZE..source + BHS_SIZE + pdu.dsl];
@@ -2017,7 +2373,7 @@ impl IscsiSession {
         // continuation. RFC 3720 Appendix D: All / <iqn> / <empty> for
         // discovery vs operational.
         let should_return = value == b"All" || value.is_empty() || value == TARGET_NAME.as_bytes();
-        let base = CONTROL_PDU_BASE;
+        let base = self.control_base();
         let mut resp = Bhs::new();
         resp.set_opcode(op::TEXT_RESP);
         resp.set_flags(flag::F_BIT);
@@ -2466,6 +2822,7 @@ impl HostTransport for IscsiSession {
                 phase_len: 0,
                 staged: None,
                 held: None,
+                chunk_bank: BankSide::Work,
             },
         };
         if req.len == 0 || u64::from(req.len) > u64::from(p.total - p.sent) {
@@ -2489,10 +2846,18 @@ impl HostTransport for IscsiSession {
         };
         match phase {
             Phase::Send(mut p) => {
-                let buf = match buf {
-                    HostBuf::Send { bytes: buf, .. } if buf.len() == p.phase_len as usize => buf,
+                let (buf, side) = match buf {
+                    HostBuf::Send { bytes: buf, bank } if buf.len() == p.phase_len as usize => {
+                        (buf, bank)
+                    }
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 };
+                if self.overlap && side != BankSide::Work && self.cmd_alt.is_none() {
+                    // The runner can only name the alternate bank when the
+                    // command was given one.
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                }
+                p.chunk_bank = self.physical_bank(side);
                 let remaining = (p.phase_base + p.phase_len).saturating_sub(p.sent);
                 if remaining == 0 {
                     self.host = HostPhase::Send(p);
@@ -2562,7 +2927,9 @@ impl HostTransport for IscsiSession {
             }
             Phase::Recv(mut p) => {
                 match buf {
-                    HostBuf::Recv { buf, .. } if buf.len() == p.phase_len as usize => {}
+                    HostBuf::Recv { buf, bank }
+                        if buf.len() == p.phase_len as usize
+                            && (!self.overlap || bank == BankSide::Work) => {}
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 }
                 if p.done {
@@ -3032,7 +3399,7 @@ mod tests {
         let mut session = IscsiSession::new();
         session.cmd_itt = 1;
         let mut work = vec![0xAAu8; BHS_SIZE + 8];
-        let total = session.build_data_in(&mut work, 1, 0, 0, 1, 0, false, None);
+        let total = session.build_data_in(&mut work, 0, 1, 0, 0, 1, 0, false, None);
         assert_eq!(total, BHS_SIZE + 1 + 3);
         assert_eq!(&work[BHS_SIZE + 1..BHS_SIZE + 4], &[0, 0, 0]);
     }
@@ -3069,6 +3436,7 @@ mod tests {
         work[src..src + payload.len()].copy_from_slice(&payload);
         let len = session.build_data_in(
             &mut work,
+            BANK,
             session.cmd_itt,
             0,
             16,

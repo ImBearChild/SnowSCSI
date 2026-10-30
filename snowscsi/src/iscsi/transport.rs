@@ -95,7 +95,10 @@ impl embedded_io::Write for TcpConn {
 /// `scratch` is the resident long-operation bank: an **empty** `scratch`
 /// selects the shared bank (`work` serves both paths), and the loop drives the
 /// long operation one `Tick` step per turn instead of reading the wire while
-/// its token is in flight.
+/// its token is in flight. An overlap session (`session.overlap()`) keeps both
+/// banks inside `work`: input is never deferred for a long token, and the
+/// boundary `Tick` before consuming a received PDU advances the long operation
+/// on the bank the command does not hold.
 pub fn serve_conn<C: Conn, S: RuntimeSet>(
     conn: &mut C,
     work: &mut [u8],
@@ -121,16 +124,26 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
     target: &mut Target<S>,
     storage: &mut dyn Storage,
 ) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-        return Err(TargetError::WorkBufTooSmall);
-    }
-    if !(work.len() - BHS_SIZE).is_multiple_of(4) {
-        return Err(TargetError::WorkBufTooSmall);
+    if session.overlap() {
+        let total = work.len();
+        if !total.is_multiple_of(2)
+            || total / 2 < crate::MIN_DATA_LEN + BHS_SIZE
+            || !(total / 2 - BHS_SIZE).is_multiple_of(4)
+        {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+    } else {
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+            return Err(TargetError::WorkBufTooSmall);
+        }
     }
     if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
         return Err(TargetError::WorkBufTooSmall);
     }
-    let shared = scratch.is_empty();
+    let shared = scratch.is_empty() && !session.overlap();
     let mut ev = Event::Tick;
     loop {
         // Shared bank: while the resident long operation holds an adapter
@@ -149,6 +162,18 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                 Action::HostSend { .. } => return Err(TargetError::Internal),
                 Action::Closed => return Ok(()),
                 Action::Error(e) => return Err(e),
+            }
+        }
+        // Overlap: a long token never defers input (it owns the other bank),
+        // but it still advances only on a boundary `Tick`. A receive
+        // completion is such a boundary, so drive one step before consuming
+        // the bytes; a mid-command receive re-emits its own action.
+        if !shared && session.overlap() && matches!(ev, Event::HostRecv { .. }) {
+            match session.poll(Event::Tick, work, scratch, target, storage) {
+                Action::HostRecv { .. } | Action::StoragePending => {}
+                Action::Closed => return Ok(()),
+                Action::Error(e) => return Err(e),
+                Action::HostSend { .. } => return Err(TargetError::Internal),
             }
         }
         match session.poll(ev, work, scratch, target, storage) {
@@ -223,16 +248,26 @@ where
     W: Storage + AsyncWake,
 {
     let result = async {
-        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-            return Err(TargetError::WorkBufTooSmall);
-        }
-        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
-            return Err(TargetError::WorkBufTooSmall);
+        if session.overlap() {
+            let total = work.len();
+            if !total.is_multiple_of(2)
+                || total / 2 < crate::MIN_DATA_LEN + BHS_SIZE
+                || !(total / 2 - BHS_SIZE).is_multiple_of(4)
+            {
+                return Err(TargetError::WorkBufTooSmall);
+            }
+        } else {
+            if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+                return Err(TargetError::WorkBufTooSmall);
+            }
+            if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+                return Err(TargetError::WorkBufTooSmall);
+            }
         }
         if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
             return Err(TargetError::WorkBufTooSmall);
         }
-        let shared = scratch.is_empty();
+        let shared = scratch.is_empty() && !session.overlap();
         let mut ev = Event::Tick;
         loop {
             // Shared bank: while the resident long operation holds an adapter
@@ -256,6 +291,18 @@ where
                     Action::HostSend { .. } => return Err(TargetError::Internal),
                     Action::Closed => return Ok(()),
                     Action::Error(e) => return Err(e),
+                }
+            }
+            // Overlap: a long token never defers input (it owns the other
+            // bank), but it still advances only on a boundary `Tick`. A
+            // receive completion is such a boundary, so drive one step before
+            // consuming the bytes; a mid-command receive re-emits its action.
+            if !shared && session.overlap() && matches!(ev, Event::HostRecv { .. }) {
+                match session.poll(Event::Tick, work, scratch, target, &mut *storage) {
+                    Action::HostRecv { .. } | Action::StoragePending => {}
+                    Action::Closed => return Ok(()),
+                    Action::Error(e) => return Err(e),
+                    Action::HostSend { .. } => return Err(TargetError::Internal),
                 }
             }
             match session.poll(ev, work, scratch, target, &mut *storage) {
@@ -333,6 +380,11 @@ where
 /// Note: `std::net::TcpListener::bind` uses the OS default listen backlog
 /// (SOMAXCONN), not the C `listen(fd, 1)`; the serial loop still queues a
 /// second connection in the backlog until the current one ends.
+///
+/// `overlap` creates each connection's [`IscsiSession`] with
+/// [`IscsiSession::with_overlap`]; `work` is then the total of two equal banks
+/// and must satisfy the per-bank floor.
+#[allow(clippy::too_many_arguments)]
 pub fn serve<P>(
     listener: TcpListener,
     stop: &AtomicBool,
@@ -341,12 +393,23 @@ pub fn serve<P>(
     table: &mut [&mut dyn crate::core::Lu<Pair = P>],
     storage: &mut dyn Storage,
     read_timeout: Option<Duration>,
+    overlap: bool,
 ) -> Result<(), TargetError> {
-    if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
-        return Err(TargetError::WorkBufTooSmall);
-    }
-    if !(work.len() - BHS_SIZE).is_multiple_of(4) {
-        return Err(TargetError::WorkBufTooSmall);
+    if overlap {
+        let total = work.len();
+        if !total.is_multiple_of(2)
+            || total / 2 < crate::MIN_DATA_LEN + BHS_SIZE
+            || !(total / 2 - BHS_SIZE).is_multiple_of(4)
+        {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+    } else {
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+            return Err(TargetError::WorkBufTooSmall);
+        }
     }
     if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
         return Err(TargetError::WorkBufTooSmall);
@@ -374,7 +437,11 @@ pub fn serve<P>(
                 continue;
             }
         };
-        let mut session = IscsiSession::new();
+        let mut session = if overlap {
+            IscsiSession::new().with_overlap()
+        } else {
+            IscsiSession::new()
+        };
         let mut target = Target::new(&mut *table);
         match serve_conn(&mut conn, work, scratch, &mut session, &mut target, storage) {
             Ok(()) => crate::info!("connection from {} ended", peer),
@@ -553,6 +620,7 @@ mod tests {
                 &mut table,
                 &mut storage,
                 Some(Duration::from_secs(5)),
+                false,
             )
             .unwrap();
             handle.join().unwrap();
@@ -641,7 +709,8 @@ mod tests {
                 &mut scratch,
                 &mut table,
                 &mut storage,
-                None
+                None,
+                false,
             ),
             Err(TargetError::WorkBufTooSmall)
         );

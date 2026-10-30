@@ -88,6 +88,11 @@ const DEFAULT_WORK_BUF_SIZE: usize = 1024 * 1024;
 /// stays at 16 KiB: larger halves buy no prefetch benefit over the USB wire
 /// chunk while doubling the cache footprint of the session.
 const OVERLAP_WORK_BUF_SIZE: usize = 16 * 1024;
+/// Default `work` total for iSCSI overlap mode: two `BHS_SIZE + 8192` banks.
+///
+/// Each bank carries its own 48-byte BHS prefix, so the two-bank total is
+/// 2 × 8240 = 16480; this is also the minimum (two `MIN_DATA_LEN` data areas).
+const ISCSI_OVERLAP_WORK_BUF_SIZE: usize = 2 * (MIN_DATA_LEN + BHS_SIZE);
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
@@ -176,15 +181,18 @@ struct ServeArgs {
     /// iSCSI, 512 for USB; default 1M). It bounds one data chunk, not the
     /// transfer: the SCSI data area is this size minus the 48-byte iSCSI BHS,
     /// and a larger READ/WRITE is streamed in bank-sized chunks rather than
-    /// rejected. With `--overlap` this is the **total** of the two USB banks.
+    /// rejected. With `--overlap` this is the **total** of two equal banks
+    /// (USB default 16K, iSCSI default 16480).
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
 
-    /// Split `work` into two equal USB banks (`--work-buf-size` is the total
-    /// in this mode). Enables prefetching the next chunk into the alternate
-    /// bank while the current one is on the bulk-IN pipe, and gives the
-    /// resident long operation its own bank. USB only; the total must be even
-    /// and each half at least 512 bytes (default total 16K).
+    /// Split `work` into two equal banks (`--work-buf-size` is the total in
+    /// this mode). Enables prefetching the next chunk into the alternate bank
+    /// while the current one is on the wire, and gives the resident long
+    /// operation its own bank. The total must be even; each half must clear its
+    /// transport's floor (512 bytes for USB, 8240 with a 4-aligned data area
+    /// for iSCSI). Defaults: USB 16K, iSCSI 16480. Cannot be combined with
+    /// `--scratch-buffer`.
     #[arg(long = "overlap")]
     overlap: bool,
 
@@ -240,7 +248,12 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
 
     let work_size = match if args.overlap {
-        parse_work_size_or(args.work_buf_size.as_deref(), OVERLAP_WORK_BUF_SIZE)
+        let default = if args.usb.is_none() {
+            ISCSI_OVERLAP_WORK_BUF_SIZE
+        } else {
+            OVERLAP_WORK_BUF_SIZE
+        };
+        parse_work_size_or(args.work_buf_size.as_deref(), default)
     } else {
         parse_work_size(args.work_buf_size.as_deref())
     } {
@@ -272,7 +285,12 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
-        if let Err(msg) = check_iscsi_work_size(work_size) {
+        let check = if args.overlap {
+            check_iscsi_overlap_work_size(work_size)
+        } else {
+            check_iscsi_work_size(work_size)
+        };
+        if let Err(msg) = check {
             eprintln!("snowscsi: {msg}");
             return ExitCode::FAILURE;
         }
@@ -561,6 +579,7 @@ fn run_serve_iscsi(
         &mut table[..],
         &mut storage,
         Some(DEFAULT_READ_TIMEOUT),
+        args.overlap,
     );
 
     if let Some(handle) = auto_handle {
@@ -1789,16 +1808,11 @@ fn parse_work_size_or(s: Option<&str>, default: usize) -> Result<usize, String> 
 /// Checked at the very top of [`run_serve`], before any listener is bound or
 /// gadget assembled, so a rejected invocation exits instead of hanging in an
 /// accept/serve loop:
-/// - iSCSI has no overlap implementation (the USB session owns the two-bank
-///   layout), so `--iscsi --overlap` is refused;
 /// - the overlap banks live inside `work`, so a separate `--scratch-buffer`
 ///   would be a third buffer with no defined owner.
 fn check_overlap(args: &ServeArgs) -> Result<(), String> {
     if !args.overlap {
         return Ok(());
-    }
-    if args.usb.is_none() {
-        return Err("iSCSI overlap is not implemented (--overlap is USB only)".to_string());
     }
     if args.scratch_buffer.is_some() {
         return Err(
@@ -1854,6 +1868,34 @@ fn check_iscsi_work_size(n: usize) -> Result<(), String> {
     if !(n - BHS_SIZE).is_multiple_of(4) {
         return Err(format!(
             "--work-buf-size {n} leaves a data area that is not a multiple of 4"
+        ));
+    }
+    Ok(())
+}
+
+/// iSCSI overlap `work` bounds: the total is split into two equal banks, each
+/// bank carrying its own 48-byte BHS prefix.
+///
+/// The total must be even, each half at least [`MIN_DATA_LEN`] + [`BHS_SIZE`],
+/// and each half's data area (`half - BHS_SIZE`) a multiple of 4.
+fn check_iscsi_overlap_work_size(n: usize) -> Result<(), String> {
+    if !n.is_multiple_of(2) {
+        return Err(format!(
+            "--work-buf-size {n} must be even with --overlap (two equal banks)"
+        ));
+    }
+    let half = n / 2;
+    let min = MIN_DATA_LEN + BHS_SIZE;
+    if half < min {
+        return Err(format!(
+            "--work-buf-size {n} leaves a {half}-byte overlap bank below the iSCSI minimum \
+             {min} (total must be at least {})",
+            2 * min
+        ));
+    }
+    if !(half - BHS_SIZE).is_multiple_of(4) {
+        return Err(format!(
+            "--work-buf-size {n} leaves a {half}-byte bank whose data area is not a multiple of 4"
         ));
     }
     Ok(())
@@ -1982,13 +2024,30 @@ mod tests {
     }
 
     #[test]
-    fn overlap_is_rejected_with_iscsi() {
+    fn iscsi_overlap_is_accepted_and_has_its_own_floor() {
         let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--overlap"]);
-        let err = check_overlap(&args).expect_err("iSCSI overlap must be refused");
-        assert!(
-            err.contains("iSCSI overlap is not implemented"),
-            "message must name the unimplemented iSCSI overlap: {err}"
+        assert!(check_overlap(&args).is_ok(), "iSCSI overlap is supported");
+
+        // Default and floor are two 8240-byte banks.
+        assert_eq!(ISCSI_OVERLAP_WORK_BUF_SIZE, 16480);
+        assert_eq!(
+            parse_work_size_or(None, ISCSI_OVERLAP_WORK_BUF_SIZE).unwrap(),
+            16480
         );
+        assert_eq!(check_iscsi_overlap_work_size(16480), Ok(()));
+        // Two banks of 8 KiB data plus the two BHS prefixes is the floor.
+        assert_eq!(
+            check_iscsi_overlap_work_size(2 * (MIN_DATA_LEN + BHS_SIZE)),
+            Ok(())
+        );
+        // One byte below the floor (odd and too short) is rejected.
+        assert!(check_iscsi_overlap_work_size(16479).is_err());
+        assert!(check_iscsi_overlap_work_size(16478).is_err());
+        assert!(check_iscsi_overlap_work_size(MIN_DATA_LEN + BHS_SIZE).is_err());
+        // Each half's data area must be 4-aligned.
+        assert!(check_iscsi_overlap_work_size(16482).is_err());
+        assert!(check_iscsi_overlap_work_size(16484).is_err());
+        assert_eq!(check_iscsi_overlap_work_size(16488), Ok(()));
     }
 
     #[test]
@@ -2001,9 +2060,11 @@ mod tests {
             err.contains("--scratch-buffer"),
             "message must name the conflicting flag: {err}"
         );
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--overlap", "--scratch-buffer"]);
+        assert!(check_overlap(&args).is_err());
 
-        // Either alone is fine: scratch only with USB (split mode), overlap
-        // only with USB (two banks).
+        // Either alone is fine: scratch selects the split long-operation bank,
+        // overlap selects the two banks inside `work`.
         let args = parse_serve(&["--usb", "--scratch-buffer"]);
         assert!(check_overlap(&args).is_ok());
         let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--scratch-buffer"]);

@@ -41,6 +41,9 @@ mod async_wake;
 mod iscsi_async;
 
 #[cfg(test)]
+mod iscsi_overlap;
+
+#[cfg(test)]
 mod store_plane;
 
 #[cfg(test)]
