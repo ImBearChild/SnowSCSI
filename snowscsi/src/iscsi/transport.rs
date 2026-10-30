@@ -136,6 +136,9 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                 // Nothing is staged in `work`; the framing action is re-emitted
                 // once the token settles.
                 Action::HostRecv { .. } => continue,
+                // No wire transfer is pending while the command waits on
+                // storage; keep the loop turning so the token can settle.
+                Action::StoragePending => continue,
                 // A response is staged in `work`, which the long token owns:
                 // dropping it (or sending it) would lose or corrupt output.
                 Action::HostSend { .. } => return Err(TargetError::Internal),
@@ -173,6 +176,11 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                     return Ok(());
                 }
                 ev = Event::HostSent;
+            }
+            Action::StoragePending => {
+                // No wire I/O: retry the command once on the next turn with a
+                // no-op tick. The blocking adapter is ready on that poll.
+                ev = Event::Tick;
             }
             Action::Closed => {
                 return Ok(());

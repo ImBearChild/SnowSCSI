@@ -37,6 +37,19 @@ use super::storage::{
     IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt,
 };
 
+/// What the active command is waiting on.
+///
+/// This is a read-only projection of the runner's pending adapter operation:
+/// it changes no state and is not a boundary. A resident long operation is
+/// separate and reported by `Runner::long_io_in_flight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingKind {
+    /// A storage operation (`Io` or `Prefetch`) is in flight.
+    Storage,
+    /// A host data phase (`HostRecv` or `HostSend`) is in flight.
+    Host,
+}
+
 /// Why the service loop ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEnd {
@@ -558,6 +571,20 @@ impl Runner {
     /// [`Self::command_boundary_of`].
     pub(crate) const fn long_io_in_flight(&self) -> bool {
         self.long_pending.is_some()
+    }
+
+    /// What the active command is waiting on, if anything.
+    ///
+    /// Read-only projection of [`DriveState::pending`]; the long operation's
+    /// retained token is reported separately by [`Self::long_io_in_flight`].
+    pub(crate) fn pending_kind(&self) -> Option<PendingKind> {
+        match self.drive_state.get().and_then(|state| state.pending) {
+            Some(PendingOp::Storage { .. }) => Some(PendingKind::Storage),
+            Some(PendingOp::HostRecv { .. } | PendingOp::HostSend { .. }) => {
+                Some(PendingKind::Host)
+            }
+            None => None,
+        }
     }
 
     // ── bookkeeping ────────────────────────────────────────────────────

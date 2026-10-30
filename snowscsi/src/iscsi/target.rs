@@ -44,7 +44,7 @@ use core::cell::Cell;
 use crate::core::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage};
 use crate::core::{
     CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
-    RuntimeSet, Sense, Target, UaClass, LUN_NOT_SUPPORTED,
+    PendingKind, RuntimeSet, Sense, Target, UaClass, LUN_NOT_SUPPORTED,
 };
 use crate::iscsi::pdu::{
     flag, iscsi_opcode_name, op, pdu_pad_len, reject, stage, status, tmf, tmf_response, Bhs,
@@ -82,6 +82,10 @@ pub enum Action<'a> {
         /// Read-ahead coordinate (unused).
         prefetch: Option<(u64, usize)>,
     },
+    /// The active command is waiting on a storage operation and no wire
+    /// transfer is staged. Feed [`Event::Tick`] to advance it once; no bytes
+    /// are read or written.
+    StoragePending,
     /// The connection is done (Logout response sent, peer closed, or a fatal
     /// protocol error): the shell closes it.
     Closed,
@@ -524,6 +528,7 @@ impl Default for IscsiSession {
 enum Emit {
     Recv { offset: usize, len: usize },
     Send(usize),
+    StoragePending,
     Closed,
     Error(TargetError),
 }
@@ -651,6 +656,7 @@ impl IscsiSession {
                 bytes: &work[..len],
                 prefetch: None,
             },
+            Emit::StoragePending => Action::StoragePending,
             Emit::Closed => Action::Closed,
             Emit::Error(e) => Action::Error(e),
         }
@@ -679,7 +685,18 @@ impl IscsiSession {
             }
         }
         match ev {
-            Event::Tick => self.expectation(),
+            Event::Tick => {
+                // A command waiting on storage advances exactly one step; there
+                // is no wire transfer to re-emit.
+                if self.cmd_active
+                    && self.session == Session::RecvPdu
+                    && target.pending_kind() == Some(PendingKind::Storage)
+                {
+                    self.step(work, scratch, target, storage)
+                } else {
+                    self.expectation()
+                }
+            }
             Event::HostRecv { len } => self.on_recv(len, work, scratch, target, storage),
             Event::HostSent => {
                 let emit = self.on_sent(work, scratch, target, storage);
@@ -1158,14 +1175,11 @@ impl IscsiSession {
                     }
                 }
                 HostPhase::Idle => {
-                    // The command is pending on storage. There is no timer in
-                    // this state machine, so the next PDU (e.g. a TMF) drives
-                    // the next step.
+                    // The command is pending on storage. There is no wire
+                    // transfer to stage; the shell feeds `Event::Tick` to
+                    // advance it once.
                     self.session = Session::RecvPdu;
-                    Emit::Recv {
-                        offset: 0,
-                        len: BHS_SIZE,
-                    }
+                    Emit::StoragePending
                 }
             },
             Stepped::Done(completion) => self.finish_command(completion, work, target),

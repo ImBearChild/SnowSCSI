@@ -92,7 +92,7 @@ use crate::core::storage::{
 };
 use crate::core::{
     CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
-    RunOutcome, RuntimeSet, Target, UaClass,
+    PendingKind, RunOutcome, RuntimeSet, Target, UaClass,
 };
 use crate::scsi::scsi::{op as scsi_op, opcode_from_cdb};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
@@ -194,6 +194,10 @@ pub enum Action<'a> {
     },
     /// Send `bytes` on the bulk-IN pipe.
     HostSend { bytes: &'a [u8] },
+    /// The active command is waiting on a storage operation and no wire
+    /// transfer is staged. Feed [`Event::Tick`] to advance it once; no bytes
+    /// are read or written.
+    StoragePending,
     /// Invalid CBW (BOT §6.6.1): STALL both bulk endpoints. The core has
     /// already returned to the Command phase; a new CBW arriving clears the
     /// halt (the host's CLEAR_FEATURE is handled by the USB core).
@@ -720,7 +724,16 @@ impl BotSession {
                 }
                 self.pending(work)
             }
-            Event::Tick => self.pending(work),
+            Event::Tick => {
+                // A command waiting on storage advances exactly one step; there
+                // is no wire transfer to re-emit.
+                if matches!(self.stage, Stage::Exec)
+                    && target.pending_kind() == Some(PendingKind::Storage)
+                {
+                    self.step(work, scratch, target, storage);
+                }
+                self.pending(work)
+            }
             Event::HostSent => {
                 // Split mode keeps the original path exactly.
                 if !shared || !matches!(self.stage, Stage::Csw) {
@@ -736,8 +749,8 @@ impl BotSession {
                 match self.on_sent(work, scratch, target, storage) {
                     // At the CSW boundary the handler re-emits the next
                     // receive; that is the only outcome the idle step may
-                    // replace.
-                    Action::HostRecv { .. } => {}
+                    // replace. A storage-only step has no wire action either.
+                    Action::HostRecv { .. } | Action::StoragePending => {}
                     // A staged send cannot occur at the CSW boundary; the
                     // bytes would also be clobbered by the idle step.
                     Action::HostSend { .. } => return Action::Error(BotTargetError::Internal),
@@ -1650,20 +1663,11 @@ impl BotSession {
                         }
                     } else {
                         // The core is still on a storage operation with no
-                        // wire phase; probe so the shell loops back with a
-                        // `HostIdle` and the next entry drives it again.
-                        Action::HostRecv {
-                            offset: cmd_base,
-                            len: 1,
-                            probe: true,
-                        }
+                        // wire phase; the shell advances it with a no-op tick.
+                        Action::StoragePending
                     }
                 }
-                Phase::Idle => Action::HostRecv {
-                    offset: cmd_base,
-                    len: 1,
-                    probe: true,
-                },
+                Phase::Idle => Action::StoragePending,
             },
             Stage::Synth {
                 total,

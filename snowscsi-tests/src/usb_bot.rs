@@ -13,7 +13,7 @@ use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowscsi::common::store::{StoreOp, StorePlane};
 use snowscsi::core::storage::{BankSide, IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-use snowscsi::core::{LongPhase, Lu, RuntimeSet, Target};
+use snowscsi::core::{LongPhase, Lu, PendingKind, RuntimeSet, Target};
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
     serve, Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
@@ -77,6 +77,7 @@ enum Drive {
 
 /// The pending [`Action`], with every borrow dropped so the driver can touch
 /// `work` again before the next `poll`.
+#[derive(Debug)]
 enum Step {
     Recv {
         offset: usize,
@@ -86,6 +87,7 @@ enum Step {
     Sent {
         is_csw: bool,
     },
+    StoragePending,
     StallBoth,
     StallIn,
 }
@@ -116,6 +118,7 @@ fn next_step<S: RuntimeSet>(
             io.send_in(bytes).unwrap();
             Step::Sent { is_csw }
         }
+        Action::StoragePending => Step::StoragePending,
         Action::StallBoth => Step::StallBoth,
         Action::StallIn => Step::StallIn,
         Action::Error(_) => panic!("BOT core error"),
@@ -171,6 +174,7 @@ fn drive_until_done<S: RuntimeSet>(
                 // here), so keep receiving.
                 ev = Event::Tick;
             }
+            Step::StoragePending => ev = Event::Tick,
             Step::StallIn => panic!("StallIn: drive ShortfallPolicy::Short explicitly"),
         }
     }
@@ -1613,6 +1617,7 @@ fn drive_short<S: RuntimeSet>(
                 // Release the stall; the withheld CSW follows.
                 ev = Event::StallApplied;
             }
+            Step::StoragePending => ev = Event::Tick,
             Step::StallBoth => panic!("unexpected StallBoth in a Short-policy drive"),
         }
     }
@@ -2339,15 +2344,11 @@ fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
                 let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
                 ev = Event::HostRecv { len: n };
             }
-            Step::Recv {
-                offset,
-                len,
-                probe: true,
-            } => {
-                // The core is in the storage-only step; a stray host byte
-                // arrives where only a one-byte probe was expected.
+            Step::StoragePending => {
+                // The core is in the storage-only step and has asked for no
+                // wire transfer. A stray host byte arrives anyway.
                 io.feed_out(&[0xEE]);
-                let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+                let n = io.try_recv_out(&mut work[..1]).unwrap();
                 assert_eq!(n, 1);
                 match s.poll(
                     Event::HostRecv { len: n },
@@ -2362,6 +2363,7 @@ fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
                 break;
             }
             Step::Sent { .. } => ev = Event::HostSent,
+            Step::Recv { probe: true, .. } => panic!("unexpected probe on a no-data command"),
             Step::StallBoth => panic!("unexpected STALL before the stray byte"),
             Step::StallIn => panic!("unexpected Bulk-In STALL"),
         }
@@ -2384,6 +2386,75 @@ fn stray_out_byte_during_storage_only_step_stalls_and_recovers() {
     assert_eq!(r, Drive::Processed);
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (2, 0, 0x00));
+}
+
+// ── Storage-only steps report a storage pending signal ─────────────
+
+/// A no-data command whose storage step stays pending returns
+/// `StoragePending`, and the next `Tick` completes it without wire I/O.
+#[test]
+fn storage_pending_signal_then_tick_completes_the_command() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]).with_pending(1);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut io = MockBotIo::new();
+
+    // SYNCHRONIZE CACHE has no host data phase but needs a storage step.
+    let cdb = [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    io.feed_out(&raw_cbw(7, 0, 0x00, 0, &cdb));
+
+    let (offset, len) = match next_step(
+        &mut s,
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &mut io,
+    ) {
+        Step::Recv {
+            offset,
+            len,
+            probe: false,
+        } => (offset, len),
+        other => panic!("expected the CBW receive, got {other:?}"),
+    };
+    let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+    match next_step(
+        &mut s,
+        Event::HostRecv { len: n },
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &mut io,
+    ) {
+        Step::StoragePending => {}
+        other => panic!("expected StoragePending, got {other:?}"),
+    }
+    assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+
+    // One no-op tick advances the command; the CSW is staged.
+    match next_step(
+        &mut s,
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &mut io,
+    ) {
+        Step::Sent { is_csw: true } => {}
+        other => panic!("expected the CSW, got {other:?}"),
+    }
+    assert_eq!(target.pending_kind(), None);
+    assert_eq!(csw_fields(&io.take_sent()), (7, 0, 0x00));
 }
 
 // ── Multi-chunk host data phases ────────────────────────────────────
@@ -2658,6 +2729,7 @@ enum TwoBankStep {
         end: usize,
         is_csw: bool,
     },
+    StoragePending,
     StallBoth,
     StallIn,
 }
@@ -2683,6 +2755,7 @@ fn two_bank_next<S: RuntimeSet>(
         }
         Action::StallBoth => TwoBankStep::StallBoth,
         Action::StallIn => TwoBankStep::StallIn,
+        Action::StoragePending => TwoBankStep::StoragePending,
         Action::Error(e) => panic!("BOT core error: {e:?}"),
     }
 }
@@ -2769,6 +2842,7 @@ fn overlap_read_alternates_banks_and_is_byte_exact() {
                 }
                 ev = Event::HostSent;
             }
+            TwoBankStep::StoragePending => ev = Event::Tick,
             TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
             TwoBankStep::StallIn => panic!("unexpected StallIn"),
         }
@@ -2855,6 +2929,7 @@ fn overlap_write_stays_in_the_command_bank() {
                 }
                 ev = Event::HostSent;
             }
+            TwoBankStep::StoragePending => ev = Event::Tick,
             TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
             TwoBankStep::StallIn => panic!("unexpected StallIn"),
         }
@@ -3201,6 +3276,7 @@ fn overlap_one_bank_read_never_uses_the_long_bank() {
                 }
                 ev = Event::HostSent;
             }
+            TwoBankStep::StoragePending => ev = Event::Tick,
             TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
             TwoBankStep::StallIn => panic!("unexpected StallIn"),
         }

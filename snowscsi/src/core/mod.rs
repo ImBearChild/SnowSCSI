@@ -58,7 +58,7 @@ pub use self::lu::{Lu, LuImpl};
 pub use self::management::{BoundaryReject, Change, ChangeResult, LuInfo};
 pub use self::permit::{BoundaryPermit, CommandPermit, ExecutionGuard, OwnerBindPermit};
 pub use self::profile::{Capacity, SpcProfile};
-pub use self::runner::{DriveStep, RunEnd, RunOutcome, Runner};
+pub use self::runner::{DriveStep, PendingKind, RunEnd, RunOutcome, Runner};
 pub use self::spc::Spc;
 pub use self::target::{StaticTarget, Target};
 pub use self::ua::{ClearReason, ClearRule, Ua, UaClass, UaSet};

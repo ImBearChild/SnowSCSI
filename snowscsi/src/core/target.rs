@@ -36,7 +36,7 @@ use super::long::LongInfo;
 use super::lu::Lu;
 use super::management::{BoundaryReject, Change, ChangeResult, LuInfo};
 use super::permit::{BoundaryPermit, CommandPermit, OwnerBindPermit};
-use super::runner::{DriveStep, RunOutcome, Runner};
+use super::runner::{DriveStep, PendingKind, RunOutcome, Runner};
 use super::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport};
 use super::ua::UaClass;
 
@@ -99,6 +99,14 @@ impl<S: SlotSet> Target<S> {
     /// with the long operation uses it to defer input until the token settles.
     pub fn long_io_in_flight(&self) -> bool {
         self.runner.long_io_in_flight()
+    }
+
+    /// What the active command is waiting on, if anything.
+    ///
+    /// A read-only projection, not a boundary: a shell uses it to tell a
+    /// storage-only step from a host data phase without reading the wire.
+    pub fn pending_kind(&self) -> Option<PendingKind> {
+        self.runner.pending_kind()
     }
 
     /// Application control entry.
@@ -1037,7 +1045,8 @@ mod tests {
     use crate::block::{BlockAttrs, BlockDevice};
     use crate::core::collections::{cons, Here, Nil, There};
     use crate::core::storage::{
-        BlockingHost, BlockingStorage, IoBuf, IoReq, StorageReceipt, SyncHost, SyncStorage,
+        BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, HostToken, HostTransport,
+        IoBuf, IoReq, IoToken, Storage, StorageReceipt, SyncHost, SyncStorage,
     };
     use crate::core::{Completion, Direction, LuImpl, NoMedium};
 
@@ -1228,6 +1237,99 @@ mod tests {
         }
 
         fn cancel(&mut self, _token: crate::core::storage::IoToken) {}
+    }
+
+    /// Storage adapter whose first poll stays pending, exposing the runner's
+    /// retained storage operation.
+    struct PendingOnceStorage {
+        pending: bool,
+    }
+
+    impl Storage for PendingOnceStorage {
+        fn begin_exec(&mut self, _req: IoReq) -> IoToken {
+            IoToken::new(0, 1)
+        }
+
+        fn poll_exec(&mut self, _token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+            if self.pending {
+                self.pending = false;
+                return Poll::Pending;
+            }
+            let len = match &buf {
+                IoBuf::None => 0,
+                IoBuf::Read(b) => b.len(),
+                IoBuf::Write(b) => b.len(),
+            };
+            Poll::Ready(StorageReceipt::ok(len))
+        }
+
+        fn cancel(&mut self, _token: IoToken) {}
+    }
+
+    /// Host seam that never completes its data phase.
+    struct PendingHost;
+
+    impl HostTransport for PendingHost {
+        fn publish(&mut self, _plan: DataPlan) -> Result<(), Fault> {
+            Ok(())
+        }
+
+        fn begin_recv(&mut self, _req: HostReq) -> HostToken {
+            HostToken::new(0, 1)
+        }
+
+        fn begin_send(&mut self, _req: HostReq) -> HostToken {
+            HostToken::new(0, 1)
+        }
+
+        fn poll_host(&mut self, _token: HostToken, _buf: HostBuf<'_>) -> Poll<HostReceipt> {
+            Poll::Pending
+        }
+
+        fn cancel(&mut self, _token: HostToken) {}
+
+        fn delivery(&self) -> Delivery {
+            Delivery::Pending
+        }
+    }
+
+    #[test]
+    fn pending_kind_projects_the_active_command_operation() {
+        let mut slots = [slot(1)];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = PendingOnceStorage { pending: true };
+        let mut host = PendingHost;
+        let mut work = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 512), &read_cdb(1))
+            .expect("start READ");
+        assert_eq!(target.pending_kind(), None, "no adapter operation yet");
+
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
+            Ok(DriveStep::Pending)
+        );
+        assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
+            Ok(DriveStep::Pending)
+        );
+        assert_eq!(target.pending_kind(), Some(PendingKind::Host));
+
+        assert_eq!(
+            target.drive_step_rt(0, &mut storage, &mut host, &mut work, &mut [], &mut scratch),
+            Ok(DriveStep::Pending)
+        );
+        assert_eq!(
+            target.pending_kind(),
+            Some(PendingKind::Host),
+            "a host phase stays projected until it completes"
+        );
     }
 
     #[test]

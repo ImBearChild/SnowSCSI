@@ -207,6 +207,9 @@ where
                 // Nothing is staged in `work`; the framing action is re-emitted
                 // once the token settles.
                 Action::HostRecv { .. } => continue,
+                // No wire transfer is pending while the command waits on
+                // storage; keep the loop turning so the token can settle.
+                Action::StoragePending => continue,
                 // Data or a stall response is staged in `work`, which the long
                 // token owns: dropping it would lose or corrupt output.
                 Action::HostSend { .. } | Action::StallBoth | Action::StallIn => {
@@ -271,6 +274,11 @@ where
                     Err(BotIoErr::Disconnected) => Event::Reset,
                     Err(_) => return Err(ServeError::Closed),
                 };
+            }
+            Action::StoragePending => {
+                // No wire I/O: retry the command once on the next turn with a
+                // no-op tick. The blocking adapter is ready on that poll.
+                ev = Event::Tick;
             }
             Action::StallBoth => {
                 // Invalid CBW: STALL both pipes (ignore a missing capability).
@@ -349,6 +357,9 @@ where
                     // Nothing is staged in `work`; the framing action is
                     // re-emitted once the token settles.
                     Action::HostRecv { .. } => continue,
+                    // No wire transfer is pending while the command waits on
+                    // storage; keep the loop turning so the token can settle.
+                    Action::StoragePending => continue,
                     // Data or a stall response is staged in `work`, which the
                     // long token owns: dropping it would lose or corrupt output.
                     Action::HostSend { .. } | Action::StallBoth | Action::StallIn => {
@@ -426,6 +437,12 @@ where
                         Err(BotIoErr::Disconnected) => Event::Reset,
                         Err(_) => return Err(ServeError::Closed),
                     };
+                }
+                Action::StoragePending => {
+                    // No wire I/O: retry the command once on the next turn with
+                    // a no-op tick. A storage adapter that stays pending is the
+                    // async shell's concern.
+                    ev = Event::Tick;
                 }
                 Action::StallBoth => {
                     let _ = recv.stall_both().await;

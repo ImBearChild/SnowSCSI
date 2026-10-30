@@ -13,7 +13,7 @@ mod tests {
     use snowscsi::common::seekable_storage::RamBackend;
     use snowscsi::common::store::{StoreOp, StorePlane};
     use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-    use snowscsi::core::{Delivery, Direction, Lu, RuntimeSet, Target};
+    use snowscsi::core::{Delivery, Direction, Lu, PendingKind, RuntimeSet, Target};
     use snowscsi::iscsi::conn::write_all;
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowscsi::iscsi::target::{Action, Event, IscsiSession, LoginStage, TargetError};
@@ -76,6 +76,11 @@ mod tests {
                     }
                     wrote = true;
                     ev = Event::HostSent;
+                }
+                Action::StoragePending => {
+                    // No wire I/O while the command waits on storage; the next
+                    // turn advances it once.
+                    ev = Event::Tick;
                 }
                 Action::Closed => return Outcome::Closed,
                 Action::Error(e) => return Outcome::Error(e),
@@ -3712,6 +3717,76 @@ mod tests {
             })
             .unwrap();
         assert!(check.iter().all(|&b| b == 0), "the fill is byte-exact");
+    }
+
+    // ── Storage-only steps report a storage pending signal ─────────
+
+    /// A command waiting on storage returns `StoragePending` (no wire action),
+    /// and the next `Tick` advances it.
+    #[test]
+    fn storage_pending_signal_then_tick_advances_the_command() {
+        let mut ram = vec![0u8; 16 * 1024];
+        block_fixture!(
+            ram, backend, 32, work, scratch, slots, table, conn, session, target, storage
+        );
+        login!(conn, session, work, scratch, target, storage);
+
+        // The first storage poll stays pending, so the command step surfaces.
+        storage.pending_polls = 1;
+
+        let mut sync = [0u8; 48];
+        sync[0] = op::SCSI_CMD;
+        sync[16..20].copy_from_slice(&be32(0x3510));
+        sync[24..28].copy_from_slice(&be32(0));
+        sync[28..32].copy_from_slice(&be32(0));
+        sync[32] = 0x35; // SYNCHRONIZE CACHE (10)
+        conn.feed(&sync, &[]);
+
+        assert!(matches!(
+            session.poll(
+                Event::Tick,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Action::HostRecv {
+                offset: 0,
+                len: BHS_SIZE
+            }
+        ));
+        let mut got = 0usize;
+        while got < BHS_SIZE {
+            match conn.read(&mut work[got..BHS_SIZE]) {
+                Ok(0) => panic!("script ended before the command BHS"),
+                Ok(n) => got += n,
+                Err(_) => panic!("script read failed"),
+            }
+        }
+        assert!(matches!(
+            session.poll(
+                Event::HostRecv { len: BHS_SIZE },
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Action::StoragePending
+        ));
+        assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+
+        // One no-op tick advances the command; the status PDU is staged.
+        assert!(matches!(
+            session.poll(
+                Event::Tick,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage
+            ),
+            Action::HostSend { .. }
+        ));
+        assert_eq!(target.pending_kind(), None);
     }
 
     // ── One buffer end-to-end through the iSCSI shell ──────────────
