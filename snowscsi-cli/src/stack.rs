@@ -9,7 +9,7 @@
 //!   stays a single `MmcDrive<CliMedium>`;
 //! - [`CliLu`] — one runtime `Lu` enum over the block and MMC slot types, with
 //!   a single [`CliPair`] (the core `Pair` type of this application);
-//! - [`CliStorage`] — a [`Storage`] adapter over the per-LUN [`StorePlane`]s,
+//! - [`CliStorage`] — a [`Storage`] adapter over the per-LUN [`OwnedPlane`]s,
 //!   routed by the runner's `select_lun` hook.
 //!
 //! The glue owns no protocol state: every method forwards to the wrapped core
@@ -18,6 +18,10 @@
 use core::task::Poll;
 
 use snowscsi::block::BlockDevice;
+use snowscsi::cdrom::media::LiveData;
+#[cfg(feature = "bundle")]
+use snowscsi::common::flat_bundle::FlatBundle;
+use snowscsi::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
 use snowscsi::common::store::{StoreOp, StorePlane};
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{
@@ -28,9 +32,104 @@ use snowscsi::core::{
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{DiscInfo, FlatCdMedium, MmcAttrs, MmcDrive, MmcMedium, MmcOp, Session, Track};
+use snowscsi::scsi::backend::BlockBackend;
+use snowscsi::scsi::fs_backend::StdFsBackend;
 
 /// Application backing handle: the CLI only needs an identity per LUN.
 pub type CliBacking = u32;
+
+/// One CLI-owned store plane.
+///
+/// Unlike [`StorePlane`], which erases to `&mut dyn` trait objects (`!Send`),
+/// this enum owns the concrete backends. The CLI forbids `unsafe`, so owning
+/// `Send` values is what lets a future adapter move a plane into a worker
+/// thread; the synchronous path builds a temporary [`StorePlane`] borrow per
+/// operation.
+// The CLI builds one plane per LUN; the size difference is dominated by the
+// live scanner's file table, not a hot-path concern (same rationale as
+// `CliLu` below).
+#[allow(clippy::large_enum_variant)]
+pub enum OwnedPlane<'a> {
+    /// Read-only byte plane.
+    BlockRo(BlockBackend<'a>),
+    /// Writable byte plane.
+    BlockRw(BlockBackend<'a>),
+    /// Directory-chunked filesystem plane (read-only or writable, as opened).
+    #[cfg(feature = "bundle")]
+    Bundle(FlatBundle<StdFsBackend>),
+    /// Live ISO9660 directory scan (read-only).
+    Live(LiveData<StdFsBackend>),
+}
+
+impl OwnedPlane<'_> {
+    /// Whether this plane should be addressed as a writable plane.
+    fn is_writable(&self) -> bool {
+        match self {
+            Self::BlockRw(_) => true,
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => !bundle.is_read_only(),
+            Self::BlockRo(_) | Self::Live(_) => false,
+        }
+    }
+
+    /// Build the erased borrow the synchronous store path executes on.
+    fn as_store_plane(&mut self) -> StorePlane<'_> {
+        if self.is_writable() {
+            StorePlane::BlockRw(self)
+        } else {
+            StorePlane::BlockRo(self)
+        }
+    }
+}
+
+impl FlatData for OwnedPlane<'_> {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        match self {
+            Self::BlockRo(backend) | Self::BlockRw(backend) => backend.read_at(off, buf),
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => bundle.read_at(off, buf),
+            Self::Live(live) => live.read_at(off, buf),
+        }
+    }
+
+    fn capacity(&self) -> u64 {
+        match self {
+            Self::BlockRo(backend) | Self::BlockRw(backend) => backend.capacity(),
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => bundle.capacity(),
+            Self::Live(live) => live.capacity(),
+        }
+    }
+}
+
+impl WritableFlatData for OwnedPlane<'_> {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
+        match self {
+            Self::BlockRw(backend) => backend.write_at(off, buf),
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => bundle.write_at(off, buf),
+            Self::BlockRo(_) | Self::Live(_) => Err(StorageError::NotWritable),
+        }
+    }
+
+    fn sync(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::BlockRw(backend) => backend.sync(),
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => bundle.sync(),
+            Self::BlockRo(_) | Self::Live(_) => Ok(()),
+        }
+    }
+
+    fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), StorageError> {
+        match self {
+            Self::BlockRw(backend) => backend.fill_at(off, len, byte),
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => bundle.fill_at(off, len, byte),
+            Self::BlockRo(_) | Self::Live(_) => Err(StorageError::NotWritable),
+        }
+    }
+}
 
 /// The media member of a CLI pair: a block slot has no medium, an MMC slot
 /// carries one of the supported media.
@@ -450,14 +549,15 @@ fn change_cross<P>(
     }
 }
 
-/// Fixed-slot synchronous storage over the per-LUN [`StorePlane`]s.
+/// Fixed-slot synchronous storage over the per-LUN [`OwnedPlane`]s.
 ///
-/// A `StorePlane` executes synchronously, so `begin_exec` only records the
-/// request and `poll_exec` runs it and answers `Ready` immediately. The runner
-/// selects the addressed LUN (`Storage::select_lun`) before each entry, which
-/// keeps one adapter usable for the whole heterogeneous slot set.
+/// A plane executes synchronously, so `begin_exec` only records the request
+/// and `poll_exec` builds the temporary [`StorePlane`] borrow, runs it and
+/// answers `Ready` immediately. The runner selects the addressed LUN
+/// (`Storage::select_lun`) before each entry, which keeps one adapter usable
+/// for the whole heterogeneous slot set.
 pub struct CliStorage<'a> {
-    planes: Vec<Option<StorePlane<'a>>>,
+    planes: Vec<Option<OwnedPlane<'a>>>,
     lun: usize,
     pending: Option<(IoReq, u32)>,
     tag: u32,
@@ -465,7 +565,7 @@ pub struct CliStorage<'a> {
 
 impl<'a> CliStorage<'a> {
     /// Build the adapter over one plane slot per LUN.
-    pub fn new(planes: Vec<Option<StorePlane<'a>>>) -> Self {
+    pub fn new(planes: Vec<Option<OwnedPlane<'a>>>) -> Self {
         Self {
             planes,
             lun: 0,
@@ -480,7 +580,7 @@ impl<'a> CliStorage<'a> {
     ) -> Result<(), (usize, snowscsi::common::seekable_storage::StorageError)> {
         for (i, plane) in self.planes.iter_mut().enumerate() {
             if let Some(plane) = plane {
-                plane.sync().map_err(|e| (i, e))?;
+                plane.as_store_plane().sync().map_err(|e| (i, e))?;
             }
         }
         Ok(())
@@ -525,6 +625,7 @@ impl Storage for CliStorage<'_> {
         let Some(plane) = self.planes.get_mut(self.lun).and_then(|p| p.as_mut()) else {
             return Poll::Ready(Self::contract());
         };
+        let mut plane = plane.as_store_plane();
         let (op, confirmed) = match buf {
             IoBuf::None => (StoreOp::Sync, 0),
             IoBuf::Read(b) => {
@@ -579,5 +680,17 @@ pub fn map_storage_error(e: snowscsi::common::seekable_storage::StorageError) ->
         StorageError::NotWritable => Fault::NotWritable,
         StorageError::Io(_) => Fault::Io,
         StorageError::Unsupported => Fault::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn owned_plane_is_send() {
+        assert_send::<OwnedPlane<'static>>();
     }
 }

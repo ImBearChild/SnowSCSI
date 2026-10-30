@@ -49,7 +49,6 @@ use snowscsi::cdrom::media::LiveData;
 use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
-use snowscsi::common::store::StorePlane;
 use snowscsi::core::{Lu, Spc, Writability};
 use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
@@ -60,7 +59,7 @@ use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableSto
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
-use stack::{CliLu, CliMedium, CliPair, CliStorage};
+use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 
 #[cfg(target_os = "linux")]
 use snowscsi::usb::{
@@ -327,10 +326,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 fn build_core_slots<'a>(
     specs: &[DeviceSpec],
     ram_disks: &'a mut Vec<Vec<u8>>,
-    backends: &'a mut Vec<BlockBackend<'a>>,
-    lives: &'a mut Vec<LiveData<StdFsBackend>>,
-    bundles: &'a mut Vec<FlatBundle<StdFsBackend>>,
-    planes: &mut Vec<Option<StorePlane<'a>>>,
+    backends: &mut Vec<BlockBackend<'a>>,
+    lives: &mut Vec<LiveData<StdFsBackend>>,
+    bundles: &mut Vec<FlatBundle<StdFsBackend>>,
+    planes: &mut Vec<Option<OwnedPlane<'a>>>,
     slots: &mut Vec<CliLu>,
 ) -> Result<(), ()> {
     if specs.is_empty() {
@@ -344,10 +343,12 @@ fn build_core_slots<'a>(
 
     planes.clear();
     slots.clear();
-    let mut be_iter = backends.iter_mut();
-    let mut live_iter = lives.iter_mut();
+    // Move the owned backends out of the build pools: the planes own them now,
+    // so `CliStorage` never holds an erased (`!Send`) borrow.
+    let mut be_iter = backends.drain(..);
+    let mut live_iter = lives.drain(..);
     #[cfg(feature = "bundle")]
-    let mut bundle_iter = bundles.iter_mut();
+    let mut bundle_iter = bundles.drain(..);
 
     for (lun, spec) in specs.iter().enumerate() {
         let backing = lun as u32;
@@ -362,10 +363,8 @@ fn build_core_slots<'a>(
                 let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
-                    planes.push(Some(StorePlane::BlockRo(be)));
-                } else {
-                    planes.push(Some(StorePlane::BlockRw(be)));
                 }
+                planes.push(Some(OwnedPlane::Bundle(be)));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
@@ -381,7 +380,7 @@ fn build_core_slots<'a>(
                 let cap = be.capacity();
                 let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
                 attrs.write_mode = Writability::ReadOnly;
-                planes.push(Some(StorePlane::BlockRo(be)));
+                planes.push(Some(OwnedPlane::Bundle(be)));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
@@ -397,9 +396,9 @@ fn build_core_slots<'a>(
                 let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
-                    planes.push(Some(StorePlane::BlockRo(be)));
+                    planes.push(Some(OwnedPlane::BlockRo(be)));
                 } else {
-                    planes.push(Some(StorePlane::BlockRw(be)));
+                    planes.push(Some(OwnedPlane::BlockRw(be)));
                 }
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
@@ -414,7 +413,7 @@ fn build_core_slots<'a>(
                 let cap = be.capacity();
                 let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
                 attrs.write_mode = Writability::ReadOnly;
-                planes.push(Some(StorePlane::BlockRo(be)));
+                planes.push(Some(OwnedPlane::BlockRo(be)));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
@@ -427,7 +426,7 @@ fn build_core_slots<'a>(
                     .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 let medium = CliMedium::Flat(FlatCdMedium::new(cap));
-                planes.push(Some(StorePlane::BlockRo(be)));
+                planes.push(Some(OwnedPlane::BlockRo(be)));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
@@ -442,7 +441,7 @@ fn build_core_slots<'a>(
                 let medium = CliMedium::Flat(FlatCdMedium::new(
                     u64::from(total) * u64::from(ISO_SECTOR_SIZE),
                 ));
-                planes.push(Some(StorePlane::BlockRo(live)));
+                planes.push(Some(OwnedPlane::Live(live)));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
@@ -456,7 +455,7 @@ fn build_core_slots<'a>(
                     .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
                 let cap = be.capacity();
                 let medium = CliMedium::DvdRam(DvdRamMedium::new(cap / u64::from(ISO_SECTOR_SIZE)));
-                planes.push(Some(StorePlane::BlockRw(be)));
+                planes.push(Some(OwnedPlane::BlockRw(be)));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
@@ -491,7 +490,7 @@ fn run_serve_iscsi(
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
     let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
-    let mut planes: Vec<Option<StorePlane>> = Vec::new();
+    let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
     if build_core_slots(
         specs,
@@ -1148,7 +1147,7 @@ fn run_serve_usb(
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
     let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
-    let mut planes: Vec<Option<StorePlane>> = Vec::new();
+    let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
     if build_core_slots(
         specs,
