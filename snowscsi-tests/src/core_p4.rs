@@ -258,12 +258,12 @@ impl SyncHost for TestHost {
 
     fn receive(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         match buf {
-            HostBuf::Recv(bytes) => {
+            HostBuf::Recv { buf: bytes, .. } => {
                 let n = (req.len as usize).min(bytes.len()).min(self.params.len());
                 bytes[..n].copy_from_slice(&self.params[..n]);
                 HostReceipt::from_adapter(n, None)
             }
-            HostBuf::Send(_) => HostReceipt::from_adapter(0, Some(Fault::Contract)),
+            HostBuf::Send { .. } => HostReceipt::from_adapter(0, Some(Fault::Contract)),
         }
     }
 

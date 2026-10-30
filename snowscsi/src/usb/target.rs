@@ -1713,7 +1713,7 @@ impl HostTransport for BotSession {
     fn poll_host(&mut self, token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
         match self.phase {
             Phase::Send(mut p) if p.token == token => {
-                let HostBuf::Send(b) = buf else {
+                let HostBuf::Send { bytes: b, .. } = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
                 if b.len() != p.chunk_len as usize {
@@ -1746,7 +1746,7 @@ impl HostTransport for BotSession {
                 }
             }
             Phase::Recv(p) if p.token == token => {
-                let HostBuf::Recv(b) = buf else {
+                let HostBuf::Recv { buf: b, .. } = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
                 if b.len() != p.chunk_len as usize {

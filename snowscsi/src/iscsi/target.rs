@@ -2374,7 +2374,7 @@ impl HostTransport for IscsiSession {
         match phase {
             Phase::Send(mut p) => {
                 let buf = match buf {
-                    HostBuf::Send(buf) if buf.len() == p.phase_len as usize => buf,
+                    HostBuf::Send { bytes: buf, .. } if buf.len() == p.phase_len as usize => buf,
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 };
                 let remaining = (p.phase_base + p.phase_len).saturating_sub(p.sent);
@@ -2446,7 +2446,7 @@ impl HostTransport for IscsiSession {
             }
             Phase::Recv(mut p) => {
                 match buf {
-                    HostBuf::Recv(buf) if buf.len() == p.phase_len as usize => {}
+                    HostBuf::Recv { buf, .. } if buf.len() == p.phase_len as usize => {}
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
                 }
                 if p.done {
@@ -2867,7 +2867,13 @@ mod tests {
 
         // First PDU: a full segment.
         assert!(matches!(
-            session.poll_host(token, HostBuf::Send(&bank)),
+            session.poll_host(
+                token,
+                HostBuf::Send {
+                    bytes: &bank,
+                    bank: crate::core::storage::BankSide::Work
+                }
+            ),
             Poll::Pending
         ));
         let staged = match &mut session.host {
@@ -2884,7 +2890,13 @@ mod tests {
 
         // Second PDU: the chunk's last byte, exactly one byte long.
         assert!(matches!(
-            session.poll_host(token, HostBuf::Send(&bank)),
+            session.poll_host(
+                token,
+                HostBuf::Send {
+                    bytes: &bank,
+                    bank: crate::core::storage::BankSide::Work
+                }
+            ),
             Poll::Pending
         ));
         let staged = match &mut session.host {

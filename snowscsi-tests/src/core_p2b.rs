@@ -70,18 +70,18 @@ impl SyncHost for TestHost {
 
     fn receive(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         match buf {
-            HostBuf::Recv(bytes) => {
+            HostBuf::Recv { buf: bytes, .. } => {
                 let accepted = (req.len as usize).min(bytes.len());
                 bytes[..accepted].fill(0xa5);
                 HostReceipt::from_adapter(accepted, None)
             }
-            HostBuf::Send(_) => HostReceipt::from_adapter(0, Some(Fault::Contract)),
+            HostBuf::Send { .. } => HostReceipt::from_adapter(0, Some(Fault::Contract)),
         }
     }
 
     fn send(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         let accepted = req.len as usize;
-        if let HostBuf::Send(bytes) = buf {
+        if let HostBuf::Send { bytes, .. } = buf {
             self.sent
                 .extend_from_slice(&bytes[..accepted.min(bytes.len())]);
         }
@@ -877,12 +877,12 @@ impl SyncHost for ParamHost {
 
     fn receive(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         match buf {
-            HostBuf::Recv(bytes) => {
+            HostBuf::Recv { buf: bytes, .. } => {
                 let n = (req.len as usize).min(bytes.len()).min(self.params.len());
                 bytes[..n].copy_from_slice(&self.params[..n]);
                 HostReceipt::from_adapter(n, None)
             }
-            HostBuf::Send(_) => HostReceipt::from_adapter(0, Some(Fault::Contract)),
+            HostBuf::Send { .. } => HostReceipt::from_adapter(0, Some(Fault::Contract)),
         }
     }
 

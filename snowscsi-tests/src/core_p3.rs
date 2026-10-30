@@ -2440,8 +2440,8 @@ impl HostTransport for SettleHost {
 
     fn poll_host(&mut self, _token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
         let (dir, len) = match &buf {
-            HostBuf::Recv(b) => (Direction::FromHost, b.len()),
-            HostBuf::Send(b) => (Direction::ToHost, b.len()),
+            HostBuf::Recv { buf: b, .. } => (Direction::FromHost, b.len()),
+            HostBuf::Send { bytes: b, .. } => (Direction::ToHost, b.len()),
         };
         self.polls = self.polls.saturating_add(1);
         self.log.borrow_mut().push(Ev::HostPoll {

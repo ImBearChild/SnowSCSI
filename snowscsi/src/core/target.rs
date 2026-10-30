@@ -1061,7 +1061,7 @@ mod tests {
             Ok(())
         }
         fn receive(&mut self, _req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
-            if let HostBuf::Recv(b) = buf {
+            if let HostBuf::Recv { buf: b, .. } = buf {
                 for byte in b.iter_mut() {
                     *byte = 0x5a;
                 }
@@ -1843,5 +1843,296 @@ mod tests {
         );
         // The eject_pending window must be gone: control is accepted again.
         assert_eq!(target.request_control(Control::Nop), Ok(()));
+    }
+    // ── Host phases carry the bank side ────────────────────────────
+
+    /// Scripted device that emits one host step from the caller's banks.
+    enum BankScript {
+        SendAlt,
+        RecvAlt,
+        SendOutside,
+    }
+
+    struct BankDevice {
+        script: Option<BankScript>,
+        active: bool,
+    }
+
+    static OUTSIDE: [u8; 16] = [0xAA; 16];
+
+    impl crate::core::Device for BankDevice {
+        type Medium = NoMedium;
+
+        fn prepare(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            _ctx: CommandContext,
+            _cdb: &[u8],
+        ) -> Result<(), Completion> {
+            self.active = true;
+            Ok(())
+        }
+
+        fn active(&self) -> bool {
+            self.active
+        }
+
+        fn resume(&mut self, _permit: &crate::core::CommandPermit) -> Result<(), Completion> {
+            Ok(())
+        }
+
+        fn poll_with_alt<'a>(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            fb: crate::core::Feedback,
+            data: &'a mut [u8],
+            alt: &'a mut [u8],
+        ) -> crate::core::PollStep<'a> {
+            match fb.kind() {
+                crate::core::FeedbackKind::Begin => {
+                    let direction = match self.script {
+                        Some(BankScript::RecvAlt) => Direction::FromHost,
+                        _ => Direction::ToHost,
+                    };
+                    crate::core::PollStep::Publish(DataPlan {
+                        direction,
+                        bytes: data.len() as u64,
+                    })
+                }
+                crate::core::FeedbackKind::PlanAccepted => match self.script.take() {
+                    Some(BankScript::SendAlt) => crate::core::PollStep::Send(&alt[..data.len()]),
+                    Some(BankScript::RecvAlt) => {
+                        self.script = None;
+                        crate::core::PollStep::Receive(&mut alt[..data.len()])
+                    }
+                    Some(BankScript::SendOutside) => {
+                        crate::core::PollStep::Send(&OUTSIDE[..data.len()])
+                    }
+                    None => crate::core::PollStep::Complete(Completion::Good),
+                },
+                _ => {
+                    self.active = false;
+                    crate::core::PollStep::Complete(Completion::Good)
+                }
+            }
+        }
+
+        fn poll<'a>(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            _fb: crate::core::Feedback,
+            _data: &'a mut [u8],
+        ) -> crate::core::PollStep<'a> {
+            // These fixtures drive `poll_with_alt` only.
+            crate::core::PollStep::Idle
+        }
+
+        fn poll_long<'a>(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            _fb: crate::core::Feedback,
+            _data: &'a mut [u8],
+        ) -> crate::core::PollStep<'a> {
+            crate::core::PollStep::Idle
+        }
+
+        fn long_info(&self) -> crate::core::LongInfo {
+            crate::core::LongInfo::IDLE
+        }
+
+        fn interrupt(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            _reason: crate::core::InterruptReason,
+            _known: crate::core::KnownEffects,
+        ) -> Result<(), Fault> {
+            Ok(())
+        }
+
+        fn finish_delivery(
+            &mut self,
+            _permit: &crate::core::CommandPermit,
+            _delivery: crate::core::Delivery,
+        ) {
+        }
+
+        fn take_medium(&mut self, _permit: &crate::core::BoundaryPermit) -> Option<NoMedium> {
+            Some(NoMedium)
+        }
+
+        fn install_medium(
+            &mut self,
+            _permit: &crate::core::BoundaryPermit,
+            _medium: NoMedium,
+        ) -> Result<(), (NoMedium, Fault)> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BankHost {
+        sent: Vec<(crate::core::storage::BankSide, usize, usize)>,
+        recv: Vec<(crate::core::storage::BankSide, usize, usize)>,
+        polls: usize,
+    }
+
+    impl HostTransport for BankHost {
+        fn publish(&mut self, _plan: DataPlan) -> Result<(), Fault> {
+            Ok(())
+        }
+
+        fn begin_recv(&mut self, _req: HostReq) -> HostToken {
+            HostToken::new(0, 3)
+        }
+
+        fn begin_send(&mut self, _req: HostReq) -> HostToken {
+            HostToken::new(0, 4)
+        }
+
+        fn poll_host(&mut self, _token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
+            self.polls += 1;
+            match buf {
+                HostBuf::Send { bytes, bank } => {
+                    self.sent.push((bank, bytes.len(), bytes.as_ptr() as usize));
+                }
+                HostBuf::Recv { buf, bank } => {
+                    let at = buf.as_ptr() as usize;
+                    self.recv.push((bank, buf.len(), at));
+                    buf.fill(0x5A);
+                }
+            }
+            Poll::Ready(HostReceipt::new(usize::MAX, None, TargetId::UNBOUND))
+        }
+
+        fn cancel(&mut self, _token: HostToken) {}
+
+        fn delivery(&self) -> crate::core::Delivery {
+            crate::core::Delivery::Complete
+        }
+    }
+
+    /// A device that sends from the alternate bank hands the host adapter the
+    /// alternate slice and `BankSide::Alt`.
+    #[test]
+    fn a_send_from_the_alternate_bank_reaches_the_host_as_alt() {
+        use crate::core::storage::BankSide;
+        let mut slots = [LuImpl::new(
+            BankDevice {
+                script: Some(BankScript::SendAlt),
+                active: false,
+            },
+            1u8,
+        )];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BankHost::default();
+        let mut work = [0u8; 16];
+        let mut alt = [0x11u8; 16];
+        let mut scratch = [0u8; 16];
+        let alt_start = alt.as_ptr() as usize;
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 16), &read_cdb(1))
+            .expect("start");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Done(Completion::Good))
+        );
+        assert_eq!(host.polls, 1);
+        assert_eq!(host.sent.len(), 1);
+        assert_eq!(host.sent[0].0, BankSide::Alt);
+        assert_eq!(host.sent[0].1, 16);
+        assert_eq!(
+            host.sent[0].2, alt_start,
+            "the host saw the alternate bank's slice"
+        );
+    }
+
+    /// The same for a receive into the alternate bank.
+    #[test]
+    fn a_receive_into_the_alternate_bank_reaches_the_host_as_alt() {
+        use crate::core::storage::BankSide;
+        let mut slots = [LuImpl::new(
+            BankDevice {
+                script: Some(BankScript::RecvAlt),
+                active: false,
+            },
+            1u8,
+        )];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BankHost::default();
+        let mut work = [0u8; 16];
+        let mut alt = [0u8; 16];
+        let mut scratch = [0u8; 16];
+        let alt_start = alt.as_ptr() as usize;
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::FromHost, 16), &read_cdb(1))
+            .expect("start");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Ok(DriveStep::Done(Completion::Good))
+        );
+        assert_eq!(host.recv.len(), 1);
+        assert_eq!(host.recv[0].0, BankSide::Alt);
+        assert_eq!(host.recv[0].1, 16);
+        assert_eq!(host.recv[0].2, alt_start);
+        assert_eq!(alt, [0x5A; 16], "the host wrote into the alternate bank");
+    }
+
+    /// A slice outside both banks is a contract violation and never reaches the
+    /// host adapter.
+    #[test]
+    fn a_host_slice_outside_both_banks_is_contract() {
+        let mut slots = [LuImpl::new(
+            BankDevice {
+                script: Some(BankScript::SendOutside),
+                active: false,
+            },
+            1u8,
+        )];
+        let table: &mut [&mut dyn Lu<Pair = crate::core::Pair<NoMedium, u8>>] =
+            &mut [&mut slots[0]];
+        let mut target = Target::new(table);
+        let mut storage = BlockingStorage::new(PassthroughStorage);
+        let mut host = BankHost::default();
+        let mut work = [0u8; 16];
+        let mut alt = [0u8; 16];
+        let mut scratch = [0u8; 16];
+
+        target
+            .drive_start_rt(0, ctx(0, Direction::ToHost, 16), &read_cdb(1))
+            .expect("start");
+        assert_eq!(
+            target.drive_step_rt(
+                0,
+                &mut storage,
+                &mut host,
+                &mut work,
+                &mut alt,
+                &mut scratch
+            ),
+            Err(Fault::Contract)
+        );
+        assert_eq!(host.polls, 0, "the host adapter is never called");
     }
 }

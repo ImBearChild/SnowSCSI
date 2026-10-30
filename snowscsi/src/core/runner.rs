@@ -33,8 +33,8 @@ use super::lu::Lu;
 use super::management::{BoundaryReject, Change, ChangeResult};
 use super::permit::{BoundaryPermit, CommandPermit, ExecutionGuard};
 use super::storage::{
-    HostBuf, HostReceipt, HostReq, HostToken, HostTransport, IoBuf, IoReceipt, IoReq, IoToken,
-    PrefetchOp, Storage, StorageOp, StorageReceipt,
+    BankSide, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, IoBuf, IoReceipt, IoReq,
+    IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt,
 };
 
 /// Why the service loop ended.
@@ -1349,36 +1349,37 @@ impl Runner {
                         dir: Direction::FromHost,
                     };
                     let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
+                    // A window outside both banks never reaches the host
+                    // adapter: nothing has moved yet, so settle without effect.
+                    let Some((offset, buf_alt)) = buf_offset else {
+                        self.settle_contract(lu, KnownEffects::NONE);
+                        return Err(Fault::Contract);
+                    };
+                    let bank = if buf_alt {
+                        BankSide::Alt
+                    } else {
+                        BankSide::Work
+                    };
                     let token = host.begin_recv(req);
                     if !token.is_valid() {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     }
-                    match host.poll_host(token, HostBuf::Recv(buf)) {
-                        Poll::Pending => match buf_offset {
-                            Some((offset, buf_alt)) => {
-                                state.pending = Some(PendingOp::HostRecv {
-                                    token,
-                                    req,
-                                    buf_offset: offset,
-                                    buf_alt,
-                                });
-                                state.work_addr = work.as_ptr() as usize;
-                                state.work_len = work.len();
-                                state.alt_addr = alt.as_ptr() as usize;
-                                state.alt_len = alt.len();
-                                self.drive_state.set(Some(state));
-                                return Ok(DriveStep::Pending);
-                            }
-                            None => {
-                                host.cancel(token);
-                                self.settle_contract(
-                                    lu,
-                                    Self::known_unobserved(Direction::FromHost),
-                                );
-                                return Err(Fault::Contract);
-                            }
-                        },
+                    match host.poll_host(token, HostBuf::Recv { buf, bank }) {
+                        Poll::Pending => {
+                            state.pending = Some(PendingOp::HostRecv {
+                                token,
+                                req,
+                                buf_offset: offset,
+                                buf_alt,
+                            });
+                            state.work_addr = work.as_ptr() as usize;
+                            state.work_len = work.len();
+                            state.alt_addr = alt.as_ptr() as usize;
+                            state.alt_len = alt.len();
+                            self.drive_state.set(Some(state));
+                            return Ok(DriveStep::Pending);
+                        }
                         Poll::Ready(raw) if raw.error() == Some(Fault::Contract) => {
                             // A returned receipt keeps its (clamped) accepted
                             // prefix; a contract error alone is not an unknown
@@ -1408,33 +1409,37 @@ impl Runner {
                         dir: Direction::ToHost,
                     };
                     let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
+                    // A window outside both banks never reaches the host
+                    // adapter: nothing has moved yet, so settle without effect.
+                    let Some((offset, buf_alt)) = buf_offset else {
+                        self.settle_contract(lu, KnownEffects::NONE);
+                        return Err(Fault::Contract);
+                    };
+                    let bank = if buf_alt {
+                        BankSide::Alt
+                    } else {
+                        BankSide::Work
+                    };
                     let token = host.begin_send(req);
                     if !token.is_valid() {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     }
-                    match host.poll_host(token, HostBuf::Send(buf)) {
-                        Poll::Pending => match buf_offset {
-                            Some((offset, buf_alt)) => {
-                                state.pending = Some(PendingOp::HostSend {
-                                    token,
-                                    req,
-                                    buf_offset: offset,
-                                    buf_alt,
-                                });
-                                state.work_addr = work.as_ptr() as usize;
-                                state.work_len = work.len();
-                                state.alt_addr = alt.as_ptr() as usize;
-                                state.alt_len = alt.len();
-                                self.drive_state.set(Some(state));
-                                return Ok(DriveStep::Pending);
-                            }
-                            None => {
-                                host.cancel(token);
-                                self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
-                                return Err(Fault::Contract);
-                            }
-                        },
+                    match host.poll_host(token, HostBuf::Send { bytes: buf, bank }) {
+                        Poll::Pending => {
+                            state.pending = Some(PendingOp::HostSend {
+                                token,
+                                req,
+                                buf_offset: offset,
+                                buf_alt,
+                            });
+                            state.work_addr = work.as_ptr() as usize;
+                            state.work_len = work.len();
+                            state.alt_addr = alt.as_ptr() as usize;
+                            state.alt_len = alt.len();
+                            self.drive_state.set(Some(state));
+                            return Ok(DriveStep::Pending);
+                        }
                         Poll::Ready(raw) if raw.error() == Some(Fault::Contract) => {
                             // A returned receipt keeps its (clamped) accepted
                             // prefix; a contract error alone is not an unknown
@@ -2737,11 +2742,18 @@ fn pending_host_buf<'a>(
     recv: bool,
 ) -> Option<HostBuf<'a>> {
     let end = offset.checked_add(req.len as usize)?;
+    let side = if buf_alt {
+        BankSide::Alt
+    } else {
+        BankSide::Work
+    };
     let bank: &'a mut [u8] = if buf_alt { alt } else { work };
     if recv {
-        bank.get_mut(offset..end).map(HostBuf::Recv)
+        bank.get_mut(offset..end)
+            .map(|buf| HostBuf::Recv { buf, bank: side })
     } else {
-        bank.get(offset..end).map(HostBuf::Send)
+        bank.get(offset..end)
+            .map(|bytes| HostBuf::Send { bytes, bank: side })
     }
 }
 

@@ -338,17 +338,41 @@ pub struct HostReq {
     pub dir: Direction,
 }
 
+/// Which of the caller's two data banks a host phase buffer lives in.
+///
+/// The runner derives it from the buffer's address; a buffer outside both
+/// banks is a contract violation and never reaches the host adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankSide {
+    /// The primary `work` bank.
+    Work,
+    /// The alternate bank (`alt`).
+    Alt,
+}
+
 /// Buffer supplied on each [`HostTransport::poll_host`].
 ///
 /// `Recv` pairs with `Direction::FromHost` and `Send` with `Direction::ToHost`;
 /// the length must equal [`HostReq::len`]. There is no "no-data" variant: a
-/// host data phase with `Direction::None` is a contract violation.
+/// host data phase with `Direction::None` is a contract violation. `bank` names
+/// the caller bank the slice belongs to and is informational for single-bank
+/// transports.
 #[derive(Debug)]
 pub enum HostBuf<'a> {
     /// Host → device data lands here.
-    Recv(&'a mut [u8]),
+    Recv {
+        /// Destination window inside the named bank.
+        buf: &'a mut [u8],
+        /// Bank the window belongs to.
+        bank: BankSide,
+    },
     /// Device → host data is taken from here.
-    Send(&'a [u8]),
+    Send {
+        /// Source window inside the named bank.
+        bytes: &'a [u8],
+        /// Bank the window belongs to.
+        bank: BankSide,
+    },
 }
 
 /// Opaque host-side token.
@@ -388,8 +412,8 @@ impl HostToken {
 /// Whether `buf` is the legal buffer for `req`.
 const fn host_buf_matches(req: HostReq, buf: &HostBuf<'_>) -> bool {
     match (req.dir, buf) {
-        (Direction::FromHost, HostBuf::Recv(b)) => req.len as usize == b.len(),
-        (Direction::ToHost, HostBuf::Send(b)) => req.len as usize == b.len(),
+        (Direction::FromHost, HostBuf::Recv { buf: b, .. }) => req.len as usize == b.len(),
+        (Direction::ToHost, HostBuf::Send { bytes: b, .. }) => req.len as usize == b.len(),
         _ => false,
     }
 }
@@ -558,8 +582,12 @@ impl<H: SyncHost> HostTransport for BlockingHost<H> {
             return Poll::Ready(host_contract_receipt());
         }
         let receipt = match buf {
-            HostBuf::Recv(b) => self.inner.receive(req, HostBuf::Recv(b)),
-            HostBuf::Send(b) => self.inner.send(req, HostBuf::Send(b)),
+            HostBuf::Recv { buf: b, bank } => {
+                self.inner.receive(req, HostBuf::Recv { buf: b, bank })
+            }
+            HostBuf::Send { bytes: b, bank } => {
+                self.inner.send(req, HostBuf::Send { bytes: b, bank })
+            }
         };
         Poll::Ready(HostReceipt::new(
             receipt.accepted().min(req.len as usize),
@@ -1208,7 +1236,7 @@ mod tests {
 
         fn receive(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
             match buf {
-                HostBuf::Recv(b) => {
+                HostBuf::Recv { buf: b, .. } => {
                     self.recv_calls += 1;
                     self.last = Some(HostCall {
                         len: req.len,
@@ -1220,7 +1248,7 @@ mod tests {
                         *byte = 0x5a;
                     }
                 }
-                HostBuf::Send(b) => {
+                HostBuf::Send { bytes: b, .. } => {
                     self.send_calls += 1;
                     self.last = Some(HostCall {
                         len: req.len,
@@ -1270,12 +1298,22 @@ mod tests {
         }
         let fifth = host.begin_send(send_req(4));
         assert!(!fifth.is_valid(), "fifth begin must exhaust the pool");
-        assert!(is_host_contract(host_ready(
-            host.poll_host(fifth, HostBuf::Send(&[0u8; 4]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            fifth,
+            HostBuf::Send {
+                bytes: &[0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
         for token in tokens {
             let mut buf = [0u8; 4];
-            let receipt = host_ready(host.poll_host(token, HostBuf::Recv(&mut buf)));
+            let receipt = host_ready(host.poll_host(
+                token,
+                HostBuf::Recv {
+                    buf: &mut buf,
+                    bank: BankSide::Work,
+                },
+            ));
             assert_eq!(receipt.error(), None);
             assert_eq!(buf, [0x5a; 4], "inner must see the caller's buffer");
         }
@@ -1285,26 +1323,49 @@ mod tests {
     #[test]
     fn host_unknown_and_repeated_tokens_are_contract() {
         let mut host = host();
-        assert!(is_host_contract(host_ready(
-            host.poll_host(host_token(0, 7), HostBuf::Recv(&mut [0u8; 4]))
-        )));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(host_token(9, 1), HostBuf::Recv(&mut [0u8; 4]))
-        )));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(HostToken::invalid(), HostBuf::Recv(&mut [0u8; 4]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            host_token(0, 7),
+            HostBuf::Recv {
+                buf: &mut [0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            host_token(9, 1),
+            HostBuf::Recv {
+                buf: &mut [0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            HostToken::invalid(),
+            HostBuf::Recv {
+                buf: &mut [0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
         assert_eq!(host.inner().recv_calls + host.inner().send_calls, 0);
 
         let token = host.begin_recv(recv_req(2));
         let mut buf = [0u8; 2];
         assert_eq!(
-            host_ready(host.poll_host(token, HostBuf::Recv(&mut buf))).error(),
+            host_ready(host.poll_host(
+                token,
+                HostBuf::Recv {
+                    buf: &mut buf,
+                    bank: BankSide::Work
+                }
+            ))
+            .error(),
             None
         );
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Recv(&mut buf))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Recv {
+                buf: &mut buf,
+                bank: BankSide::Work
+            }
+        ))));
         assert_eq!(host.inner().recv_calls, 1);
     }
 
@@ -1314,37 +1375,63 @@ mod tests {
 
         // Recv token polled with Send data.
         let token = host.begin_recv(recv_req(4));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Send(&[0u8; 4]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Send {
+                bytes: &[0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
         // Send token polled with Recv data.
         let token = host.begin_send(send_req(4));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Recv(&mut [0u8; 4]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Recv {
+                buf: &mut [0u8; 4],
+                bank: BankSide::Work
+            }
+        ))));
         // Length mismatch in both directions.
         let token = host.begin_recv(recv_req(4));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Recv(&mut [0u8; 8]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Recv {
+                buf: &mut [0u8; 8],
+                bank: BankSide::Work
+            }
+        ))));
         let token = host.begin_send(send_req(4));
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Send(&[0u8; 3]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Send {
+                bytes: &[0u8; 3],
+                bank: BankSide::Work
+            }
+        ))));
         // A no-data host phase has no legal HostBuf variant.
         let token = host.begin_send(HostReq {
             len: 0,
             dir: Direction::None,
         });
-        assert!(is_host_contract(host_ready(
-            host.poll_host(token, HostBuf::Send(&[]))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            token,
+            HostBuf::Send {
+                bytes: &[],
+                bank: BankSide::Work
+            }
+        ))));
         assert_eq!(host.inner().recv_calls + host.inner().send_calls, 0);
 
         // Matching pairs reach the right SyncHost method.
         let token = host.begin_recv(recv_req(4));
         let mut buf = [0u8; 4];
-        let receipt = host_ready(host.poll_host(token, HostBuf::Recv(&mut buf)));
+        let receipt = host_ready(host.poll_host(
+            token,
+            HostBuf::Recv {
+                buf: &mut buf,
+                bank: BankSide::Work,
+            },
+        ));
         assert_eq!(receipt.error(), None);
         assert_eq!(host.inner().recv_calls, 1);
         assert_eq!(host.inner().send_calls, 0);
@@ -1359,7 +1446,13 @@ mod tests {
         );
 
         let token = host.begin_send(send_req(4));
-        let receipt = host_ready(host.poll_host(token, HostBuf::Send(&[0u8; 4])));
+        let receipt = host_ready(host.poll_host(
+            token,
+            HostBuf::Send {
+                bytes: &[0u8; 4],
+                bank: BankSide::Work,
+            },
+        ));
         assert_eq!(receipt.error(), None);
         assert_eq!(host.inner().send_calls, 1);
         assert_eq!(
@@ -1379,7 +1472,13 @@ mod tests {
         host.inner_mut().accepts = 99;
         let token = host.begin_recv(recv_req(4));
         let mut buf = [0u8; 4];
-        let receipt = host_ready(host.poll_host(token, HostBuf::Recv(&mut buf)));
+        let receipt = host_ready(host.poll_host(
+            token,
+            HostBuf::Recv {
+                buf: &mut buf,
+                bank: BankSide::Work,
+            },
+        ));
         assert_eq!(receipt.accepted(), 4);
         assert_eq!(receipt.error(), None);
         // The runner re-stamps the owner, so the adapter's own stamp is dropped.
@@ -1387,7 +1486,13 @@ mod tests {
 
         host.inner_mut().accepts = 2;
         let token = host.begin_send(send_req(4));
-        let receipt = host_ready(host.poll_host(token, HostBuf::Send(&[0u8; 4])));
+        let receipt = host_ready(host.poll_host(
+            token,
+            HostBuf::Send {
+                bytes: &[0u8; 4],
+                bank: BankSide::Work,
+            },
+        ));
         assert_eq!(receipt.accepted(), 2, "short data phase stays short");
     }
 
@@ -1399,22 +1504,44 @@ mod tests {
         host.cancel(a);
         host.cancel(a);
         let mut buf = [0u8; 4];
-        assert!(is_host_contract(host_ready(
-            host.poll_host(a, HostBuf::Recv(&mut buf))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            a,
+            HostBuf::Recv {
+                buf: &mut buf,
+                bank: BankSide::Work
+            }
+        ))));
 
         let c = host.begin_recv(recv_req(4));
         assert!(c.is_valid());
         assert_ne!(c, a);
-        assert!(is_host_contract(host_ready(
-            host.poll_host(a, HostBuf::Recv(&mut buf))
-        )));
+        assert!(is_host_contract(host_ready(host.poll_host(
+            a,
+            HostBuf::Recv {
+                buf: &mut buf,
+                bank: BankSide::Work
+            }
+        ))));
         assert_eq!(
-            host_ready(host.poll_host(b, HostBuf::Recv(&mut buf))).error(),
+            host_ready(host.poll_host(
+                b,
+                HostBuf::Recv {
+                    buf: &mut buf,
+                    bank: BankSide::Work
+                }
+            ))
+            .error(),
             None
         );
         assert_eq!(
-            host_ready(host.poll_host(c, HostBuf::Recv(&mut buf))).error(),
+            host_ready(host.poll_host(
+                c,
+                HostBuf::Recv {
+                    buf: &mut buf,
+                    bank: BankSide::Work
+                }
+            ))
+            .error(),
             None
         );
         assert_eq!(host.inner().recv_calls, 2);
@@ -1423,7 +1550,14 @@ mod tests {
         let d = host.begin_recv(recv_req(4));
         host.cancel(host_token(d.index, a.tag));
         assert_eq!(
-            host_ready(host.poll_host(d, HostBuf::Recv(&mut buf))).error(),
+            host_ready(host.poll_host(
+                d,
+                HostBuf::Recv {
+                    buf: &mut buf,
+                    bank: BankSide::Work
+                }
+            ))
+            .error(),
             None
         );
     }

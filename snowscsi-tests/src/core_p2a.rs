@@ -153,7 +153,7 @@ impl SyncHost for TestHost {
     fn receive(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         let len = req.len as usize;
         match buf {
-            HostBuf::Recv(bytes) => {
+            HostBuf::Recv { buf: bytes, .. } => {
                 let accepted = self.recv_accepts.unwrap_or(len).min(len);
                 for byte in bytes[..accepted].iter_mut() {
                     *byte = 0xa5;
@@ -161,14 +161,14 @@ impl SyncHost for TestHost {
                 self.push(HostEvent::Recv(accepted));
                 HostReceipt::from_adapter(accepted, None)
             }
-            HostBuf::Send(_) => HostReceipt::from_adapter(0, Some(Fault::Contract)),
+            HostBuf::Send { .. } => HostReceipt::from_adapter(0, Some(Fault::Contract)),
         }
     }
 
     fn send(&mut self, req: HostReq, buf: HostBuf<'_>) -> HostReceipt {
         let len = req.len as usize;
         let accepted = self.read_accepts.unwrap_or(len).min(len);
-        if let HostBuf::Send(bytes) = buf {
+        if let HostBuf::Send { bytes, .. } = buf {
             let end = self.sent_len + accepted;
             if end <= self.sent_data.len() {
                 self.sent_data[self.sent_len..end].copy_from_slice(&bytes[..accepted]);
