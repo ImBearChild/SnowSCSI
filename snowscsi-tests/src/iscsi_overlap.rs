@@ -648,3 +648,89 @@ fn overlap_shell_does_not_defer_input_for_a_long_token() {
         "both TURs reached the wire: {itts:?}"
     );
 }
+
+// ── Timing probe: two banks on a copying wire ───────────────────────
+
+/// `PlaneSet` with an artificial per-operation delay. This models a slow
+/// backing store; the mock wire still copies into a `Vec`, so it is the
+/// analogue of a blocking TCP `write` (the caller's buffer is free as soon as
+/// the write returns).
+struct SlowStorage<'a> {
+    inner: PlaneSet<'a>,
+    delay: std::time::Duration,
+}
+
+impl Storage for SlowStorage<'_> {
+    fn select_lun(&mut self, lun: usize) {
+        self.inner.select_lun(lun);
+    }
+
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.inner.begin_exec(req)
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        std::thread::sleep(self.delay);
+        self.inner.poll_exec(token, buf)
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        self.inner.cancel(token);
+    }
+}
+
+fn measure_read(overlap: bool, delay: std::time::Duration) -> std::time::Duration {
+    const BLOCKS: u16 = 256; // 128 KiB at 512-byte blocks
+    const TOTAL: usize = BLOCKS as usize * 512;
+
+    let mut ram = vec![0u8; TOTAL];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(BLOCKS as u64, 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = SlowStorage {
+        inner: PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+        delay,
+    };
+
+    let mut session = if overlap {
+        IscsiSession::new().with_overlap()
+    } else {
+        IscsiSession::new()
+    };
+    let mut work = vec![0u8; if overlap { 2 * BANK } else { BANK }];
+    let mut scratch = Vec::new();
+    let mut conn = MockConn::new();
+    conn.feed_padded(&login_bhs(REQ_TEXT.len() as u32), REQ_TEXT.as_bytes());
+    conn.feed(&read10_bhs(0, BLOCKS, 7, 0), &[]);
+
+    let started = std::time::Instant::now();
+    drive(
+        &mut session,
+        &mut conn,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &mut Vec::new(),
+    );
+    started.elapsed()
+}
+
+/// Timing probe, ignored by default. The mock wire copies, so both modes are
+/// expected to be dominated by the storage delay; the two banks only help a
+/// transport that keeps the caller's buffer busy after `write` returns.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn measure_single_vs_overlap_on_a_copying_wire() {
+    let delay = std::time::Duration::from_millis(2);
+    // Warm up once so the allocator and the first-touch faults do not skew the
+    // comparison.
+    let _ = measure_read(false, std::time::Duration::ZERO);
+    let single = measure_read(false, delay);
+    let overlap = measure_read(true, delay);
+    println!("single-bank={single:?} overlap={overlap:?} (storage delay {delay:?}/read)");
+}
