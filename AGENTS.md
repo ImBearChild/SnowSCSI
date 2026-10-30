@@ -53,6 +53,23 @@ making changes. Crate names at a glance:
 - `snowscsi-tests` — integration tests (the only crate allowing `unsafe`)
 - `tools/` — not a workspace member: external Python black-box tests + helpers
 
+## LIB / CLI / examples boundary
+
+The library crates (`snowscsi-common`, `snowscsi-iso9660`, `snowscsi`) are
+**runtime-agnostic**: they must not depend on Tokio, embassy, a platform flash
+or file driver, an executor/waker, or `spawn_blocking`. They provide the
+poll/step core and the runtime-agnostic seams (`Storage`, `HostTransport`,
+`PendingKind`/`Action::StoragePending`, `AsyncWake`, `AsyncConn`,
+`serve_conn_async`, `serve_async`).
+
+Platform adapters belong to the application:
+
+- `snowscsi-cli` may own a runtime (e.g. Tokio), file/block I/O and the
+  `AsyncConn` / `Storage + AsyncWake` implementations for that runtime.
+- `examples/` own embassy USB, flash/DMA slot registration and board glue.
+
+They are not workspace members and must not be pulled into the library.
+
 ## Implementation Status
 
 | Component | Status |
@@ -94,12 +111,20 @@ git checkout legacy
   `cargo build -p snowscsi-common --no-default-features`.
   (Known gap: `cargo test -p snowscsi --no-default-features --features scsi`
   does not compile — unit tests use `Vec`/`String` without pulling in `std`.)
-- **Transport layer**: `Conn` trait = blanket impl of `embedded_io::Read + Write`.
-  BSD transport (`TcpStream`) behind `std` feature in `snowscsi::iscsi`.
-  USB MSC transport: `BotIo`/`Gadget` seams in `snowscsi::usb` — the
-  non-blocking `BotSession` core never does platform I/O; the Linux FunctionFS
-  bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives only in `snowscsi-cli`
-  under `cfg(target_os = "linux")`.
+- **Transport layer**: `Conn` = blanket `embedded_io::Read + Write`; `AsyncConn`
+  is the runtime-agnostic async mirror behind `async-io` and
+  `serve_conn_async` awaits both the connection and a `Storage + AsyncWake`
+  adapter. `serve_async` is the USB mirror. Neither implies a runtime; the
+  caller's executor drives them. USB MSC: `BotIo`/`Gadget` seams in
+  `snowscsi::usb` — the non-blocking `BotSession` core never does platform I/O;
+  the Linux FunctionFS bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives
+  only in `snowscsi-cli` under `cfg(target_os = "linux")`.
+- **Banks**: `work` is the command/data bank; an optional alternate bank holds
+  a prefetched Data-In chunk. An empty `scratch` shares the command bank with
+  the resident long operation; a non-empty one keeps the split long-op bank.
+  `--overlap` splits `work` into two equal banks (USB and iSCSI) and uses the
+  alternate for prefetch; `HostBuf` carries `BankSide` so a transport frames a
+  PDU in the bank that holds it. The core only ever sees bank-relative slices.
 - **Red lines**: `#![deny(unsafe_code)]` on `snowscsi-common`, `snowscsi-iso9660`
   and `snowscsi`; `snowscsi-cli` uses `#![forbid(unsafe_code)]`.
   `snowscsi-tests` is the only crate that allows `unsafe` (libiscsi FFI).
