@@ -14,26 +14,18 @@
 //!   PDT 0x00 / `cdrom()` read-only PDT 0x05, the former
 //!   `CDBlockDevice`). Constructors borrow the plane once for geometry;
 //!   the data phase hands the shell a `StoreOp`.
-//! - `luns`: [`Luns`] — a 1:1 bundle of device handles and store planes.
 //! - `iscsi_pdu`: iSCSI PDU (BHS) field codec (RFC 3720 §10.x).
 //! - `conn`: connection abstraction (`embedded_io::Read + Write`).
 //! - `iscsi_target`: iSCSI target session state machine (RFC 3720 §5/§10).
 //! - `transport`: BSD TCP transport (gated by `std`).
 
-#[cfg(feature = "async-io")]
-pub mod async_luns;
 pub mod backend;
 pub mod block;
 pub mod device;
 #[cfg(feature = "std")]
 pub mod fs_backend;
-pub mod luns;
 pub mod sbc;
 #[allow(clippy::module_inception)]
 pub mod scsi;
 pub mod spc;
 pub(crate) mod util;
-
-#[cfg(feature = "async-io")]
-pub use async_luns::AsyncLuns;
-pub use luns::Luns;

@@ -18,3 +18,10 @@ filesystem and formats the medium (FORMAT UNIT + its own UDF `mkfs`).
 | [`esp32p4-touch-lcd-35`](esp32p4-touch-lcd-35/) | **ESP32-P4** (RISC-V, dual-core) | **Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5** | ESP32-P4 (silicon rev ≥ v3.0 required; measured on v3.2) |
 | [`esp32s3-pocket-dongle`](esp32s3-pocket-dongle/) | **ESP32-S3** (Xtensa LX7, dual-core) | **Pocket-Dongle-S3** (AliExpress "ESP32-S3 0.96 LCD dongle", vendor repo [`ronenkr/Pocket-Dongle-S3`](https://github.com/ronenkr/Pocket-Dongle-S3)) | ESP32-S3 N16R8 (16 MB flash, 8 MB PSRAM, 512 KB SRAM) |
 
+
+## Legacy state
+
+These examples target the removed `scsi::Luns` / `scsi::AsyncLuns` bundles and
+the old `serve_async` signature. They are detached crates (not workspace
+members) and are kept for reference only; porting them to the core
+`Target`/bank model is a separate effort.
