@@ -26,8 +26,9 @@
 //! cannot interleave). The same host path may appear on several LUNs; each
 //! is an independent SCSI device with its own LBA semantics, so a dual-mount
 //! warning is printed to stderr. SIGINT / SIGTERM trigger a graceful
-//! shutdown: the blocking `accept()` is woken by a probe connection,
-//! `serve()` returns, and every store plane is `sync()`ed before exit.
+//! shutdown: the blocking `accept()` is woken by a probe connection, the async
+//! loop by a runtime notification, the serve call returns, and every store
+//! plane is `sync()`ed before exit.
 
 mod spec;
 mod stack;
@@ -51,6 +52,12 @@ use snowscsi::common::flat_bundle::FlatBundle;
 use snowscsi::common::fs_storage::OpenOptions;
 use snowscsi::core::{Lu, Spc, Writability};
 use snowscsi::iscsi::pdu::BHS_SIZE;
+#[cfg(feature = "tokio")]
+use snowscsi::iscsi::target::IscsiSession;
+#[cfg(feature = "tokio")]
+use snowscsi::iscsi::target::TargetError;
+#[cfg(feature = "tokio")]
+use snowscsi::iscsi::transport::serve_conn_async;
 use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
@@ -59,6 +66,8 @@ use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableSto
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
+#[cfg(feature = "tokio")]
+use stack::tokio_conn::TokioConn;
 use stack::worker::WorkerStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 
@@ -225,8 +234,9 @@ struct ServeArgs {
 
     /// Host transport execution: `blocking` (default) or `async`.
     ///
-    /// The asynchronous path is not implemented in this build, so `async` is
-    /// rejected before any listener is bound.
+    /// `async` runs the iSCSI accept and session loops on a Tokio runtime and
+    /// needs this build's `tokio` feature. USB has no asynchronous endpoint
+    /// adapter yet, so `--wire async --usb` is rejected before any setup.
     #[arg(long = "wire", value_name = "MODE", default_value = "blocking")]
     wire: Wire,
 
@@ -288,6 +298,7 @@ fn main() -> ExitCode {
 }
 
 /// Resolved serve configuration: the two switches plus the buffers they imply.
+#[derive(Debug)]
 struct ServeConfig {
     wire: Wire,
     banks: Banks,
@@ -314,8 +325,8 @@ impl ServeConfig {
     /// Storage execution model derived from the two switches.
     fn storage(&self) -> &'static str {
         match (self.wire, self.banks) {
-            (Wire::Blocking, Banks::Dual) => "worker",
-            _ => "inline",
+            (_, Banks::Dual) => "worker",
+            (_, Banks::Single) => "inline",
         }
     }
 
@@ -381,10 +392,17 @@ fn run_serve(args: ServeArgs) -> ExitCode {
 /// Resolve the two switches into a [`ServeConfig`], rejecting combinations the
 /// transports cannot honor.
 fn resolve_config(args: &ServeArgs) -> Result<ServeConfig, String> {
-    // The platform-side async transport adapters do not exist yet; fail before
-    // any bind or gadget setup, for either transport.
+    // The USB async endpoints are still blocking, so `async` is iSCSI-only.
+    if args.wire == Wire::Async && args.usb.is_some() {
+        return Err("async USB is not implemented; use --wire blocking".to_string());
+    }
+    // Without the Tokio binding there is no iSCSI async adapter in this build;
+    // fail before any listener is bound.
+    #[cfg(not(feature = "tokio"))]
     if args.wire == Wire::Async {
-        return Err("async wire is not implemented in this build".to_string());
+        return Err(
+            "async wire requires the `tokio` feature: rebuild with --features tokio".to_string(),
+        );
     }
     check_banks(args)?;
 
@@ -642,13 +660,28 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
     };
 
     let stop = Arc::new(AtomicBool::new(false));
+    // The blocking accept loop is woken by a probe connection; the async loop
+    // awaits a notification instead.
+    #[cfg(feature = "tokio")]
+    let shutdown: Option<Arc<tokio::sync::Notify>> =
+        (config.wire == Wire::Async).then(|| Arc::new(tokio::sync::Notify::new()));
+    let probe = (config.wire == Wire::Blocking)
+        .then(|| listener.local_addr().ok())
+        .flatten();
     {
         let stop = Arc::clone(&stop);
-        let probe = listener.local_addr().ok();
+        #[cfg(feature = "tokio")]
+        let shutdown = shutdown.clone();
         if let Err(e) = ctrlc::set_handler(move || {
             stop.store(true, Ordering::SeqCst);
             if let Some(addr) = probe {
                 let _ = std::net::TcpStream::connect(addr);
+            }
+            #[cfg(feature = "tokio")]
+            if let Some(shutdown) = shutdown.as_ref() {
+                // `notify_one` stores a permit when no waiter is registered,
+                // so a signal that lands between two `select!`s is not lost.
+                shutdown.notify_one();
             }
         }) {
             eprintln!("snowscsi: failed to install signal handler: {e}");
@@ -672,6 +705,41 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
     } else {
         None
     };
+
+    if config.wire == Wire::Async {
+        #[cfg(feature = "tokio")]
+        {
+            let res = serve_iscsi_async(
+                listener,
+                &stop,
+                shutdown.expect("async wire installs a shutdown signal"),
+                &mut work,
+                &mut scratch,
+                &mut table[..],
+                planes,
+                config,
+            );
+            if let Some(handle) = auto_handle {
+                stop.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+                teardown_iscsi_auto(bound);
+            }
+            return match res {
+                Ok(()) => {
+                    log::info!("shutting down");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("snowscsi: server error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            unreachable!("async wire is rejected during configuration");
+        }
+    }
 
     let serve_res = if config.overlap() {
         let per_bank = config.per_bank();
@@ -724,6 +792,154 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
 
     log::info!("shutting down");
     ExitCode::SUCCESS
+}
+
+/// `--wire async` iSCSI: serve one connection at a time on a Tokio runtime.
+///
+/// The storage backend is the same per-plane worker the blocking dual-bank
+/// mode uses (a scoped thread, because the planes borrow `'a` storage and are
+/// not `'static`, which rules out `spawn_blocking`). `--banks single` runs the
+/// inline adapter, which never pends.
+#[cfg(feature = "tokio")]
+#[allow(clippy::too_many_arguments)]
+fn serve_iscsi_async<'a>(
+    listener: TcpListener,
+    stop: &Arc<AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    table: &mut [&mut dyn Lu<Pair = CliPair>],
+    planes: Vec<Option<OwnedPlane<'a>>>,
+    config: &ServeConfig,
+) -> Result<(), TargetError> {
+    if let Err(e) = listener.set_nonblocking(true) {
+        log::error!("failed to make the listener non-blocking: {e}");
+        return Err(TargetError::Io);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            log::error!("failed to start the async runtime: {e}");
+            return Err(TargetError::Io);
+        }
+    };
+    // `from_std` registers the socket with the runtime's reactor, so it must
+    // run inside the runtime context.
+    let listener = {
+        let _guard = runtime.enter();
+        match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(e) => {
+                log::error!("failed to register the listener with the runtime: {e}");
+                return Err(TargetError::Io);
+            }
+        }
+    };
+
+    let per_bank = config.per_bank();
+    if config.overlap() {
+        std::thread::scope(|scope| {
+            let mut store = WorkerStore::new(scope, planes, per_bank);
+            let res = runtime.block_on(accept_loop(
+                &listener, stop, &shutdown, work, scratch, table, &mut store, true,
+            ));
+            if let Err((i, e)) = store.sync() {
+                eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+            }
+            res
+        })
+    } else {
+        let mut storage = CliStorage::new(planes);
+        let res = runtime.block_on(accept_loop(
+            &listener,
+            stop,
+            &shutdown,
+            work,
+            scratch,
+            table,
+            &mut storage,
+            false,
+        ));
+        if let Err((i, e)) = storage.sync() {
+            eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+        }
+        res
+    }
+}
+
+/// Serial accept loop on a Tokio listener, stopped by a notification.
+///
+/// A fresh [`IscsiSession`] (and a fresh core target over the same slots) is
+/// built per connection, exactly as the blocking loop does. One connection is
+/// served at a time: `Target` owns the mutable slot table.
+#[cfg(feature = "tokio")]
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop<W>(
+    listener: &tokio::net::TcpListener,
+    stop: &AtomicBool,
+    shutdown: &tokio::sync::Notify,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    table: &mut [&mut dyn Lu<Pair = CliPair>],
+    storage: &mut W,
+    overlap: bool,
+) -> Result<(), TargetError>
+where
+    W: snowscsi::core::storage::Storage + snowscsi::core::async_wake::AsyncWake,
+{
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let accepted = tokio::select! {
+            _ = shutdown.notified() => return Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                log::warn!("accept failed: {e}");
+                return Err(TargetError::Io);
+            }
+        };
+        log::info!("accepted connection from {peer}");
+        let mut conn = TokioConn::new(stream);
+        let mut session = if overlap {
+            IscsiSession::new().with_overlap()
+        } else {
+            IscsiSession::new()
+        };
+        let mut target = snowscsi::core::Target::new(&mut *table);
+        // A signal that arrived between accept and this select must not strand
+        // the connection: the `Notify` may already have fired.
+        if stop.load(Ordering::SeqCst) {
+            session.connection_lost();
+            let _ = target.settle_transport_end(&mut *storage, &mut session);
+            return Ok(());
+        }
+        tokio::select! {
+            r = serve_conn_async(
+                &mut conn,
+                work,
+                scratch,
+                &mut session,
+                &mut target,
+                &mut *storage,
+            ) => r?,
+            _ = shutdown.notified() => {
+                session.connection_lost();
+                let _ = target.settle_transport_end(&mut *storage, &mut session);
+                return Ok(());
+            }
+        }
+        log::info!("connection from {peer} ended");
+    }
 }
 
 // ── iSCSI auto-config (open-iscsi) ─────────────────────────────────────
@@ -2291,16 +2507,51 @@ mod tests {
     }
 
     #[test]
-    fn async_wire_is_rejected_before_binding() {
-        for transport in [vec!["--usb"], vec!["--iscsi", "127.0.0.1:0"]] {
-            let mut argv = vec!["--wire", "async"];
-            argv.extend(transport);
-            let args = parse_serve(&argv);
-            match resolve_config(&args) {
-                Ok(_) => panic!("async must be rejected"),
-                Err(err) => assert_eq!(err, "async wire is not implemented in this build"),
-            }
-        }
+    fn async_wire_rejects_usb_before_binding() {
+        // USB has no asynchronous endpoint adapter yet, so the combination is
+        // refused for both feature sets.
+        let args = parse_serve(&["--wire", "async", "--usb"]);
+        assert_eq!(
+            resolve_config(&args).unwrap_err(),
+            "async USB is not implemented; use --wire blocking"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn async_iscsi_resolves_and_prints_its_config() {
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--wire", "async"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(cfg.wire, Wire::Async);
+        assert_eq!(
+            cfg.line(1),
+            format!(
+                "wire=async banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+            )
+        );
+
+        let args = parse_serve(&[
+            "--iscsi",
+            "127.0.0.1:0",
+            "--wire",
+            "async",
+            "--banks",
+            "dual",
+        ]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(1),
+            "wire=async banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
+        );
+    }
+
+    #[cfg(not(feature = "tokio"))]
+    #[test]
+    fn async_without_the_tokio_feature_is_rejected() {
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--wire", "async"]);
+        let err = resolve_config(&args).expect_err("async needs the tokio binding");
+        assert!(err.contains("rebuild with --features tokio"), "{err}");
     }
 
     #[test]

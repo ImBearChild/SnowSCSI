@@ -35,6 +35,8 @@ use snowscsi::mmc::{DiscInfo, FlatCdMedium, MmcAttrs, MmcDrive, MmcMedium, MmcOp
 use snowscsi::scsi::backend::BlockBackend;
 use snowscsi::scsi::fs_backend::StdFsBackend;
 
+#[cfg(feature = "tokio")]
+pub mod tokio_conn;
 pub mod worker;
 
 /// Application backing handle: the CLI only needs an identity per LUN.
@@ -671,6 +673,15 @@ impl Storage for CliStorage<'_> {
                 self.pending = None;
             }
         }
+    }
+}
+
+/// Inline storage never pends, so an async shell waiting on it completes on
+/// the first poll (the same contract as the library's synchronous adapter).
+#[cfg(feature = "tokio")]
+impl snowscsi::core::async_wake::AsyncWake for CliStorage<'_> {
+    fn poll_wake(&mut self, _cx: &mut core::task::Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }
 

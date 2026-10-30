@@ -233,6 +233,28 @@ fn print_config_prints_one_line_and_exits() {
     );
 }
 
+/// `--print-config` reports the async wire without binding anything.
+#[cfg(feature = "tokio")]
+#[test]
+fn print_config_reports_the_async_wire() {
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:0",
+        "--wire",
+        "async",
+        "--print-config",
+    ]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        "wire=async banks=single storage=inline per_bank=1048576 work=1048576 scratch=0 lun=1"
+    );
+}
+
 #[test]
 fn serve_rejects_iscsi_dual_below_the_two_bank_floor() {
     // One byte below 2 × 8240 is refused before the portal is bound.
@@ -1051,6 +1073,96 @@ fn serve_warns_on_block_and_cdrom_dual_mount() {
     assert!(status.success(), "snowscsi should exit 0 after SIGINT");
 
     let _ = std::fs::remove_file(&img);
+}
+
+/// Start an async-wire server with `extra`, connect once, then SIGINT it.
+#[cfg(all(unix, feature = "tokio"))]
+fn run_async_serve_then_sigint(extra: &[&str]) {
+    use std::io::BufRead;
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut args = vec![
+        "serve",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:0",
+        "--wire",
+        "async",
+    ];
+    args.extend_from_slice(extra);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowscsi");
+
+    // The listening line carries the ephemeral portal: `listening on ADDR with
+    // …`. Report the address once the server is ready.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    {
+        let stderr = child.stderr.take().expect("child stderr");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if let Some(rest) = line.split("listening on ").nth(1) {
+                    let addr = rest.split_whitespace().next().and_then(|a| a.parse().ok());
+                    if let Some(addr) = addr {
+                        let _ = ready_tx.send(addr);
+                        return;
+                    }
+                }
+                line.clear();
+            }
+        });
+    }
+
+    let addr: SocketAddr = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(child.id().to_string())
+                .status();
+            let _ = child.wait();
+            panic!("snowscsi did not announce 'listening' for the async wire");
+        });
+
+    // Open a connection and leave it idle: the server parks in the session
+    // loop (or the accept loop) until the signal arrives.
+    let conn = TcpStream::connect(addr).expect("connect to the async portal");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let sent = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(sent, "kill -INT failed");
+
+    let status = child.wait().expect("wait for snowscsi");
+    assert!(
+        status.success(),
+        "the async wire should exit 0 after SIGINT for {args:?}, got {status:?}"
+    );
+    drop(conn);
+}
+
+/// `--wire async` binds, accepts a TCP connection and shuts down cleanly on
+/// SIGINT. The async accept loop is stopped by a notification rather than the
+/// blocking path's probe connection; both storage models are exercised.
+#[cfg(all(unix, feature = "tokio"))]
+#[test]
+fn serve_async_wire_accepts_and_exits_cleanly_on_sigint() {
+    for extra in [&[][..], &["--banks", "dual"][..]] {
+        run_async_serve_then_sigint(extra);
+    }
 }
 
 /// The same file path as both `--block img=` and

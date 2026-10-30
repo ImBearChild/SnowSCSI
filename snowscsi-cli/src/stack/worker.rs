@@ -17,9 +17,11 @@
 //! stays `Pending` until the buffer returns and its own token is polled again.
 //! Writes wait in the table until the caller supplies their data.
 
-use core::task::Poll;
+use core::task::{Context, Poll, Waker};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::Scope;
 
 use snowscsi::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
@@ -73,6 +75,45 @@ struct Slot {
     staged: Option<Vec<u8>>,
 }
 
+/// Completion signal shared between a plane's slot table and its worker.
+///
+/// The worker records progress before waking, so a completion that lands
+/// between the registration and the check in [`WorkerPlane::poll_wake`] is
+/// still reported as [`Poll::Ready`].
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+struct WorkerWake {
+    progressed: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+impl WorkerWake {
+    fn new() -> Self {
+        Self {
+            progressed: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Store the task to wake on the next completion.
+    fn register(&self, waker: &Waker) {
+        *self.waker.lock().unwrap() = Some(waker.clone());
+    }
+
+    /// Record that the worker posted a result and wake the registered task.
+    fn notify(&self) {
+        self.progressed.store(true, Ordering::SeqCst);
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn take_progress(&self) -> bool {
+        self.progressed.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// One LUN's worker channel plus the slot table the caller addresses.
 struct WorkerPlane {
     slots: [Option<Slot>; SLOTS],
@@ -82,10 +123,12 @@ struct WorkerPlane {
     /// `None` while the buffer is on the worker thread.
     buf: Option<Vec<u8>>,
     per_bank: usize,
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    wake: Arc<WorkerWake>,
 }
 
 impl WorkerPlane {
-    fn new(tx: Sender<Job>, rx: Receiver<Done>, per_bank: usize) -> Self {
+    fn new(tx: Sender<Job>, rx: Receiver<Done>, per_bank: usize, wake: Arc<WorkerWake>) -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
             tx,
@@ -93,6 +136,7 @@ impl WorkerPlane {
             next_tag: 1,
             buf: Some(vec![0u8; per_bank]),
             per_bank,
+            wake,
         }
     }
 
@@ -280,6 +324,34 @@ impl WorkerPlane {
         }
     }
 
+    /// Register a waker and report whether this plane can make progress.
+    ///
+    /// The waker is registered *before* the completion check: a `Done` posted
+    /// in between is either collected by the drain or wakes the fresh waker.
+    /// `Ready` means a job settled (its receipt is waiting in the slot table)
+    /// or nothing is running, so the caller must poll its token to advance.
+    /// `Done` is never consumed here beyond moving it into the slot table.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    fn poll_wake(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.wake.register(cx.waker());
+        self.drain();
+        let settled = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.state == SlotState::Settled);
+        let running = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.state == SlotState::Running);
+        if self.wake.take_progress() || settled || !running {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     /// Wait for any in-flight job so the staging buffer is back, then run one
     /// `Sync` on the plane.
     fn sync(&mut self) -> Result<(), StorageError> {
@@ -361,8 +433,10 @@ impl WorkerStore {
             };
             let (job_tx, job_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
-            scope.spawn(move || worker_loop(plane, job_rx, done_tx));
-            workers.push(Some(WorkerPlane::new(job_tx, done_rx, per_bank)));
+            let wake = Arc::new(WorkerWake::new());
+            let worker_wake = Arc::clone(&wake);
+            scope.spawn(move || worker_loop(plane, job_rx, done_tx, worker_wake));
+            workers.push(Some(WorkerPlane::new(job_tx, done_rx, per_bank, wake)));
         }
         Self {
             planes: workers,
@@ -382,7 +456,12 @@ impl WorkerStore {
 }
 
 /// Worker thread: execute jobs until the store is dropped.
-fn worker_loop(mut plane: OwnedPlane<'_>, jobs: Receiver<Job>, done: Sender<Done>) {
+fn worker_loop(
+    mut plane: OwnedPlane<'_>,
+    jobs: Receiver<Job>,
+    done: Sender<Done>,
+    wake: Arc<WorkerWake>,
+) {
     while let Ok(job) = jobs.recv() {
         let mut buf = job.buf;
         let len = job.req.len as usize;
@@ -401,6 +480,7 @@ fn worker_loop(mut plane: OwnedPlane<'_>, jobs: Receiver<Job>, done: Sender<Done
         {
             return;
         }
+        wake.notify();
     }
 }
 
@@ -428,6 +508,18 @@ impl Storage for WorkerStore {
             if let Some(index) = plane.find(token) {
                 plane.release(index);
             }
+        }
+    }
+}
+
+/// The async shell waits on the plane the runner selected last; a LUN without
+/// a plane has nothing left to wait for.
+#[cfg(feature = "tokio")]
+impl snowscsi::core::async_wake::AsyncWake for WorkerStore {
+    fn poll_wake(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self.planes.get_mut(self.lun).and_then(Option::as_mut) {
+            Some(plane) => plane.poll_wake(cx),
+            None => Poll::Ready(()),
         }
     }
 }
@@ -600,6 +692,84 @@ mod tests {
             assert_eq!(poll_read(&mut store, a, &mut a_out), StorageReceipt::ok(4));
             let mut b_out = [0u8; 4];
             assert_eq!(poll_read(&mut store, b, &mut b_out), StorageReceipt::ok(4));
+
+            assert!(store.sync().is_ok());
+        });
+    }
+
+    /// Waker that records that it was woken.
+    #[cfg(feature = "tokio")]
+    struct FlagWake(Arc<AtomicBool>);
+
+    #[cfg(feature = "tokio")]
+    impl std::task::Wake for FlagWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Poll `future` with `cx` until it completes. No runtime and no `unsafe`.
+    #[cfg(feature = "tokio")]
+    fn block_on<F: core::future::Future>(future: F, cx: &mut Context<'_>) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(out) = future.as_mut().poll(cx) {
+                return out;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn poll_wake_wakes_the_registered_task_and_reports_a_settled_read() {
+        use snowscsi::core::async_wake::{wait, AsyncWake};
+        use std::task::Waker;
+
+        let mut ram = vec![0u8; 4096];
+        ram[..4].copy_from_slice(b"disk");
+        std::thread::scope(|scope| {
+            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let mut store = WorkerStore::new(scope, vec![Some(plane)], 1024);
+
+            let woken = Arc::new(AtomicBool::new(false));
+            let waker = Waker::from(Arc::new(FlagWake(Arc::clone(&woken))));
+            let mut cx = Context::from_waker(&waker);
+
+            // Park a waker before the job exists: an immediate RAM read must
+            // still be observed through `wake`, not only through the drain.
+            assert!(
+                store.poll_wake(&mut cx).is_ready(),
+                "no job is running, so the plane must report progress"
+            );
+
+            let token = store.begin_exec(read_req(0, 4));
+            assert_ne!(token, invalid());
+
+            // Await the adapter exactly as the async shell does.
+            block_on(wait(&mut store), &mut cx);
+            // `wait` may return because the drain already saw `Done`, a moment
+            // before the worker reaches `notify`. Give that wake a bounded wait
+            // instead of assuming the two are ordered.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !woken.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                woken.load(Ordering::SeqCst),
+                "the worker must wake the registered waker after posting Done"
+            );
+
+            let mut out = [0u8; 4];
+            assert_eq!(
+                poll_read(&mut store, token, &mut out),
+                StorageReceipt::ok(4)
+            );
+            assert_eq!(&out, b"disk");
 
             assert!(store.sync().is_ok());
         });

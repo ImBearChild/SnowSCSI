@@ -23,7 +23,7 @@ doc = false
 [features]
 default = ["full"]
 full = ["std", "scsi", "iscsi", "dvdram", "cdrom", "livefs", "usb", "bundle", "log",
-        "dep:clap", "dep:ctrlc", "dep:env_logger"]
+        "tokio", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 std = ["snowscsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 scsi = ["snowscsi/scsi"]
 dvdram = ["snowscsi/dvdram"]
@@ -34,6 +34,10 @@ usb = ["snowscsi/usb"]
 bundle = ["snowscsi/bundle"]
 log = ["snowscsi/log", "dep:log"]
 defmt = ["snowscsi/defmt"]
+# Tokio binding for the runtime-agnostic async seams (`--wire async`). The
+# library only provides the traits; this feature supplies the platform
+# adapters and the multi-threaded executor.
+tokio = ["dep:tokio", "snowscsi/async-io"]
 
 [dependencies]
 snowscsi.workspace = true
@@ -43,6 +47,7 @@ env_logger = { version = "0.11", optional = true }
 log = { workspace = true, optional = true }
 embedded-io.workspace = true
 heapless.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "signal", "macros"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 usb-gadget = "1.1"
