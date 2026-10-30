@@ -131,8 +131,10 @@ where
 /// the long-operation bank, and an **empty** `scratch` selects the shared
 /// bank: the loop drives the long operation one `Tick` step per turn and
 /// defers bulk and control input while its token is in flight (at most one
-/// long-operation chunk). `target` owns the LUN slots and `storage` executes
-/// the device's storage operations.
+/// long-operation chunk). An overlap session keeps both banks inside `work`,
+/// so the long operation takes the bank the command is not using and input is
+/// **not** deferred. `target` owns the LUN slots and `storage` executes the
+/// device's storage operations.
 ///
 /// `Action::StallBoth` (invalid CBW) STALLs both endpoints and keeps receiving:
 /// the core has already returned to the Command phase and a new CBW clears the
@@ -187,7 +189,10 @@ where
     // is "nothing new" (a stall, a receive timeout) carries `Tick` and the
     // next `poll` re-emits the pending action.
     let mut ev = Event::Tick;
-    let shared = scratch.is_empty();
+    // Overlap sessions keep both banks inside `work`; the session allocates the
+    // free one to a resident long operation, so input is never deferred for a
+    // long token. Shared mode still owns `work` while the token is in flight.
+    let shared = scratch.is_empty() && !session.overlap();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());

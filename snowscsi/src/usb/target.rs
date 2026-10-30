@@ -398,6 +398,10 @@ pub struct BotSession {
     overlap: bool,
     /// Bank holding command framing and Data-Out for the active command.
     cmd_bank: BankSide,
+    /// Alternate bank available to the current command (overlap only).
+    cmd_alt: Option<BankSide>,
+    /// Whether the command bank choice was emitted for this CBW boundary.
+    cmd_selected: bool,
     /// CBW tag / declared host length / direction of the active transaction.
     tag: u32,
     declared: u64,
@@ -414,6 +418,8 @@ pub struct BotSession {
     gate: Gate,
     /// LUN whose resident long operation the idle entries advance.
     long_lun: Option<usize>,
+    /// Bank held by the resident long operation while its token is in flight.
+    long_bank: Option<BankSide>,
 }
 
 impl Default for BotSession {
@@ -444,6 +450,8 @@ impl BotSession {
             shortfall: ShortfallPolicy::default(),
             overlap: false,
             cmd_bank: BankSide::Work,
+            cmd_alt: None,
+            cmd_selected: false,
             tag: 0,
             declared: 0,
             host_dir: BotDir::DataOut,
@@ -453,6 +461,7 @@ impl BotSession {
             delivery: Delivery::NotApplicable,
             gate: Gate::EMPTY,
             long_lun: None,
+            long_bank: None,
         }
     }
 
@@ -518,6 +527,13 @@ impl BotSession {
         self.overlap
     }
 
+    /// The bank currently held by the resident long operation, if its storage
+    /// token is in flight. `None` when no long token is pending or the session
+    /// is not in overlap mode.
+    pub fn long_bank(&self) -> Option<BankSide> {
+        self.long_bank
+    }
+
     /// Get Max LUN answer value (`num_luns - 1`, ≤ 15). The LUN count is
     /// refreshed from the target on every [`poll`](Self::poll) entry. Pure
     /// getter (no state change).
@@ -548,12 +564,17 @@ impl BotSession {
         self.bank_base(work_len, self.cmd_bank)
     }
 
-    /// The bank that is not the command bank.
-    fn alternate_bank(&self) -> BankSide {
-        match self.cmd_bank {
+    /// The other one of the two banks.
+    const fn other_bank(bank: BankSide) -> BankSide {
+        match bank {
             BankSide::Work => BankSide::Alt,
             BankSide::Alt => BankSide::Work,
         }
+    }
+
+    /// The bank that is not the command bank.
+    fn alternate_bank(&self) -> BankSide {
+        Self::other_bank(self.cmd_bank)
     }
 
     /// Map a runner-side bank (relative to the `work`/`alt` arguments) to the
@@ -570,6 +591,10 @@ impl BotSession {
     }
 
     /// Split `work` into the command bank and the alternate bank.
+    ///
+    /// The alternate is empty when the resident long operation holds the other
+    /// bank: a command then gets exactly one bank and never prefetches into a
+    /// bank whose storage token is still live.
     fn banks<'w>(&self, work: &'w mut [u8]) -> (&'w mut [u8], &'w mut [u8]) {
         if !self.overlap {
             return (work, &mut []);
@@ -577,16 +602,52 @@ impl BotSession {
         let half = work.len() / 2;
         let (first, second) = work.split_at_mut(half);
         match self.cmd_bank {
-            BankSide::Work => (first, second),
-            BankSide::Alt => (second, first),
+            BankSide::Work => match self.cmd_alt {
+                Some(BankSide::Alt) => (first, second),
+                _ => (first, &mut []),
+            },
+            BankSide::Alt => match self.cmd_alt {
+                Some(BankSide::Work) => (second, first),
+                _ => (second, &mut []),
+            },
         }
     }
 
-    /// The command bank is fixed for a transaction and chosen when the command
-    /// boundary is emitted. Overlap mode does not advance a resident long
-    /// operation in this path, so the first bank is always available.
+    /// Fix the command bank for the transaction beginning at this boundary.
+    ///
+    /// A resident long operation with an in-flight token holds one bank; the
+    /// command then gets the other bank and no alternate. With no token pending
+    /// the command gets bank A and bank B as its alternate.
     fn choose_command_bank(&mut self) {
-        self.cmd_bank = BankSide::Work;
+        if !self.overlap {
+            self.cmd_bank = BankSide::Work;
+            self.cmd_alt = None;
+            return;
+        }
+        match self.long_bank {
+            Some(long) => {
+                self.cmd_bank = Self::other_bank(long);
+                self.cmd_alt = None;
+            }
+            None => {
+                self.cmd_bank = BankSide::Work;
+                self.cmd_alt = Some(BankSide::Alt);
+            }
+        }
+    }
+
+    /// Keep an already-emitted command boundary consistent with the long
+    /// operation's bank: it loses its alternate when the long token takes that
+    /// bank and regains it once the token has settled.
+    fn refresh_command_alt(&mut self) {
+        if !self.overlap || !self.cmd_selected || self.cmd_active {
+            return;
+        }
+        self.cmd_alt = if self.long_bank.is_some() {
+            None
+        } else {
+            Some(self.alternate_bank())
+        };
     }
 
     // ── Poll interface (non-blocking state machine) ───────────────
@@ -615,21 +676,37 @@ impl BotSession {
             return Action::Error(BotTargetError::WorkBufTooSmall);
         }
         self.num_luns = target.slot_count().clamp(1, 16) as u8;
+        if self.overlap && !target.long_io_in_flight() {
+            self.long_bank = None;
+            self.refresh_command_alt();
+        }
 
         // Every entry that starts at a command boundary advances the resident
         // long operation once: one poll per entry. With an empty `scratch` the
         // long operation shares `work` with the wire, so it may only advance on
         // a `Tick` entry: a `HostRecv`/`HostSent` entry may hold a staged
-        // CBW/response in that buffer. Overlap mode reserves both banks for the
-        // command and does not advance a resident long operation.
+        // CBW/response in that buffer. Overlap mode gives the long operation
+        // one of the two banks and only advances it on a `Tick` at the command
+        // boundary.
         let shared = scratch.is_empty() && !self.overlap;
-        if !self.overlap
-            && !self.cmd_active
-            && matches!(self.stage, Stage::Command { .. })
-            && (!shared || matches!(ev, Event::Tick))
-            && self.idle_entry(work, scratch, target, storage)
-        {
-            return Action::Error(BotTargetError::Io);
+        if !self.cmd_active && matches!(self.stage, Stage::Command { .. }) {
+            let advance_long = if self.overlap {
+                matches!(ev, Event::Tick)
+            } else {
+                !shared || matches!(ev, Event::Tick)
+            };
+            let ended = if advance_long {
+                if self.overlap {
+                    self.overlap_idle_entry(work, target, storage)
+                } else {
+                    self.idle_entry(work, scratch, target, storage)
+                }
+            } else {
+                false
+            };
+            if ended {
+                return Action::Error(BotTargetError::Io);
+            }
         }
 
         match ev {
@@ -723,6 +800,59 @@ impl BotSession {
         matches!(target.tick(), RunOutcome::Ended { .. })
     }
 
+    /// Overlap-mode long entry: lend the resident long operation one bank of
+    /// `work` (the bank opposite the command bank) and keep using that same
+    /// bank while its storage token is in flight.
+    fn overlap_idle_entry<S: RuntimeSet>(
+        &mut self,
+        work: &mut [u8],
+        target: &mut Target<S>,
+        storage: &mut dyn Storage,
+    ) -> bool {
+        if let Some(lun) = self.long_lun {
+            let bank = match self.long_bank {
+                Some(bank) => bank,
+                // A live token must never be re-borrowed from a guessed bank.
+                None if target.long_io_in_flight() => {
+                    return matches!(target.tick(), RunOutcome::Ended { .. });
+                }
+                None => self.alternate_bank(),
+            };
+            let half = work.len() / 2;
+            let (first, second) = work.split_at_mut(half);
+            let long = match bank {
+                BankSide::Work => first,
+                BankSide::Alt => second,
+            };
+            let mut empty = [0u8; 0];
+            match target.poll_long_entry_rt(lun, storage, &mut empty, long) {
+                Ok(info) => {
+                    if matches!(info.phase, LongPhase::Foreground | LongPhase::Background) {
+                        self.long_bank = target.long_io_in_flight().then_some(bank);
+                        self.refresh_command_alt();
+                    } else {
+                        self.long_lun = None;
+                        self.long_bank = None;
+                        self.refresh_command_alt();
+                        if info.phase == LongPhase::Settled && info.error.is_none() {
+                            // The medium changed under the host: report it on
+                            // the next reporting command, like the device's
+                            // own post-format unit attention.
+                            let _ = target.raise_ua_rt(lun, UaClass::MediumChanged);
+                        }
+                    }
+                }
+                Err(fault) => {
+                    self.long_lun = None;
+                    self.long_bank = None;
+                    self.refresh_command_alt();
+                    target.fatal(fault);
+                }
+            }
+        }
+        matches!(target.tick(), RunOutcome::Ended { .. })
+    }
+
     fn on_sent<'a, S: RuntimeSet>(
         &'a mut self,
         work: &'a mut [u8],
@@ -797,6 +927,7 @@ impl BotSession {
             Stage::Csw => {
                 self.stage = Stage::Command { got: 0 };
                 self.cmd_active = false;
+                self.cmd_selected = false;
                 self.delivery = Delivery::Complete;
                 self.phase = Phase::Idle;
                 self.pending(work)
@@ -972,6 +1103,7 @@ impl BotSession {
                 // CLEAR_FEATURE(ENDPOINT_HALT) is handled by the USB core;
                 // the next CBW arriving means the halt is clear.
                 self.stage = Stage::Command { got: 0 };
+                self.cmd_selected = false;
                 Action::StallBoth
             }
             Some(cbw) => {
@@ -1437,6 +1569,7 @@ impl BotSession {
         self.stage = Stage::Command { got: 0 };
         self.phase = Phase::Idle;
         self.cmd_active = false;
+        self.cmd_selected = false;
         self.gate = Gate::EMPTY;
         self.delivery = Delivery::NotApplicable;
     }
@@ -1469,8 +1602,10 @@ impl BotSession {
     fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
         // A new command boundary fixes the command bank before the first CBW
         // byte is requested; the rest of the transaction reuses it.
-        if !self.cmd_active && matches!(self.stage, Stage::Command { got: 0 }) {
+        if !self.cmd_active && matches!(self.stage, Stage::Command { got: 0 }) && !self.cmd_selected
+        {
             self.choose_command_bank();
+            self.cmd_selected = true;
         }
         let bank_len = self.bank_len(work.len());
         let cmd_base = self.cmd_base(work.len());

@@ -12,8 +12,8 @@
 use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowscsi::common::store::{StoreOp, StorePlane};
-use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-use snowscsi::core::{Lu, RuntimeSet, Target};
+use snowscsi::core::storage::{BankSide, IoBuf, IoReq, IoToken, Storage, StorageReceipt};
+use snowscsi::core::{LongPhase, Lu, RuntimeSet, Target};
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
     serve, Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
@@ -106,7 +106,7 @@ fn next_step<S: RuntimeSet>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<S>,
-    storage: &mut PlaneSet<'_>,
+    storage: &mut dyn Storage,
     io: &mut MockBotIo,
 ) -> Step {
     match session.poll(ev, work, scratch, target, storage) {
@@ -131,7 +131,7 @@ fn drive_until_done<S: RuntimeSet>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<S>,
-    storage: &mut PlaneSet<'_>,
+    storage: &mut dyn Storage,
 ) -> Drive {
     let mut ev = Event::Tick;
     let mut csw_sent = false;
@@ -2669,7 +2669,7 @@ fn two_bank_next<S: RuntimeSet>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<S>,
-    storage: &mut PlaneSet<'_>,
+    storage: &mut dyn Storage,
     io: &mut MockBotIo,
 ) -> TwoBankStep {
     match session.poll(ev, work, scratch, target, storage) {
@@ -2951,4 +2951,300 @@ fn overlap_rejects_odd_total_and_short_bank() {
         } => {}
         other => panic!("expected the command boundary after valid sizes, got {other:?}"),
     }
+}
+
+// ── Long-operation bank lending ─────────────────────────────────────
+
+/// Routes LUN 0 to the resident long operation's storage plane and every other
+/// LUN to the command plane, so both may hold a token at the same time.
+struct SplitLunPlan<'a> {
+    long: PlaneSet<'a>,
+    command: PlaneSet<'a>,
+    lun: usize,
+}
+
+impl Storage for SplitLunPlan<'_> {
+    fn select_lun(&mut self, lun: usize) {
+        self.lun = lun;
+        self.long.select_lun(0);
+        self.command.select_lun(0);
+    }
+
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        if self.lun == 0 {
+            self.long.begin_exec(req)
+        } else {
+            self.command.begin_exec(req)
+        }
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        if self.lun == 0 {
+            self.long.poll_exec(token, buf)
+        } else {
+            self.command.poll_exec(token, buf)
+        }
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        if self.lun == 0 {
+            self.long.cancel(token);
+        } else {
+            self.command.cancel(token);
+        }
+    }
+}
+
+/// Overlap mode does not defer the TUR: the shell reads its CBW while the
+/// FORMAT zero-fill token is still in flight, the TUR completes, and the fill
+/// settles byte-exactly.
+#[test]
+fn overlap_long_token_does_not_defer_the_tur() {
+    let mut ram = vec![0xEEu8; 64 * 1024];
+    let out = Arc::new(Mutex::new(VecDeque::new()));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let fill_done = Arc::new(AtomicBool::new(false));
+    let violated = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut params = [0u8; 12];
+    params[1] = 0x02; // Immed
+    params[2..4].copy_from_slice(&8u16.to_be_bytes());
+    params[8] = 0x00; // Format Type 0 (full format)
+    let tur = raw_cbw(TUR_TAG, 0, 0x80, 0, &[0x00, 0, 0, 0, 0, 0]);
+    {
+        let mut q = out.lock().unwrap();
+        q.extend(raw_cbw(FORMAT_TAG, 12, 0x00, 0, &[0x04, 0x11, 0, 0, 0, 0]));
+        q.extend(params);
+    }
+
+    let mut io = SharedBankIo {
+        out: Arc::clone(&out),
+        in_: Vec::new(),
+        in_flight: Arc::clone(&in_flight),
+        fill_done: Arc::clone(&fill_done),
+        violated: Arc::clone(&violated),
+        stop_tag: TUR_TAG,
+        need_fill_done: true,
+        saw_close_csw: false,
+        stop: Arc::clone(&stop),
+    };
+    let mut gadget = MockGadget::new();
+    let mut session = BotSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * snowscsi::MIN_DATA_LEN];
+    let mut scratch = Vec::new();
+
+    let mut slots = [TestLu::dvdram(1, 0)];
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    {
+        let mut backend = RamBackend::new(&mut ram);
+        let mut storage = SharedPlan {
+            inner: PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+            out: Arc::clone(&out),
+            in_flight: Arc::clone(&in_flight),
+            fill_done: Arc::clone(&fill_done),
+            inject: Some(tur.to_vec()),
+        };
+        let result = serve(
+            &mut io,
+            &mut gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &stop,
+        );
+        assert_eq!(result, Ok(()), "the scripted host ends the session");
+    }
+
+    assert!(
+        violated.load(Ordering::SeqCst),
+        "the overlap shell must read the TUR CBW while the long token is in flight"
+    );
+    assert!(io.saw_close_csw, "the TUR was serviced");
+    assert!(
+        session.long_bank().is_none(),
+        "the settled fill released its bank"
+    );
+    assert!(
+        ram[..2048].iter().all(|b| *b == 0),
+        "the FORMAT fill is byte-exact"
+    );
+}
+
+/// While the long token holds bank B, a READ on another LUN gets bank A only:
+/// it completes byte-exactly and never stages a prefetch into B.
+#[test]
+fn overlap_one_bank_read_never_uses_the_long_bank() {
+    const BANK: usize = 8192;
+    const BLOCKS: u16 = 32; // 16 KiB = two bank-sized chunks
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const FORMAT_TAG_LOCAL: u32 = 0x81;
+    const READ_TAG: u32 = 0x82;
+
+    let mut long_ram = vec![0xEEu8; 64 * 1024];
+    let mut cmd_ram = vec![0u8; TOTAL];
+    for (i, b) in cmd_ram.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected = cmd_ram.clone();
+    let mut long_backend = RamBackend::new(&mut long_ram);
+    let mut cmd_backend = RamBackend::new(&mut cmd_ram);
+    let long = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut long_backend))]).with_pending(1);
+    let command = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut cmd_backend))]);
+    let mut storage = SplitLunPlan {
+        long,
+        command,
+        lun: 0,
+    };
+
+    let mut slots = [TestLu::dvdram(1, 0), TestLu::block(128, 512, 1)];
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * BANK];
+    let mut scratch = Vec::new();
+    let mut io = MockBotIo::new();
+
+    // Arm the resident FORMAT fill (Immed=1).
+    let mut params = [0u8; 12];
+    params[1] = 0x02;
+    params[2..4].copy_from_slice(&8u16.to_be_bytes());
+    io.feed_out(&raw_cbw(
+        FORMAT_TAG_LOCAL,
+        12,
+        0x00,
+        0,
+        &[0x04, 0x11, 0, 0, 0, 0],
+    ));
+    io.feed_out(&params);
+    assert_eq!(
+        drive_until_done(
+            &mut s,
+            &mut io,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        ),
+        Drive::Processed
+    );
+    io.take_sent();
+
+    // The first Tick starts the fill token on the bank opposite the command.
+    let (cbw_offset, cbw_len) = match s.poll(
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostRecv {
+            offset,
+            len,
+            probe: false,
+        } => (offset, len),
+        other => panic!("expected the command boundary, got {other:?}"),
+    };
+    assert_eq!(s.long_bank(), Some(BankSide::Alt));
+    assert_eq!(cbw_offset, 0, "the CBW stays in the command bank");
+
+    // READ LUN 1 while the long token still holds the alternate bank.
+    let read_cbw = raw_cbw(READ_TAG, TOTAL as u32, 0x80, 1, &rw10(0x28, 0, BLOCKS));
+    io.feed_out(&read_cbw);
+    let n = io
+        .try_recv_out(&mut work[cbw_offset..cbw_offset + cbw_len])
+        .unwrap();
+    let work_start = work.as_ptr() as usize;
+    let mut data_sends = 0;
+    let mut csw_sent = false;
+    let mut ev = Event::HostRecv { len: n };
+    loop {
+        match two_bank_next(
+            &mut s,
+            ev,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &mut io,
+        ) {
+            TwoBankStep::Recv { offset, len, probe } => {
+                if csw_sent && len == CBW_LEN && !probe {
+                    break;
+                }
+                if probe {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
+                        Ok(n) => ev = Event::HostRecv { len: n },
+                        Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
+                        Err(_) => panic!("mock bulk-OUT I/O error"),
+                    }
+                } else {
+                    let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+                    ev = Event::HostRecv { len: n };
+                }
+            }
+            TwoBankStep::Sent { start, end, is_csw } => {
+                if start >= work_start && end <= work_start + work.len() {
+                    assert!(
+                        end <= work_start + BANK,
+                        "a one-bank READ staged into the long operation's bank"
+                    );
+                    data_sends += 1;
+                } else {
+                    assert!(is_csw, "a HostSend outside work must be the CSW");
+                }
+                if is_csw {
+                    csw_sent = true;
+                }
+                ev = Event::HostSent;
+            }
+            TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
+            TwoBankStep::StallIn => panic!("unexpected StallIn"),
+        }
+    }
+
+    assert_eq!(data_sends, TOTAL / BANK, "one send per bank-sized chunk");
+    assert_eq!(
+        s.long_bank(),
+        Some(BankSide::Alt),
+        "the long token must still be in flight"
+    );
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), TOTAL + CSW_LEN);
+    assert_eq!(&sent[..TOTAL], expected.as_slice(), "byte-exact READ");
+    assert_eq!(csw_fields(&sent), (READ_TAG, 0, 0x00), "zero residue");
+
+    // Tick the resident fill to completion; its bank is then released.
+    for _ in 0..64 {
+        let _ = s.poll(
+            Event::Tick,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        );
+        if matches!(
+            target.snapshot_rt(0).map(|info| info.long.phase),
+            Ok(LongPhase::Settled)
+        ) {
+            break;
+        }
+    }
+    assert!(matches!(
+        target.snapshot_rt(0).map(|info| info.long.phase),
+        Ok(LongPhase::Settled)
+    ));
+    assert!(
+        s.long_bank().is_none(),
+        "the long bank clears when the operation settles"
+    );
+    let mut check = vec![0u8; 64 * 1024];
+    plane_read(&mut storage.long, 0, &mut check);
+    assert!(
+        check[..2048].iter().all(|&b| b == 0),
+        "the FORMAT fill is byte-exact"
+    );
 }
