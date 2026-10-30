@@ -11,8 +11,9 @@
 //! BHS, then the remainder — AHS + data segment + padding), driven by the
 //! [`Action::HostRecv`] offset/length pairs, so a shell carries no protocol
 //! knowledge. The AHS/data bytes are placed where the SCSI layer needs them:
-//! the BHS at `work[0..48]`, a Data-Out segment at its final offset inside the
-//! command's data area.
+//! the BHS at `work[base..base + 48]`, a Data-Out segment at its final offset
+//! inside the command's data area, where `base` is the PDU bank offset of the
+//! session.
 //!
 //! SCSI command execution is delegated to the core [`Target`]: the session
 //! builds the [`CommandContext`] from the wire, starts the command and drives
@@ -31,12 +32,12 @@
 //! # Work-buffer contract
 //!
 //! `work` is the wire/PDU bank: `work.len() >= crate::MIN_DATA_LEN +
-//! pdu::BHS_SIZE`. The leading [`pdu::BHS_SIZE`] bytes carry the wire header;
-//! the remainder is the SCSI data area and the transport's [`HostTransport`]
-//! bank, which bounds one device data chunk (a larger transfer is streamed in
-//! chunks). Its size also fixes this target's declared
-//! `MaxRecvDataSegmentLength` for the connection (RFC 3720 §12.12). `scratch`
-//! is the resident long-operation bank and must hold at least
+//! pdu::BHS_SIZE`. At the PDU base the leading [`pdu::BHS_SIZE`] bytes carry
+//! the wire header; the remainder of the bank is the SCSI data area and the
+//! transport's [`HostTransport`] bank, which bounds one device data chunk (a
+//! larger transfer is streamed in chunks). Its size also fixes this target's
+//! declared `MaxRecvDataSegmentLength` for the connection (RFC 3720 §12.12).
+//! `scratch` is the resident long-operation bank and must hold at least
 //! [`crate::MIN_DATA_LEN`] bytes.
 
 use core::cell::Cell;
@@ -64,9 +65,10 @@ use crate::scsi::scsi::{op as scsi_op, opcode_from_cdb, opcode_name};
 pub enum Action<'a> {
     /// Receive `len` bytes into `work[offset..offset + len]`.
     ///
-    /// The BHS of a PDU is read at offset 0; a data segment is read directly
-    /// at its final place in the SCSI data area, so the transport never has to
-    /// stage or copy it.
+    /// `offset` is absolute in `work`; the session has already added the
+    /// current PDU bank base. The BHS of a PDU is read at the bank base, a
+    /// data segment is read directly at its final place in the SCSI data
+    /// area, so the transport never has to stage or copy it.
     HostRecv {
         /// Byte offset inside `work`.
         offset: usize,
@@ -113,9 +115,10 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetError {
     /// Caller's work buffer is smaller than [`crate::MIN_DATA_LEN`] +
-    /// `BHS_SIZE` (data area too small for the SCSI layer and the Login text),
-    /// its data area (`work.len() - BHS_SIZE`) is not a multiple of 4, or the
-    /// scratch bank is smaller than [`crate::MIN_DATA_LEN`].
+    /// `BHS_SIZE` behind the PDU base (data area too small for the SCSI layer
+    /// and the Login text), that data area (`work.len() - pdu_base -
+    /// BHS_SIZE`) is not a multiple of 4, or the scratch bank is smaller than
+    /// [`crate::MIN_DATA_LEN`].
     WorkBufTooSmall,
     /// Connection I/O failure (details logged by the transport).
     Io,
@@ -198,6 +201,10 @@ const TARGET_NAME: &str = "iqn.1970-01.local.snowscsi:target";
 
 /// Target Transfer Tag for R2T — single outstanding transfer.
 const TTT: u32 = 1;
+/// Base offset of a PDU that no command owns (Login, Text, NOP, Logout, task
+/// management, Reject): those responses must never borrow the bank a running
+/// command is using.
+const CONTROL_PDU_BASE: usize = 0;
 /// RFC 3720 §12.13/§12.14 suggested defaults (clamped when the initiator sends
 /// more).
 const DEFAULT_FIRST_BURST: u32 = 65536;
@@ -350,17 +357,22 @@ enum Session {
     /// Waiting for the BHS of the next PDU.
     RecvPdu,
     /// Waiting for the remainder of the current PDU (stored at
-    /// `work[BHS_SIZE..]`).
+    /// `work[base + BHS_SIZE..]`).
     RecvData { total: usize },
     /// Waiting for a Data-Out BHS solicited by an R2T.
     OutBhs,
     /// Waiting for a Data-Out data segment; the shell stores it at the final
     /// offset inside the SCSI data area.
     OutData { dsl: usize },
-    /// Waiting for the Data-Out padding (discarded into `work[0..pad]`).
+    /// Waiting for the Data-Out padding (discarded at the PDU bank base).
     OutPad { pad: usize },
-    /// A complete PDU is staged in `work[..len]` and must be sent.
-    Send { len: usize, kind: SendKind },
+    /// A complete PDU is staged in `work[base..base + len]` and must be sent.
+    Send {
+        len: usize,
+        /// Bank offset the staged PDU starts at, fixed when it was built.
+        base: usize,
+        kind: SendKind,
+    },
     /// Terminal (Logout / fatal protocol error / peer close).
     Closed,
 }
@@ -515,6 +527,12 @@ pub struct IscsiSession {
     long_lun: Option<usize>,
     /// Length of the SCSI data area handed to the core for the current step.
     bank_len: usize,
+    /// Bank offset of the PDU currently being framed inside `work`.
+    ///
+    /// The BHS sits at `work[pdu_base..pdu_base + BHS_SIZE]` and the SCSI data
+    /// area at `work[pdu_base + BHS_SIZE..]`. It is `0` for the single-bank
+    /// session and only changes at a PDU boundary.
+    pdu_base: usize,
 }
 
 impl Default for IscsiSession {
@@ -527,7 +545,7 @@ impl Default for IscsiSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Emit {
     Recv { offset: usize, len: usize },
-    Send(usize),
+    Send { len: usize, base: usize },
     StoragePending,
     Closed,
     Error(TargetError),
@@ -567,6 +585,7 @@ impl IscsiSession {
             abort_pending: false,
             long_lun: None,
             bank_len: 0,
+            pdu_base: 0,
         }
     }
 
@@ -599,12 +618,13 @@ impl IscsiSession {
     /// `work` is the single time-multiplexed PDU bank
     /// (`>= crate::MIN_DATA_LEN + BHS_SIZE`): incoming bytes land at the
     /// offset the previous action requested, the 48-byte BHS at
-    /// `work[..BHS_SIZE]`, and the SCSI data area at `work[BHS_SIZE..]`.
-    /// The data area bounds one device data chunk (`work.len() - BHS_SIZE`);
-    /// a larger transfer is streamed in bank-sized chunks, and each Data-In
-    /// PDU still carries at most `MaxRecvDataSegmentLength` bytes.
-    /// The data area also fixes the `MaxRecvDataSegmentLength` this target
-    /// declares for the connection (RFC 3720 §12.12).
+    /// `work[pdu_base..pdu_base + BHS_SIZE]`, and the SCSI data area at
+    /// `work[pdu_base + BHS_SIZE..]`.
+    /// The data area bounds one device data chunk (`work.len() - pdu_base -
+    /// BHS_SIZE`); a larger transfer is streamed in bank-sized chunks, and
+    /// each Data-In PDU still carries at most `MaxRecvDataSegmentLength`
+    /// bytes. The data area also fixes the `MaxRecvDataSegmentLength` this
+    /// target declares for the connection (RFC 3720 §12.12).
     /// `scratch` is the resident long-operation bank: an **empty** `scratch`
     /// selects the shared bank (`work` serves both paths, and the long
     /// operation only advances on [`Event::Tick`]); a non-empty one must be at
@@ -622,14 +642,16 @@ impl IscsiSession {
         target: &'b mut Target<S>,
         storage: &'b mut dyn Storage,
     ) -> Action<'a> {
-        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+        let base = self.pdu_base;
+        if base > work.len() || work.len() - base < crate::MIN_DATA_LEN + BHS_SIZE {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
+        let data_area = work.len() - base - BHS_SIZE;
         // Every Data-In PDU is padded to a 4-byte boundary, and the padding
         // may land on bytes that are still unsent when a chunk is staged.
         // Require an aligned data area up front instead of trusting that
         // callers always size the bank that way.
-        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+        if !data_area.is_multiple_of(4) {
             return Action::Error(TargetError::WorkBufTooSmall);
         }
         if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
@@ -644,16 +666,15 @@ impl IscsiSession {
         // the Login Response declares it, and never change it while the
         // connection lives.
         if !self.recv_mdsl_fixed {
-            self.our_recv_mdsl = (work.len() - BHS_SIZE)
-                .clamp(MIN_RECV_DATA_SEGMENT as usize, OUR_RECV_MDSL as usize)
-                as u32;
+            self.our_recv_mdsl =
+                data_area.clamp(MIN_RECV_DATA_SEGMENT as usize, OUR_RECV_MDSL as usize) as u32;
             self.recv_mdsl_fixed = true;
         }
         let emit = self.entry(ev, work, scratch, target, storage);
         match emit {
             Emit::Recv { offset, len } => Action::HostRecv { offset, len },
-            Emit::Send(len) => Action::HostSend {
-                bytes: &work[..len],
+            Emit::Send { len, base } => Action::HostSend {
+                bytes: &work[base..base + len],
                 prefetch: None,
             },
             Emit::StoragePending => Action::StoragePending,
@@ -726,13 +747,14 @@ impl IscsiSession {
 
     /// The action that re-emits the current position.
     fn expectation(&self) -> Emit {
+        let base = self.pdu_base;
         match self.session {
             Session::RecvPdu | Session::OutBhs => Emit::Recv {
-                offset: 0,
+                offset: base,
                 len: BHS_SIZE,
             },
             Session::RecvData { total } => Emit::Recv {
-                offset: BHS_SIZE,
+                offset: base + BHS_SIZE,
                 len: total,
             },
             Session::OutData { dsl } => {
@@ -741,15 +763,15 @@ impl IscsiSession {
                     _ => 0,
                 };
                 Emit::Recv {
-                    offset: BHS_SIZE + local,
+                    offset: base + BHS_SIZE + local,
                     len: dsl,
                 }
             }
             Session::OutPad { pad } => Emit::Recv {
-                offset: 0,
+                offset: base,
                 len: pad,
             },
-            Session::Send { len, .. } => Emit::Send(len),
+            Session::Send { len, base, .. } => Emit::Send { len, base },
             Session::Closed => Emit::Closed,
         }
     }
@@ -805,10 +827,11 @@ impl IscsiSession {
     ) -> Emit {
         match self.session {
             Session::RecvPdu => {
-                if len != BHS_SIZE || work.len() < BHS_SIZE {
+                let base = self.pdu_base;
+                if len != BHS_SIZE || work.len() < base.saturating_add(BHS_SIZE) {
                     return Emit::Error(TargetError::Internal);
                 }
-                self.bhs.copy_from_slice(&work[..BHS_SIZE]);
+                self.bhs.copy_from_slice(&work[base..base + BHS_SIZE]);
                 // Bound the declared segment before framing the remainder: a
                 // PDU above this target's receive capability is answered (and
                 // the connection closed) without consuming its payload.
@@ -821,7 +844,7 @@ impl IscsiSession {
                     Ok(total) => {
                         self.session = Session::RecvData { total };
                         Emit::Recv {
-                            offset: BHS_SIZE,
+                            offset: base + BHS_SIZE,
                             len: total,
                         }
                     }
@@ -836,10 +859,11 @@ impl IscsiSession {
                 self.dispatch(work, scratch, target, storage)
             }
             Session::OutBhs => {
+                let base = self.pdu_base;
                 if len != BHS_SIZE {
                     return Emit::Error(TargetError::Internal);
                 }
-                self.bhs.copy_from_slice(&work[..BHS_SIZE]);
+                self.bhs.copy_from_slice(&work[base..base + BHS_SIZE]);
                 let bhs = Bhs::from_bytes(self.bhs);
                 if bhs.total_ahs_length() != 0 {
                     return self.reject(work, reject::PROTOCOL_ERROR);
@@ -869,13 +893,13 @@ impl IscsiSession {
                     HostPhase::Recv(p) => accepted.saturating_sub(p.chunk_base),
                     _ => 0,
                 };
-                let end = BHS_SIZE + local as usize + dsl;
+                let end = base + BHS_SIZE + local as usize + dsl;
                 if end > work.len() {
                     return Emit::Error(TargetError::WorkBufTooSmall);
                 }
                 self.session = Session::OutData { dsl };
                 Emit::Recv {
-                    offset: BHS_SIZE + local as usize,
+                    offset: base + BHS_SIZE + local as usize,
                     len: dsl,
                 }
             }
@@ -887,7 +911,7 @@ impl IscsiSession {
                 if pad > 0 {
                     self.session = Session::OutPad { pad };
                     Emit::Recv {
-                        offset: 0,
+                        offset: self.pdu_base,
                         len: pad,
                     }
                 } else {
@@ -993,23 +1017,28 @@ impl IscsiSession {
             match self.host {
                 HostPhase::Recv(p) if p.r2t_pending => {
                     self.build_r2t(work);
+                    let base = self.pdu_base;
                     self.session = Session::Send {
                         len: BHS_SIZE,
+                        base,
                         kind: SendKind::R2t,
                     };
-                    Emit::Send(BHS_SIZE)
+                    Emit::Send {
+                        len: BHS_SIZE,
+                        base,
+                    }
                 }
                 HostPhase::Recv(_) => {
                     self.session = Session::OutBhs;
                     Emit::Recv {
-                        offset: 0,
+                        offset: self.pdu_base,
                         len: BHS_SIZE,
                     }
                 }
                 _ => {
                     self.session = Session::RecvPdu;
                     Emit::Recv {
-                        offset: 0,
+                        offset: self.pdu_base,
                         len: BHS_SIZE,
                     }
                 }
@@ -1033,12 +1062,15 @@ impl IscsiSession {
 
     /// The length of the current PDU's remainder (AHS + data + padding),
     /// computed from the saved BHS.
+    ///
+    /// `work_len` is the whole bank; the room available to the remainder is
+    /// the data area of the current PDU base, never the area in front of it.
     fn pdu_remainder(&self, work_len: usize) -> Result<usize, TargetError> {
         let bhs = Bhs::from_bytes(self.bhs);
         let dsl = bhs.data_segment_len() as usize;
         let total =
             usize::from(bhs.total_ahs_length()) * 4 + dsl + pdu_pad_len(dsl as u32) as usize;
-        if BHS_SIZE + total > work_len {
+        if BHS_SIZE + total > work_len.saturating_sub(self.pdu_base) {
             return Err(TargetError::WorkBufTooSmall);
         }
         Ok(total)
@@ -1132,7 +1164,7 @@ impl IscsiSession {
         work: &mut [u8],
     ) -> Stepped {
         let lun = self.cmd_lun;
-        let bank = &mut work[BHS_SIZE..];
+        let bank = &mut work[self.pdu_base + BHS_SIZE..];
         self.bank_len = bank.len();
         match target.drive_step_rt(lun, storage, self, bank, &mut [], &mut []) {
             Ok(crate::core::DriveStep::Pending) => Stepped::Pending,
@@ -1161,15 +1193,20 @@ impl IscsiSession {
                 HostPhase::Recv(p) => {
                     if p.r2t_pending {
                         self.build_r2t(work);
+                        let base = self.pdu_base;
                         self.session = Session::Send {
                             len: BHS_SIZE,
+                            base,
                             kind: SendKind::R2t,
                         };
-                        Emit::Send(BHS_SIZE)
+                        Emit::Send {
+                            len: BHS_SIZE,
+                            base,
+                        }
                     } else {
                         self.session = Session::OutBhs;
                         Emit::Recv {
-                            offset: 0,
+                            offset: self.pdu_base,
                             len: BHS_SIZE,
                         }
                     }
@@ -1292,11 +1329,13 @@ impl IscsiSession {
         self.note_status(itt);
         let autosense = self.status_autosense.take();
         let len = self.build_response(work, itt, scsi_status, sense);
+        let base = self.pdu_base;
         self.session = Session::Send {
             len,
+            base,
             kind: SendKind::Status { itt, autosense },
         };
-        Emit::Send(len)
+        Emit::Send { len, base }
     }
 
     /// Remember that `itt`'s terminal status PDU is now staged.
@@ -1326,19 +1365,20 @@ impl IscsiSession {
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         let mut dlen = 0usize;
+        let base = self.pdu_base;
         if scsi_status == status::CHECK_CONDITION {
             if let Some(sense) = sense {
-                work[BHS_SIZE] = 0;
-                work[BHS_SIZE + 1] = 18;
-                sense_write_fixed(sense, &mut work[BHS_SIZE + 2..BHS_SIZE + 20]);
+                work[base + BHS_SIZE] = 0;
+                work[base + BHS_SIZE + 1] = 18;
+                sense_write_fixed(sense, &mut work[base + BHS_SIZE + 2..base + BHS_SIZE + 20]);
                 dlen = 20;
             }
         }
         bhs.set_data_segment_len(dlen as u32);
-        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        work[base..base + BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
-        work[total..total + pad].fill(0);
+        work[base + total..base + total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         total + pad
     }
@@ -1358,11 +1398,13 @@ impl IscsiSession {
             _ => return Emit::Error(TargetError::Internal),
         };
         let total = self.build_data_in(work, self.cmd_itt, offset, bank, len, data_sn, f_bit, None);
+        let base = self.pdu_base;
         self.session = Session::Send {
             len: total,
+            base,
             kind: SendKind::DataIn,
         };
-        Emit::Send(total)
+        Emit::Send { len: total, base }
     }
 
     /// Terminating Data-In PDU (F=1, S=1) carrying the fixed status.
@@ -1386,14 +1428,16 @@ impl IscsiSession {
             true,
             Some(status),
         );
+        let base = self.pdu_base;
         self.session = Session::Send {
             len: total,
+            base,
             kind: SendKind::Status {
                 itt: self.cmd_itt,
                 autosense: None,
             },
         };
-        Emit::Send(total)
+        Emit::Send { len: total, base }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1409,12 +1453,13 @@ impl IscsiSession {
         scsi_status: Option<u8>,
     ) -> usize {
         let len = len as usize;
+        let base = self.pdu_base;
         if bank > 0 && len > 0 {
             // The device's send buffer for this chunk sits at the start of the
             // SCSI data area; move it in front of the BHS.
-            let start = BHS_SIZE + bank as usize;
+            let start = base + BHS_SIZE + bank as usize;
             let end = start + len;
-            work.copy_within(start..end, BHS_SIZE);
+            work.copy_within(start..end, base + BHS_SIZE);
         }
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
@@ -1433,13 +1478,13 @@ impl IscsiSession {
         bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        work[base..base + BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let total = BHS_SIZE + len;
         // Every Data-In PDU is padded to a 4-byte boundary, including
         // intermediate chunks: an intermediate tail may be 1-3 bytes long.
         let pad = pdu_pad_len(len as u32) as usize;
         if pad > 0 {
-            work[total..total + pad].fill(0);
+            work[base + total..base + total + pad].fill(0);
         }
         if scsi_status.is_some() {
             self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
@@ -1448,6 +1493,7 @@ impl IscsiSession {
     }
 
     fn build_r2t(&mut self, work: &mut [u8]) {
+        let base = self.pdu_base;
         let p = match &mut self.host {
             HostPhase::Recv(p) => p,
             _ => return,
@@ -1478,7 +1524,7 @@ impl IscsiSession {
         p.data_sn = 0;
         p.burst_remaining = desired;
         p.r2t_pending = false;
-        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        work[base..base + BHS_SIZE].copy_from_slice(bhs.as_bytes());
     }
 
     fn reject(&mut self, work: &mut [u8], reason: u8) -> Emit {
@@ -1490,6 +1536,9 @@ impl IscsiSession {
             reason,
             reason
         );
+        // A Reject is a control PDU: it is framed at the control bank, never
+        // over the bank a running command owns.
+        let base = CONTROL_PDU_BASE;
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::REJECT);
         bhs.set_flags(flag::F_BIT);
@@ -1499,14 +1548,15 @@ impl IscsiSession {
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_data_segment_len(BHS_SIZE as u32);
-        work[..BHS_SIZE].copy_from_slice(bhs.as_bytes());
-        work[BHS_SIZE..2 * BHS_SIZE].copy_from_slice(rejected.as_bytes());
+        work[base..base + BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        work[base + BHS_SIZE..base + 2 * BHS_SIZE].copy_from_slice(rejected.as_bytes());
         let total = 2 * BHS_SIZE;
         let pad = pdu_pad_len(BHS_SIZE as u32) as usize;
-        work[total..total + pad].fill(0);
+        work[base + total..base + total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: total + pad,
+            base,
             kind: SendKind::Close,
         };
         if self.cmd_active || self.status_itt.is_some() {
@@ -1522,7 +1572,10 @@ impl IscsiSession {
             // The connection ends with the command still owned by the target.
             self.cmd_active = false;
         }
-        Emit::Send(total + pad)
+        Emit::Send {
+            len: total + pad,
+            base,
+        }
     }
 
     // ── PDU dispatch ──────────────────────────────────────────────
@@ -1598,7 +1651,7 @@ impl IscsiSession {
         if !immediate_flag {
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
                 return Emit::Recv {
-                    offset: 0,
+                    offset: self.pdu_base,
                     len: BHS_SIZE,
                 };
             }
@@ -1668,8 +1721,8 @@ impl IscsiSession {
         self.cmd_direction = direction;
         self.cmd_w = w_bit;
         // Immediate write data of the command PDU already sits at
-        // `work[BHS_SIZE..BHS_SIZE + dsl]`, which is the SCSI data area the
-        // device receives into.
+        // `work[base + BHS_SIZE..base + BHS_SIZE + dsl]`, which is the SCSI
+        // data area the device receives into.
         self.immediate = if w_bit { pdu.dsl as u32 } else { 0 };
         self.plan = DataPlan {
             direction: Direction::None,
@@ -1720,8 +1773,12 @@ impl IscsiSession {
         if opcode == scsi_op::REQUEST_SENSE {
             let alloc = cdb.get(4).copied().unwrap_or(0) as usize;
             let n = alloc.min(18);
+            let base = self.pdu_base;
             if n > 0 {
-                sense_write_fixed(LUN_NOT_SUPPORTED, &mut work[BHS_SIZE..BHS_SIZE + n]);
+                sense_write_fixed(
+                    LUN_NOT_SUPPORTED,
+                    &mut work[base + BHS_SIZE..base + BHS_SIZE + n],
+                );
             }
             // A Data-In carrying the fixed-format sense; the command is not
             // driven by any slot.
@@ -1729,12 +1786,13 @@ impl IscsiSession {
             let total = self.build_data_in(work, itt, 0, 0, n as u32, 0, true, Some(status::GOOD));
             self.session = Session::Send {
                 len: total,
+                base,
                 kind: SendKind::Status {
                     itt,
                     autosense: None,
                 },
             };
-            return Emit::Send(total);
+            return Emit::Send { len: total, base };
         }
         self.emit_response(work, itt, status::CHECK_CONDITION, Some(LUN_NOT_SUPPORTED))
     }
@@ -1761,7 +1819,7 @@ impl IscsiSession {
         if !immediate_flag {
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
                 return Emit::Recv {
-                    offset: 0,
+                    offset: self.pdu_base,
                     len: BHS_SIZE,
                 };
             }
@@ -1809,15 +1867,20 @@ impl IscsiSession {
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let base = CONTROL_PDU_BASE;
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
-        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        work[base + BHS_SIZE..base + BHS_SIZE + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: BHS_SIZE + pad,
+            base,
             kind: SendKind::Tmf,
         };
-        Emit::Send(BHS_SIZE + pad)
+        Emit::Send {
+            len: BHS_SIZE + pad,
+            base,
+        }
     }
 
     fn handle_nop(&mut self, work: &mut [u8], pdu: &Pdu) -> Emit {
@@ -1832,7 +1895,7 @@ impl IscsiSession {
                 return self.reject(work, reject::PROTOCOL_ERROR);
             }
             return Emit::Recv {
-                offset: 0,
+                offset: self.pdu_base,
                 len: BHS_SIZE,
             };
         }
@@ -1842,7 +1905,7 @@ impl IscsiSession {
             let recv_cmd_sn = bhs.cmd_sn();
             if recv_cmd_sn != self.cmd_sn.wrapping_add(1) {
                 return Emit::Recv {
-                    offset: 0,
+                    offset: self.pdu_base,
                     len: BHS_SIZE,
                 };
             }
@@ -1866,16 +1929,27 @@ impl IscsiSession {
         // peer declared it can receive, not by a fixed constant.
         let dlen = pdu.dsl.min(self.peer_recv_mdsl as usize);
         resp.set_data_segment_len(dlen as u32);
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let source = self.pdu_base;
+        let base = CONTROL_PDU_BASE;
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
+        if source != base && dlen > 0 {
+            // The echoed ping data was received in the request's bank; move it
+            // behind the control BHS so the response stays at the control base.
+            work.copy_within(source + BHS_SIZE..source + BHS_SIZE + dlen, base + BHS_SIZE);
+        }
         let total = BHS_SIZE + dlen;
         let pad = pdu_pad_len(dlen as u32) as usize;
-        work[total..total + pad].fill(0);
+        work[base + total..base + total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: total + pad,
+            base,
             kind: SendKind::Continue,
         };
-        Emit::Send(total + pad)
+        Emit::Send {
+            len: total + pad,
+            base,
+        }
     }
 
     fn handle_logout(&mut self, work: &mut [u8], pdu: &Pdu) -> Emit {
@@ -1887,25 +1961,31 @@ impl IscsiSession {
         resp.set_stat_sn(self.stat_sn.get());
         resp.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         resp.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let base = CONTROL_PDU_BASE;
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
-        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        work[base + BHS_SIZE..base + BHS_SIZE + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: BHS_SIZE + pad,
+            base,
             kind: SendKind::Close,
         };
-        Emit::Send(BHS_SIZE + pad)
+        Emit::Send {
+            len: BHS_SIZE + pad,
+            base,
+        }
     }
 
     fn handle_text(&mut self, work: &mut [u8], pdu: &Pdu) -> Emit {
         let bhs = &pdu.bhs;
         // F=0 (continuation) and non-0xFFFFFFFF TTT are not supported (no
         // fragmentation); the handler stays lenient for a minimal text BHS.
-        if pdu.dsl > work.len() - BHS_SIZE {
+        let source = self.pdu_base;
+        if pdu.dsl > work.len().saturating_sub(source + BHS_SIZE) {
             return Emit::Error(TargetError::WorkBufTooSmall);
         }
-        let data = &work[BHS_SIZE..BHS_SIZE + pdu.dsl];
+        let data = &work[source + BHS_SIZE..source + BHS_SIZE + pdu.dsl];
         let mut pos = 0usize;
         let mut found = false;
         let mut value: &[u8] = &[];
@@ -1937,6 +2017,7 @@ impl IscsiSession {
         // continuation. RFC 3720 Appendix D: All / <iqn> / <empty> for
         // discovery vs operational.
         let should_return = value == b"All" || value.is_empty() || value == TARGET_NAME.as_bytes();
+        let base = CONTROL_PDU_BASE;
         let mut resp = Bhs::new();
         resp.set_opcode(op::TEXT_RESP);
         resp.set_flags(flag::F_BIT);
@@ -1949,17 +2030,20 @@ impl IscsiSession {
             // RFC 3720 §10.11.6: a Text Response must not exceed the
             // initiator's declared receive segment; also stay inside this
             // target's own segment bound and the work bank.
-            let cap = (work.len() - BHS_SIZE)
+            let cap = work
+                .len()
+                .saturating_sub(base)
+                .saturating_sub(BHS_SIZE)
                 .min(self.our_recv_mdsl as usize)
                 .min(self.peer_recv_mdsl as usize);
             let txt = TARGET_NAME.as_bytes();
             let prefix = b"TargetName=";
             let needed = prefix.len() + txt.len() + 1;
             if needed <= cap {
-                work[BHS_SIZE..BHS_SIZE + prefix.len()].copy_from_slice(prefix);
-                work[BHS_SIZE + prefix.len()..BHS_SIZE + prefix.len() + txt.len()]
+                work[base + BHS_SIZE..base + BHS_SIZE + prefix.len()].copy_from_slice(prefix);
+                work[base + BHS_SIZE + prefix.len()..base + BHS_SIZE + prefix.len() + txt.len()]
                     .copy_from_slice(txt);
-                work[BHS_SIZE + prefix.len() + txt.len()] = 0;
+                work[base + BHS_SIZE + prefix.len() + txt.len()] = 0;
                 needed as u32
             } else {
                 // The key cannot be delivered as requested; answer it as not
@@ -1967,7 +2051,7 @@ impl IscsiSession {
                 // an empty data segment.
                 let alt = b"TargetName=NotUnderstood\0";
                 if alt.len() <= cap {
-                    work[BHS_SIZE..BHS_SIZE + alt.len()].copy_from_slice(alt);
+                    work[base + BHS_SIZE..base + BHS_SIZE + alt.len()].copy_from_slice(alt);
                     alt.len() as u32
                 } else {
                     0
@@ -1977,16 +2061,20 @@ impl IscsiSession {
             0
         };
         resp.set_data_segment_len(dlen);
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let total = BHS_SIZE + dlen as usize;
         let pad = pdu_pad_len(dlen) as usize;
-        work[total..total + pad].fill(0);
+        work[base + total..base + total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: total + pad,
+            base,
             kind: SendKind::Continue,
         };
-        Emit::Send(total + pad)
+        Emit::Send {
+            len: total + pad,
+            base,
+        }
     }
 
     // ── Login Phase ───────────────────────────────────────────────
@@ -1997,6 +2085,8 @@ impl IscsiSession {
             dsl: Bhs::from_bytes(self.bhs).data_segment_len() as usize,
         };
         let req = &pdu.bhs;
+        // Login is framed before any command owns a bank.
+        let base = CONTROL_PDU_BASE;
         // Login C bit (byte1 bit6, RFC 3720 §10.12.1) — continuation not
         // supported; reject if set.
         if req.as_bytes()[1] & 0x40 != 0 {
@@ -2008,7 +2098,7 @@ impl IscsiSession {
             // Initiator Error / Version not supported.
             return self.login_error(work, 0x02, 0x05);
         }
-        if pdu.dsl > self.our_recv_mdsl as usize || BHS_SIZE + pdu.dsl > work.len() {
+        if pdu.dsl > self.our_recv_mdsl as usize || base + BHS_SIZE + pdu.dsl > work.len() {
             // Initiator Error / Invalid during login.
             return self.login_error(work, 0x02, 0x0B);
         }
@@ -2024,9 +2114,12 @@ impl IscsiSession {
         // in the free tail, then move it in front of the BHS. `negotiate`
         // never writes past the bounded response area, so a pathological
         // request truncates cleanly instead of failing the session.
-        let (head, tail) = work.split_at_mut(BHS_SIZE + pdu.dsl);
-        let resp_len = self.negotiate(&head[BHS_SIZE..], tail);
-        work.copy_within(BHS_SIZE + pdu.dsl..BHS_SIZE + pdu.dsl + resp_len, BHS_SIZE);
+        let (head, tail) = work.split_at_mut(base + BHS_SIZE + pdu.dsl);
+        let resp_len = self.negotiate(&head[base + BHS_SIZE..], tail);
+        work.copy_within(
+            base + BHS_SIZE + pdu.dsl..base + BHS_SIZE + pdu.dsl + resp_len,
+            base + BHS_SIZE,
+        );
 
         let nsg = if t {
             match req_csg {
@@ -2064,11 +2157,11 @@ impl IscsiSession {
         resp.set_exp_cmd_sn(req.cmd_sn());
         resp.set_max_cmd_sn(req.cmd_sn());
 
-        // Assemble: BHS at work[0..48], data at work[48..48+resp_len].
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        // Assemble: BHS at work[base..base+48], data behind it.
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let total = BHS_SIZE + resp_len;
         let pad = pdu_pad_len(resp_len as u32) as usize;
-        work[total..total + pad].fill(0);
+        work[base + total..base + total + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
 
         if t {
@@ -2082,9 +2175,13 @@ impl IscsiSession {
         }
         self.session = Session::Send {
             len: total + pad,
+            base,
             kind: SendKind::Continue,
         };
-        Emit::Send(total + pad)
+        Emit::Send {
+            len: total + pad,
+            base,
+        }
     }
 
     /// Login Response rejecting the request with the given Status-Class and
@@ -2110,15 +2207,20 @@ impl IscsiSession {
         resp.set_max_cmd_sn(req.cmd_sn());
         resp.as_mut_bytes()[36] = status_class;
         resp.as_mut_bytes()[37] = status_detail;
-        work[..BHS_SIZE].copy_from_slice(resp.as_bytes());
+        let base = CONTROL_PDU_BASE;
+        work[base..base + BHS_SIZE].copy_from_slice(resp.as_bytes());
         let pad = pdu_pad_len(0) as usize;
-        work[BHS_SIZE..BHS_SIZE + pad].fill(0);
+        work[base + BHS_SIZE..base + BHS_SIZE + pad].fill(0);
         self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         self.session = Session::Send {
             len: BHS_SIZE + pad,
+            base,
             kind: SendKind::Close,
         };
-        Emit::Send(BHS_SIZE + pad)
+        Emit::Send {
+            len: BHS_SIZE + pad,
+            base,
+        }
     }
 
     /// Parse initiator key=value text into a response, updating negotiated
@@ -2933,6 +3035,148 @@ mod tests {
         let total = session.build_data_in(&mut work, 1, 0, 0, 1, 0, false, None);
         assert_eq!(total, BHS_SIZE + 1 + 3);
         assert_eq!(&work[BHS_SIZE + 1..BHS_SIZE + 4], &[0, 0, 0]);
+    }
+
+    /// A nonzero PDU base frames the Data-In BHS and payload at the bank start
+    /// and emits the staged send from that base.
+    #[test]
+    fn data_in_framing_and_send_use_a_nonzero_pdu_base() {
+        use crate::block::{BlockAttrs, BlockDevice};
+        use crate::core::storage::{BlockingStorage, IoBuf, IoReq, StorageReceipt, SyncStorage};
+        use crate::core::{Lu, LuImpl, NoMedium, Pair, Spc, Target};
+
+        struct Sink;
+        impl SyncStorage for Sink {
+            fn exec(&mut self, _req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+                let len = match &buf {
+                    IoBuf::None => 0,
+                    IoBuf::Read(b) => b.len(),
+                    IoBuf::Write(b) => b.len(),
+                };
+                StorageReceipt::ok(len)
+            }
+        }
+
+        const BANK: usize = 8240;
+        let mut session = IscsiSession::new();
+        session.pdu_base = BANK;
+        session.cmd_itt = 7;
+        session.recv_mdsl_fixed = true;
+        let mut work = vec![0xAAu8; 2 * BANK];
+
+        let payload = [1u8, 2, 3, 4, 5];
+        let src = BANK + BHS_SIZE + 16;
+        work[src..src + payload.len()].copy_from_slice(&payload);
+        let len = session.build_data_in(
+            &mut work,
+            session.cmd_itt,
+            0,
+            16,
+            payload.len() as u32,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(len, BHS_SIZE + payload.len() + 3, "the PDU is padded");
+
+        let bhs = Bhs::from_bytes(work[BANK..BANK + BHS_SIZE].try_into().unwrap());
+        assert_eq!(bhs.opcode(), op::SCSI_DATA_IN);
+        assert_eq!(bhs.data_segment_len() as usize, payload.len());
+        assert_eq!(
+            &work[BANK + BHS_SIZE..BANK + BHS_SIZE + payload.len()],
+            &payload,
+            "the payload is moved directly behind the bank's BHS"
+        );
+        assert!(
+            work[..BANK].iter().all(|&b| b == 0xAA),
+            "the slot in front of the base is untouched"
+        );
+        assert!(
+            work[BANK + len..src].iter().all(|&b| b == 0xAA),
+            "nothing between the PDU end and the source is touched"
+        );
+
+        // The deferred send slices from the bank base, not from work[0].
+        let mut slot = LuImpl::new(Spc::new(BlockDevice::new(BlockAttrs::new(16, 512))), 0u8);
+        let mut table = [&mut slot as &mut dyn Lu<Pair = Pair<NoMedium, u8>>];
+        let mut target = Target::new(&mut table[..]);
+        let mut storage = BlockingStorage::new(Sink);
+        let mut scratch = [0u8; 0];
+        session.session = Session::Send {
+            len,
+            base: BANK,
+            kind: SendKind::Continue,
+        };
+        match session.poll(
+            Event::Tick,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        ) {
+            Action::HostSend { bytes, .. } => {
+                assert_eq!(bytes.len(), len);
+                assert_eq!(
+                    bytes[0] & 0x3F,
+                    op::SCSI_DATA_IN,
+                    "the send starts at the PDU base"
+                );
+                assert_eq!(&bytes[BHS_SIZE..BHS_SIZE + payload.len()], &payload);
+                assert_eq!(
+                    &bytes[BHS_SIZE + payload.len()..],
+                    &[0, 0, 0],
+                    "the emitted PDU keeps its padding"
+                );
+            }
+            other => panic!("expected HostSend, got {other:?}"),
+        }
+
+        // The receive path asks for the next BHS at the same base.
+        session.session = Session::RecvPdu;
+        match session.poll(
+            Event::Tick,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+        ) {
+            Action::HostRecv { offset, len } => {
+                assert_eq!(offset, BANK);
+                assert_eq!(len, BHS_SIZE);
+            }
+            other => panic!("expected HostRecv, got {other:?}"),
+        }
+    }
+
+    /// A declared segment plus padding that fits the whole work slice but not
+    /// the current bank's data area is refused, so framing never runs past
+    /// `base + BHS_SIZE + bank data area`.
+    #[test]
+    fn pdu_remainder_is_bounded_by_the_bank_data_area() {
+        const BANK: usize = 8240;
+        const AREA: usize = BANK - BHS_SIZE;
+        const WORK: usize = 2 * BANK;
+
+        let mut session = IscsiSession::new();
+        let mut bhs = Bhs::new();
+        bhs.set_data_segment_len(AREA as u32);
+        session.bhs = *bhs.as_bytes();
+
+        // Exactly one bank's data area fits at either base.
+        assert_eq!(session.pdu_remainder(WORK), Ok(AREA));
+        session.pdu_base = BANK;
+        assert_eq!(session.pdu_remainder(WORK), Ok(AREA));
+
+        // One byte more overruns the second bank's data area, even though it
+        // still fits the whole slice at base 0.
+        bhs.set_data_segment_len(AREA as u32 + 1);
+        session.bhs = *bhs.as_bytes();
+        assert_eq!(
+            session.pdu_remainder(WORK),
+            Err(TargetError::WorkBufTooSmall)
+        );
+        session.pdu_base = 0;
+        assert_eq!(session.pdu_remainder(WORK), Ok(AREA + 1 + 3));
     }
 
     #[test]
