@@ -45,11 +45,12 @@ CHUNK = "1M"
 CHUNK_BYTES = 1 * 1024 * 1024
 
 
-@unittest.skipUnless(
-    is_root() and have_tool("iscsiadm"),
-    "requires root + iscsiadm (open-iscsi)",
-)
-class BundleLoopbackTest(unittest.TestCase):
+class _BundleScenario:
+    """Scenario shared by the per-mode test cases below."""
+
+    # Extra `serve` arguments for this mode.
+    EXTRA = ()
+
     @classmethod
     def setUpClass(cls):
         cls.iscsid_started = start_iscsid()
@@ -64,7 +65,9 @@ class BundleLoopbackTest(unittest.TestCase):
     def setUp(self):
         self.bundle_dir = tempfile.mkdtemp(prefix="snowscsi-bundle-")
         self.server = ServerHandle(
-            "--block", f"imgdir={self.bundle_dir},size={SIZE},chunk={CHUNK}"
+            "--block",
+            f"imgdir={self.bundle_dir},size={SIZE},chunk={CHUNK}",
+            *self.EXTRA,
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)
@@ -149,12 +152,30 @@ class BundleLoopbackTest(unittest.TestCase):
         # Restart the server on the same bundle directory (no size= needed:
         # the BUNDLE header already exists).
         self.server = ServerHandle(
-            "--block", f"imgdir={self.bundle_dir},chunk={CHUNK}"
+            "--block", f"imgdir={self.bundle_dir},chunk={CHUNK}", *self.EXTRA
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)
         dev = self.session.login(expected_bytes=SIZE_BYTES)
         sh("dd", f"if={dev}", "bs=512", "count=1", "skip=100")
+
+
+@unittest.skipUnless(
+    is_root() and have_tool("iscsiadm"),
+    "requires root + iscsiadm (open-iscsi)",
+)
+class BundleLoopbackTest(_BundleScenario, unittest.TestCase):
+    """Single-bank, blocking wire (the default)."""
+
+
+@unittest.skipUnless(
+    is_root() and have_tool("iscsiadm"),
+    "requires root + iscsiadm (open-iscsi)",
+)
+class BundleLoopbackDualTest(_BundleScenario, unittest.TestCase):
+    """Two banks and the per-LUN storage worker."""
+
+    EXTRA = ("--banks", "dual")
 
 
 if __name__ == "__main__":

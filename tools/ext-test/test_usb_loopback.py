@@ -305,11 +305,12 @@ def reclaim_stale_gadgets(udc=TEST_UDC):
     return reclaimed
 
 
-@unittest.skipUnless(
-    is_root(),
-    "requires root (to modprobe dummy_hcd and drive the loopback)",
-)
-class UsbLoopbackTest(unittest.TestCase):
+class _UsbScenario:
+    """Scenario shared by the per-mode test cases below."""
+
+    # Extra `serve` arguments for this mode.
+    EXTRA = ()
+
     @classmethod
     def setUpClass(cls):
         # Auto-load the test-only UDC module and the configfs gadget
@@ -370,7 +371,7 @@ class UsbLoopbackTest(unittest.TestCase):
         self.addCleanup(self._discard_image)
         self.mount = None
         self.server = None
-        self.server = UsbServer(self.img)
+        self.server = UsbServer(self.img, extra=self.EXTRA)
         self._logs.append(self.server.log_path)
 
     def tearDown(self):
@@ -505,7 +506,7 @@ class UsbLoopbackTest(unittest.TestCase):
         # Read-only backend: rebind the same image read-only, verify reads
         # work and writes are rejected.
         self.server.stop()
-        self.server = UsbServer(self.img, read_only=True)
+        self.server = UsbServer(self.img, read_only=True, extra=self.EXTRA)
         self._logs.append(self.server.log_path)
         dev = self._wait_device()
         sh("dd", f"if={dev}", "of=/dev/null", "bs=1M", "count=1")
@@ -543,12 +544,12 @@ class UsbServer:
     device timeout.
     """
 
-    def __init__(self, img, read_only=False, startup_grace=1.0):
+    def __init__(self, img, read_only=False, startup_grace=1.0, extra=()):
         spec = f"img={img},ro" if read_only else f"img={img}"
         self.log_path = tempfile.mktemp(prefix="snowscsi-usb-log-")
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
-            [find_binary(), "serve", "--usb", "--block", spec],
+            [find_binary(), "serve", "--usb", "--block", spec, *extra],
             stdout=subprocess.DEVNULL,
             stderr=self.log,
             text=True,
@@ -615,6 +616,24 @@ class UsbServer:
         finally:
             self.log.close()
             self.proc = None
+
+
+@unittest.skipUnless(
+    is_root(),
+    "requires root (to modprobe dummy_hcd and drive the loopback)",
+)
+class UsbLoopbackTest(_UsbScenario, unittest.TestCase):
+    """Single-bank, blocking wire (the default)."""
+
+
+@unittest.skipUnless(
+    is_root(),
+    "requires root (to modprobe dummy_hcd and drive the loopback)",
+)
+class UsbLoopbackDualTest(_UsbScenario, unittest.TestCase):
+    """Two banks and the per-LUN storage worker."""
+
+    EXTRA = ("--banks", "dual")
 
 
 if __name__ == "__main__":

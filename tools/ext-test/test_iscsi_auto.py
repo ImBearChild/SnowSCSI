@@ -33,11 +33,12 @@ RAM_SIZE = "8M"
 RAM_BYTES = 8 * 1024 * 1024
 
 
-@unittest.skipUnless(
-    is_root() and have_tool("iscsiadm"),
-    "requires root + iscsiadm (open-iscsi)",
-)
-class IscsiAutoTest(unittest.TestCase):
+class _IscsiAutoScenario:
+    """Scenario shared by the per-mode test cases below."""
+
+    # Extra `serve` arguments for this mode.
+    EXTRA = ()
+
     @classmethod
     def setUpClass(cls):
         cls.iscsid_started = start_iscsid()
@@ -54,7 +55,7 @@ class IscsiAutoTest(unittest.TestCase):
         purge_target_sessions()
         self.before = sd_snapshot()
         self.server = ServerHandle(
-            "--block", f"ram={RAM_SIZE}", iscsi_auto=True
+            "--block", f"ram={RAM_SIZE}", iscsi_auto=True, *self.EXTRA
         )
         self.server.__enter__()
         self.device = None
@@ -73,6 +74,24 @@ class IscsiAutoTest(unittest.TestCase):
             self.before, timeout=30, expected_bytes=RAM_BYTES
         )
         self.assertTrue(os.path.exists(self.device), f"device {self.device} missing")
+
+
+@unittest.skipUnless(
+    is_root() and have_tool("iscsiadm"),
+    "requires root + iscsiadm (open-iscsi)",
+)
+class IscsiAutoTest(_IscsiAutoScenario, unittest.TestCase):
+    """Single-bank, blocking wire (the default)."""
+
+
+@unittest.skipUnless(
+    is_root() and have_tool("iscsiadm"),
+    "requires root + iscsiadm (open-iscsi)",
+)
+class IscsiAutoDualTest(_IscsiAutoScenario, unittest.TestCase):
+    """Two banks and the per-LUN storage worker."""
+
+    EXTRA = ("--banks", "dual")
 
 
 if __name__ == "__main__":

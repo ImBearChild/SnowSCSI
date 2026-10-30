@@ -24,6 +24,8 @@ import os
 import unittest
 
 from harness import (
+    MODE_VARIANTS,
+    have_async_wire,
     IscsiSession,
     ServerHandle,
     full_disk_test,
@@ -59,21 +61,32 @@ class IscsiLoopbackTest(unittest.TestCase):
             stop_iscsid()
 
     def setUp(self):
-        self.server = ServerHandle("--block", f"ram={RAM_SIZE}")
-        self.server.__enter__()
-        self.session = IscsiSession(self.server.addr)
+        self.server = None
+        self.session = None
         self.mount = None
 
     def tearDown(self):
+        self._stop()
+
+    def _start(self, extra):
+        self.server = ServerHandle("--block", f"ram={RAM_SIZE}", *extra)
+        self.server.__enter__()
+        self.session = IscsiSession(self.server.addr)
+
+    def _stop(self):
         unmount(self.mount)
         self.mount = None
-        self.session.logout()
-        try:
-            self.server.__exit__(None, None, None)
-        except AssertionError:
-            pass  # the test body already recorded its own failure
+        if self.session is not None:
+            self.session.logout()
+            self.session = None
+        if self.server is not None:
+            try:
+                self.server.__exit__(None, None, None)
+            except AssertionError:
+                pass  # the test body already recorded its own failure
+            self.server = None
 
-    def test_login_format_mount_write_read_fsck(self):
+    def _scenario(self):
         dev = self.session.login(expected_bytes=RAM_BYTES)
         self.assertTrue(os.path.exists(dev), f"device {dev} missing")
 
@@ -95,6 +108,21 @@ class IscsiLoopbackTest(unittest.TestCase):
         unmount(self.mount, check=True)
         self.mount = None
         sh("fsck.ext4", "-fn", dev)
+
+    def test_login_format_mount_write_read_fsck(self):
+        for name, extra in MODE_VARIANTS:
+            if name == "async" and not have_async_wire():
+                continue
+            with self.subTest(mode=name):
+                self._start(extra)
+                try:
+                    self._scenario()
+                except AssertionError:
+                    print(f"\n--- server log tail ({name}) ---\n"
+                          + self.server.log_tail(20000))
+                    raise
+                finally:
+                    self._stop()
 
 
 if __name__ == "__main__":

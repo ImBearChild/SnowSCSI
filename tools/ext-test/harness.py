@@ -28,6 +28,33 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 # The target name the server reports (mirrors `transport.rs` / target tests).
 TARGET_NAME = "iqn.1970-01.local.snowscsi:target"
 
+# Execution modes the black-box suite can drive. Each entry is a fresh
+# `serve` argument set; the name is only used in `subTest`/logs.
+MODE_VARIANTS = (
+    ("single", ()),
+    ("dual", ("--banks", "dual")),
+    ("async", ("--banks", "dual", "--wire", "async")),
+)
+
+# iSCSI-only modes: USB has no async endpoint adapter yet.
+USB_MODE_VARIANTS = MODE_VARIANTS[:2]
+
+def have_async_wire():
+    """True when the built binary has the `tokio` feature (`--wire async`)."""
+    proc = subprocess.run(
+        [
+            find_binary(),
+            "serve",
+            "--block", "ram=1M",
+            "--iscsi", "127.0.0.1:0",
+            "--print-config",
+            "--wire", "async",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
 # Standard iSCSI loopback portal (`--iscsi auto` binds it when free).
 ISCSI_STANDARD_PORT = 3260
 
