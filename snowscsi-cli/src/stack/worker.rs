@@ -576,6 +576,36 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_read_keeps_its_buffer_until_it_is_polled() {
+        let mut ram = vec![0u8; 1024];
+        std::thread::scope(|scope| {
+            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let mut store = WorkerStore::new(scope, vec![Some(plane)], 512);
+
+            // A takes the plane's only staging buffer; B cannot start until A
+            // has been polled, even if A's job has already finished.
+            let a = store.begin_exec(read_req(0, 4));
+            let b = store.begin_exec(read_req(4, 4));
+            let mut out = [0u8; 4];
+            assert!(matches!(
+                store.poll_exec(b, IoBuf::Read(&mut out)),
+                Poll::Pending
+            ));
+            assert!(matches!(
+                store.poll_exec(b, IoBuf::Read(&mut out)),
+                Poll::Pending
+            ));
+
+            let mut a_out = [0u8; 4];
+            assert_eq!(poll_read(&mut store, a, &mut a_out), StorageReceipt::ok(4));
+            let mut b_out = [0u8; 4];
+            assert_eq!(poll_read(&mut store, b, &mut b_out), StorageReceipt::ok(4));
+
+            assert!(store.sync().is_ok());
+        });
+    }
+
+    #[test]
     fn a_full_slot_table_mints_an_invalid_token() {
         let mut ram = vec![0u8; 1024];
         std::thread::scope(|scope| {
@@ -593,6 +623,20 @@ mod tests {
                 .collect();
             assert_eq!(store.begin_exec(write_req(0, 4)), invalid());
 
+            for token in tokens {
+                store.cancel(token);
+            }
+
+            // Reads occupy a slot as well, even though only one can hold the
+            // staging buffer at a time.
+            let tokens: Vec<_> = (0..SLOTS)
+                .map(|_| {
+                    let token = store.begin_exec(read_req(0, 4));
+                    assert_ne!(token, invalid());
+                    token
+                })
+                .collect();
+            assert_eq!(store.begin_exec(read_req(0, 4)), invalid());
             for token in tokens {
                 store.cancel(token);
             }
