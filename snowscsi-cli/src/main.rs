@@ -82,6 +82,12 @@ use usb_gadget::{udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
 /// largest host transfer the initiator issues; 1 MiB covers the kernel's
 /// default iSCSI transfer cap.
 const DEFAULT_WORK_BUF_SIZE: usize = 1024 * 1024;
+/// Default `work` total for USB overlap mode (two equal 8 KiB banks).
+///
+/// `--overlap` treats `--work-buf-size` as the **total** of two banks, so this
+/// stays at 16 KiB: larger halves buy no prefetch benefit over the USB wire
+/// chunk while doubling the cache footprint of the session.
+const OVERLAP_WORK_BUF_SIZE: usize = 16 * 1024;
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
@@ -170,9 +176,17 @@ struct ServeArgs {
     /// iSCSI, 512 for USB; default 1M). It bounds one data chunk, not the
     /// transfer: the SCSI data area is this size minus the 48-byte iSCSI BHS,
     /// and a larger READ/WRITE is streamed in bank-sized chunks rather than
-    /// rejected.
+    /// rejected. With `--overlap` this is the **total** of the two USB banks.
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
+
+    /// Split `work` into two equal USB banks (`--work-buf-size` is the total
+    /// in this mode). Enables prefetching the next chunk into the alternate
+    /// bank while the current one is on the bulk-IN pipe, and gives the
+    /// resident long operation its own bank. USB only; the total must be even
+    /// and each half at least 512 bytes (default total 16K).
+    #[arg(long = "overlap")]
+    overlap: bool,
 
     /// Allocate a separate long-operation buffer (split mode).
     ///
@@ -218,7 +232,18 @@ fn main() -> ExitCode {
 fn run_serve(args: ServeArgs) -> ExitCode {
     init_logging(args.verbose);
 
-    let work_size = match parse_work_size(args.work_buf_size.as_deref()) {
+    // Flag combinations the transports cannot honor: reject them before any
+    // size parsing, listener bind or gadget setup.
+    if let Err(msg) = check_overlap(&args) {
+        eprintln!("snowscsi: {msg}");
+        return ExitCode::FAILURE;
+    }
+
+    let work_size = match if args.overlap {
+        parse_work_size_or(args.work_buf_size.as_deref(), OVERLAP_WORK_BUF_SIZE)
+    } else {
+        parse_work_size(args.work_buf_size.as_deref())
+    } {
         Ok(n) => n,
         Err(msg) => {
             eprintln!("snowscsi: {msg}");
@@ -255,7 +280,12 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Err(msg) = check_usb_work_size(work_size) {
+        let check = if args.overlap {
+            check_usb_overlap_work_size(work_size)
+        } else {
+            check_usb_work_size(work_size)
+        };
+        if let Err(msg) = check {
             eprintln!("snowscsi: {msg}");
             return ExitCode::FAILURE;
         }
@@ -1185,6 +1215,11 @@ fn run_serve_usb(
     };
     let lun_count = table.len();
     let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
+    if args.overlap {
+        // Two equal banks inside `work`: command framing/Data-Out in one,
+        // prefetch and the resident long operation in the other.
+        session = session.with_overlap();
+    }
     let mut work = vec![0u8; work_size];
     let mut scratch = split_bank(scratch_len);
     let mut target = snowscsi::core::Target::new(&mut table[..]);
@@ -1730,8 +1765,14 @@ fn init_logging(verbose: u8) {
 /// A transfer larger than the buffer is streamed in bank-sized chunks, so this
 /// is a throughput/latency knob rather than a maximum transfer size.
 fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
+    parse_work_size_or(s, DEFAULT_WORK_BUF_SIZE)
+}
+
+/// [`parse_work_size`] with an explicit default: USB overlap mode uses
+/// [`OVERLAP_WORK_BUF_SIZE`] (the total of two banks).
+fn parse_work_size_or(s: Option<&str>, default: usize) -> Result<usize, String> {
     let bytes = match s {
-        None => DEFAULT_WORK_BUF_SIZE as u64,
+        None => default as u64,
         Some(v) => spec::parse_size(v).ok_or_else(|| format!("invalid --work-buf-size: {v}"))?,
     };
     let n = usize::try_from(bytes).map_err(|_| format!("--work-buf-size {bytes} is too large"))?;
@@ -1741,6 +1782,32 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
         ));
     }
     Ok(n)
+}
+
+/// Reject `--overlap` combinations the selected transport cannot honor.
+///
+/// Checked at the very top of [`run_serve`], before any listener is bound or
+/// gadget assembled, so a rejected invocation exits instead of hanging in an
+/// accept/serve loop:
+/// - iSCSI has no overlap implementation (the USB session owns the two-bank
+///   layout), so `--iscsi --overlap` is refused;
+/// - the overlap banks live inside `work`, so a separate `--scratch-buffer`
+///   would be a third buffer with no defined owner.
+fn check_overlap(args: &ServeArgs) -> Result<(), String> {
+    if !args.overlap {
+        return Ok(());
+    }
+    if args.usb.is_none() {
+        return Err("iSCSI overlap is not implemented (--overlap is USB only)".to_string());
+    }
+    if args.scratch_buffer.is_some() {
+        return Err(
+            "--overlap cannot be combined with --scratch-buffer: the two overlap banks \
+             already live inside --work-buf-size (the long operation gets one of them)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the optional split-mode long-operation bank.
@@ -1803,6 +1870,25 @@ fn check_usb_work_size(n: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// USB overlap `work` bounds: the total is split into two equal banks, so it
+/// must be even and each half must still clear [`MIN_DATA_AREA`].
+fn check_usb_overlap_work_size(n: usize) -> Result<(), String> {
+    if !n.is_multiple_of(2) {
+        return Err(format!(
+            "--work-buf-size {n} must be even with --overlap (two equal banks)"
+        ));
+    }
+    let half = n / 2;
+    if half < MIN_DATA_AREA {
+        return Err(format!(
+            "--work-buf-size {n} leaves a {half}-byte overlap bank below the USB minimum \
+             {MIN_DATA_AREA} (total must be at least {})",
+            2 * MIN_DATA_AREA
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a hexadecimal u16 (with optional `0x` prefix) for `--vid`/`--pid`.
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
     let body = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -1839,6 +1925,89 @@ mod tests {
         assert!(parse_work_size(Some("511")).is_err()); // below the USB floor
         assert_eq!(parse_work_size(Some("512")).unwrap(), MIN_DATA_AREA);
         assert!(parse_work_size(Some("bogus")).is_err());
+    }
+
+    /// Parse a `serve` invocation with a RAM block device plus `extra` flags.
+    fn parse_serve(extra: &[&str]) -> ServeArgs {
+        let mut argv = vec!["snowscsi", "serve", "--block", "ram=1M"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).expect("parse") {
+            Cli::Serve(a) => a,
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_overlap_flag_parses() {
+        let args = parse_serve(&["--usb", "--overlap"]);
+        assert!(args.overlap, "--overlap must set the flag");
+        assert_eq!(args.usb.as_deref(), Some("auto"));
+        assert!(check_overlap(&args).is_ok());
+
+        let args = parse_serve(&["--usb"]);
+        assert!(!args.overlap, "overlap is opt-in");
+    }
+
+    #[test]
+    fn overlap_work_size_defaults_to_the_two_bank_total() {
+        // The overlap default is the *total* of two equal banks, not the 1M
+        // single-bank default.
+        assert_eq!(OVERLAP_WORK_BUF_SIZE, 16384);
+        assert_eq!(
+            parse_work_size_or(None, OVERLAP_WORK_BUF_SIZE).unwrap(),
+            16384
+        );
+        assert_eq!(
+            parse_work_size_or(Some("32K"), OVERLAP_WORK_BUF_SIZE).unwrap(),
+            32 * 1024
+        );
+        // Without --overlap the historical 1M default is unchanged.
+        assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
+    }
+
+    #[test]
+    fn overlap_work_size_bounds() {
+        // Two banks of MIN_DATA_AREA each is the floor (1024 total).
+        assert_eq!(check_usb_overlap_work_size(2 * MIN_DATA_AREA), Ok(()));
+        assert_eq!(check_usb_overlap_work_size(OVERLAP_WORK_BUF_SIZE), Ok(()));
+        assert_eq!(check_usb_overlap_work_size(2 * MIN_DATA_AREA + 2), Ok(()));
+
+        // Each half must clear the 512-byte USB data-area floor.
+        assert!(check_usb_overlap_work_size(2 * MIN_DATA_AREA - 2).is_err());
+        assert!(check_usb_overlap_work_size(MIN_DATA_AREA).is_err());
+
+        // The total must split evenly.
+        assert!(check_usb_overlap_work_size(OVERLAP_WORK_BUF_SIZE + 1).is_err());
+        assert!(check_usb_overlap_work_size(2 * MIN_DATA_AREA - 1).is_err());
+    }
+
+    #[test]
+    fn overlap_is_rejected_with_iscsi() {
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--overlap"]);
+        let err = check_overlap(&args).expect_err("iSCSI overlap must be refused");
+        assert!(
+            err.contains("iSCSI overlap is not implemented"),
+            "message must name the unimplemented iSCSI overlap: {err}"
+        );
+    }
+
+    #[test]
+    fn overlap_conflicts_with_scratch_buffer() {
+        // The overlap banks live inside `work`, so a third scratch bank is
+        // rejected instead of silently ignored.
+        let args = parse_serve(&["--usb", "--overlap", "--scratch-buffer"]);
+        let err = check_overlap(&args).expect_err("scratch + overlap must be refused");
+        assert!(
+            err.contains("--scratch-buffer"),
+            "message must name the conflicting flag: {err}"
+        );
+
+        // Either alone is fine: scratch only with USB (split mode), overlap
+        // only with USB (two banks).
+        let args = parse_serve(&["--usb", "--scratch-buffer"]);
+        assert!(check_overlap(&args).is_ok());
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--scratch-buffer"]);
+        assert!(check_overlap(&args).is_ok());
     }
 
     #[test]

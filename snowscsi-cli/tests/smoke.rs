@@ -174,6 +174,106 @@ fn serve_rejects_work_buf_too_small() {
     assert!(!out.status.success());
 }
 
+/// Run the binary with a wall-clock bound so a CLI bug that binds/serves
+/// instead of rejecting a flag combination fails the test instead of hanging
+/// the suite.
+fn run_with_timeout(args: &[&str], secs: u64) -> Output {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn snowscsi");
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(out) => out.expect("wait for snowscsi"),
+        Err(_) => {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+            panic!("snowscsi hung on {args:?}; expected a fast rejection");
+        }
+    }
+}
+
+#[test]
+fn serve_rejects_overlap_with_iscsi_before_binding() {
+    // The rejection must happen before the portal is bound: the process exits
+    // on its own with a clear message (port 0 would otherwise serve forever).
+    let out = run_with_timeout(
+        &[
+            "serve",
+            "--block",
+            "ram=1M",
+            "--iscsi",
+            "127.0.0.1:0",
+            "--overlap",
+        ],
+        10,
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("iSCSI overlap is not implemented"),
+        "expected a clear iSCSI overlap rejection, got: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_rejects_overlap_with_scratch_buffer() {
+    let out = run_with_timeout(
+        &[
+            "serve",
+            "--block",
+            "ram=1M",
+            "--usb",
+            "--overlap",
+            "--scratch-buffer",
+        ],
+        10,
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--scratch-buffer"),
+        "expected the conflicting flag to be named, got: {err}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_rejects_odd_overlap_work_size_before_gadget_setup() {
+    // Validation runs before the UDC lookup/gadget bind, so this needs no USB
+    // device.
+    let out = run_with_timeout(
+        &[
+            "serve",
+            "--block",
+            "ram=1M",
+            "--usb",
+            "--overlap",
+            "--work-buf-size",
+            "1025",
+        ],
+        10,
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("must be even"),
+        "expected an even-total rejection, got: {err}"
+    );
+}
+
 /// SIGINT → graceful shutdown → exit 0: the accept
 /// loop is woken, `serve()` returns, backends are sync()ed, process exits 0.
 #[cfg(unix)]
