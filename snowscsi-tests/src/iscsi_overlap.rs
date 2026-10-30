@@ -855,3 +855,130 @@ fn pending_after_host_sent_reports_storage_pending_then_delivers_the_next_chunk(
     assert_eq!(data_in_payload(&sent), expected, "byte-exact read");
     assert_eq!(storage.begins, TOTAL / (BANK - BHS_SIZE) + 1);
 }
+
+fn write10_bhs(lba: u32, blocks: u16, itt: u32, cmd_sn: u32) -> [u8; 48] {
+    let mut bhs = [0u8; 48];
+    bhs[0] = op::SCSI_CMD;
+    bhs[1] = 0xA1; // W bit, no immediate data
+    bhs[16..20].copy_from_slice(&be32(itt));
+    bhs[24..28].copy_from_slice(&be32(cmd_sn));
+    bhs[28..32].copy_from_slice(&be32(cmd_sn));
+    bhs[32] = 0x2A; // WRITE(10)
+    bhs[34..38].copy_from_slice(&be32(lba));
+    bhs[39..41].copy_from_slice(&blocks.to_be_bytes());
+    bhs
+}
+
+fn data_out_bhs(itt: u32, ttt: u32, data_sn: u32, bo: u32, dsl: u32) -> [u8; 48] {
+    let mut bhs = [0u8; 48];
+    bhs[0] = op::SCSI_DATA_OUT;
+    bhs[1] = 0x80;
+    bhs[5] = (dsl >> 16) as u8;
+    bhs[6] = (dsl >> 8) as u8;
+    bhs[7] = dsl as u8;
+    bhs[16..20].copy_from_slice(&be32(itt));
+    bhs[20..24].copy_from_slice(&be32(ttt));
+    bhs[36..40].copy_from_slice(&be32(data_sn));
+    bhs[40..44].copy_from_slice(&be32(bo));
+    bhs
+}
+
+/// A Data-Out chunk whose required write is still in flight reports
+/// `StoragePending`; the next `Tick` resumes and the write commits exactly.
+#[test]
+fn pending_write_after_data_out_reports_storage_pending_then_resumes() {
+    use embedded_io::Read as _;
+    use snowscsi::iscsi::pdu::Bhs;
+
+    const BLOCKS: u16 = 32;
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const ITT: u32 = 9;
+
+    let mut ram = vec![0u8; TOTAL];
+    let payload: Vec<u8> = (0..TOTAL as u32)
+        .map(|i| (i.wrapping_mul(13) % 251) as u8)
+        .collect();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(u64::from(BLOCKS), 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage =
+        PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]).with_pending(usize::MAX);
+    let mut session = IscsiSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * BANK];
+    let mut scratch = Vec::new();
+    let mut conn = MockConn::new();
+    conn.feed_padded(&login_bhs(REQ_TEXT.len() as u32), REQ_TEXT.as_bytes());
+    conn.feed(&write10_bhs(0, BLOCKS, ITT, 0), &[]);
+
+    let mut ev = Event::Tick;
+    let mut pending_data_len = 0usize;
+    let mut last_data_out = false;
+    let mut storage_pending_after_data = false;
+    let mut status_seen = false;
+    loop {
+        match session.poll(ev, &mut work, &mut scratch, &mut target, &mut storage) {
+            Action::HostRecv { offset, len } => {
+                let mut got = 0usize;
+                while got < len {
+                    match conn.read(&mut work[offset + got..offset + len]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                if got < len {
+                    break;
+                }
+                if len == pending_data_len && len != 0 {
+                    last_data_out = true;
+                    pending_data_len = 0;
+                } else {
+                    last_data_out = false;
+                }
+                ev = Event::HostRecv { len };
+            }
+            Action::HostSend { bytes } => {
+                let opcode = bytes[0] & 0x3F;
+                if opcode == op::R2T {
+                    let bhs = Bhs::from_bytes(bytes[..BHS_SIZE].try_into().unwrap());
+                    let bo = bhs.buffer_offset() as usize;
+                    let desired = bhs.desired_data_len() as usize;
+                    let dout =
+                        data_out_bhs(bhs.itt(), bhs.ttt(), 0, bhs.buffer_offset(), desired as u32);
+                    conn.feed_padded(&dout, &payload[bo..bo + desired]);
+                    pending_data_len = desired;
+                }
+                embedded_io::Write::write_all(&mut conn, bytes).unwrap();
+                if opcode == op::SCSI_RESP {
+                    status_seen = bytes[3] == status::GOOD;
+                    break;
+                }
+                ev = Event::HostSent;
+            }
+            Action::StoragePending => {
+                if last_data_out {
+                    storage_pending_after_data = true;
+                    // Release the adapter so the following Tick can settle the
+                    // companion and finish the command.
+                    storage.pending_polls = 0;
+                }
+                last_data_out = false;
+                ev = Event::Tick;
+            }
+            Action::Closed => break,
+            Action::Error(error) => panic!("session error: {error:?}"),
+        }
+    }
+
+    assert!(
+        storage_pending_after_data,
+        "a pending write after Data-Out must report StoragePending"
+    );
+    assert!(status_seen, "WRITE completed with GOOD status");
+    let expected = payload;
+    drop(storage);
+    assert_eq!(&ram[..TOTAL], &expected[..], "byte-exact commit");
+}

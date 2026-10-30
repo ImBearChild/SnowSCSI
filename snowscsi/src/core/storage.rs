@@ -86,6 +86,24 @@ pub enum PrefetchOp<'a> {
     },
 }
 
+/// Required write of an already-received chunk.
+///
+/// Deliberately a separate type from [`StorageOp`] so a read or sync can never
+/// be submitted as a wire-step companion. The write shares
+/// [`Storage::begin_exec`]/[`Storage::poll_exec`] with ordinary writes.
+#[derive(Debug)]
+pub enum WriteOp<'a> {
+    /// Write a chunk the host already delivered.
+    Write {
+        /// Resource id, local to the current Lu.
+        resource: u16,
+        /// Byte offset inside the resource.
+        offset: u64,
+        /// Source buffer.
+        buf: &'a [u8],
+    },
+}
+
 /// Metadata-only storage request.
 ///
 /// [`IoToken`] is unrelated to buffer lifetime: `dir` and `len` are what

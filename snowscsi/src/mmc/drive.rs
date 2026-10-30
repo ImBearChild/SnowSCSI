@@ -745,7 +745,8 @@ impl<M: MmcMedium> MmcDrive<M> {
             FeedbackKind::PlanAccepted
             | FeedbackKind::HostReceived
             | FeedbackKind::HostSent
-            | FeedbackKind::HostSentWithIo => return PollStep::Idle,
+            | FeedbackKind::HostSentWithIo
+            | FeedbackKind::HostReceivedWithIo => return PollStep::Idle,
         }
         let remaining = total.saturating_sub(done);
         if remaining == 0 {
@@ -1003,7 +1004,10 @@ impl<M: MmcMedium> MmcDrive<M> {
                                 self.long = LongOp::Idle;
                                 return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
                             }
-                            PollStep::Receive(&mut data[..FORMAT_PARAMS_LEN])
+                            PollStep::Receive {
+                                buf: &mut data[..FORMAT_PARAMS_LEN],
+                                write: None,
+                            }
                         }
                         FeedbackKind::HostReceived => {
                             if data.len() < FORMAT_PARAMS_LEN {
@@ -2375,7 +2379,7 @@ mod tests {
             other => panic!("expected parameter-list publish, got {other:?}"),
         }
         match dev.poll(permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Receive(bytes) => assert_eq!(bytes.len(), FORMAT_PARAMS_LEN),
+            PollStep::Receive { buf: bytes, .. } => assert_eq!(bytes.len(), FORMAT_PARAMS_LEN),
             other => panic!("expected parameter-list receive, got {other:?}"),
         }
         data[..FORMAT_PARAMS_LEN].copy_from_slice(params);
@@ -2875,7 +2879,7 @@ mod tests {
         ));
         assert!(matches!(
             dev.poll(&permit, Feedback::plan_accepted(), &mut big),
-            PollStep::Receive(bytes) if bytes.len() == FORMAT_PARAMS_LEN
+            PollStep::Receive { buf: bytes, .. } if bytes.len() == FORMAT_PARAMS_LEN
         ));
         assert!(matches!(
             dev.poll(

@@ -359,6 +359,8 @@ struct RecvPhase {
     wire_target: u32,
     /// The BOT layer finished the wire receive; `poll_host` may answer Ready.
     wire_done: bool,
+    /// Physical bank the current device chunk lands in.
+    bank: BankSide,
 }
 
 /// H-versus-D gate computed by [`HostTransport::publish`].
@@ -1656,13 +1658,14 @@ impl BotSession {
                     }
                 }
                 Phase::Recv(p) => {
-                    // Data-Out always lands in the command bank.
+                    // Data-Out follows the bank the device selected for this
+                    // chunk; the write companion stays in the other bank.
                     let cap = bank_len as u32;
                     let local_received = p.received.saturating_sub(p.chunk_base);
                     let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
                     if local_received < local_target {
                         Action::HostRecv {
-                            offset: cmd_base + local_received as usize,
+                            offset: self.bank_base(work.len(), p.bank) + local_received as usize,
                             len: (local_target - local_received) as usize,
                             probe: false,
                         }
@@ -1902,6 +1905,7 @@ impl HostTransport for BotSession {
                 chunk_len: 0,
                 wire_target: 0,
                 wire_done: false,
+                bank: BankSide::Work,
             },
         };
         if req.len > total.saturating_sub(p.accepted) {
@@ -2014,13 +2018,17 @@ impl HostTransport for BotSession {
                     Poll::Ready(HostReceipt::from_adapter(p.chunk_accept as usize, None))
                 }
             }
-            Phase::Recv(p) if p.token == token => {
-                let HostBuf::Recv { buf: b, .. } = buf else {
+            Phase::Recv(mut p) if p.token == token => {
+                let HostBuf::Recv { buf: b, bank } = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
                 if b.len() != p.chunk_len as usize {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 }
+                if self.overlap && bank == BankSide::Alt && self.cmd_alt.is_none() {
+                    return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
+                }
+                p.bank = self.physical_bank(bank);
                 if !p.wire_done {
                     self.phase = Phase::Recv(p);
                     return Poll::Pending;

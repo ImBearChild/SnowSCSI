@@ -2865,7 +2865,7 @@ fn overlap_read_alternates_banks_and_is_byte_exact() {
 /// Two banks: a 16 KiB WRITE receives every chunk into the command bank (the
 /// first half), never the alternate, and commits the bytes exactly.
 #[test]
-fn overlap_write_stays_in_the_command_bank() {
+fn overlap_write_uses_both_banks() {
     const BANK: usize = 8192;
     const TOTAL: usize = 2 * BANK;
     const TAG: u32 = 0x72;
@@ -2891,6 +2891,7 @@ fn overlap_write_stays_in_the_command_bank() {
     let mut ev = Event::Tick;
     let mut csw_sent = false;
     let mut data_recvs = 0;
+    let mut data_banks = Vec::new();
     loop {
         match two_bank_next(
             &mut s,
@@ -2906,10 +2907,20 @@ fn overlap_write_stays_in_the_command_bank() {
                     break;
                 }
                 if !probe && len != CBW_LEN {
-                    assert!(
-                        offset + len <= BANK,
-                        "Data-Out must stay in the command bank (offset {offset}, len {len})"
-                    );
+                    let bank = if offset >= BANK {
+                        assert!(
+                            offset + len <= 2 * BANK,
+                            "Data-Out must stay inside one bank (offset {offset}, len {len})"
+                        );
+                        1
+                    } else {
+                        assert!(
+                            offset + len <= BANK,
+                            "Data-Out must stay inside one bank (offset {offset}, len {len})"
+                        );
+                        0
+                    };
+                    data_banks.push(bank);
                     data_recvs += 1;
                 }
                 if probe {
@@ -2936,6 +2947,11 @@ fn overlap_write_stays_in_the_command_bank() {
     }
 
     assert_eq!(data_recvs, TOTAL / BANK, "one receive per bank-sized chunk");
+    assert_eq!(
+        data_banks,
+        vec![0, 1],
+        "Data-Out alternates between the command and alternate banks"
+    );
     let sent = io.take_sent();
     assert_eq!(csw_fields(&sent), (TAG, 0, 0x00), "zero residue");
     let mut check = vec![0u8; TOTAL];

@@ -477,6 +477,8 @@ struct RecvPhase {
     consumed: bool,
     /// Every byte of the plan was received.
     done: bool,
+    /// Physical bank the current device chunk lands in.
+    bank: BankSide,
 }
 
 /// Per-connection iSCSI session state.
@@ -988,12 +990,14 @@ impl IscsiSession {
                 len: total,
             },
             Session::OutData { dsl } => {
-                let local = match self.host {
-                    HostPhase::Recv(p) => p.accepted.saturating_sub(p.chunk_base) as usize,
-                    _ => 0,
+                let (local, bank) = match self.host {
+                    HostPhase::Recv(p) => {
+                        (p.accepted.saturating_sub(p.chunk_base) as usize, p.bank)
+                    }
+                    _ => (0, BankSide::Work),
                 };
                 Emit::Recv {
-                    offset: base + BHS_SIZE + local,
+                    offset: self.bank_base(bank) + BHS_SIZE + local,
                     len: dsl,
                 }
             }
@@ -1181,17 +1185,18 @@ impl IscsiSession {
                 if dsl == 0 {
                     return self.finish_data_out(0, work, scratch, target, storage);
                 }
-                let local = match self.host {
-                    HostPhase::Recv(p) => accepted.saturating_sub(p.chunk_base),
-                    _ => 0,
+                let (local, bank) = match self.host {
+                    HostPhase::Recv(p) => (accepted.saturating_sub(p.chunk_base), p.bank),
+                    _ => (0, BankSide::Work),
                 };
-                let end = base + BHS_SIZE + local as usize + dsl;
-                if end > self.bank_end(work.len(), base) {
+                let data_base = self.bank_base(bank);
+                let end = data_base + BHS_SIZE + local as usize + dsl;
+                if end > self.bank_end(work.len(), data_base) {
                     return Emit::Error(TargetError::WorkBufTooSmall);
                 }
                 self.session = Session::OutData { dsl };
                 Emit::Recv {
-                    offset: base + BHS_SIZE + local as usize,
+                    offset: data_base + BHS_SIZE + local as usize,
                     len: dsl,
                 }
             }
@@ -1530,6 +1535,11 @@ impl IscsiSession {
                             len: BHS_SIZE,
                             base,
                         }
+                    } else if p.produced >= p.phase_end
+                        && target.pending_kind() == Some(PendingKind::Storage)
+                    {
+                        self.session = Session::RecvPdu;
+                        Emit::StoragePending
                     } else {
                         self.session = Session::OutBhs;
                         Emit::Recv {
@@ -2777,6 +2787,7 @@ impl HostTransport for IscsiSession {
                 r2t_pending: false,
                 consumed: false,
                 done: false,
+                bank: BankSide::Work,
             },
         };
         if p.produced >= p.total {
@@ -2928,12 +2939,18 @@ impl HostTransport for IscsiSession {
                 Poll::Pending
             }
             Phase::Recv(mut p) => {
-                match buf {
+                let bank = match buf {
                     HostBuf::Recv { buf, bank }
                         if buf.len() == p.phase_len as usize
-                            && (!self.overlap || bank == BankSide::Work) => {}
+                            && (!self.overlap
+                                || bank == BankSide::Work
+                                || self.cmd_alt.is_some()) =>
+                    {
+                        bank
+                    }
                     _ => return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract))),
-                }
+                };
+                p.bank = self.physical_bank(bank);
                 if p.done {
                     self.host = HostPhase::Recv(p);
                     return Poll::Ready(HostReceipt::from_adapter(p.phase_len as usize, None));

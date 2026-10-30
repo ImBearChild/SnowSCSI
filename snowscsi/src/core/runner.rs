@@ -34,7 +34,7 @@ use super::management::{BoundaryReject, Change, ChangeResult};
 use super::permit::{BoundaryPermit, CommandPermit, ExecutionGuard};
 use super::storage::{
     BankSide, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, IoBuf, IoReceipt, IoReq,
-    IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt,
+    IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt, WriteOp,
 };
 
 /// What the active command is waiting on.
@@ -1379,7 +1379,13 @@ impl Runner {
                         if raw.error().is_some() {
                             state.host_failed = true;
                         }
-                        state.feedback = Feedback::host_received(raw);
+                        if let Some((_, io)) = state.retained_io.take() {
+                            state.feedback = Feedback::host_received_with_io(raw, io);
+                        } else if state.companion.is_some() {
+                            state.retained_host = Some((req, raw));
+                        } else {
+                            state.feedback = Feedback::host_received(raw);
+                        }
                     }
                     HostResume::Unaddressable => {
                         host.cancel(token);
@@ -1444,8 +1450,12 @@ impl Runner {
             match self.poll_companion_once(&mut state, storage, work, alt) {
                 CompanionPoll::Pending | CompanionPoll::Gone => {}
                 CompanionPoll::Ready((req, receipt)) => {
-                    if let Some((_, host_receipt)) = state.retained_host.take() {
-                        state.feedback = Feedback::host_sent_with_io(host_receipt, receipt);
+                    if let Some((host_req, host_receipt)) = state.retained_host.take() {
+                        state.feedback = if host_req.dir == Direction::FromHost {
+                            Feedback::host_received_with_io(host_receipt, receipt)
+                        } else {
+                            Feedback::host_sent_with_io(host_receipt, receipt)
+                        };
                     } else {
                         state.retained_io = Some((req, receipt));
                     }
@@ -1475,11 +1485,19 @@ impl Runner {
         // both somehow remain, deliver them together instead of overwriting
         // one feedback with the other.
         match (state.retained_host.take(), state.retained_io.take()) {
-            (Some((_, host_receipt)), Some((_, receipt))) => {
-                state.feedback = Feedback::host_sent_with_io(host_receipt, receipt);
+            (Some((host_req, host_receipt)), Some((_, receipt))) => {
+                state.feedback = if host_req.dir == Direction::FromHost {
+                    Feedback::host_received_with_io(host_receipt, receipt)
+                } else {
+                    Feedback::host_sent_with_io(host_receipt, receipt)
+                };
             }
-            (Some((_, host_receipt)), None) => {
-                state.feedback = Feedback::host_sent(host_receipt);
+            (Some((host_req, host_receipt)), None) => {
+                state.feedback = if host_req.dir == Direction::FromHost {
+                    Feedback::host_received(host_receipt)
+                } else {
+                    Feedback::host_sent(host_receipt)
+                };
             }
             (None, Some((_, receipt))) => {
                 state.feedback = Feedback::io_done(receipt);
@@ -1636,7 +1654,11 @@ impl Runner {
                         return Ok(DriveStep::Pending);
                     }
                 }
-                PollStep::Receive(buf) => {
+                PollStep::Receive { buf, write } => {
+                    // One storage companion at a time: the device cannot
+                    // combine a new required write while its previous
+                    // companion is still in flight.
+                    debug_assert!(state.companion.is_none() && state.retained_io.is_none());
                     // A host data phase must match the declared direction;
                     // otherwise the plan/context contract was already broken.
                     if state.ctx.host_direction != Direction::FromHost {
@@ -1647,13 +1669,70 @@ impl Runner {
                         len: buf.len() as u32,
                         dir: Direction::FromHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
-                    // A window outside both banks never reaches the host
-                    // adapter: nothing has moved yet, so settle without effect.
-                    let Some((offset, buf_alt)) = buf_offset else {
+                    // Resolve both windows before anything reaches an adapter.
+                    let Some((offset, buf_alt)) =
+                        slice_offset(work_start, work_len, alt_start, alt_len, buf)
+                    else {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     };
+                    let companion = match write {
+                        Some(WriteOp::Write {
+                            resource,
+                            offset: write_offset,
+                            buf: write_buf,
+                        }) => {
+                            let Some((companion_offset, companion_alt)) =
+                                slice_offset(work_start, work_len, alt_start, alt_len, write_buf)
+                            else {
+                                self.settle_contract(lu, KnownEffects::NONE);
+                                return Err(Fault::Contract);
+                            };
+                            if windows_overlap(buf, write_buf) {
+                                self.settle_contract(lu, KnownEffects::NONE);
+                                return Err(Fault::Contract);
+                            }
+                            let companion_req = IoReq {
+                                resource,
+                                offset: write_offset,
+                                len: write_buf.len() as u32,
+                                dir: Direction::FromHost,
+                            };
+                            Some((companion_req, companion_offset, companion_alt, write_buf))
+                        }
+                        None => None,
+                    };
+
+                    // Submit the required write first; a blocking adapter
+                    // settles it here, an asynchronous one keeps its token.
+                    if let Some((companion_req, companion_offset, companion_alt, companion_buf)) =
+                        companion
+                    {
+                        debug_assert!(companion_req.dir == Direction::FromHost);
+                        let token = storage.begin_exec(companion_req);
+                        if token.is_valid() {
+                            match storage.poll_exec(token, IoBuf::Write(companion_buf)) {
+                                Poll::Pending => {
+                                    state.companion = Some(PendingOp::Storage {
+                                        token,
+                                        req: companion_req,
+                                        buf_offset: companion_offset,
+                                        buf_alt: companion_alt,
+                                        prefetch: false,
+                                    });
+                                    self.note_required_io(true);
+                                }
+                                Poll::Ready(raw) => {
+                                    let receipt = sanitize_storage_receipt(companion_req, raw);
+                                    state.retained_io = Some((
+                                        companion_req,
+                                        IoReceipt::from_storage(receipt, self.owner),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     let bank = if buf_alt {
                         BankSide::Alt
                     } else {
@@ -1661,7 +1740,9 @@ impl Runner {
                     };
                     let token = host.begin_recv(req);
                     if !token.is_valid() {
-                        self.settle_contract(lu, KnownEffects::NONE);
+                        self.cancel_state_tokens(&state, storage, host);
+                        let known = Self::known_for_state(&state);
+                        self.settle_contract(lu, known);
                         return Err(Fault::Contract);
                     }
                     match host.poll_host(token, HostBuf::Recv { buf, bank }) {
@@ -1683,9 +1764,13 @@ impl Runner {
                             // A returned receipt keeps its (clamped) accepted
                             // prefix; a contract error alone is not an unknown
                             // write.
-                            let known = Self::known_from_host_receipt(sanitize_host_receipt(
-                                req, raw, self.owner,
-                            ));
+                            self.cancel_state_tokens(&state, storage, host);
+                            let known = Self::merge_known(
+                                Self::known_from_host_receipt(sanitize_host_receipt(
+                                    req, raw, self.owner,
+                                )),
+                                Self::known_for_state(&state),
+                            );
                             self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
@@ -1694,7 +1779,19 @@ impl Runner {
                             if receipt.error().is_some() {
                                 state.host_failed = true;
                             }
-                            state.feedback = Feedback::host_received(receipt);
+                            if let Some((_, io)) = state.retained_io.take() {
+                                state.feedback = Feedback::host_received_with_io(receipt, io);
+                            } else if state.companion.is_some() {
+                                state.retained_host = Some((req, receipt));
+                                state.work_addr = work.as_ptr() as usize;
+                                state.work_len = work.len();
+                                state.alt_addr = alt.as_ptr() as usize;
+                                state.alt_len = alt.len();
+                                self.drive_state.set(Some(state));
+                                return Ok(DriveStep::Pending);
+                            } else {
+                                state.feedback = Feedback::host_received(receipt);
+                            }
                         }
                     }
                 }
@@ -2809,7 +2906,7 @@ impl Runner {
                 }
                 return Ok(lu.long_info());
             }
-            PollStep::Publish(_) | PollStep::Receive(_) | PollStep::Send { .. } => {
+            PollStep::Publish(_) | PollStep::Receive { .. } | PollStep::Send { .. } => {
                 // The device broke the long-operation contract but did not
                 // consume the receipt: restore it instead of dropping facts.
                 self.long_feedback = Some((lun, feedback));
@@ -2909,7 +3006,7 @@ impl Runner {
             PollStep::Complete(_)
             | PollStep::Idle
             | PollStep::Publish(_)
-            | PollStep::Receive(_)
+            | PollStep::Receive { .. }
             | PollStep::Send { .. } => {}
         }
         self.clear_long_feedback(lun);
@@ -3016,7 +3113,7 @@ impl Runner {
             PollStep::Complete(_)
             | PollStep::Idle
             | PollStep::Publish(_)
-            | PollStep::Receive(_)
+            | PollStep::Receive { .. }
             | PollStep::Send { .. } => self.clear_long_feedback(lun),
         }
         Err(Fault::Contract)
@@ -3367,7 +3464,10 @@ mod tests {
                     bytes: &data[..len],
                     prefetch: None,
                 },
-                Script::Receive { len } => PollStep::Receive(&mut data[..len]),
+                Script::Receive { len } => PollStep::Receive {
+                    buf: &mut data[..len],
+                    write: None,
+                },
                 Script::Complete(completion) => {
                     self.active = false;
                     PollStep::Complete(completion)

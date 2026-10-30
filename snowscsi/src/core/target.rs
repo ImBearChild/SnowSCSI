@@ -2008,7 +2008,10 @@ mod tests {
                     },
                     Some(BankScript::RecvAlt) => {
                         self.script = None;
-                        crate::core::PollStep::Receive(&mut alt[..data.len()])
+                        crate::core::PollStep::Receive {
+                            buf: &mut alt[..data.len()],
+                            write: None,
+                        }
                     }
                     Some(BankScript::SendOutside) => crate::core::PollStep::Send {
                         bytes: &OUTSIDE[..data.len()],

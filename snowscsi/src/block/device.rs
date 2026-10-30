@@ -15,7 +15,7 @@
 //! [`Storage`]: crate::core::storage::Storage
 
 use crate::block::BlockAttrs;
-use crate::core::storage::{PrefetchOp, StorageOp};
+use crate::core::storage::{PrefetchOp, StorageOp, WriteOp};
 use crate::core::{
     storage_fault_sense, BoundaryPermit, Capacity, CommandContext, CommandPermit, Completion,
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
@@ -79,10 +79,23 @@ enum Stage {
     Send,
     /// READ: speculative read of the next chunk, not yet settled.
     Prefetch,
-    /// WRITE: receive host data.
-    WriteRecv,
-    /// WRITE: issue the backing write.
-    WriteIo,
+    /// WRITE: receive host data, optionally while the previous chunk is
+    /// being written.
+    WriteRecv {
+        pending_write: Option<(usize, bool)>,
+    },
+    /// WRITE: the previous chunk is being written while the next one is
+    /// received into the other bank.
+    WritePipe {
+        pending_write: (usize, bool),
+        next_in_alt: bool,
+        next_len: usize,
+    },
+    /// WRITE: the final (or a fallback) backing write is in flight.
+    WriteIo {
+        pending: (usize, bool),
+        queued: Option<(usize, bool, bool)>,
+    },
     /// WRITE with FUA: flush after the write before completing.
     PostSync,
     /// SYNCHRONIZE CACHE: issue the flush.
@@ -410,6 +423,13 @@ impl BlockDevice {
         self.offset + u64::from(self.progress)
     }
 
+    /// Bytes of the chunk after advancing `progress` by `advance`.
+    fn chunk_after(&self, advance: usize, bank_len: usize) -> usize {
+        (self.bytes as usize)
+            .saturating_sub(self.progress as usize + advance)
+            .min(bank_len)
+    }
+
     /// Issue the normal read of the current chunk.
     fn read_chunk<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let len = self.next_chunk(data.len());
@@ -614,7 +634,9 @@ impl Device for BlockDevice {
                 };
                 self.stage = match self.direction {
                     Direction::ToHost => Stage::ReadIo,
-                    Direction::FromHost => Stage::WriteRecv,
+                    Direction::FromHost => Stage::WriteRecv {
+                        pending_write: None,
+                    },
                     Direction::None => Stage::SyncIo,
                 };
                 PollStep::Publish(plan)
@@ -694,18 +716,23 @@ impl Device for BlockDevice {
                 self.stage = Stage::Send;
                 self.send_chunk(data, alt)
             }
-            // WRITE: receive host data, then write the accepted prefix.
-            (Stage::WriteRecv, FeedbackKind::PlanAccepted) => {
+            // WRITE: one-deep pipeline. The chunk being written is always the
+            // bank that is not being received.
+            (Stage::WriteRecv { .. }, FeedbackKind::PlanAccepted) => {
                 let len = self.next_chunk(data.len());
-                PollStep::Receive(&mut data[..len])
+                self.accepted = 0;
+                self.host_error = None;
+                PollStep::Receive {
+                    buf: &mut data[..len],
+                    write: None,
+                }
             }
-            (Stage::WriteRecv, FeedbackKind::HostReceived) => {
+            (Stage::WriteRecv { .. }, FeedbackKind::HostReceived) => {
                 let len = self.next_chunk(data.len());
                 let (accepted, failed) = host_facts(fb, len);
                 self.accepted = accepted as u32;
                 self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
                 if accepted == 0 {
-                    // Zero progress: nothing to write, and the command fails.
                     return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
                 self.host_error = if failed || accepted < len {
@@ -713,7 +740,31 @@ impl Device for BlockDevice {
                 } else {
                     None
                 };
-                self.stage = Stage::WriteIo;
+                let more = self.host_error.is_none()
+                    && self.progress.saturating_add(accepted as u32) < self.bytes;
+                if more && !alt.is_empty() {
+                    let next_len = self.chunk_after(accepted, alt.len());
+                    if next_len == 0 {
+                        return self.finish(Completion::Check(INTERNAL_FAILURE));
+                    }
+                    self.stage = Stage::WritePipe {
+                        pending_write: (accepted, false),
+                        next_in_alt: true,
+                        next_len,
+                    };
+                    return PollStep::Receive {
+                        buf: &mut alt[..next_len],
+                        write: Some(WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..accepted],
+                        }),
+                    };
+                }
+                self.stage = Stage::WriteIo {
+                    pending: (accepted, false),
+                    queued: None,
+                };
                 self.io_issues = self.io_issues.saturating_add(1);
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
@@ -721,7 +772,127 @@ impl Device for BlockDevice {
                     buf: &data[..accepted],
                 })
             }
-            (Stage::WriteIo, FeedbackKind::IoDone) => {
+            // A missing companion (pool exhaustion) forces the previous write
+            // through the plain path; the chunk just received is queued.
+            (
+                Stage::WritePipe {
+                    pending_write,
+                    next_in_alt,
+                    next_len,
+                },
+                FeedbackKind::HostReceived,
+            ) => {
+                let (accepted, failed) = host_facts(fb, next_len);
+                self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
+                let pending_buf = if pending_write.1 {
+                    &alt[..pending_write.0]
+                } else {
+                    &data[..pending_write.0]
+                };
+                self.stage = Stage::WriteIo {
+                    pending: pending_write,
+                    queued: Some((accepted, next_in_alt, failed || accepted < next_len)),
+                };
+                self.io_issues = self.io_issues.saturating_add(1);
+                PollStep::Io(StorageOp::Write {
+                    resource: 0,
+                    offset: self.next_offset(),
+                    buf: pending_buf,
+                })
+            }
+            (
+                Stage::WritePipe {
+                    pending_write,
+                    next_in_alt,
+                    next_len,
+                },
+                FeedbackKind::HostReceivedWithIo,
+            ) => {
+                let (accepted, failed) = host_facts(fb, next_len);
+                self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
+                let Some(io) = fb.io() else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                if let Some(fault) = io.error() {
+                    self.effects.confirmed_write = self
+                        .effects
+                        .confirmed_write
+                        .saturating_add(io.confirmed() as u64);
+                    if io.effect() == Effect::UnknownRemainder {
+                        self.effects.unknown_remainder = true;
+                    }
+                    return self.storage_sense(fault, IoContext::Write);
+                }
+                self.effects.confirmed_write = self
+                    .effects
+                    .confirmed_write
+                    .saturating_add(io.confirmed() as u64);
+                if io.effect() == Effect::UnknownRemainder {
+                    self.effects.unknown_remainder = true;
+                }
+                if failed || accepted < next_len {
+                    // The previous write is confirmed; the partial receive is
+                    // not written and the command ends.
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
+                }
+                if io.confirmed() < pending_write.0 {
+                    return self.finish(Completion::Check(WRITE_ERROR));
+                }
+                self.progress = self.progress.saturating_add(io.confirmed() as u32);
+                self.accepted = accepted as u32;
+                let last = self.progress.saturating_add(accepted as u32) >= self.bytes;
+                let other_alt = !next_in_alt;
+                let other_len = if other_alt { alt.len() } else { data.len() };
+                if last {
+                    self.stage = Stage::WriteIo {
+                        pending: (accepted, next_in_alt),
+                        queued: None,
+                    };
+                    self.io_issues = self.io_issues.saturating_add(1);
+                    return if next_in_alt {
+                        PollStep::Io(StorageOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &alt[..accepted],
+                        })
+                    } else {
+                        PollStep::Io(StorageOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..accepted],
+                        })
+                    };
+                }
+                let next_len = self.chunk_after(accepted, other_len);
+                if next_len == 0 {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                }
+                self.stage = Stage::WritePipe {
+                    pending_write: (accepted, next_in_alt),
+                    next_in_alt: other_alt,
+                    next_len,
+                };
+                if next_in_alt {
+                    PollStep::Receive {
+                        buf: &mut data[..next_len],
+                        write: Some(WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &alt[..accepted],
+                        }),
+                    }
+                } else {
+                    PollStep::Receive {
+                        buf: &mut alt[..next_len],
+                        write: Some(WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..accepted],
+                        }),
+                    }
+                }
+            }
+            (Stage::WriteIo { pending, queued }, FeedbackKind::IoDone) => {
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
@@ -742,13 +913,12 @@ impl Device for BlockDevice {
                 if receipt.effect() == Effect::UnknownRemainder {
                     self.effects.unknown_remainder = true;
                 }
-                let short = receipt.confirmed() < self.accepted as usize;
+                let short = receipt.confirmed() < pending.0;
                 if self.host_error.is_none() && !short {
                     self.progress = self.progress.saturating_add(receipt.confirmed() as u32);
                 }
                 if self.fua && self.host_error.is_none() && !short && self.progress >= self.bytes {
-                    // FUA write: flush before reporting GOOD. The adapter owns
-                    // whether the flush really reaches non-volatile storage.
+                    // FUA write: flush before reporting GOOD.
                     self.stage = Stage::PostSync;
                     self.io_issues = self.io_issues.saturating_add(1);
                     return PollStep::Io(StorageOp::Sync { resource: 0 });
@@ -759,11 +929,45 @@ impl Device for BlockDevice {
                 if short {
                     return self.finish(Completion::Check(WRITE_ERROR));
                 }
+                if let Some((queued_len, queued_alt, queued_failed)) = queued {
+                    self.accepted = queued_len as u32;
+                    if queued_len == 0 {
+                        return self.finish(Completion::Check(COMMAND_ABORTED));
+                    }
+                    self.host_error = if queued_failed {
+                        Some(Completion::Check(COMMAND_ABORTED))
+                    } else {
+                        None
+                    };
+                    self.stage = Stage::WriteIo {
+                        pending: (queued_len, queued_alt),
+                        queued: None,
+                    };
+                    self.io_issues = self.io_issues.saturating_add(1);
+                    return if queued_alt {
+                        PollStep::Io(StorageOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &alt[..queued_len],
+                        })
+                    } else {
+                        PollStep::Io(StorageOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..queued_len],
+                        })
+                    };
+                }
                 if self.progress < self.bytes {
-                    // More host data: start the next chunk's receive phase.
                     let len = self.next_chunk(data.len());
-                    self.stage = Stage::WriteRecv;
-                    return PollStep::Receive(&mut data[..len]);
+                    self.accepted = 0;
+                    self.stage = Stage::WriteRecv {
+                        pending_write: None,
+                    };
+                    return PollStep::Receive {
+                        buf: &mut data[..len],
+                        write: None,
+                    };
                 }
                 self.finish(Completion::Good)
             }
@@ -1213,7 +1417,7 @@ mod tests {
         .expect("prepare");
         dev.poll(&permit, Feedback::begin(), &mut data);
         match dev.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Receive(bytes) => assert_eq!(bytes.len(), 512),
+            PollStep::Receive { buf: bytes, .. } => assert_eq!(bytes.len(), 512),
             other => panic!("expected receive, got {other:?}"),
         }
         for (chunk, offset) in [(0u32, 0u64), (1, 512), (2, 1024)] {
@@ -1239,7 +1443,7 @@ mod tests {
                 // The next receive phase is issued in the same step that
                 // settles the previous write.
                 match dev.poll(&permit, io_receipt(512, None), &mut data) {
-                    PollStep::Receive(bytes) => assert_eq!(bytes.len(), 512),
+                    PollStep::Receive { buf: bytes, .. } => assert_eq!(bytes.len(), 512),
                     other => panic!("expected next receive, got {other:?}"),
                 }
             }
@@ -1302,7 +1506,7 @@ mod tests {
         assert_eq!(plan.bytes, 512);
         assert!(matches!(
             dev.poll(&permit, Feedback::plan_accepted(), &mut data),
-            PollStep::Receive(_)
+            PollStep::Receive { .. }
         ));
         match dev.poll(
             &permit,
@@ -2182,5 +2386,182 @@ mod tests {
         assert_eq!(sizes, vec![BANK, BANK, BANK, TOTAL - 3 * BANK]);
         assert_eq!(alt_prefetches, 2);
         assert_eq!(delivered, TOTAL);
+    }
+    /// A two-bank WRITE pipelines the first chunk's write with the second
+    /// chunk's receive and finishes with the last chunk's write.
+    #[test]
+    fn two_bank_write_pipelines_across_banks() {
+        let mut dev = BlockDevice::new(BlockAttrs::new(2, 512));
+        let permit = permit();
+        let mut data = [0u8; 512];
+        let mut alt = [0u8; 512];
+        let data_addr = data.as_ptr() as usize;
+        let alt_addr = alt.as_ptr() as usize;
+        let in_data = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= data_addr && p + buf.len() <= data_addr + 512
+        };
+        let in_alt = |buf: &[u8]| {
+            let p = buf.as_ptr() as usize;
+            p >= alt_addr && p + buf.len() <= alt_addr + 512
+        };
+
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::FromHost, 1024),
+                &cdb10(WRITE_10, 0, 2)
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt),
+            PollStep::Publish(_)
+        ));
+        match dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt) {
+            PollStep::Receive { buf, write: None } => assert!(in_data(buf)),
+            other => panic!("expected first receive, got {other:?}"),
+        }
+        match dev.poll_with_alt(
+            &permit,
+            Feedback::host_received(HostReceipt::test(512, None)),
+            &mut data,
+            &mut alt,
+        ) {
+            PollStep::Receive {
+                buf,
+                write:
+                    Some(WriteOp::Write {
+                        offset, buf: prev, ..
+                    }),
+            } => {
+                assert!(in_alt(buf));
+                assert!(in_data(prev));
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected pipelined receive, got {other:?}"),
+        }
+        match dev.poll_with_alt(
+            &permit,
+            Feedback::host_received_with_io(
+                HostReceipt::test(512, None),
+                IoReceipt::test(512, None, Effect::Known),
+            ),
+            &mut data,
+            &mut alt,
+        ) {
+            PollStep::Io(StorageOp::Write { offset, buf, .. }) => {
+                assert_eq!(offset, 512);
+                assert!(in_alt(buf));
+            }
+            other => panic!("expected final write, got {other:?}"),
+        }
+        assert!(matches!(
+            dev.poll_with_alt(&permit, io_receipt(512, None), &mut data, &mut alt),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(dev.known_effects().confirmed_write, 1024);
+        assert_eq!(dev.known_effects().host_prefix, 1024);
+    }
+
+    /// A failed write with a fully received next chunk takes the storage-sense
+    /// path; the host prefix still counts both chunks and the confirmed write
+    /// is exactly the reported prefix.
+    #[test]
+    fn write_failure_with_a_full_receive_takes_the_storage_sense() {
+        let mut dev = BlockDevice::new(BlockAttrs::new(2, 512));
+        let permit = permit();
+        let mut data = [0u8; 512];
+        let mut alt = [0u8; 512];
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::FromHost, 1024),
+                &cdb10(WRITE_10, 0, 2)
+            ),
+            Ok(())
+        );
+        dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt);
+        dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt);
+        assert!(matches!(
+            dev.poll_with_alt(
+                &permit,
+                Feedback::host_received(HostReceipt::test(512, None)),
+                &mut data,
+                &mut alt,
+            ),
+            PollStep::Receive {
+                write: Some(WriteOp::Write { .. }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            dev.poll_with_alt(
+                &permit,
+                Feedback::host_received_with_io(
+                    HostReceipt::test(512, None),
+                    IoReceipt::test(128, Some(Fault::Io), Effect::Known),
+                ),
+                &mut data,
+                &mut alt,
+            ),
+            PollStep::Complete(Completion::Check(WRITE_ERROR))
+        ));
+        assert_eq!(dev.known_effects().confirmed_write, 128);
+        assert_eq!(dev.known_effects().host_prefix, 1024);
+        assert!(!dev.known_effects().unknown_remainder);
+    }
+
+    /// A short receive ends the command even when the companion write
+    /// succeeded; both prefixes remain accounted.
+    #[test]
+    fn short_receive_with_a_successful_write_aborts() {
+        let mut dev = BlockDevice::new(BlockAttrs::new(2, 512));
+        let permit = permit();
+        let mut data = [0u8; 512];
+        let mut alt = [0u8; 512];
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::FromHost, 1024),
+                &cdb10(WRITE_10, 0, 2)
+            ),
+            Ok(())
+        );
+        dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt);
+        dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt);
+        dev.poll_with_alt(
+            &permit,
+            Feedback::host_received(HostReceipt::test(512, None)),
+            &mut data,
+            &mut alt,
+        );
+        assert!(matches!(
+            dev.poll_with_alt(
+                &permit,
+                Feedback::host_received_with_io(
+                    HostReceipt::test(256, None),
+                    IoReceipt::test(512, None, Effect::Known),
+                ),
+                &mut data,
+                &mut alt,
+            ),
+            PollStep::Complete(Completion::Check(COMMAND_ABORTED))
+        ));
+        assert_eq!(dev.known_effects().confirmed_write, 512);
+        assert_eq!(dev.known_effects().host_prefix, 768);
+        assert!(!dev.active());
+    }
+
+    /// A zero-length WRITE publishes no data phase and no companion.
+    #[test]
+    fn zero_length_write_is_a_plain_good_completion() {
+        let mut dev = BlockDevice::new(BlockAttrs::new(2, 512));
+        let permit = permit();
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 0), &cdb10(WRITE_10, 0, 0)),
+            Err(Completion::Good)
+        );
+        assert!(!dev.active());
     }
 }

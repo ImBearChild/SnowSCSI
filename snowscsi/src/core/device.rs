@@ -15,7 +15,7 @@ use super::errors::{Completion, Delivery, Fault, KnownEffects, Sense};
 use super::long::LongInfo;
 use super::permit::{BoundaryPermit, CommandPermit};
 use super::profile::SpcProfile;
-use super::storage::{HostReceipt, IoReceipt, PrefetchOp, StorageOp};
+use super::storage::{HostReceipt, IoReceipt, PrefetchOp, StorageOp, WriteOp};
 use super::ua::UaClass;
 
 /// Core's zero-sized placeholder pair member. It implements no trait; a
@@ -239,6 +239,8 @@ pub enum FeedbackKind {
     HostSent,
     /// A host send and its speculative read-ahead settled together.
     HostSentWithIo,
+    /// A host receive and its required write settled together.
+    HostReceivedWithIo,
 }
 
 /// Opaque per-poll feedback.
@@ -314,6 +316,16 @@ impl Feedback {
         }
     }
 
+    /// A host receive phase and its required write settled together.
+    #[allow(dead_code)] // minted by `Runner` in the runner card
+    pub(crate) fn host_received_with_io(host: HostReceipt, io: IoReceipt) -> Self {
+        Self {
+            kind: FeedbackKind::HostReceivedWithIo,
+            io,
+            host,
+        }
+    }
+
     /// What this poll step is reporting.
     #[must_use]
     pub const fn kind(&self) -> FeedbackKind {
@@ -324,7 +336,9 @@ impl Feedback {
     #[must_use]
     pub const fn io(&self) -> Option<IoReceipt> {
         match self.kind {
-            FeedbackKind::IoDone | FeedbackKind::HostSentWithIo => Some(self.io),
+            FeedbackKind::IoDone
+            | FeedbackKind::HostSentWithIo
+            | FeedbackKind::HostReceivedWithIo => Some(self.io),
             _ => None,
         }
     }
@@ -333,9 +347,10 @@ impl Feedback {
     #[must_use]
     pub const fn host(&self) -> Option<HostReceipt> {
         match self.kind {
-            FeedbackKind::HostReceived | FeedbackKind::HostSent | FeedbackKind::HostSentWithIo => {
-                Some(self.host)
-            }
+            FeedbackKind::HostReceived
+            | FeedbackKind::HostSent
+            | FeedbackKind::HostSentWithIo
+            | FeedbackKind::HostReceivedWithIo => Some(self.host),
             _ => None,
         }
     }
@@ -359,8 +374,14 @@ pub enum PollStep<'a> {
     Io(StorageOp<'a>),
     /// Speculative read; failure/cancel never changes the completion.
     Prefetch(PrefetchOp<'a>),
-    /// Receive host data into the caller's bank (write-style commands).
-    Receive(&'a mut [u8]),
+    /// Receive host data into the caller's bank (write-style commands),
+    /// optionally submitting the required write of the previous chunk.
+    Receive {
+        /// Host → device bytes for this step.
+        buf: &'a mut [u8],
+        /// Required write of the chunk received in the previous entry.
+        write: Option<WriteOp<'a>>,
+    },
     /// Send data to the host (read-style commands), optionally submitting the
     /// speculative read of the next chunk in the same poll.
     Send {

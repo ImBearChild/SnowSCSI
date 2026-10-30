@@ -40,6 +40,9 @@ pub enum DvdRamState {
     Deliver,
     /// WRITE: waiting for the host data.
     WriteRecv,
+    /// WRITE: the previous chunk is being written while the next one is
+    /// received into the other bank.
+    WritePipe,
     /// WRITE: the backing write is being issued.
     WriteIo,
     /// COMMIT: the sync is being issued.
@@ -80,6 +83,12 @@ pub struct DvdRamMedium {
     next_in_alt: bool,
     /// Bytes of that prefetched chunk.
     next_len: usize,
+    /// Chunk already received and currently being written: accepted length and
+    /// the bank it lives in.
+    pending_write: Option<(usize, bool)>,
+    /// Chunk received while a missing companion forced the previous write
+    /// through the plain path: accepted length, bank and whether it was short.
+    queued_recv: Option<(usize, bool, bool)>,
 }
 
 impl DvdRamMedium {
@@ -103,6 +112,8 @@ impl DvdRamMedium {
             chunk_len: 0,
             next_in_alt: false,
             next_len: 0,
+            pending_write: None,
+            queued_recv: None,
         }
     }
 
@@ -140,6 +151,8 @@ impl DvdRamMedium {
         self.chunk_len = 0;
         self.next_in_alt = false;
         self.next_len = 0;
+        self.pending_write = None;
+        self.queued_recv = None;
     }
 
     /// Total bytes selected by the admitted operation.
@@ -165,6 +178,13 @@ impl DvdRamMedium {
             }
             _ => 0,
         }
+    }
+
+    /// Bytes of the chunk after advancing `progress` by `advance`.
+    fn chunk_after(&self, advance: usize, bank_len: usize) -> usize {
+        self.total_bytes()
+            .saturating_sub(self.progress as usize + advance)
+            .min(bank_len)
     }
 
     /// Issue the normal read of the current chunk.
@@ -480,13 +500,17 @@ impl MmcMedium for DvdRamMedium {
             (DvdRamState::WriteRecv, FeedbackKind::PlanAccepted) => {
                 let chunk = self.next_chunk(data.len());
                 if total > 0 && chunk == 0 {
-                    // Same staging rule as the read path: a bank that cannot
-                    // hold one chunk is the target's own inability to stage
-                    // (04/44/00), not a bad CDB. The step entries reject an
-                    // empty bank first.
+                    // A bank that cannot hold one chunk is the target's own
+                    // inability to stage (04/44/00), not a bad CDB.
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 }
-                PollStep::Receive(&mut data[..chunk])
+                self.pending_write = None;
+                self.queued_recv = None;
+                self.phase = DvdRamState::WriteRecv;
+                PollStep::Receive {
+                    buf: &mut data[..chunk],
+                    write: None,
+                }
             }
             (DvdRamState::WriteRecv, FeedbackKind::HostReceived) => {
                 let chunk = self.next_chunk(data.len());
@@ -499,6 +523,26 @@ impl MmcMedium for DvdRamMedium {
                     // prefix, so no host byte is silently promoted to success.
                     return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                self.pending_write = Some((accepted, false));
+                let more =
+                    self.progress.saturating_add(accepted as u32) < self.total_bytes() as u32;
+                if more && !alt.is_empty() {
+                    let next_len = self.chunk_after(accepted, alt.len());
+                    if next_len == 0 {
+                        return self.finish(Completion::Check(INTERNAL_FAILURE));
+                    }
+                    self.next_in_alt = true;
+                    self.next_len = next_len;
+                    self.phase = DvdRamState::WritePipe;
+                    return PollStep::Receive {
+                        buf: &mut alt[..next_len],
+                        write: Some(crate::core::storage::WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..accepted],
+                        }),
+                    };
+                }
                 self.phase = DvdRamState::WriteIo;
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
@@ -506,23 +550,169 @@ impl MmcMedium for DvdRamMedium {
                     buf: &data[..accepted],
                 })
             }
+            (DvdRamState::WritePipe, FeedbackKind::HostReceived) => {
+                let chunk = self.next_len;
+                let (accepted, failed) = match fb.host() {
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
+                    None => (0, true),
+                };
+                let Some((pending_len, pending_alt)) = self.pending_write else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                self.queued_recv = Some((accepted, self.next_in_alt, failed || accepted < chunk));
+                self.phase = DvdRamState::WriteIo;
+                let buf: &[u8] = if pending_alt {
+                    &alt[..pending_len]
+                } else {
+                    &data[..pending_len]
+                };
+                PollStep::Io(StorageOp::Write {
+                    resource: 0,
+                    offset: self.next_offset(),
+                    buf,
+                })
+            }
+            (DvdRamState::WritePipe, FeedbackKind::HostReceivedWithIo) => {
+                let chunk = self.next_len;
+                let recv_alt = self.next_in_alt;
+                let (accepted, failed) = match fb.host() {
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
+                    None => (0, true),
+                };
+                let Some(io) = fb.io() else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                let Some((pending_len, _pending_alt)) = self.pending_write else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                if let Some(fault) = io.error() {
+                    return self.storage_sense(fault, IoContext::Write);
+                }
+                if failed || accepted < chunk {
+                    // The previous write is confirmed; the partial receive is
+                    // not written and the command ends.
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
+                }
+                if io.confirmed() < pending_len || io.effect() != Effect::Known {
+                    return self.finish(Completion::Check(MEDIUM_ERROR));
+                }
+                self.progress = self.progress.saturating_add(io.confirmed() as u32);
+                self.pending_write = Some((accepted, recv_alt));
+                let total = self.total_bytes();
+                let last = self.progress as usize + accepted >= total;
+                let other_alt = !recv_alt;
+                let other_len = if other_alt { alt.len() } else { data.len() };
+                if last {
+                    self.phase = DvdRamState::WriteIo;
+                    let buf: &[u8] = if recv_alt {
+                        &alt[..accepted]
+                    } else {
+                        &data[..accepted]
+                    };
+                    return PollStep::Io(StorageOp::Write {
+                        resource: 0,
+                        offset: self.next_offset(),
+                        buf,
+                    });
+                }
+                let next_len = self.chunk_after(accepted, other_len);
+                if next_len == 0 {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                }
+                self.next_in_alt = other_alt;
+                self.next_len = next_len;
+                self.phase = DvdRamState::WritePipe;
+                if recv_alt {
+                    PollStep::Receive {
+                        buf: &mut data[..next_len],
+                        write: Some(crate::core::storage::WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &alt[..accepted],
+                        }),
+                    }
+                } else {
+                    PollStep::Receive {
+                        buf: &mut alt[..next_len],
+                        write: Some(crate::core::storage::WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..accepted],
+                        }),
+                    }
+                }
+            }
             (DvdRamState::WriteIo, FeedbackKind::IoDone) => {
-                let chunk = self.next_chunk(data.len());
+                let Some((pending_len, _pending_alt)) = self.pending_write else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
                 let Some(receipt) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Write);
                 }
-                if receipt.confirmed() < chunk || receipt.effect() != Effect::Known {
+                if receipt.confirmed() < pending_len || receipt.effect() != Effect::Known {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
-                self.progress = self.progress.saturating_add(chunk as u32);
+                self.progress = self.progress.saturating_add(pending_len as u32);
+                if let Some((queued_len, queued_alt, queued_failed)) = self.queued_recv.take() {
+                    if queued_failed || queued_len == 0 {
+                        return self.finish(Completion::Check(COMMAND_ABORTED));
+                    }
+                    self.pending_write = Some((queued_len, queued_alt));
+                    let total = self.total_bytes();
+                    let last = self.progress as usize + queued_len >= total;
+                    if last {
+                        self.phase = DvdRamState::WriteIo;
+                        let buf: &[u8] = if queued_alt {
+                            &alt[..queued_len]
+                        } else {
+                            &data[..queued_len]
+                        };
+                        return PollStep::Io(StorageOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf,
+                        });
+                    }
+                    let other_alt = !queued_alt;
+                    let other_len = if other_alt { alt.len() } else { data.len() };
+                    let next_len = self.chunk_after(queued_len, other_len);
+                    if next_len == 0 {
+                        return self.finish(Completion::Check(INTERNAL_FAILURE));
+                    }
+                    self.next_in_alt = other_alt;
+                    self.next_len = next_len;
+                    self.phase = DvdRamState::WritePipe;
+                    if queued_alt {
+                        return PollStep::Receive {
+                            buf: &mut data[..next_len],
+                            write: Some(crate::core::storage::WriteOp::Write {
+                                resource: 0,
+                                offset: self.next_offset(),
+                                buf: &alt[..queued_len],
+                            }),
+                        };
+                    }
+                    return PollStep::Receive {
+                        buf: &mut alt[..next_len],
+                        write: Some(crate::core::storage::WriteOp::Write {
+                            resource: 0,
+                            offset: self.next_offset(),
+                            buf: &data[..queued_len],
+                        }),
+                    };
+                }
+                let total = self.total_bytes();
                 if (self.progress as usize) < total {
-                    // More host data: start the next chunk's receive phase.
                     let next = self.next_chunk(data.len());
+                    self.pending_write = None;
                     self.phase = DvdRamState::WriteRecv;
-                    return PollStep::Receive(&mut data[..next]);
+                    return PollStep::Receive {
+                        buf: &mut data[..next],
+                        write: None,
+                    };
                 }
                 self.finish(Completion::Good)
             }
@@ -702,7 +892,7 @@ mod tests {
         }
         assert!(matches!(
             m.poll(Feedback::plan_accepted(), &mut data),
-            PollStep::Receive(buf) if buf.len() == 2048
+            PollStep::Receive { buf, .. } if buf.len() == 2048
         ));
         match m.poll(
             Feedback::host_received(HostReceipt::test(2048, None)),
@@ -844,7 +1034,7 @@ mod tests {
         let mut step = m.poll(Feedback::plan_accepted(), &mut data);
         loop {
             match step {
-                PollStep::Receive(buf) => {
+                PollStep::Receive { buf, .. } => {
                     let len = buf.len();
                     buf.copy_from_slice(&payload[received..received + len]);
                     received += len;
@@ -976,6 +1166,62 @@ mod tests {
         assert_eq!(delivered, BLOCKS as usize * 2048);
         assert_eq!(prefetches, 3, "three later chunks");
         assert_eq!(alt_prefetches, 2, "alternate bank carries the odd chunks");
+        assert!(!m.active());
+    }
+    #[test]
+    fn two_bank_write_pipelines_across_banks() {
+        let mut m = medium(4);
+        let mut data = [0x11u8; 2048];
+        let mut alt = [0x22u8; 2048];
+        assert_eq!(m.begin(MmcOp::Write { lba: 0, blocks: 2 }), Ok(()));
+        assert!(matches!(
+            m.poll_with_alt(Feedback::begin(), &mut data, &mut alt),
+            PollStep::Publish(_)
+        ));
+        match m.poll_with_alt(Feedback::plan_accepted(), &mut data, &mut alt) {
+            PollStep::Receive { buf, write: None } => assert_eq!(buf.len(), 2048),
+            other => panic!("expected first receive, got {other:?}"),
+        }
+        match m.poll_with_alt(
+            Feedback::host_received(HostReceipt::test(2048, None)),
+            &mut data,
+            &mut alt,
+        ) {
+            PollStep::Receive {
+                buf,
+                write:
+                    Some(crate::core::storage::WriteOp::Write {
+                        offset, buf: prev, ..
+                    }),
+            } => {
+                assert_eq!(buf.len(), 2048);
+                assert_eq!(prev.len(), 2048);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected pipelined receive, got {other:?}"),
+        }
+        match m.poll_with_alt(
+            Feedback::host_received_with_io(
+                HostReceipt::test(2048, None),
+                IoReceipt::test(2048, None, Effect::Known),
+            ),
+            &mut data,
+            &mut alt,
+        ) {
+            PollStep::Io(StorageOp::Write { offset, buf, .. }) => {
+                assert_eq!(offset, 2048);
+                assert_eq!(buf.len(), 2048);
+            }
+            other => panic!("expected final write, got {other:?}"),
+        }
+        assert!(matches!(
+            m.poll_with_alt(
+                Feedback::io_done(IoReceipt::test(2048, None, Effect::Known)),
+                &mut data,
+                &mut alt,
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
         assert!(!m.active());
     }
 }

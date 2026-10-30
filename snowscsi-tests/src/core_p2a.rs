@@ -818,6 +818,63 @@ fn a_failed_prefetch_falls_back_without_changing_the_completion() {
     );
 }
 
+/// A WRITE larger than the bank streams through the two-bank pipeline with a
+/// blocking adapter: every chunk is received into the bank that is not being
+/// written and committed byte-exact.
+#[test]
+fn write_larger_than_the_bank_pipelines_across_two_banks() {
+    let mut target = Target::new(cons(slot(1), Nil));
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut host = BlockingHost::new(TestHost::new());
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx(0, Direction::FromHost, 1536), &write_cdb(0, 3),),
+        Ok(())
+    );
+    let mut result = Ok(snowscsi::core::DriveStep::Pending);
+    for _ in 0..8 {
+        result = target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch,
+        );
+        if result != Ok(snowscsi::core::DriveStep::Pending) {
+            break;
+        }
+    }
+    assert_eq!(
+        result,
+        Ok(snowscsi::core::DriveStep::Done(Completion::Good))
+    );
+    assert!(storage.inner().data[..1536].iter().all(|b| *b == 0xa5));
+    assert_eq!(
+        storage.inner().ops(),
+        &[
+            Some(LegalOp::Write {
+                offset: 0,
+                len: 512
+            }),
+            Some(LegalOp::Write {
+                offset: 512,
+                len: 512
+            }),
+            Some(LegalOp::Write {
+                offset: 1024,
+                len: 512
+            }),
+        ]
+    );
+    assert_eq!(
+        slot0(&target).device_ref().known_effects().confirmed_write,
+        1536
+    );
+}
+
 /// A WRITE larger than the bank commits every chunk, byte-exact.
 #[test]
 fn write_larger_than_the_bank_commits_every_chunk() {

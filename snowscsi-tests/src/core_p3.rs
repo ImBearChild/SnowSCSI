@@ -13,7 +13,7 @@
 use snowscsi::block::{BlockAttrs, BlockDevice};
 use snowscsi::core::storage::{
     BlockingHost, BlockingStorage, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, IoBuf,
-    IoReq, IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt, SyncHost, SyncStorage,
+    IoReq, IoToken, PrefetchOp, Storage, StorageOp, StorageReceipt, SyncHost, SyncStorage, WriteOp,
 };
 use snowscsi::core::{
     cons, decide_eject, At, BoundaryPermit, BoundaryReject, Change, CommandContext, CommandPermit,
@@ -2114,6 +2114,7 @@ enum Step {
     Prefetch(usize),
     Sync,
     Receive(usize),
+    ReceiveCombined { len: usize, write: usize },
     Send(usize),
     SendCombined { len: usize, prefetch: usize },
     Complete(Completion),
@@ -2244,7 +2245,18 @@ impl Device for SettleDevice {
                 buf: &mut data[..len],
             }),
             Step::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
-            Step::Receive(len) => PollStep::Receive(&mut data[..len]),
+            Step::Receive(len) => PollStep::Receive {
+                buf: &mut data[..len],
+                write: None,
+            },
+            Step::ReceiveCombined { len, write } => PollStep::Receive {
+                buf: &mut alt[..len],
+                write: Some(WriteOp::Write {
+                    resource: 1,
+                    offset: 1,
+                    buf: &data[..write],
+                }),
+            },
             Step::Send(len) => PollStep::Send {
                 bytes: &data[..len],
                 prefetch: None,
@@ -2461,6 +2473,8 @@ impl Storage for CompanionStorage {
 struct SettleHost {
     log: Log,
     pending: u32,
+    /// Polls answered `Ready` before `pending` starts applying.
+    ready_before_pending: u32,
     accepted: Option<usize>,
     error: Option<Fault>,
     delivery: Delivery,
@@ -2479,6 +2493,7 @@ impl SettleHost {
         Self {
             log,
             pending: 0,
+            ready_before_pending: 0,
             accepted: None,
             error: None,
             delivery: Delivery::Complete,
@@ -2495,6 +2510,15 @@ impl SettleHost {
     fn pending_then(log: Log, pending: u32) -> Self {
         Self {
             pending,
+            ..Self::ready(log)
+        }
+    }
+
+    /// Answer `ready` polls at once, then keep answering `Pending`.
+    fn ready_then_pending(log: Log, ready: u32, pending: u32) -> Self {
+        Self {
+            pending,
+            ready_before_pending: ready,
             ..Self::ready(log)
         }
     }
@@ -2530,7 +2554,9 @@ impl HostTransport for SettleHost {
             dir,
             len: len as u32,
         });
-        if self.pending > 0 {
+        if self.ready_before_pending > 0 {
+            self.ready_before_pending -= 1;
+        } else if self.pending > 0 {
             self.pending -= 1;
             return Poll::Pending;
         }
@@ -2650,6 +2676,7 @@ impl Device for LongDevice {
             Step::Publish(_)
             | Step::Prefetch(_)
             | Step::Receive(_)
+            | Step::ReceiveCombined { .. }
             | Step::Send(_)
             | Step::SendCombined { .. } => PollStep::Idle,
         }
@@ -5145,5 +5172,266 @@ fn stop_with_both_tokens_drains_then_settles() {
         target.drive_start_static::<Here>(ctx_data(Direction::ToHost, 1024), &[0x28]),
         Err(Fault::Boundary),
         "a stopped target is terminal; the bank is not left wedged behind a token"
+    );
+}
+
+// ── Data-Out companion (receive + required write) ───────────────────────────
+
+fn write_pipeline_steps() -> [Option<Step>; 8] {
+    [
+        Some(Step::Publish(DataPlan {
+            direction: Direction::FromHost,
+            bytes: 1024,
+        })),
+        Some(Step::Receive(512)),
+        Some(Step::ReceiveCombined {
+            len: 512,
+            write: 512,
+        }),
+        Some(Step::Write(512)),
+        Some(Step::Complete(Completion::Good)),
+        None,
+        None,
+        None,
+    ]
+}
+
+/// The write companion settles before the receive token: the combined feedback
+/// is delivered once and the last chunk is written as a plain `Io`.
+#[test]
+fn write_pipeline_settles_the_companion_first() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_pipeline_steps()), 4);
+    let mut storage = SettleStorage::ready(log.clone(), StorageReceipt::ok(512));
+    let mut host = SettleHost::pending_then(log.clone(), 1);
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 1024), &[0x2A])
+        .expect("start");
+    let mut result = Ok(DriveStep::Pending);
+    for _ in 0..4 {
+        result = target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch,
+        );
+        if result != Ok(DriveStep::Pending) {
+            break;
+        }
+    }
+    assert_eq!(result, Ok(DriveStep::Done(Completion::Good)));
+    assert_eq!(storage.begins, 2, "one pipeline write plus the final write");
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device
+            .feedbacks
+            .iter()
+            .filter(|kind| **kind == FeedbackKind::HostReceivedWithIo)
+            .count(),
+        1,
+        "exactly one combined feedback"
+    );
+    assert_eq!(device.last_known, None);
+}
+
+/// The receive token settles first: the runner retains it, then the companion
+/// settles on the next entry and the combined feedback is delivered once.
+#[test]
+fn write_pipeline_settles_the_receive_first() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_pipeline_steps()), 4);
+    let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready(log.clone());
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 1024), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Done(Completion::Good))
+    );
+    assert_eq!(storage.begins, 2);
+    let device = slot0(&target).device_ref();
+    assert_eq!(
+        device
+            .feedbacks
+            .iter()
+            .filter(|kind| **kind == FeedbackKind::HostReceivedWithIo)
+            .count(),
+        1,
+        "exactly one combined feedback"
+    );
+}
+
+/// `Stop` with a retained receive and a live write companion drains both
+/// without cancelling and merges the host prefix with the confirmed write.
+#[test]
+fn stop_with_both_data_out_tokens_drains_then_settles() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_pipeline_steps()), 4);
+    let mut storage = SettleStorage::pending_then(log.clone(), 3, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready_then_pending(log.clone(), 1, 1);
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 1024), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.pending_kind(), Some(PendingKind::Host));
+
+    target.stop();
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+    assert_eq!((storage.cancels, host.cancels), (0, 0));
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.pending_kind(), Some(PendingKind::Storage));
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Control(RunOutcome::Ended {
+            reason: RunEnd::Stopped,
+            error: None,
+        }))
+    );
+    assert_eq!(
+        (storage.cancels, host.cancels),
+        (0, 0),
+        "Stop drains both healthy tokens"
+    );
+    let device = slot0(&target).device_ref();
+    assert_eq!(device.interrupts, 1);
+    assert_eq!(
+        device.last_known,
+        Some(KnownEffects {
+            confirmed_write: 512,
+            host_prefix: 512,
+            ..KnownEffects::NONE
+        }),
+        "host facts merge first, then the confirmed write"
+    );
+}
+
+/// `Abort` with both Data-Out tokens cancels the companion before the host
+/// token and leaves the banks reusable.
+#[test]
+fn abort_with_both_data_out_tokens_cancels_the_companion_first() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let mut target = settle_target(SettleDevice::new(log.clone(), write_pipeline_steps()), 4);
+    let mut storage = SettleStorage::pending_then(log.clone(), u32::MAX, StorageReceipt::ok(512));
+    let mut host = SettleHost::ready_then_pending(log.clone(), 1, u32::MAX);
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    target
+        .drive_start_static::<Here>(ctx_data(Direction::FromHost, 1024), &[0x2A])
+        .expect("start");
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
+    );
+    assert_eq!(target.pending_kind(), Some(PendingKind::Host));
+
+    assert_eq!(target.request_control(Control::Abort), Ok(()));
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Done(Completion::Check(Sense::new(
+            0x0B, 0x45, 0x00
+        ))))
+    );
+    assert_eq!(storage.cancels, 1);
+    assert_eq!(host.cancels, 1);
+    assert!(
+        at(&log, |event| matches!(event, Ev::Cancel))
+            < at(&log, |event| matches!(event, Ev::HostCancel)),
+        "the write companion is cancelled before the receive token"
+    );
+
+    // The same banks start the next command without a stale-window contract.
+    assert_eq!(
+        target.drive_start_static::<Here>(ctx_data(Direction::FromHost, 1024), &[0x2A]),
+        Ok(())
+    );
+    assert_eq!(
+        target.drive_step_static::<Here>(
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch
+        ),
+        Ok(DriveStep::Pending)
     );
 }
