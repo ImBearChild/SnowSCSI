@@ -96,6 +96,9 @@ impl WorkerWake {
     }
 
     /// Store the task to wake on the next completion.
+    ///
+    /// One waiter only: the shell awaits a single connection at a time, so a
+    /// second concurrent waiter would overwrite this slot and never wake.
     fn register(&self, waker: &Waker) {
         *self.waker.lock().unwrap() = Some(waker.clone());
     }
@@ -340,12 +343,19 @@ impl WorkerPlane {
             .iter()
             .flatten()
             .any(|slot| slot.state == SlotState::Settled);
+        // A write whose data has not been supplied yet cannot make progress on
+        // its own; parking here keeps `StoragePending` from spinning.
+        let waiting = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| slot.state == SlotState::Waiting);
         let running = self
             .slots
             .iter()
             .flatten()
             .any(|slot| slot.state == SlotState::Running);
-        if self.wake.take_progress() || settled || !running {
+        if self.wake.take_progress() || settled || (!running && !waiting) {
             Poll::Ready(())
         } else {
             Poll::Pending

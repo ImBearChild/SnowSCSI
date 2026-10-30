@@ -236,7 +236,9 @@ struct ServeArgs {
     ///
     /// `async` runs the iSCSI accept and session loops on a Tokio runtime and
     /// needs this build's `tokio` feature. USB has no asynchronous endpoint
-    /// adapter yet, so `--wire async --usb` is rejected before any setup.
+    /// adapter yet, so `--wire async --usb` is rejected before any setup. The
+    /// async path has no idle read timeout: an open but idle connection parks
+    /// the serial accept loop.
     #[arg(long = "wire", value_name = "MODE", default_value = "blocking")]
     wire: Wire,
 
@@ -904,8 +906,14 @@ where
                 if stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                log::warn!("accept failed: {e}");
-                return Err(TargetError::Io);
+                // A transient accept failure (EMFILE, a peer reset before
+                // accept) must not kill the server; back off like the blocking
+                // loop, but stay cancellable.
+                log::warn!("accept failed: {e}, retrying");
+                tokio::select! {
+                    _ = shutdown.notified() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => continue,
+                }
             }
         };
         log::info!("accepted connection from {peer}");
