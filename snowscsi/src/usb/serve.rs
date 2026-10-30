@@ -9,10 +9,11 @@
 //!
 //! `serve_async` (feature `async-io`) is the asynchronous mirror: the same
 //! control plane and the same event/action contract, but the bulk seam is
-//! awaited (`AsyncBotRecv` / `AsyncBotSend`). It still performs one command
-//! step per entry; storage I/O is the core's and cannot be overlapped by the
-//! shell. Both loops share `handle_ctrl`, so reset and Get Max LUN behave
-//! identically.
+//! awaited (`AsyncBotRecv` / `AsyncBotSend`) and a storage-only step awaits the
+//! [`AsyncWake`] adapter instead of spinning. It still performs one command
+//! step per entry; storage I/O is the core's and is never handed to the shell
+//! as a wire action. Both loops share `handle_ctrl`, so reset and Get Max LUN
+//! behave identically.
 //!
 //! Platform quirks (e.g. the Linux FunctionFS aio receive needing an
 //! MPS-multiple buffer) live in the platform's `BotIo` implementation, not
@@ -21,6 +22,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
+#[cfg(feature = "async-io")]
+use crate::core::async_wake::{self, AsyncWake};
 use crate::core::storage::Storage;
 use crate::core::{RuntimeSet, Target};
 use crate::usb::gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
@@ -308,17 +311,19 @@ where
 /// Asynchronous serve shell: the awaited mirror of [`serve`].
 ///
 /// Same control plane, same event/action contract, same reset semantics — but
-/// the bulk seam is awaited ([`AsyncBotRecv`] / [`AsyncBotSend`]). The control
-/// plane is drained after every await so a reset that arrives while an I/O is
-/// in flight supersedes the in-flight completion (the completion is discarded
-/// and `Event::Tick` carried instead).
+/// the bulk seam is awaited ([`AsyncBotRecv`] / [`AsyncBotSend`]) and a
+/// [`Action::StoragePending`] step awaits the [`AsyncWake`] adapter before the
+/// next poll. The control plane is drained after every await so a reset that
+/// arrives while an I/O is in flight supersedes the in-flight completion (the
+/// completion is discarded and `Event::Tick` carried instead).
 ///
-/// Each entry performs one [`BotSession::poll`] step; storage I/O runs inside
-/// the core target and is never handed to the shell, so there is no overlap
-/// state to carry across awaits.
+/// Each entry performs one [`BotSession::poll`] step. `storage` is passed to
+/// the core as `&mut dyn Storage`; the shell only uses it for the
+/// storage-pending wait, so the async adapter and the synchronous one share the
+/// same core path.
 #[cfg(feature = "async-io")]
 #[allow(clippy::too_many_arguments)]
-pub async fn serve_async<R, S, G, T>(
+pub async fn serve_async<R, S, G, T, W>(
     recv: &mut R,
     send: &mut S,
     gadget: &mut G,
@@ -326,7 +331,7 @@ pub async fn serve_async<R, S, G, T>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<T>,
-    storage: &mut dyn Storage,
+    storage: &mut W,
     stop: &AtomicBool,
 ) -> Result<(), ServeError>
 where
@@ -334,6 +339,7 @@ where
     S: AsyncBotSend,
     G: for<'a> Gadget<'a>,
     T: RuntimeSet,
+    W: Storage + AsyncWake,
 {
     // A `Short` session needs a Bulk-In STALL; reject a transport that cannot
     // do it before entering the loop (same up-front check as `serve`).
@@ -353,13 +359,16 @@ where
             // and defer every input (control requests included) until its token
             // settles. The deferral is bounded by one long-operation chunk.
             if shared && target.long_io_in_flight() {
-                match session.poll(Event::Tick, work, scratch, target, storage) {
+                match session.poll(Event::Tick, work, scratch, target, &mut *storage) {
                     // Nothing is staged in `work`; the framing action is
                     // re-emitted once the token settles.
                     Action::HostRecv { .. } => continue,
-                    // No wire transfer is pending while the command waits on
-                    // storage; keep the loop turning so the token can settle.
-                    Action::StoragePending => continue,
+                    // The long token is waiting on storage: await the adapter
+                    // instead of turning the loop.
+                    Action::StoragePending => {
+                        async_wake::wait(&mut *storage).await;
+                        continue;
+                    }
                     // Data or a stall response is staged in `work`, which the
                     // long token owns: dropping it would lose or corrupt output.
                     Action::HostSend { .. } | Action::StallBoth | Action::StallIn => {
@@ -372,7 +381,15 @@ where
             // 1) Control plane first (arrives at any time, even mid data phase).
             // A reset replaces `ev` with `Tick` and aborts the in-flight
             // transfer.
-            if handle_ctrl(gadget, session, work, scratch, target, storage, &mut ev)? {
+            if handle_ctrl(
+                gadget,
+                session,
+                work,
+                scratch,
+                target,
+                &mut *storage,
+                &mut ev,
+            )? {
                 continue;
             }
 
@@ -384,7 +401,7 @@ where
 
             // 2) Feed the carried event, execute the returned action, and
             // carry the completion in `ev`.
-            match session.poll(ev, work, scratch, target, storage) {
+            match session.poll(ev, work, scratch, target, &mut *storage) {
                 Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
                     // The step above started the resident long operation; its
                     // token now owns `work`. The receive is re-emitted on the
@@ -439,9 +456,10 @@ where
                     };
                 }
                 Action::StoragePending => {
-                    // No wire I/O: retry the command once on the next turn with
-                    // a no-op tick. A storage adapter that stays pending is the
-                    // async shell's concern.
+                    // No wire I/O: await the storage adapter, then feed a
+                    // no-op tick so the core re-polls the settled operation.
+                    // This yields instead of spinning.
+                    async_wake::wait(&mut *storage).await;
                     ev = Event::Tick;
                 }
                 Action::StallBoth => {
@@ -462,7 +480,15 @@ where
             // supersedes the just-completed I/O (its event is replaced by
             // `Event::Tick`).
             while !stop.load(Ordering::Relaxed) {
-                if !handle_ctrl(gadget, session, work, scratch, target, storage, &mut ev)? {
+                if !handle_ctrl(
+                    gadget,
+                    session,
+                    work,
+                    scratch,
+                    target,
+                    &mut *storage,
+                    &mut ev,
+                )? {
                     break;
                 }
             }
@@ -478,7 +504,7 @@ where
         }
     }
     .await;
-    let _ = target.settle_transport_end(storage, session);
+    let _ = target.settle_transport_end(&mut *storage, session);
     result
 }
 

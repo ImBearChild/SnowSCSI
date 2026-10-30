@@ -35,6 +35,9 @@ pub mod golden_iscsi;
 pub mod async_golden;
 
 #[cfg(test)]
+mod async_wake;
+
+#[cfg(test)]
 mod store_plane;
 
 #[cfg(test)]

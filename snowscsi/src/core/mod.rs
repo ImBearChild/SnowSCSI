@@ -12,6 +12,8 @@
 //! - [`permit`] — privately minted permits and [`ExecutionGuard`];
 //! - [`long`], [`management`], [`ua`], [`eject`] — long-operation, management,
 //!   unit-attention and eject values;
+//! - [`async_wake`] — the waker-based completion seam for asynchronous shells
+//!   ([`AsyncWake`](async_wake::AsyncWake) / [`wait`](async_wake::wait));
 //! - [`storage`] — [`Storage`](storage::Storage)/[`HostTransport`](storage::HostTransport)
 //!   and their synchronous adapters;
 //! - [`collections`], [`lu`], [`runner`], [`target`] — slot sets, the `Lu`
@@ -26,6 +28,7 @@
 //! This module is named `core`, so inside it always spell the language crate as
 //! `::core::…`; a bare `core::…` in this tree risks resolving ambiguously.
 
+pub mod async_wake;
 pub mod collections;
 pub mod device;
 pub mod eject;
@@ -41,6 +44,7 @@ pub mod storage;
 pub mod target;
 pub mod ua;
 
+pub use self::async_wake::{wait, AsyncWake};
 pub use self::collections::{cons, At, Cons, Here, Index, Nil, RuntimeSet, SlotSet, There};
 pub use self::device::{
     Admission, CommandContext, Control, DataPlan, Device, Direction, Feedback, FeedbackKind,

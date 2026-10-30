@@ -9,6 +9,7 @@ use core::task::Poll;
 
 use snowscsi::block::{BlockAttrs, BlockDevice};
 use snowscsi::common::store::{StoreOp, StorePlane};
+use snowscsi::core::async_wake::AsyncWake;
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{
     Admission, BoundaryPermit, Change, ChangeResult, CommandContext, CommandPermit, Completion,
@@ -564,5 +565,14 @@ impl Storage for PlaneSet<'_> {
                 self.token = None;
             }
         }
+    }
+}
+
+/// A synchronous plane set is always ready: `poll_exec` only reports the
+/// scripted `pending_polls` count, which a wake-based shell never leaves
+/// armed in the golden replay.
+impl AsyncWake for PlaneSet<'_> {
+    fn poll_wake(&mut self, _cx: &mut core::task::Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }

@@ -23,8 +23,9 @@
 //! This module lives inside `crate::core`, so the language crate is always
 //! spelled `::core::…` here.
 
-use ::core::task::Poll;
+use ::core::task::{Context, Poll};
 
+use super::async_wake::AsyncWake;
 use super::device::{DataPlan, Direction, TargetId};
 use super::errors::{Delivery, Effect, Fault};
 
@@ -319,6 +320,14 @@ impl<S: SyncStorage> Storage for BlockingStorage<S> {
 
     fn cancel(&mut self, token: IoToken) {
         self.release(token);
+    }
+}
+
+/// A blocking adapter is always ready: its `poll_exec` never returns
+/// [`Poll::Pending`], so an asynchronous shell waiting on it completes at once.
+impl<S: SyncStorage> AsyncWake for BlockingStorage<S> {
+    fn poll_wake(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }
 
