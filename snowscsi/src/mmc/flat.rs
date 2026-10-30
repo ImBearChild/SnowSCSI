@@ -2,7 +2,7 @@
 //!
 //! A single-track, single-session, finalized CD data medium with no backing
 //! bytes of its own: reads become
-//! [`StorageOp::Read`](crate::core::storage::StorageOp::Read) at
+//! [`StorageOp::Read`] at
 //! `lba * 2048` and the runner's `Storage` adapter supplies the bytes. The
 //! medium never allocates and owns only geometry plus the in-flight step state.
 //!

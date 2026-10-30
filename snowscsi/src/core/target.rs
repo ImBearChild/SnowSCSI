@@ -17,7 +17,7 @@
 //!
 //! Production deliberately has no null host: [`Target::drive_rt`] /
 //! [`StaticTarget::drive_static`] accept only commands with no host data phase
-//! ([`NoHostData`]); a data-bearing command must use the `_host` variants with a
+//! (`NoHostData`); a data-bearing command must use the `_host` variants with a
 //! real [`HostTransport`]. This is a compile-time-visible contract, not a
 //! zero-filled success.
 

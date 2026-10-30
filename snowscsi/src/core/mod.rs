@@ -3,22 +3,35 @@
 //! This is the `no_std`, allocation-free, `unsafe`-free vocabulary layer of the
 //! public API. It contains only pure values and seams:
 //!
-//! - [`errors`] — [`Sense`]/[`Completion`]/[`Fault`], the `storage_fault_sense`
-//!   table and `commit_fault`;
-//! - [`device`] — the [`Device`] lifecycle trait, [`NoMedium`]/[`Pair`] and the
-//!   static [`InquiryData`]/[`RemovalEncoding`] descriptors;
-//! - [`profile`] — the defaulted [`SpcProfile`] capability seam for the public
+//! - [`errors`](crate::core::errors) — [`Sense`](crate::core::Sense) /
+//!   [`Completion`](crate::core::Completion) / [`Fault`](crate::core::Fault),
+//!   the `storage_fault_sense` table and `commit_fault`;
+//! - [`device`](crate::core::device) — the [`Device`](crate::core::Device)
+//!   lifecycle trait, [`NoMedium`](crate::core::NoMedium) /
+//!   [`Pair`](crate::core::Pair) and the static
+//!   [`InquiryData`](crate::core::InquiryData) /
+//!   [`RemovalEncoding`](crate::core::RemovalEncoding) descriptors;
+//! - [`profile`](crate::core::profile) — the defaulted
+//!   [`SpcProfile`](crate::core::SpcProfile) capability seam for the public
 //!   query commands (extension clause);
-//! - [`permit`] — privately minted permits and [`ExecutionGuard`];
-//! - [`long`], [`management`], [`ua`], [`eject`] — long-operation, management,
-//!   unit-attention and eject values;
-//! - [`async_wake`] — the waker-based completion seam for asynchronous shells
-//!   ([`AsyncWake`](async_wake::AsyncWake) / [`wait`](async_wake::wait));
-//! - [`storage`] — [`Storage`](storage::Storage)/[`HostTransport`](storage::HostTransport)
-//!   and their synchronous adapters;
-//! - [`collections`], [`lu`], [`runner`], [`target`] — slot sets, the `Lu`
-//!   seam, the runner state machine and the `Target`/`StaticTarget` entries;
-//! - [`spc`] — the six-command public `Spc` wrapper.
+//! - [`permit`](crate::core::permit) — privately minted permits and
+//!   [`ExecutionGuard`](crate::core::ExecutionGuard);
+//! - [`long`](crate::core::long), [`management`](crate::core::management),
+//!   [`ua`](crate::core::ua), [`eject`](crate::core::eject) — long-operation,
+//!   management, unit-attention and eject values;
+//! - [`async_wake`](crate::core::async_wake) — the waker-based completion seam
+//!   for asynchronous shells
+//!   ([`AsyncWake`](crate::core::async_wake::AsyncWake) /
+//!   [`wait`](crate::core::async_wake::wait));
+//! - [`storage`](crate::core::storage) —
+//!   [`Storage`](crate::core::storage::Storage) /
+//!   [`HostTransport`](crate::core::storage::HostTransport) and their
+//!   synchronous adapters;
+//! - [`collections`](crate::core::collections), [`lu`](crate::core::lu),
+//!   [`runner`](crate::core::runner), [`target`](crate::core::target) — slot
+//!   sets, the `Lu` seam, the runner state machine and the
+//!   `Target`/`StaticTarget` entries;
+//! - [`spc`](crate::core::spc) — the six-command public `Spc` wrapper.
 //!
 //! The core layer holds no executor task, no buffer ownership and no profile
 //! behaviour; buffers are re-borrowed by the caller on every poll.

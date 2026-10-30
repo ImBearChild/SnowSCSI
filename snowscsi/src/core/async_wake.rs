@@ -80,7 +80,8 @@
 /// Register a waker and report whether the adapter has made progress.
 ///
 /// The operation named by the adapter's live token is complete when this
-/// returns [`Poll::Ready`]. A [`Poll::Pending`] result must have registered
+/// returns [`Poll::Ready`](::core::task::Poll::Ready). A
+/// [`Poll::Pending`](::core::task::Poll::Pending) result must have registered
 /// `cx.waker()` (or an equivalent platform waker) so the adapter wakes it when
 /// the operation settles.
 pub trait AsyncWake {

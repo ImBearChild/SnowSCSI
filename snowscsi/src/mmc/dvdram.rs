@@ -3,7 +3,7 @@
 //! A rewritable single-track data medium behind the `dvdram` feature. Like
 //! [`FlatCdMedium`](super::flat::FlatCdMedium) it owns only geometry and the
 //! in-flight state: reads and writes become
-//! [`StorageOp`](crate::core::storage::StorageOp) at `lba * 2048`, and the
+//! [`StorageOp`] at `lba * 2048`, and the
 //! runner's `Storage` adapter supplies the bytes.
 //!
 //! FORMAT zero-fill is drive-owned (`MmcDrive::poll_long`); this medium accepts

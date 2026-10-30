@@ -20,7 +20,7 @@
 //!
 //! An **empty** `scratch` selects the shared bank: `work` serves the command
 //! path and the resident long operation in turn, the session advances the long
-//! operation only on [`Event::Tick`](crate::usb::Event::Tick), and
+//! operation only on [`Event::Tick`], and
 //! [`serve`](crate::usb::serve::serve) defers bulk/control input while a long
 //! token is in flight (a query or control request waits at most one
 //! long-operation chunk). A **non-empty** `scratch` (at least

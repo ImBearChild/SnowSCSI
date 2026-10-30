@@ -32,7 +32,8 @@
 //! # Work-buffer contract
 //!
 //! `work` is the wire/PDU bank: `work.len() >= crate::MIN_DATA_LEN +
-//! pdu::BHS_SIZE`. At the PDU base the leading [`pdu::BHS_SIZE`] bytes carry
+//! pdu::BHS_SIZE`. At the PDU base the leading
+//! [`pdu::BHS_SIZE`](crate::iscsi::pdu::BHS_SIZE) bytes carry
 //! the wire header; the remainder of the bank is the SCSI data area and the
 //! transport's [`HostTransport`] bank, which bounds one device data chunk (a
 //! larger transfer is streamed in chunks). Its size also fixes this target's

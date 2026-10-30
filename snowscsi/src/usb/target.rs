@@ -33,7 +33,7 @@
 //! `work` is the transport's data bank: it bounds one device data chunk (the
 //! core streams a larger transfer in bank-sized chunks) and must hold at least
 //! [`crate::MIN_DATA_AREA`] bytes. The data-in wire stream is additionally
-//! chunked at [`WIRE_CHUNK`] bytes independently of the bank size. `scratch` is
+//! chunked at `WIRE_CHUNK` bytes independently of the bank size. `scratch` is
 //! the resident long-operation bank and must hold at least
 //! [`crate::MIN_DATA_LEN`] bytes.
 //!
