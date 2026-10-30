@@ -37,6 +37,12 @@
 //! the resident long-operation bank and must hold at least
 //! [`crate::MIN_DATA_LEN`] bytes.
 //!
+//! A session opted into overlap mode ([`BotSession::with_overlap`]) treats
+//! `work` as **two** equal banks: its length must be even and each half at
+//! least [`crate::MIN_DATA_AREA`]. Command framing and Data-Out use one bank;
+//! Data-In chunks may alternate between the two, so the core can stage the
+//! next chunk in the idle bank while the current one is on the bulk-IN pipe.
+//!
 //! # Data-In shortfall policy ([`ShortfallPolicy`])
 //!
 //! BOT §6.7.2 (cases (4)/(5): the host's `dCBWDataTransferLength` exceeding
@@ -81,7 +87,9 @@
 
 use core::task::Poll;
 
-use crate::core::storage::{HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage};
+use crate::core::storage::{
+    BankSide, HostBuf, HostReceipt, HostReq, HostToken, HostTransport, Storage,
+};
 use crate::core::{
     CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
     RunOutcome, RuntimeSet, Target, UaClass,
@@ -203,7 +211,8 @@ pub enum Event {
     /// No-I/O driver tick (startup + timer): change no state and re-emit the
     /// current pending [`Action`].
     Tick,
-    /// The shell received `len` bytes into `work[0..len]`.
+    /// The shell received `len` bytes at the offset the previous
+    /// [`Action::HostRecv`] asked for (the command bank, or its data offset).
     HostRecv { len: usize },
     /// The shell's receive found no data (timed out). Has end-of-phase
     /// meaning for the Data-Out overrun drain.
@@ -320,6 +329,8 @@ struct SendPhase {
     chunk_wire_end: u32,
     /// Wire total when the current chunk started.
     phase_wire_base: u32,
+    /// Bank that holds the staged chunk.
+    bank: BankSide,
     /// Chunk staged and awaiting `Event::HostSent`: bank offset and length.
     staged: Option<(u32, u32)>,
 }
@@ -383,6 +394,10 @@ pub struct BotSession {
     bulk_mps: u64,
     /// How a Data-In shortfall ends (default `ShortNoStall`).
     shortfall: ShortfallPolicy,
+    /// Two-bank overlap mode (default off).
+    overlap: bool,
+    /// Bank holding command framing and Data-Out for the active command.
+    cmd_bank: BankSide,
     /// CBW tag / declared host length / direction of the active transaction.
     tag: u32,
     declared: u64,
@@ -427,6 +442,8 @@ impl BotSession {
             num_luns: num_luns.clamp(1, 16) as u8,
             bulk_mps: BOT_BULK_MPS,
             shortfall: ShortfallPolicy::default(),
+            overlap: false,
+            cmd_bank: BankSide::Work,
             tag: 0,
             declared: 0,
             host_dir: BotDir::DataOut,
@@ -483,11 +500,93 @@ impl BotSession {
         self.shortfall
     }
 
+    /// Select the two-bank overlap mode (builder style; default off).
+    ///
+    /// In overlap mode [`poll`](Self::poll)'s `work` is the **total** of two
+    /// equal banks: its length must be even and each half at least
+    /// [`crate::MIN_DATA_AREA`]. Command framing and Data-Out use one bank; a
+    /// Data-In phase may stage from either bank, which lets the core read the
+    /// next chunk into the other bank while the current one is on the wire.
+    /// Single-bank sessions keep the historical layout (`work` is one bank).
+    pub fn with_overlap(mut self) -> Self {
+        self.overlap = true;
+        self
+    }
+
+    /// Whether the session uses two equal banks inside `work`.
+    pub fn overlap(&self) -> bool {
+        self.overlap
+    }
+
     /// Get Max LUN answer value (`num_luns - 1`, ≤ 15). The LUN count is
     /// refreshed from the target on every [`poll`](Self::poll) entry. Pure
     /// getter (no state change).
     pub fn max_lun(&self) -> u8 {
         self.num_luns.saturating_sub(1)
+    }
+
+    /// Length of one bank inside `work`.
+    fn bank_len(&self, work_len: usize) -> usize {
+        if self.overlap {
+            work_len / 2
+        } else {
+            work_len
+        }
+    }
+
+    /// Absolute offset of `bank` inside `work`.
+    fn bank_base(&self, work_len: usize, bank: BankSide) -> usize {
+        if self.overlap && bank == BankSide::Alt {
+            work_len / 2
+        } else {
+            0
+        }
+    }
+
+    /// Absolute offset of the command bank inside `work`.
+    fn cmd_base(&self, work_len: usize) -> usize {
+        self.bank_base(work_len, self.cmd_bank)
+    }
+
+    /// The bank that is not the command bank.
+    fn alternate_bank(&self) -> BankSide {
+        match self.cmd_bank {
+            BankSide::Work => BankSide::Alt,
+            BankSide::Alt => BankSide::Work,
+        }
+    }
+
+    /// Map a runner-side bank (relative to the `work`/`alt` arguments) to the
+    /// physical half of the caller's `work`.
+    fn physical_bank(&self, side: BankSide) -> BankSide {
+        if !self.overlap {
+            BankSide::Work
+        } else {
+            match side {
+                BankSide::Work => self.cmd_bank,
+                BankSide::Alt => self.alternate_bank(),
+            }
+        }
+    }
+
+    /// Split `work` into the command bank and the alternate bank.
+    fn banks<'w>(&self, work: &'w mut [u8]) -> (&'w mut [u8], &'w mut [u8]) {
+        if !self.overlap {
+            return (work, &mut []);
+        }
+        let half = work.len() / 2;
+        let (first, second) = work.split_at_mut(half);
+        match self.cmd_bank {
+            BankSide::Work => (first, second),
+            BankSide::Alt => (second, first),
+        }
+    }
+
+    /// The command bank is fixed for a transaction and chosen when the command
+    /// boundary is emitted. Overlap mode does not advance a resident long
+    /// operation in this path, so the first bank is always available.
+    fn choose_command_bank(&mut self) {
+        self.cmd_bank = BankSide::Work;
     }
 
     // ── Poll interface (non-blocking state machine) ───────────────
@@ -510,6 +609,8 @@ impl BotSession {
     ) -> Action<'a> {
         if work.len() < crate::MIN_DATA_AREA
             || (!scratch.is_empty() && scratch.len() < crate::MIN_DATA_LEN)
+            || (self.overlap
+                && (!work.len().is_multiple_of(2) || work.len() / 2 < crate::MIN_DATA_AREA))
         {
             return Action::Error(BotTargetError::WorkBufTooSmall);
         }
@@ -519,9 +620,11 @@ impl BotSession {
         // long operation once: one poll per entry. With an empty `scratch` the
         // long operation shares `work` with the wire, so it may only advance on
         // a `Tick` entry: a `HostRecv`/`HostSent` entry may hold a staged
-        // CBW/response in that buffer.
-        let shared = scratch.is_empty();
-        if !self.cmd_active
+        // CBW/response in that buffer. Overlap mode reserves both banks for the
+        // command and does not advance a resident long operation.
+        let shared = scratch.is_empty() && !self.overlap;
+        if !self.overlap
+            && !self.cmd_active
             && matches!(self.stage, Stage::Command { .. })
             && (!shared || matches!(ev, Event::Tick))
             && self.idle_entry(work, scratch, target, storage)
@@ -714,11 +817,11 @@ impl BotSession {
             Stage::Command { got } => self.on_cbw(len, got, work, scratch, target, storage),
             Stage::Exec if matches!(self.phase, Phase::Recv(_)) => {
                 let mut stray = false;
+                let cap = self.bank_len(work.len()) as u32;
                 let done = {
                     let Phase::Recv(p) = &mut self.phase else {
                         return Action::Error(BotTargetError::Internal);
                     };
-                    let cap = work.len() as u32;
                     let local_received = p.received.saturating_sub(p.chunk_base);
                     let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
                     let remaining = local_target.saturating_sub(local_received);
@@ -756,7 +859,7 @@ impl BotSession {
                 if probe {
                     // A full probe means the host may still have overrun bytes;
                     // a short one proves the OUT pipe is empty.
-                    if len < DRAIN_CHUNK.min(work.len()) {
+                    if len < DRAIN_CHUNK.min(self.bank_len(work.len())) {
                         self.write_csw(csw);
                     } else {
                         self.stage = Stage::Drain {
@@ -844,8 +947,11 @@ impl BotSession {
         target: &mut Target<S>,
         storage: &mut dyn Storage,
     ) -> Action<'a> {
-        // The shell guarantees `len <= work.len()`; clamp defensively.
-        let recv = &work[..len.min(work.len())];
+        // The shell wrote the CBW at the command bank offset; clamp
+        // defensively to that bank.
+        let base = self.cmd_base(work.len());
+        let bank_len = self.bank_len(work.len());
+        let recv = &work[base..base + len.min(bank_len)];
         if recv.len() > CBW_LEN - got {
             crate::warn!(
                 "bot: CBW packet tail {} bytes discarded (single-packet CBW is 31B)",
@@ -936,7 +1042,9 @@ impl BotSession {
             // ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED on *every* call.
             if opcode == scsi_op::REQUEST_SENSE {
                 let sense = crate::core::LUN_NOT_SUPPORTED;
-                let n = sense_write_fixed(sense, work);
+                let base = self.cmd_base(work.len());
+                let bank_len = self.bank_len(work.len());
+                let n = sense_write_fixed(sense, &mut work[base..base + bank_len]);
                 self.synthesize_data_in(n, declared);
             } else {
                 self.fail_command(CswStatus::Failed);
@@ -977,7 +1085,9 @@ impl BotSession {
             Err(Fault::LunNotFound) => {
                 if opcode == scsi_op::REQUEST_SENSE {
                     let sense = crate::core::LUN_NOT_SUPPORTED;
-                    let n = sense_write_fixed(sense, work);
+                    let base = self.cmd_base(work.len());
+                    let bank_len = self.bank_len(work.len());
+                    let n = sense_write_fixed(sense, &mut work[base..base + bank_len]);
                     self.synthesize_data_in(n, declared);
                 } else {
                     self.fail_command(CswStatus::Failed);
@@ -1001,7 +1111,8 @@ impl BotSession {
         storage: &mut dyn Storage,
     ) {
         let lun = self.lun;
-        let result = target.drive_step_rt(lun, storage, self, work, &mut [], scratch);
+        let (command, alternate) = self.banks(work);
+        let result = target.drive_step_rt(lun, storage, self, command, alternate, scratch);
         match result {
             Ok(crate::core::DriveStep::Pending) => {}
             Ok(crate::core::DriveStep::Done(completion)) => self.finish(completion),
@@ -1240,8 +1351,8 @@ impl BotSession {
         };
     }
 
-    /// Enter a synthesized Data-In phase for `available` bytes staged in
-    /// `work[0..available]`.
+    /// Enter a synthesized Data-In phase for `available` bytes staged at the
+    /// command bank's base (`work[cmd_base..cmd_base + available]`).
     fn synthesize_data_in(&mut self, available: usize, declared: u64) {
         self.cmd_active = false;
         self.phase = Phase::Idle;
@@ -1320,7 +1431,8 @@ impl BotSession {
             // Reset recovery keeps the command-abort path; no `Control::Nop`
             // is queued because the boundary is not clean by definition here.
             let _ = target.request_control(Control::Abort);
-            let _ = target.drive_step_rt(lun, storage, self, work, &mut [], scratch);
+            let (command, alternate) = self.banks(work);
+            let _ = target.drive_step_rt(lun, storage, self, command, alternate, scratch);
         }
         self.stage = Stage::Command { got: 0 };
         self.phase = Phase::Idle;
@@ -1355,39 +1467,49 @@ impl BotSession {
     /// The action for the current state (re-emitted on `Event::Tick` and after
     /// an out-of-band control event).
     fn pending<'a>(&'a mut self, work: &'a mut [u8]) -> Action<'a> {
-        self.stage_send(work.len());
+        // A new command boundary fixes the command bank before the first CBW
+        // byte is requested; the rest of the transaction reuses it.
+        if !self.cmd_active && matches!(self.stage, Stage::Command { got: 0 }) {
+            self.choose_command_bank();
+        }
+        let bank_len = self.bank_len(work.len());
+        let cmd_base = self.cmd_base(work.len());
+        self.stage_send(bank_len);
         let stage = self.stage;
         match stage {
             Stage::Command { got } => Action::HostRecv {
-                offset: 0,
+                offset: cmd_base,
                 len: CBW_LEN - got,
                 probe: false,
             },
             Stage::Exec => match self.phase {
                 Phase::Send(p) => {
                     let (bank_offset, len) = p.staged.unwrap_or((0, 0));
+                    let base = self.bank_base(work.len(), p.bank);
                     let start = bank_offset as usize;
                     let end = start + len as usize;
-                    if end > work.len() || start >= end {
+                    if end > bank_len || start >= end {
                         return Action::Error(BotTargetError::Internal);
                     }
                     // Fill bytes beyond the device's relevant bytes are zeros,
-                    // never stale bank contents.
+                    // never stale bank contents. The fill stays in the bank
+                    // that holds the staged chunk.
                     let plan = p.chunk_len as usize;
                     if end > plan {
-                        work[plan.max(start)..end].fill(0);
+                        work[base + plan.max(start)..base + end].fill(0);
                     }
                     Action::HostSend {
-                        bytes: &work[start..end],
+                        bytes: &work[base + start..base + end],
                     }
                 }
                 Phase::Recv(p) => {
-                    let cap = work.len() as u32;
+                    // Data-Out always lands in the command bank.
+                    let cap = bank_len as u32;
                     let local_received = p.received.saturating_sub(p.chunk_base);
                     let local_target = p.wire_target.saturating_sub(p.chunk_base).min(cap);
                     if local_received < local_target {
                         Action::HostRecv {
-                            offset: local_received as usize,
+                            offset: cmd_base + local_received as usize,
                             len: (local_target - local_received) as usize,
                             probe: false,
                         }
@@ -1396,14 +1518,14 @@ impl BotSession {
                         // wire phase; probe so the shell loops back with a
                         // `HostIdle` and the next entry drives it again.
                         Action::HostRecv {
-                            offset: 0,
+                            offset: cmd_base,
                             len: 1,
                             probe: true,
                         }
                     }
                 }
                 Phase::Idle => Action::HostRecv {
-                    offset: 0,
+                    offset: cmd_base,
                     len: 1,
                     probe: true,
                 },
@@ -1417,13 +1539,14 @@ impl BotSession {
                 let Some(chunk) = staged else {
                     return Action::Error(BotTargetError::Internal);
                 };
+                // Synthesized responses are staged in the command bank.
                 let start = wire as usize;
                 let end = start + chunk as usize;
-                if end > work.len() || end as u64 > total {
+                if end > bank_len || end as u64 > total {
                     return Action::Error(BotTargetError::Internal);
                 }
                 Action::HostSend {
-                    bytes: &work[start..end],
+                    bytes: &work[cmd_base + start..cmd_base + end],
                 }
             }
             Stage::Pad { chunk, .. } => Action::HostSend {
@@ -1434,13 +1557,13 @@ impl BotSession {
             Stage::Drain {
                 remaining, probe, ..
             } => Action::HostRecv {
-                offset: 0,
-                // Every drain window is clipped to the caller's bank; the
+                offset: cmd_base,
+                // Every drain window is clipped to the command bank; the
                 // overrun probe must not ask for more than the bank holds.
                 len: if probe {
-                    DRAIN_CHUNK.min(work.len())
+                    DRAIN_CHUNK.min(bank_len)
                 } else {
-                    (remaining.min(DRAIN_CHUNK as u64) as usize).min(work.len())
+                    (remaining.min(DRAIN_CHUNK as u64) as usize).min(bank_len)
                 },
                 probe,
             },
@@ -1685,6 +1808,7 @@ impl HostTransport for BotSession {
                 chunk_accept: 0,
                 chunk_wire_end: 0,
                 phase_wire_base: 0,
+                bank: BankSide::Work,
                 staged: None,
             },
         };
@@ -1713,9 +1837,10 @@ impl HostTransport for BotSession {
     fn poll_host(&mut self, token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
         match self.phase {
             Phase::Send(mut p) if p.token == token => {
-                let HostBuf::Send { bytes: b, .. } = buf else {
+                let HostBuf::Send { bytes: b, bank } = buf else {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 };
+                p.bank = self.physical_bank(bank);
                 if b.len() != p.chunk_len as usize {
                     return Poll::Ready(HostReceipt::from_adapter(0, Some(Fault::Contract)));
                 }
@@ -1792,8 +1917,8 @@ impl BotSession {
         HostToken::new(0, self.host_gen)
     }
 
-    /// Stage the next Data-In chunk inside `work` (the caller's bank).
-    fn stage_send(&mut self, work_len: usize) {
+    /// Stage the next Data-In chunk inside the bank that holds the phase.
+    fn stage_send(&mut self, bank_len: usize) {
         if let Phase::Send(p) = &mut self.phase {
             if p.staged.is_some() || p.wire >= p.chunk_wire_end {
                 return;
@@ -1802,12 +1927,12 @@ impl BotSession {
             // `Pad` stage's zero source.
             let bank_end = p
                 .phase_wire_base
-                .saturating_add(work_len.min(u32::MAX as usize) as u32);
+                .saturating_add(bank_len.min(u32::MAX as usize) as u32);
             if p.chunk_wire_end > bank_end {
                 p.chunk_wire_end = bank_end;
             }
             let start = p.wire.saturating_sub(p.phase_wire_base);
-            let cap = (work_len.min(u32::MAX as usize) as u32).saturating_sub(start);
+            let cap = (bank_len.min(u32::MAX as usize) as u32).saturating_sub(start);
             let remaining = p.chunk_wire_end.saturating_sub(p.wire);
             let n = remaining.min(WIRE_CHUNK as u32).min(cap);
             if n > 0 {

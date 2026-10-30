@@ -69,6 +69,18 @@ impl MmcMedium for TestMedium {
         }
     }
 
+    fn poll_with_alt<'a>(
+        &mut self,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        match self {
+            Self::Flat(m) => m.poll_with_alt(fb, data, alt),
+            Self::DvdRam(m) => m.poll_with_alt(fb, data, alt),
+        }
+    }
+
     fn active(&self) -> bool {
         match self {
             Self::Flat(m) => m.active(),
@@ -258,6 +270,19 @@ impl Lu for TestLu {
         match self {
             Self::Block(l) => l.poll(permit, feedback, data),
             Self::Mmc(l) => l.poll(permit, feedback, data),
+        }
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        permit: &CommandPermit,
+        feedback: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        match self {
+            Self::Block(l) => l.poll_with_alt(permit, feedback, data, alt),
+            Self::Mmc(l) => l.poll_with_alt(permit, feedback, data, alt),
         }
     }
 

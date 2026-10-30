@@ -2643,3 +2643,312 @@ fn case_07_at_a_chunk_boundary_reports_a_phase_error_and_keeps_the_session() {
     assert_eq!(r, Drive::Processed);
     assert_eq!(csw_fields(&io.take_sent()), (0x42, 0, 0x00));
 }
+
+// ── Two-bank overlap ────────────────────────────────────────────────
+
+/// One observed step with no borrow back into the session or the banks.
+enum TwoBankStep {
+    Recv {
+        offset: usize,
+        len: usize,
+        probe: bool,
+    },
+    Sent {
+        start: usize,
+        end: usize,
+        is_csw: bool,
+    },
+    StallBoth,
+    StallIn,
+}
+
+/// Poll the session once, executing a pending bulk-IN send immediately.
+fn two_bank_next<S: RuntimeSet>(
+    session: &mut BotSession,
+    ev: Event,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    target: &mut Target<S>,
+    storage: &mut PlaneSet<'_>,
+    io: &mut MockBotIo,
+) -> TwoBankStep {
+    match session.poll(ev, work, scratch, target, storage) {
+        Action::HostRecv { offset, len, probe } => TwoBankStep::Recv { offset, len, probe },
+        Action::HostSend { bytes } => {
+            let start = bytes.as_ptr() as usize;
+            let end = start.saturating_add(bytes.len());
+            let is_csw = bytes.len() == CSW_LEN && bytes.starts_with(b"USBS");
+            io.send_in(bytes).unwrap();
+            TwoBankStep::Sent { start, end, is_csw }
+        }
+        Action::StallBoth => TwoBankStep::StallBoth,
+        Action::StallIn => TwoBankStep::StallIn,
+        Action::Error(e) => panic!("BOT core error: {e:?}"),
+    }
+}
+
+/// Two equal banks: a 2 MiB READ alternates its bulk-IN source between the
+/// command bank and the alternate bank, keeps the CBW in the command bank,
+/// and delivers the medium byte-exactly with zero residue.
+#[test]
+fn overlap_read_alternates_banks_and_is_byte_exact() {
+    const BLOCKS: u16 = 4096; // 2 MiB at 512-byte blocks
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const BANK: usize = 8192;
+    const TAG: u32 = 0x71;
+
+    let mut ram = vec![0u8; TOTAL];
+    for (i, b) in ram.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected = ram.clone();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(BLOCKS as u64, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new().with_overlap();
+    let mut work = vec![0u8; BANK * 2];
+    let mut scratch = Vec::new();
+    let mut io = MockBotIo::new();
+    let cbw = raw_cbw(TAG, TOTAL as u32, 0x80, 0, &rw10(0x28, 0, BLOCKS));
+    io.feed_out(&cbw);
+
+    assert!(s.overlap());
+    let work_start = work.as_ptr() as usize;
+    let mut cbw_offset = None;
+    let mut data_sends = Vec::new();
+    let mut ev = Event::Tick;
+    let mut csw_sent = false;
+    loop {
+        match two_bank_next(
+            &mut s,
+            ev,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &mut io,
+        ) {
+            TwoBankStep::Recv { offset, len, probe } => {
+                if !csw_sent && cbw_offset.is_none() && len == CBW_LEN && !probe {
+                    cbw_offset = Some(offset);
+                }
+                if csw_sent && len == CBW_LEN && !probe {
+                    break;
+                }
+                if probe {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
+                        Ok(n) => ev = Event::HostRecv { len: n },
+                        Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
+                        Err(_) => panic!("mock bulk-OUT I/O error"),
+                    }
+                } else {
+                    let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+                    ev = Event::HostRecv { len: n };
+                }
+            }
+            TwoBankStep::Sent { start, end, is_csw } => {
+                if start >= work_start && end <= work_start + work.len() {
+                    let bank = if end <= work_start + BANK {
+                        assert!(start >= work_start);
+                        0
+                    } else {
+                        assert!(
+                            start >= work_start + BANK,
+                            "a bulk-IN chunk must not cross the bank split"
+                        );
+                        1
+                    };
+                    data_sends.push((bank, end - start));
+                } else {
+                    assert!(is_csw, "a HostSend outside work must be the CSW");
+                }
+                if is_csw {
+                    csw_sent = true;
+                }
+                ev = Event::HostSent;
+            }
+            TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
+            TwoBankStep::StallIn => panic!("unexpected StallIn"),
+        }
+    }
+
+    // The first bank is the command bank, so the CBW starts at offset 0.
+    assert_eq!(cbw_offset, Some(0));
+    assert_eq!(data_sends.len(), TOTAL / BANK);
+    for (chunk, (bank, len)) in data_sends.iter().enumerate() {
+        assert_eq!(*len, BANK, "chunk {chunk} must be one bank");
+        assert_eq!(*bank, chunk % 2, "chunk {chunk} must alternate banks");
+    }
+
+    let sent = io.take_sent();
+    assert_eq!(sent.len(), TOTAL + CSW_LEN);
+    assert_eq!(&sent[..TOTAL], expected.as_slice(), "byte-exact read");
+    assert_eq!(csw_fields(&sent), (TAG, 0, 0x00), "zero residue");
+}
+
+/// Two banks: a 16 KiB WRITE receives every chunk into the command bank (the
+/// first half), never the alternate, and commits the bytes exactly.
+#[test]
+fn overlap_write_stays_in_the_command_bank() {
+    const BANK: usize = 8192;
+    const TOTAL: usize = 2 * BANK;
+    const TAG: u32 = 0x72;
+
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new().with_overlap();
+    let mut work = vec![0u8; BANK * 2];
+    let mut scratch = Vec::new();
+    let mut io = MockBotIo::new();
+
+    let payload: Vec<u8> = (0..TOTAL as u32)
+        .map(|i| (i.wrapping_mul(13) % 251) as u8)
+        .collect();
+    let cbw = raw_cbw(TAG, TOTAL as u32, 0x00, 0, &rw10(0x2A, 0, 32));
+    io.feed_out(&cbw);
+    io.feed_out(&payload);
+
+    let mut ev = Event::Tick;
+    let mut csw_sent = false;
+    let mut data_recvs = 0;
+    loop {
+        match two_bank_next(
+            &mut s,
+            ev,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &mut io,
+        ) {
+            TwoBankStep::Recv { offset, len, probe } => {
+                if csw_sent && len == CBW_LEN && !probe {
+                    break;
+                }
+                if !probe && len != CBW_LEN {
+                    assert!(
+                        offset + len <= BANK,
+                        "Data-Out must stay in the command bank (offset {offset}, len {len})"
+                    );
+                    data_recvs += 1;
+                }
+                if probe {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
+                        Ok(n) => ev = Event::HostRecv { len: n },
+                        Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
+                        Err(_) => panic!("mock bulk-OUT I/O error"),
+                    }
+                } else {
+                    let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+                    ev = Event::HostRecv { len: n };
+                }
+            }
+            TwoBankStep::Sent { is_csw, .. } => {
+                if is_csw {
+                    csw_sent = true;
+                }
+                ev = Event::HostSent;
+            }
+            TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
+            TwoBankStep::StallIn => panic!("unexpected StallIn"),
+        }
+    }
+
+    assert_eq!(data_recvs, TOTAL / BANK, "one receive per bank-sized chunk");
+    let sent = io.take_sent();
+    assert_eq!(csw_fields(&sent), (TAG, 0, 0x00), "zero residue");
+    let mut check = vec![0u8; TOTAL];
+    plane_read(&mut storage, 0, &mut check);
+    assert_eq!(check, payload, "byte-exact commit");
+}
+
+/// A session without overlap keeps the historical layout: the CBW starts at
+/// offset 0 of `work`.
+#[test]
+fn single_bank_session_cbw_starts_at_zero() {
+    let mut ram = vec![0u8; 4096];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(8, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_AREA];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+
+    assert!(!s.overlap());
+    match s.poll(
+        Event::Tick,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostRecv {
+            offset: 0,
+            len: CBW_LEN,
+            probe: false,
+        } => {}
+        other => panic!("expected the single-bank command boundary, got {other:?}"),
+    }
+}
+
+/// Overlap mode rejects an odd total and any bank below the USB data-area
+/// floor before touching the target.
+#[test]
+fn overlap_rejects_odd_total_and_short_bank() {
+    let mut ram = vec![0u8; 4096];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(8, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut s = BotSession::new().with_overlap();
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+
+    let mut odd = vec![0u8; 2 * snowscsi::MIN_DATA_AREA + 1];
+    assert!(matches!(
+        s.poll(
+            Event::Tick,
+            &mut odd,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
+        Action::Error(BotTargetError::WorkBufTooSmall)
+    ));
+
+    let mut short = vec![0u8; 2 * (snowscsi::MIN_DATA_AREA - 1)];
+    assert!(matches!(
+        s.poll(
+            Event::Tick,
+            &mut short,
+            &mut scratch,
+            &mut target,
+            &mut storage
+        ),
+        Action::Error(BotTargetError::WorkBufTooSmall)
+    ));
+
+    let mut valid = vec![0u8; 2 * snowscsi::MIN_DATA_AREA];
+    match s.poll(
+        Event::Tick,
+        &mut valid,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+    ) {
+        Action::HostRecv {
+            offset: 0,
+            len: CBW_LEN,
+            probe: false,
+        } => {}
+        other => panic!("expected the command boundary after valid sizes, got {other:?}"),
+    }
+}
