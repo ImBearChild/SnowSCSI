@@ -4,6 +4,11 @@
 //! only works on a portable no_std byte stream; the host supplies a concrete
 //! transport (BSD `TcpStream`, mock, esp-wifi socket). `read_exact` /
 //! `write_all` loop over partial transfers (RFC 3720 §3.1 byte stream).
+//!
+//! With the `async-io` feature, [`AsyncConn`] is the awaited mirror of
+//! [`Conn`]: the shell awaits reads and writes instead of blocking. It is a
+//! plain trait, so a runtime binding (Tokio, embassy, …) lives outside this
+//! crate; no async runtime is pulled in here.
 
 /// Byte-stream connection (blanket impl of `embedded_io::Read + Write`).
 pub trait Conn: embedded_io::Read + embedded_io::Write {}
@@ -39,6 +44,42 @@ pub fn write_all<C: Conn + ?Sized>(conn: &mut C, mut buf: &[u8]) -> Result<(), (
             return Err(());
         }
         buf = &buf[n..];
+    }
+    Ok(())
+}
+
+/// Asynchronous byte-stream connection (feature `async-io`).
+///
+/// The awaited mirror of [`Conn`]. Read may return fewer bytes than requested
+/// (a short TCP read); `Ok(0)` is EOF. `write_all` must consume the whole
+/// buffer or report an error. Error kinds are deliberately coarse for the same
+/// reason as [`Conn`]: any transport failure closes the connection.
+#[cfg(feature = "async-io")]
+#[allow(async_fn_in_trait)]
+pub trait AsyncConn {
+    /// Read at least 1 byte; `Ok(0)` is EOF. Short reads are allowed.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()>;
+
+    /// Write the whole buffer.
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), ()>;
+}
+
+/// Read exactly `buf.len()` bytes from an [`AsyncConn`], looping over short
+/// reads.
+///
+/// Returns `Err(())` on an I/O error or EOF (0-byte read, peer closed).
+#[cfg(feature = "async-io")]
+#[allow(clippy::result_unit_err)]
+pub async fn read_exact_async<C: AsyncConn + ?Sized>(
+    conn: &mut C,
+    mut buf: &mut [u8],
+) -> Result<(), ()> {
+    while !buf.is_empty() {
+        let n = conn.read(buf).await?;
+        if n == 0 {
+            return Err(());
+        }
+        buf = &mut buf[n..];
     }
     Ok(())
 }

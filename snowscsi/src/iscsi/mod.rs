@@ -18,7 +18,9 @@
 //!
 //! [`pdu`] holds the 48-byte BHS field codec. The blocking shell
 //! `transport::serve` (behind `std`) wraps a `std::net::TcpListener` in a
-//! serial accept loop around the `Action`/`Event` protocol.
+//! serial accept loop around the `Action`/`Event` protocol. With `async-io`,
+//! `transport::serve_conn_async` is the awaited single-connection mirror over
+//! `conn::AsyncConn`; the caller owns the listener and runtime.
 //!
 //! # Work-buffer contract
 //!

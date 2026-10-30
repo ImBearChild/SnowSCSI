@@ -27,6 +27,11 @@ use crate::iscsi::conn::{read_exact, write_all, Conn};
 use crate::iscsi::pdu::BHS_SIZE;
 use crate::iscsi::target::{Action, Event, IscsiSession, TargetError};
 
+#[cfg(feature = "async-io")]
+use crate::core::async_wake::{self, AsyncWake};
+#[cfg(feature = "async-io")]
+use crate::iscsi::conn::{read_exact_async, AsyncConn};
+
 /// Default read timeout guarding login / command loop / Data-Out.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -190,6 +195,126 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
             }
         }
     }
+}
+
+/// Drive one iSCSI connection to completion over an asynchronous byte stream
+/// (feature `async-io`).
+///
+/// The awaited mirror of [`serve_conn`]: the same `Action`/`Event` protocol,
+/// the same bank checks and the same connection-loss settlement, but reads and
+/// writes are awaited and a [`Action::StoragePending`] step awaits the
+/// [`AsyncWake`] adapter instead of spinning. Runtime binding is the caller's
+/// concern; this crate only serves one connection and owns no listener.
+///
+/// Returns `Ok(())` when the session closes the connection or the peer hangs
+/// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
+#[cfg(feature = "async-io")]
+pub async fn serve_conn_async<C, S, W>(
+    conn: &mut C,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    session: &mut IscsiSession,
+    target: &mut Target<S>,
+    storage: &mut W,
+) -> Result<(), TargetError>
+where
+    C: AsyncConn,
+    S: RuntimeSet,
+    W: Storage + AsyncWake,
+{
+    let result = async {
+        if work.len() < crate::MIN_DATA_LEN + BHS_SIZE {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        if !(work.len() - BHS_SIZE).is_multiple_of(4) {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        if scratch.len() < crate::MIN_DATA_LEN && !scratch.is_empty() {
+            return Err(TargetError::WorkBufTooSmall);
+        }
+        let shared = scratch.is_empty();
+        let mut ev = Event::Tick;
+        loop {
+            // Shared bank: while the resident long operation holds an adapter
+            // token, `work` is its data bank. Drive it one step per turn and
+            // never read the wire until it settles, so a staged PDU is never
+            // clobbered.
+            if shared && target.long_io_in_flight() {
+                match session.poll(Event::Tick, work, scratch, target, &mut *storage) {
+                    // Nothing is staged in `work`; the framing action is
+                    // re-emitted once the token settles.
+                    Action::HostRecv { .. } => continue,
+                    // No wire transfer is pending while the command waits on
+                    // storage; await the adapter so the token can settle.
+                    Action::StoragePending => {
+                        async_wake::wait(&mut *storage).await;
+                        continue;
+                    }
+                    // A response is staged in `work`, which the long token
+                    // owns: dropping it (or sending it) would lose or corrupt
+                    // output.
+                    Action::HostSend { .. } => return Err(TargetError::Internal),
+                    Action::Closed => return Ok(()),
+                    Action::Error(e) => return Err(e),
+                }
+            }
+            match session.poll(ev, work, scratch, target, &mut *storage) {
+                Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
+                    // The step above started the resident long operation; its
+                    // token now owns `work`. The receive is re-emitted on the
+                    // next entry, so drop it and drive the long operation first.
+                    ev = Event::Tick;
+                    continue;
+                }
+                Action::HostSend { .. } if shared && target.long_io_in_flight() => {
+                    // The response lives in `work`, which the long token is
+                    // using; this state must not be reached.
+                    return Err(TargetError::Internal);
+                }
+                Action::HostRecv { offset, len } => {
+                    if offset.checked_add(len).is_none_or(|end| end > work.len()) {
+                        return Err(TargetError::Internal);
+                    }
+                    // Exact read of the framing length the session asked for,
+                    // at the offset it chose. EOF or an I/O failure ends the
+                    // connection (settled below).
+                    if read_exact_async(conn, &mut work[offset..offset + len])
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    ev = Event::HostRecv { len };
+                }
+                Action::HostSend { bytes, .. } => {
+                    if conn.write_all(bytes).await.is_err() {
+                        return Ok(());
+                    }
+                    ev = Event::HostSent;
+                }
+                Action::StoragePending => {
+                    // No wire I/O: await the storage adapter, then feed a
+                    // no-op tick so the core re-polls the settled operation.
+                    async_wake::wait(&mut *storage).await;
+                    ev = Event::Tick;
+                }
+                Action::Closed => {
+                    return Ok(());
+                }
+                Action::Error(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    .await;
+
+    // Whatever ended the loop, the wire is gone: a live command must be settled
+    // before the slots can be served by the next connection. `connection_lost`
+    // makes the session's host seam fail closed (no PDU can be staged).
+    session.connection_lost();
+    let _ = target.settle_transport_end(&mut *storage, session);
+    result
 }
 
 /// Serial accept loop: serve one connection at a time,
