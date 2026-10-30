@@ -216,6 +216,10 @@ impl DvdRamMedium {
 
     /// Send the staged read chunk from the bank that holds it.
     fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        // A plain send carries no read-ahead: never let a stale peek leak into
+        // a later combined settlement.
+        self.next_in_alt = false;
+        self.next_len = 0;
         let len = self.chunk_len;
         if self.chunk_in_alt {
             PollStep::Send {
@@ -429,7 +433,7 @@ impl MmcMedium for DvdRamMedium {
                 let Some(io) = fb.io() else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
-                if io.error().is_some() || io.confirmed() < self.next_len {
+                if io.error().is_some() || io.confirmed() != self.next_len {
                     // Speculative data is optional: re-read the same range as
                     // a required read; the command outcome is unchanged.
                     self.progress = self.progress.saturating_add(chunk as u32);

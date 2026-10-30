@@ -581,10 +581,20 @@ impl Runner {
 
     /// What the active command is waiting on, if anything.
     ///
-    /// Read-only projection of [`DriveState::pending`]; the long operation's
-    /// retained token is reported separately by [`Self::long_io_in_flight`].
+    /// Read-only projection of the command's live tokens: the host token wins
+    /// while the shell still owes a wire action, the storage companion is
+    /// reported when it is the only one left. The long operation's retained
+    /// token is reported separately by [`Self::long_io_in_flight`].
     pub(crate) fn pending_kind(&self) -> Option<PendingKind> {
         let state = self.drive_state.get()?;
+        // A settled receipt is always delivered in the same entry that reaps
+        // its counterpart, so it never outlives every live token.
+        debug_assert!(
+            state.retained_host.is_none() || state.pending.is_some() || state.companion.is_some()
+        );
+        debug_assert!(
+            state.retained_io.is_none() || state.pending.is_some() || state.companion.is_some()
+        );
         match state.pending {
             Some(PendingOp::Storage { .. }) => Some(PendingKind::Storage),
             Some(PendingOp::HostRecv { .. } | PendingOp::HostSend { .. }) => {
@@ -617,6 +627,9 @@ impl Runner {
         self.speculative_io.set(false);
         // A settled read-ahead whose host step has not been delivered yet is
         // part of the same speculative window and must not outlive the cancel.
+        // Callers that still need the fact read `known_for_state` first; a
+        // cancel is only about the window, not about inventing or erasing
+        // facts.
         if let Some(mut state) = self.drive_state.get() {
             if matches!(state.retained_io, Some((req, _)) if req.dir == Direction::ToHost) {
                 state.retained_io = None;
@@ -1458,12 +1471,20 @@ impl Runner {
             return Ok(DriveStep::Pending);
         }
 
-        // Defensive: a retained fact never outlives its live counterpart.
-        if let Some((_, host_receipt)) = state.retained_host.take() {
-            state.feedback = Feedback::host_sent(host_receipt);
-        }
-        if let Some((_, receipt)) = state.retained_io.take() {
-            state.feedback = Feedback::io_done(receipt);
+        // Defensive: a retained fact never outlives its live counterpart. If
+        // both somehow remain, deliver them together instead of overwriting
+        // one feedback with the other.
+        match (state.retained_host.take(), state.retained_io.take()) {
+            (Some((_, host_receipt)), Some((_, receipt))) => {
+                state.feedback = Feedback::host_sent_with_io(host_receipt, receipt);
+            }
+            (Some((_, host_receipt)), None) => {
+                state.feedback = Feedback::host_sent(host_receipt);
+            }
+            (None, Some((_, receipt))) => {
+                state.feedback = Feedback::io_done(receipt);
+            }
+            (None, None) => {}
         }
 
         let permit = self.command_permit();
@@ -1678,6 +1699,10 @@ impl Runner {
                     }
                 }
                 PollStep::Send { bytes, prefetch } => {
+                    // One storage companion at a time: the device cannot
+                    // combine a new read-ahead while its previous companion is
+                    // still in flight (it has not received the host fact yet).
+                    debug_assert!(state.companion.is_none() && state.retained_io.is_none());
                     if state.ctx.host_direction != Direction::ToHost {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);

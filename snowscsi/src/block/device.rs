@@ -452,6 +452,10 @@ impl BlockDevice {
 
     /// Send the staged read chunk from the bank that holds it.
     fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
+        // A plain send carries no read-ahead: never let a stale peek leak into
+        // a later combined settlement.
+        self.next_in_alt = false;
+        self.next_len = 0;
         let len = self.chunk_len;
         if self.chunk_in_alt {
             PollStep::Send {
