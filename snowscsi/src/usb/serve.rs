@@ -349,7 +349,7 @@ where
 
     let result = async {
         let mut ev = Event::Tick;
-        let shared = scratch.is_empty();
+        let shared = scratch.is_empty() && !session.overlap();
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
