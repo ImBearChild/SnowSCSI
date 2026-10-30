@@ -3324,3 +3324,133 @@ fn overlap_one_bank_read_never_uses_the_long_bank() {
         "the FORMAT fill is byte-exact"
     );
 }
+
+// ── Storage companion after the wire send ───────────────────────────
+
+/// Storage plane that delays only the companion: the first operation (the
+/// required read) settles at once, later operations answer `Pending` a
+/// programmed number of times.
+struct DelayedPrefetchStorage<'a> {
+    inner: PlaneSet<'a>,
+    begins: usize,
+    prefetch_pending: u32,
+}
+
+impl<'a> DelayedPrefetchStorage<'a> {
+    fn new(inner: PlaneSet<'a>, prefetch_pending: u32) -> Self {
+        Self {
+            inner,
+            begins: 0,
+            prefetch_pending,
+        }
+    }
+}
+
+impl Storage for DelayedPrefetchStorage<'_> {
+    fn select_lun(&mut self, lun: usize) {
+        self.inner.select_lun(lun);
+    }
+
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.begins = self.begins.saturating_add(1);
+        self.inner.begin_exec(req)
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        if self.begins >= 2 && self.prefetch_pending > 0 {
+            self.prefetch_pending -= 1;
+            return Poll::Pending;
+        }
+        self.inner.poll_exec(token, buf)
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        self.inner.cancel(token);
+    }
+}
+
+/// A pending companion after the wire send reports `StoragePending`; the next
+/// `Tick` delivers the combined receipt and the following Data-In chunk.
+#[test]
+fn storage_pending_after_data_in_send_then_tick_delivers_the_next_chunk() {
+    const BLOCKS: u16 = 64;
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const BANK: usize = 8192;
+    const TAG: u32 = 0x72;
+
+    let mut ram = vec![0u8; TOTAL];
+    for (i, byte) in ram.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let expected = ram.clone();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(u64::from(BLOCKS), 512, 0)];
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = DelayedPrefetchStorage::new(
+        PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+        2,
+    );
+    let mut session = BotSession::new().with_overlap();
+    let mut work = vec![0u8; BANK * 2];
+    let mut scratch = Vec::new();
+    let mut io = MockBotIo::new();
+    let cbw = raw_cbw(TAG, TOTAL as u32, 0x80, 0, &rw10(0x28, 0, BLOCKS));
+    io.feed_out(&cbw);
+
+    let mut ev = Event::Tick;
+    let mut csw_sent = false;
+    let mut last_send_was_data = false;
+    let mut storage_pending_after_data = false;
+    loop {
+        match two_bank_next(
+            &mut session,
+            ev,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &mut io,
+        ) {
+            TwoBankStep::Recv { offset, len, probe } => {
+                if csw_sent && len == CBW_LEN && !probe {
+                    break;
+                }
+                if probe {
+                    match io.try_recv_out(&mut work[offset..offset + len]) {
+                        Ok(n) => ev = Event::HostRecv { len: n },
+                        Err(BotIoErr::WouldBlock) => ev = Event::HostIdle,
+                        Err(_) => panic!("mock bulk-OUT I/O error"),
+                    }
+                } else {
+                    let n = io.try_recv_out(&mut work[offset..offset + len]).unwrap();
+                    ev = Event::HostRecv { len: n };
+                }
+            }
+            TwoBankStep::Sent { is_csw, .. } => {
+                last_send_was_data = !is_csw;
+                if is_csw {
+                    csw_sent = true;
+                }
+                ev = Event::HostSent;
+            }
+            TwoBankStep::StoragePending => {
+                if last_send_was_data {
+                    storage_pending_after_data = true;
+                }
+                last_send_was_data = false;
+                ev = Event::Tick;
+            }
+            TwoBankStep::StallBoth => panic!("unexpected StallBoth"),
+            TwoBankStep::StallIn => panic!("unexpected StallIn"),
+        }
+    }
+
+    assert!(
+        storage_pending_after_data,
+        "a pending companion after the wire send must not be an internal error"
+    );
+    let sent = io.take_sent();
+    assert_eq!(&sent[..TOTAL], &expected[..], "byte-exact read");
+    assert_eq!(csw_fields(&sent), (TAG, 0, 0x00));
+}

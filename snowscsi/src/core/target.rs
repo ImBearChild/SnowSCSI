@@ -2002,14 +2002,18 @@ mod tests {
                     })
                 }
                 crate::core::FeedbackKind::PlanAccepted => match self.script.take() {
-                    Some(BankScript::SendAlt) => crate::core::PollStep::Send(&alt[..data.len()]),
+                    Some(BankScript::SendAlt) => crate::core::PollStep::Send {
+                        bytes: &alt[..data.len()],
+                        prefetch: None,
+                    },
                     Some(BankScript::RecvAlt) => {
                         self.script = None;
                         crate::core::PollStep::Receive(&mut alt[..data.len()])
                     }
-                    Some(BankScript::SendOutside) => {
-                        crate::core::PollStep::Send(&OUTSIDE[..data.len()])
-                    }
+                    Some(BankScript::SendOutside) => crate::core::PollStep::Send {
+                        bytes: &OUTSIDE[..data.len()],
+                        prefetch: None,
+                    },
                     None => crate::core::PollStep::Complete(Completion::Good),
                 },
                 _ => {

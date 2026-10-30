@@ -734,3 +734,124 @@ fn measure_single_vs_overlap_on_a_copying_wire() {
     let overlap = measure_read(true, delay);
     println!("single-bank={single:?} overlap={overlap:?} (storage delay {delay:?}/read)");
 }
+
+/// Storage plane that delays only the companion: the first operation (the
+/// required read) settles at once, later operations answer `Pending` a
+/// programmed number of times.
+struct DelayedPrefetchStorage<'a> {
+    inner: PlaneSet<'a>,
+    begins: usize,
+    prefetch_pending: u32,
+}
+
+impl<'a> DelayedPrefetchStorage<'a> {
+    fn new(inner: PlaneSet<'a>, prefetch_pending: u32) -> Self {
+        Self {
+            inner,
+            begins: 0,
+            prefetch_pending,
+        }
+    }
+}
+
+impl Storage for DelayedPrefetchStorage<'_> {
+    fn select_lun(&mut self, lun: usize) {
+        self.inner.select_lun(lun);
+    }
+
+    fn begin_exec(&mut self, req: IoReq) -> IoToken {
+        self.begins = self.begins.saturating_add(1);
+        self.inner.begin_exec(req)
+    }
+
+    fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+        if self.begins >= 2 && self.prefetch_pending > 0 {
+            self.prefetch_pending -= 1;
+            return Poll::Pending;
+        }
+        self.inner.poll_exec(token, buf)
+    }
+
+    fn cancel(&mut self, token: IoToken) {
+        self.inner.cancel(token);
+    }
+}
+
+/// A storage-only step after the wire send reports `StoragePending`, and the
+/// next `Tick` delivers the combined receipt and the next Data-In chunk.
+#[test]
+fn pending_after_host_sent_reports_storage_pending_then_delivers_the_next_chunk() {
+    use embedded_io::Read as _;
+
+    const BLOCKS: u16 = 64;
+    const TOTAL: usize = BLOCKS as usize * 512;
+
+    let mut ram = vec![0u8; TOTAL];
+    for (i, byte) in ram.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let expected = ram.clone();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(u64::from(BLOCKS), 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = DelayedPrefetchStorage::new(
+        PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]),
+        2,
+    );
+    let mut session = IscsiSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * BANK];
+    let mut scratch = Vec::new();
+    let mut conn = MockConn::new();
+    conn.feed_padded(&login_bhs(REQ_TEXT.len() as u32), REQ_TEXT.as_bytes());
+    conn.feed(&read10_bhs(0, BLOCKS, 7, 0), &[]);
+
+    let mut sent = Vec::new();
+    let mut ev = Event::Tick;
+    let mut last_was_data_in = false;
+    let mut storage_pending_after_data = false;
+    loop {
+        match session.poll(ev, &mut work, &mut scratch, &mut target, &mut storage) {
+            Action::HostRecv { offset, len } => {
+                let mut got = 0usize;
+                while got < len {
+                    match conn.read(&mut work[offset + got..offset + len]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got += n,
+                    }
+                }
+                last_was_data_in = false;
+                ev = Event::HostRecv { len };
+            }
+            Action::HostSend { bytes } => {
+                let is_data_in = (bytes[0] & 0x3F) == op::SCSI_DATA_IN;
+                sent.push(Sent {
+                    offset: bytes.as_ptr() as usize,
+                    bytes: bytes.to_vec(),
+                });
+                embedded_io::Write::write_all(&mut conn, bytes).unwrap();
+                last_was_data_in = is_data_in;
+                ev = Event::HostSent;
+            }
+            Action::StoragePending => {
+                if last_was_data_in {
+                    storage_pending_after_data = true;
+                }
+                last_was_data_in = false;
+                ev = Event::Tick;
+            }
+            Action::Closed => break,
+            Action::Error(error) => panic!("session error: {error:?}"),
+        }
+    }
+
+    assert!(
+        storage_pending_after_data,
+        "a pending companion after the wire send must not be an internal error"
+    );
+    assert_eq!(data_in_payload(&sent), expected, "byte-exact read");
+    assert_eq!(storage.begins, TOTAL / (BANK - BHS_SIZE) + 1);
+}

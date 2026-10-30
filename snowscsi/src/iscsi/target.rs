@@ -85,13 +85,9 @@ pub enum Action<'a> {
         len: usize,
     },
     /// Send `bytes` to the wire (a complete PDU: BHS + data + padding).
-    /// `prefetch` is the next read-ahead coordinate for read-phase overlap
-    /// (always `None` in v1).
     HostSend {
         /// Complete PDU to put on the wire.
         bytes: &'a [u8],
-        /// Read-ahead coordinate (unused).
-        prefetch: Option<(u64, usize)>,
     },
     /// The active command is waiting on a storage operation and no wire
     /// transfer is staged. Feed [`Event::Tick`] to advance it once; no bytes
@@ -877,7 +873,6 @@ impl IscsiSession {
             Emit::Recv { offset, len } => Action::HostRecv { offset, len },
             Emit::Send { len, base } => Action::HostSend {
                 bytes: &work[base..base + len],
-                prefetch: None,
             },
             Emit::StoragePending => Action::StoragePending,
             Emit::Closed => Action::Closed,
@@ -1514,7 +1509,13 @@ impl IscsiSession {
                     Some((offset, bank, len, f_bit)) => {
                         self.emit_data_in(work, offset, bank, len, f_bit)
                     }
-                    None => Emit::Error(TargetError::Internal),
+                    None => {
+                        // The wire step already reached the host and only the
+                        // storage companion is still in flight. There is
+                        // nothing to stage until it settles.
+                        self.session = Session::RecvPdu;
+                        Emit::StoragePending
+                    }
                 },
                 HostPhase::Recv(p) => {
                     if p.r2t_pending {

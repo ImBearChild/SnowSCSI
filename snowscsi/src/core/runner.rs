@@ -151,6 +151,12 @@ struct DriveState {
     feedback: Feedback,
     host_failed: bool,
     pending: Option<PendingOp>,
+    /// A storage companion submitted together with the live host step.
+    companion: Option<PendingOp>,
+    /// Host receipt retained while its companion is still in flight.
+    retained_host: Option<(HostReq, HostReceipt)>,
+    /// Companion receipt retained while the host step is still in flight.
+    retained_io: Option<(IoReq, IoReceipt)>,
     /// Fixed completion produced by an admission/prepare reject.
     done: Option<Completion>,
     /// Declared command context; the `Publish` contract compares against it.
@@ -578,11 +584,13 @@ impl Runner {
     /// Read-only projection of [`DriveState::pending`]; the long operation's
     /// retained token is reported separately by [`Self::long_io_in_flight`].
     pub(crate) fn pending_kind(&self) -> Option<PendingKind> {
-        match self.drive_state.get().and_then(|state| state.pending) {
+        let state = self.drive_state.get()?;
+        match state.pending {
             Some(PendingOp::Storage { .. }) => Some(PendingKind::Storage),
             Some(PendingOp::HostRecv { .. } | PendingOp::HostSend { .. }) => {
                 Some(PendingKind::Host)
             }
+            None if state.companion.is_some() => Some(PendingKind::Storage),
             None => None,
         }
     }
@@ -607,6 +615,14 @@ impl Runner {
 
     fn cancel_speculative_io(&self) {
         self.speculative_io.set(false);
+        // A settled read-ahead whose host step has not been delivered yet is
+        // part of the same speculative window and must not outlive the cancel.
+        if let Some(mut state) = self.drive_state.get() {
+            if matches!(state.retained_io, Some((req, _)) if req.dir == Direction::ToHost) {
+                state.retained_io = None;
+                self.drive_state.set(Some(state));
+            }
+        }
     }
 
     /// Retained inbound bytes keep the boundary incomplete; wired by the
@@ -648,10 +664,8 @@ impl Runner {
         let Some(state) = self.drive_state.get() else {
             return Fault::Contract;
         };
-        if let Some(pending) = state.pending {
-            self.cancel_pending(pending, storage, host);
-        }
-        let known = Self::known_for_pending(state.pending);
+        self.cancel_state_tokens(&state, storage, host);
+        let known = Self::known_for_state(&state);
         self.settle_contract(lu, known);
         Fault::Contract
     }
@@ -681,6 +695,9 @@ impl Runner {
                     feedback: Feedback::begin(),
                     host_failed: false,
                     pending: None,
+                    companion: None,
+                    retained_host: None,
+                    retained_io: None,
                     done: Some(completion),
                     ctx,
                     work_addr: 0,
@@ -702,6 +719,9 @@ impl Runner {
                 feedback: Feedback::begin(),
                 host_failed: false,
                 pending: None,
+                companion: None,
+                retained_host: None,
+                retained_io: None,
                 done: Some(completion),
                 ctx,
                 work_addr: 0,
@@ -716,6 +736,9 @@ impl Runner {
             feedback: Feedback::begin(),
             host_failed: false,
             pending: None,
+            companion: None,
+            retained_host: None,
+            retained_io: None,
             done: None,
             ctx,
             work_addr: 0,
@@ -815,6 +838,54 @@ impl Runner {
         }
     }
 
+    /// Facts already known for every live token of a command.
+    ///
+    /// The host facts come first, then the companion facts; a receipt that has
+    /// already settled is retained as a fact even if its token is no longer
+    /// live.
+    fn known_for_state(state: &DriveState) -> KnownEffects {
+        let host = match state.retained_host {
+            Some((_, receipt)) => Self::known_from_host_receipt(receipt),
+            None => Self::known_for_pending(state.pending),
+        };
+        let companion = match state.retained_io {
+            Some((req, receipt)) => Self::known_from_io_receipt(req, receipt),
+            None => Self::known_for_pending(state.companion),
+        };
+        Self::merge_known(host, companion)
+    }
+
+    /// Merge companion facts into the host facts of the same command.
+    fn merge_known(mut host: KnownEffects, companion: KnownEffects) -> KnownEffects {
+        host.confirmed_write = host
+            .confirmed_write
+            .saturating_add(companion.confirmed_write);
+        host.sync_durable |= companion.sync_durable;
+        host.unknown_remainder |= companion.unknown_remainder;
+        host.host_prefix = host.host_prefix.max(companion.host_prefix);
+        host
+    }
+
+    /// Cancel every live token of a command, companion first.
+    fn cancel_state_tokens(
+        &self,
+        state: &DriveState,
+        storage: &mut dyn Storage,
+        host: &mut dyn HostTransport,
+    ) {
+        if let Some(companion) = state.companion {
+            self.cancel_pending(companion, storage, host);
+        }
+        if let Some(pending) = state.pending {
+            self.cancel_pending(pending, storage, host);
+        }
+        if let Some((req, _)) = state.retained_io {
+            if req.dir == Direction::ToHost {
+                self.cancel_speculative_io();
+            }
+        }
+    }
+
     /// Facts confirmed by a storage receipt that was **returned** by the
     /// adapter.
     ///
@@ -851,6 +922,24 @@ impl Runner {
         }
     }
 
+    /// Facts confirmed by a sanitized storage receipt already stamped with the
+    /// runner's owner.
+    fn known_from_io_receipt(req: IoReq, receipt: IoReceipt) -> KnownEffects {
+        let write_or_sync = matches!(req.dir, Direction::FromHost | Direction::None);
+        let mut known = KnownEffects::NONE;
+        if req.dir == Direction::FromHost {
+            known.confirmed_write = receipt.confirmed() as u64;
+        }
+        if req.dir == Direction::None
+            && receipt.error().is_none()
+            && receipt.effect() == Effect::Known
+        {
+            known.sync_durable = true;
+        }
+        known.unknown_remainder = write_or_sync && receipt.effect() == Effect::UnknownRemainder;
+        known
+    }
+
     /// Stop is a cooperative **drain**, not a cancel.
     ///
     /// New submission is already closed by `Target::stop`. The pending token is
@@ -867,97 +956,168 @@ impl Runner {
         alt: &mut [u8],
         mut state: DriveState,
     ) -> Result<Option<DriveStep>, Fault> {
-        let known = match state.pending {
-            Some(PendingOp::Storage {
-                token,
-                req,
-                buf_offset,
-                buf_alt,
-                prefetch,
-            }) => {
-                let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
-                    .map(|buf| storage.poll_exec(token, buf));
-                match polled {
-                    Some(Poll::Pending) => {
-                        state.work_addr = work.as_ptr() as usize;
-                        state.work_len = work.len();
-                        state.alt_addr = alt.as_ptr() as usize;
-                        state.alt_len = alt.len();
-                        self.drive_state.set(Some(state));
-                        return Ok(Some(DriveStep::Pending));
-                    }
-                    Some(Poll::Ready(raw)) => {
-                        if prefetch {
-                            self.cancel_speculative_io();
-                        } else {
-                            self.note_required_io(false);
+        // Poll the command token once. A returned receipt is retained as a
+        // fact; a live token keeps the state and the drain continues on a later
+        // entry.
+        if let Some(pending) = state.pending {
+            match pending {
+                PendingOp::Storage {
+                    token,
+                    req,
+                    buf_offset,
+                    buf_alt,
+                    prefetch,
+                } => {
+                    let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
+                        .map(|buf| storage.poll_exec(token, buf));
+                    match polled {
+                        Some(Poll::Pending) => {}
+                        Some(Poll::Ready(raw)) => {
+                            if prefetch {
+                                self.cancel_speculative_io();
+                            } else {
+                                self.note_required_io(false);
+                            }
+                            state.pending = None;
+                            let receipt = sanitize_storage_receipt(req, raw);
+                            if raw.error.is_some() {
+                                // An errored token is cancelled for slot
+                                // hygiene; the returned receipt remains the
+                                // authoritative fact.
+                                storage.cancel(token);
+                            }
+                            state.retained_io =
+                                Some((req, IoReceipt::from_storage(receipt, self.owner)));
                         }
-                        let receipt = sanitize_storage_receipt(req, raw);
-                        let known = Self::known_from_storage_receipt(req, receipt);
-                        if raw.error.is_some() {
-                            // An errored token is cancelled for slot
-                            // hygiene. `cancel` returning does not rewrite the
-                            // facts the returned receipt already established
-                            // ("receipt 已返回").
+                        None => {
+                            // The caller's bank no longer addresses this
+                            // window: the drain cannot advance, so it cancels.
                             storage.cancel(token);
+                            if prefetch {
+                                self.cancel_speculative_io();
+                            } else {
+                                self.note_required_io(false);
+                            }
+                            state.pending = None;
+                            state.retained_io = Some((
+                                req,
+                                IoReceipt::from_storage(
+                                    Self::cancelled_receipt(req.dir),
+                                    self.owner,
+                                ),
+                            ));
                         }
-                        known
-                    }
-                    None => {
-                        // The caller's `work` no longer addresses this window:
-                        // the drain cannot advance, so it cancels.
-                        storage.cancel(token);
-                        if prefetch {
-                            self.cancel_speculative_io();
-                        } else {
-                            self.note_required_io(false);
-                        }
-                        Self::known_unobserved(req.dir)
                     }
                 }
-            }
-            Some(PendingOp::HostRecv {
-                token,
-                req,
-                buf_offset,
-                buf_alt,
-            })
-            | Some(PendingOp::HostSend {
-                token,
-                req,
-                buf_offset,
-                buf_alt,
-            }) => {
-                let is_recv = req.dir == Direction::FromHost;
-                let polled = pending_host_buf(work, alt, req, buf_offset, buf_alt, is_recv)
-                    .map(|buf| host.poll_host(token, buf));
-                match polled {
-                    Some(Poll::Pending) => {
-                        state.work_addr = work.as_ptr() as usize;
-                        state.work_len = work.len();
-                        state.alt_addr = alt.as_ptr() as usize;
-                        state.alt_len = alt.len();
-                        self.drive_state.set(Some(state));
-                        return Ok(Some(DriveStep::Pending));
-                    }
-                    Some(Poll::Ready(raw)) => {
-                        // A returned host receipt is authoritative: keep its
-                        // (clamped) accepted prefix and do not fabricate an
-                        // unknown write remainder. The token is still cancelled
-                        // for slot hygiene when the adapter reported an error.
-                        if raw.error().is_some() {
+                PendingOp::HostRecv {
+                    token,
+                    req,
+                    buf_offset,
+                    buf_alt,
+                }
+                | PendingOp::HostSend {
+                    token,
+                    req,
+                    buf_offset,
+                    buf_alt,
+                } => {
+                    let is_recv = req.dir == Direction::FromHost;
+                    let polled = pending_host_buf(work, alt, req, buf_offset, buf_alt, is_recv)
+                        .map(|buf| host.poll_host(token, buf));
+                    match polled {
+                        Some(Poll::Pending) => {}
+                        Some(Poll::Ready(raw)) => {
+                            // A returned host receipt is authoritative: keep
+                            // its (clamped) accepted prefix.
+                            if raw.error().is_some() {
+                                host.cancel(token);
+                            }
+                            state.pending = None;
+                            state.retained_host =
+                                Some((req, sanitize_host_receipt(req, raw, self.owner)));
+                        }
+                        None => {
                             host.cancel(token);
+                            state.pending = None;
+                            state.retained_host =
+                                Some((req, HostReceipt::new(0, Some(Fault::Contract), self.owner)));
                         }
-                        Self::known_from_host_receipt(sanitize_host_receipt(req, raw, self.owner))
-                    }
-                    None => {
-                        host.cancel(token);
-                        Self::known_unobserved(req.dir)
                     }
                 }
             }
-            None => KnownEffects::NONE,
-        };
+        }
+
+        // Then the companion once, with the bank it was submitted with.
+        if let Some(companion) = state.companion {
+            match companion {
+                PendingOp::Storage {
+                    token,
+                    req,
+                    buf_offset,
+                    buf_alt,
+                    prefetch,
+                } => {
+                    let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
+                        .map(|buf| storage.poll_exec(token, buf));
+                    match polled {
+                        Some(Poll::Pending) => {}
+                        Some(Poll::Ready(raw)) => {
+                            if prefetch {
+                                self.cancel_speculative_io();
+                            } else {
+                                self.note_required_io(false);
+                            }
+                            state.companion = None;
+                            let receipt = sanitize_storage_receipt(req, raw);
+                            if raw.error.is_some() {
+                                storage.cancel(token);
+                            }
+                            state.retained_io =
+                                Some((req, IoReceipt::from_storage(receipt, self.owner)));
+                        }
+                        None => {
+                            storage.cancel(token);
+                            if prefetch {
+                                self.cancel_speculative_io();
+                            } else {
+                                self.note_required_io(false);
+                            }
+                            state.companion = None;
+                            state.retained_io = Some((
+                                req,
+                                IoReceipt::from_storage(
+                                    Self::cancelled_receipt(req.dir),
+                                    self.owner,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                PendingOp::HostRecv { token, .. } | PendingOp::HostSend { token, .. } => {
+                    // A companion is storage-only; this is defensive hygiene.
+                    host.cancel(token);
+                    state.companion = None;
+                }
+            }
+        }
+
+        if state.pending.is_some() || state.companion.is_some() {
+            state.work_addr = work.as_ptr() as usize;
+            state.work_len = work.len();
+            state.alt_addr = alt.as_ptr() as usize;
+            state.alt_len = alt.len();
+            self.drive_state.set(Some(state));
+            return Ok(Some(DriveStep::Pending));
+        }
+
+        // Merge host facts first, then companion facts.
+        let mut known = KnownEffects::NONE;
+        if let Some((_, receipt)) = state.retained_host {
+            known = Self::merge_known(known, Self::known_from_host_receipt(receipt));
+        }
+        if let Some((req, receipt)) = state.retained_io {
+            known = Self::merge_known(known, Self::known_from_io_receipt(req, receipt));
+        }
         let permit = self.command_permit();
         let interrupted = lu.interrupt(&permit, InterruptReason::Stop, known);
         lu.finish_delivery(&permit, Delivery::Failed);
@@ -997,10 +1157,8 @@ impl Runner {
             self.drive_state.set(None);
             return Ok(());
         }
-        let known = Self::known_for_pending(state.pending);
-        if let Some(pending) = state.pending {
-            self.cancel_pending(pending, storage, host);
-        }
+        let known = Self::known_for_state(&state);
+        self.cancel_state_tokens(&state, storage, host);
         let permit = self.command_permit();
         let interrupted = lu.interrupt(&permit, reason, known);
         lu.finish_delivery(&permit, Delivery::Failed);
@@ -1081,14 +1239,12 @@ impl Runner {
         } else {
             state.alt_addr != alt_addr || state.alt_len != alt_len
         };
-        if state.pending.is_some()
+        if (state.pending.is_some() || state.companion.is_some())
             && state.work_len != 0
             && (state.work_addr != work_addr || state.work_len != work_len || alt_changed)
         {
-            if let Some(pending) = state.pending {
-                self.cancel_pending(pending, storage, host);
-            }
-            let known = Self::known_for_pending(state.pending);
+            self.cancel_state_tokens(&state, storage, host);
+            let known = Self::known_for_state(&state);
             self.settle_contract(lu, known);
             return Err(Fault::Contract);
         }
@@ -1127,8 +1283,10 @@ impl Runner {
             return self.abort_control(lu, storage, host);
         }
 
-        // 4. Continue the retained adapter operation, then poll the device once
-        //    more with the receipt as feedback.
+        // 4. Resume every live token at most once, then poll the device once
+        //    more with the settled feedback. The host token and the storage
+        //    companion are independent domains; neither may be starved by the
+        //    other.
         if let Some(pending) = state.pending {
             match pending {
                 PendingOp::Storage {
@@ -1141,7 +1299,7 @@ impl Runner {
                     let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
                         .map(|buf| storage.poll_exec(token, buf));
                     match polled {
-                        Some(Poll::Pending) => return Ok(DriveStep::Pending),
+                        Some(Poll::Pending) => {}
                         Some(Poll::Ready(receipt)) => {
                             if prefetch {
                                 self.cancel_speculative_io();
@@ -1191,13 +1349,18 @@ impl Runner {
                     buf_alt,
                 } => match self.resume_host(host, work, alt, token, req, buf_offset, buf_alt, true)
                 {
-                    HostResume::Pending => return Ok(DriveStep::Pending),
+                    HostResume::Pending => {}
                     HostResume::Retained(raw) => {
                         state.pending = None;
                         if raw.error() == Some(Fault::Contract) {
                             // The receipt was returned: keep its accepted prefix
                             // and never invent an unknown remainder.
-                            self.settle_contract(lu, Self::known_from_host_receipt(raw));
+                            self.cancel_state_tokens(&state, storage, host);
+                            let known = Self::merge_known(
+                                Self::known_from_host_receipt(raw),
+                                Self::known_for_state(&state),
+                            );
+                            self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
                         if raw.error().is_some() {
@@ -1207,7 +1370,13 @@ impl Runner {
                     }
                     HostResume::Unaddressable => {
                         host.cancel(token);
-                        self.settle_contract(lu, Self::known_unobserved(Direction::FromHost));
+                        state.pending = None;
+                        self.cancel_state_tokens(&state, storage, host);
+                        let known = Self::merge_known(
+                            Self::known_unobserved(Direction::FromHost),
+                            Self::known_for_state(&state),
+                        );
+                        self.settle_contract(lu, known);
                         return Err(Fault::Contract);
                     }
                 },
@@ -1219,28 +1388,82 @@ impl Runner {
                 } => {
                     match self.resume_host(host, work, alt, token, req, buf_offset, buf_alt, false)
                     {
-                        HostResume::Pending => return Ok(DriveStep::Pending),
+                        HostResume::Pending => {}
                         HostResume::Retained(raw) => {
                             state.pending = None;
                             if raw.error() == Some(Fault::Contract) {
-                                // The receipt was returned: keep its accepted prefix
-                                // and never invent an unknown remainder.
-                                self.settle_contract(lu, Self::known_from_host_receipt(raw));
+                                self.cancel_state_tokens(&state, storage, host);
+                                let known = Self::merge_known(
+                                    Self::known_from_host_receipt(raw),
+                                    Self::known_for_state(&state),
+                                );
+                                self.settle_contract(lu, known);
                                 return Err(Fault::Contract);
                             }
                             if raw.error().is_some() {
                                 state.host_failed = true;
                             }
-                            state.feedback = Feedback::host_sent(raw);
+                            if let Some((_, io)) = state.retained_io.take() {
+                                state.feedback = Feedback::host_sent_with_io(raw, io);
+                            } else if state.companion.is_some() {
+                                state.retained_host = Some((req, raw));
+                            } else {
+                                state.feedback = Feedback::host_sent(raw);
+                            }
                         }
                         HostResume::Unaddressable => {
                             host.cancel(token);
-                            self.settle_contract(lu, Self::known_unobserved(Direction::ToHost));
+                            state.pending = None;
+                            self.cancel_state_tokens(&state, storage, host);
+                            let known = Self::merge_known(
+                                Self::known_unobserved(Direction::ToHost),
+                                Self::known_for_state(&state),
+                            );
+                            self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
                     }
                 }
             }
+        }
+
+        if state.companion.is_some() {
+            match self.poll_companion_once(&mut state, storage, work, alt) {
+                CompanionPoll::Pending | CompanionPoll::Gone => {}
+                CompanionPoll::Ready((req, receipt)) => {
+                    if let Some((_, host_receipt)) = state.retained_host.take() {
+                        state.feedback = Feedback::host_sent_with_io(host_receipt, receipt);
+                    } else {
+                        state.retained_io = Some((req, receipt));
+                    }
+                }
+                CompanionPoll::Unaddressable(dir) => {
+                    self.cancel_state_tokens(&state, storage, host);
+                    let known = Self::merge_known(
+                        Self::known_for_state(&state),
+                        Self::known_unobserved(dir),
+                    );
+                    self.settle_contract(lu, known);
+                    return Err(Fault::Contract);
+                }
+            }
+        }
+
+        if state.pending.is_some() || state.companion.is_some() {
+            state.work_addr = work.as_ptr() as usize;
+            state.work_len = work.len();
+            state.alt_addr = alt.as_ptr() as usize;
+            state.alt_len = alt.len();
+            self.drive_state.set(Some(state));
+            return Ok(DriveStep::Pending);
+        }
+
+        // Defensive: a retained fact never outlives its live counterpart.
+        if let Some((_, host_receipt)) = state.retained_host.take() {
+            state.feedback = Feedback::host_sent(host_receipt);
+        }
+        if let Some((_, receipt)) = state.retained_io.take() {
+            state.feedback = Feedback::io_done(receipt);
         }
 
         let permit = self.command_permit();
@@ -1345,6 +1568,34 @@ impl Runner {
                     offset,
                     buf,
                 }) => {
+                    // A companion is already in flight: never submit a second
+                    // storage operation. Poll it once and deliver its receipt;
+                    // the device then either falls back or sends the chunk.
+                    if state.companion.is_some() {
+                        match self.poll_companion_once(&mut state, storage, work, alt) {
+                            CompanionPoll::Pending | CompanionPoll::Gone => {
+                                state.work_addr = work.as_ptr() as usize;
+                                state.work_len = work.len();
+                                state.alt_addr = alt.as_ptr() as usize;
+                                state.alt_len = alt.len();
+                                self.drive_state.set(Some(state));
+                                return Ok(DriveStep::Pending);
+                            }
+                            CompanionPoll::Ready((_, receipt)) => {
+                                state.feedback = Feedback::io_done(receipt);
+                                continue;
+                            }
+                            CompanionPoll::Unaddressable(dir) => {
+                                self.cancel_state_tokens(&state, storage, host);
+                                let known = Self::merge_known(
+                                    Self::known_for_state(&state),
+                                    Self::known_unobserved(dir),
+                                );
+                                self.settle_contract(lu, known);
+                                return Err(Fault::Contract);
+                            }
+                        }
+                    }
                     self.prefetch_events
                         .set(self.prefetch_events.get().saturating_add(1));
                     let req = IoReq {
@@ -1426,22 +1677,81 @@ impl Runner {
                         }
                     }
                 }
-                PollStep::Send(buf) => {
+                PollStep::Send { bytes, prefetch } => {
                     if state.ctx.host_direction != Direction::ToHost {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     }
                     let req = HostReq {
-                        len: buf.len() as u32,
+                        len: bytes.len() as u32,
                         dir: Direction::ToHost,
                     };
-                    let buf_offset = slice_offset(work_start, work_len, alt_start, alt_len, buf);
-                    // A window outside both banks never reaches the host
-                    // adapter: nothing has moved yet, so settle without effect.
-                    let Some((offset, buf_alt)) = buf_offset else {
+                    // Resolve both windows before anything reaches an adapter.
+                    let Some((offset, buf_alt)) =
+                        slice_offset(work_start, work_len, alt_start, alt_len, bytes)
+                    else {
                         self.settle_contract(lu, KnownEffects::NONE);
                         return Err(Fault::Contract);
                     };
+                    let companion = match prefetch {
+                        Some(PrefetchOp::Read {
+                            resource,
+                            offset: prefetch_offset,
+                            buf,
+                        }) => {
+                            let Some((companion_offset, companion_alt)) =
+                                slice_offset(work_start, work_len, alt_start, alt_len, buf)
+                            else {
+                                self.settle_contract(lu, KnownEffects::NONE);
+                                return Err(Fault::Contract);
+                            };
+                            if windows_overlap(bytes, buf) {
+                                self.settle_contract(lu, KnownEffects::NONE);
+                                return Err(Fault::Contract);
+                            }
+                            let companion_req = IoReq {
+                                resource,
+                                offset: prefetch_offset,
+                                len: buf.len() as u32,
+                                dir: Direction::ToHost,
+                            };
+                            Some((companion_req, companion_offset, companion_alt, buf))
+                        }
+                        None => None,
+                    };
+
+                    // Submit the speculative read first; a blocking adapter
+                    // settles it here, an asynchronous one keeps its token.
+                    if let Some((companion_req, companion_offset, companion_alt, companion_buf)) =
+                        companion
+                    {
+                        debug_assert!(companion_req.dir == Direction::ToHost);
+                        self.prefetch_events
+                            .set(self.prefetch_events.get().saturating_add(1));
+                        let token = storage.begin_exec(companion_req);
+                        if token.is_valid() {
+                            match storage.poll_exec(token, IoBuf::Read(companion_buf)) {
+                                Poll::Pending => {
+                                    state.companion = Some(PendingOp::Storage {
+                                        token,
+                                        req: companion_req,
+                                        buf_offset: companion_offset,
+                                        buf_alt: companion_alt,
+                                        prefetch: true,
+                                    });
+                                    self.note_speculative_io(true);
+                                }
+                                Poll::Ready(raw) => {
+                                    let receipt = sanitize_storage_receipt(companion_req, raw);
+                                    state.retained_io = Some((
+                                        companion_req,
+                                        IoReceipt::from_storage(receipt, self.owner),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     let bank = if buf_alt {
                         BankSide::Alt
                     } else {
@@ -1449,10 +1759,12 @@ impl Runner {
                     };
                     let token = host.begin_send(req);
                     if !token.is_valid() {
-                        self.settle_contract(lu, KnownEffects::NONE);
+                        self.cancel_state_tokens(&state, storage, host);
+                        let known = Self::known_for_state(&state);
+                        self.settle_contract(lu, known);
                         return Err(Fault::Contract);
                     }
-                    match host.poll_host(token, HostBuf::Send { bytes: buf, bank }) {
+                    match host.poll_host(token, HostBuf::Send { bytes, bank }) {
                         Poll::Pending => {
                             state.pending = Some(PendingOp::HostSend {
                                 token,
@@ -1471,9 +1783,13 @@ impl Runner {
                             // A returned receipt keeps its (clamped) accepted
                             // prefix; a contract error alone is not an unknown
                             // write.
-                            let known = Self::known_from_host_receipt(sanitize_host_receipt(
-                                req, raw, self.owner,
-                            ));
+                            self.cancel_state_tokens(&state, storage, host);
+                            let known = Self::merge_known(
+                                Self::known_from_host_receipt(sanitize_host_receipt(
+                                    req, raw, self.owner,
+                                )),
+                                Self::known_for_state(&state),
+                            );
                             self.settle_contract(lu, known);
                             return Err(Fault::Contract);
                         }
@@ -1482,7 +1798,19 @@ impl Runner {
                             if receipt.error().is_some() {
                                 state.host_failed = true;
                             }
-                            state.feedback = Feedback::host_sent(receipt);
+                            if let Some((_, io)) = state.retained_io.take() {
+                                state.feedback = Feedback::host_sent_with_io(receipt, io);
+                            } else if state.companion.is_some() {
+                                state.retained_host = Some((req, receipt));
+                                state.work_addr = work.as_ptr() as usize;
+                                state.work_len = work.len();
+                                state.alt_addr = alt.as_ptr() as usize;
+                                state.alt_len = alt.len();
+                                self.drive_state.set(Some(state));
+                                return Ok(DriveStep::Pending);
+                            } else {
+                                state.feedback = Feedback::host_sent(receipt);
+                            }
                         }
                     }
                 }
@@ -1649,6 +1977,58 @@ impl Runner {
         if let Err(fault) = interrupted {
             // A settle that cannot be proven safe ends the service.
             self.set_fatal(fault);
+        }
+    }
+
+    /// Poll the storage companion of a combined host step once.
+    ///
+    /// Clears `state.companion` on a terminal answer; `Pending` leaves it in
+    /// place. A window that can no longer be addressed is cancelled and
+    /// reported so the caller can settle the command.
+    fn poll_companion_once(
+        &self,
+        state: &mut DriveState,
+        storage: &mut dyn Storage,
+        work: &mut [u8],
+        alt: &mut [u8],
+    ) -> CompanionPoll {
+        let Some(PendingOp::Storage {
+            token,
+            req,
+            buf_offset,
+            buf_alt,
+            prefetch,
+        }) = state.companion
+        else {
+            return CompanionPoll::Gone;
+        };
+        let polled = pending_io_buf(work, alt, req, buf_offset, buf_alt)
+            .map(|buf| storage.poll_exec(token, buf));
+        match polled {
+            Some(Poll::Pending) => CompanionPoll::Pending,
+            Some(Poll::Ready(raw)) => {
+                if prefetch {
+                    self.cancel_speculative_io();
+                } else {
+                    self.note_required_io(false);
+                }
+                state.companion = None;
+                let receipt = sanitize_storage_receipt(req, raw);
+                if raw.error.is_some() {
+                    storage.cancel(token);
+                }
+                CompanionPoll::Ready((req, IoReceipt::from_storage(receipt, self.owner)))
+            }
+            None => {
+                storage.cancel(token);
+                if prefetch {
+                    self.cancel_speculative_io();
+                } else {
+                    self.note_required_io(false);
+                }
+                state.companion = None;
+                CompanionPoll::Unaddressable(req.dir)
+            }
         }
     }
 
@@ -2404,7 +2784,7 @@ impl Runner {
                 }
                 return Ok(lu.long_info());
             }
-            PollStep::Publish(_) | PollStep::Receive(_) | PollStep::Send(_) => {
+            PollStep::Publish(_) | PollStep::Receive(_) | PollStep::Send { .. } => {
                 // The device broke the long-operation contract but did not
                 // consume the receipt: restore it instead of dropping facts.
                 self.long_feedback = Some((lun, feedback));
@@ -2505,7 +2885,7 @@ impl Runner {
             | PollStep::Idle
             | PollStep::Publish(_)
             | PollStep::Receive(_)
-            | PollStep::Send(_) => {}
+            | PollStep::Send { .. } => {}
         }
         self.clear_long_feedback(lun);
         Ok(lu.long_info())
@@ -2612,7 +2992,7 @@ impl Runner {
             | PollStep::Idle
             | PollStep::Publish(_)
             | PollStep::Receive(_)
-            | PollStep::Send(_) => self.clear_long_feedback(lun),
+            | PollStep::Send { .. } => self.clear_long_feedback(lun),
         }
         Err(Fault::Contract)
     }
@@ -2626,6 +3006,18 @@ enum HostResume {
     Retained(HostReceipt),
     /// The retained window is no longer addressable inside `work`.
     Unaddressable,
+}
+
+/// Outcome of polling the storage companion once.
+enum CompanionPoll {
+    /// Still pending; the token stays retained.
+    Pending,
+    /// Settled with its stamped receipt and request.
+    Ready((IoReq, IoReceipt)),
+    /// The retained window is no longer addressable; the token was cancelled.
+    Unaddressable(Direction),
+    /// No companion was retained.
+    Gone,
 }
 
 /// The host-data contract: the direction must match; a Data-In response may be
@@ -2683,6 +3075,25 @@ fn slice_offset(
         }
     }
     None
+}
+
+/// Whether two caller windows overlap.
+///
+/// A combined companion must live in the bank the host step does not use; the
+/// runner rejects an overlapping window before submitting anything.
+fn windows_overlap(a: &[u8], b: &[u8]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let a_start = a.as_ptr() as usize;
+    let b_start = b.as_ptr() as usize;
+    let Some(a_end) = a_start.checked_add(a.len()) else {
+        return true;
+    };
+    let Some(b_end) = b_start.checked_add(b.len()) else {
+        return true;
+    };
+    a_start < b_end && b_start < a_end
 }
 
 /// Split one long-operation [`StorageOp`] into its metadata request, buffer and
@@ -2927,7 +3338,10 @@ mod tests {
                     buf: &mut data[..len],
                 }),
                 Script::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
-                Script::Send { len } => PollStep::Send(&data[..len]),
+                Script::Send { len } => PollStep::Send {
+                    bytes: &data[..len],
+                    prefetch: None,
+                },
                 Script::Receive { len } => PollStep::Receive(&mut data[..len]),
                 Script::Complete(completion) => {
                     self.active = false;
@@ -4316,6 +4730,15 @@ mod tests {
         );
         assert_eq!(bench.storage.cancels, 1);
         assert_eq!(bench.runner.boundary(&bench.slot), Ok(()));
+    }
+
+    #[test]
+    fn companion_windows_must_not_overlap() {
+        let data = [0u8; 32];
+        assert!(windows_overlap(&data, &data));
+        assert!(windows_overlap(&data[..16], &data[8..24]));
+        assert!(!windows_overlap(&data[..8], &data[8..16]));
+        assert!(!windows_overlap(&data[..0], &data));
     }
 
     #[test]

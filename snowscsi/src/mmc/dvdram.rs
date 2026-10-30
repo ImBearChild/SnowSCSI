@@ -76,6 +76,10 @@ pub struct DvdRamMedium {
     /// Bytes of the read chunk handed to the host, in the bank named by
     /// `chunk_in_alt`.
     chunk_len: usize,
+    /// Bank of the chunk the staged `Send` prefetches for the following step.
+    next_in_alt: bool,
+    /// Bytes of that prefetched chunk.
+    next_len: usize,
 }
 
 impl DvdRamMedium {
@@ -97,6 +101,8 @@ impl DvdRamMedium {
             progress: 0,
             chunk_in_alt: false,
             chunk_len: 0,
+            next_in_alt: false,
+            next_len: 0,
         }
     }
 
@@ -132,6 +138,8 @@ impl DvdRamMedium {
         self.progress = 0;
         self.chunk_in_alt = false;
         self.chunk_len = 0;
+        self.next_in_alt = false;
+        self.next_len = 0;
     }
 
     /// Total bytes selected by the admitted operation.
@@ -210,9 +218,73 @@ impl DvdRamMedium {
     fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
         let len = self.chunk_len;
         if self.chunk_in_alt {
-            PollStep::Send(&alt[..len])
+            PollStep::Send {
+                bytes: &alt[..len],
+                prefetch: None,
+            }
         } else {
-            PollStep::Send(&data[..len])
+            PollStep::Send {
+                bytes: &data[..len],
+                prefetch: None,
+            }
+        }
+    }
+
+    /// Describe the speculative read of the chunk after the staged one.
+    ///
+    /// Pure projection: no stage, progress or bank state changes. A
+    /// single-bank caller gets no companion and keeps the serial read-ahead.
+    fn peek_prefetch(&self, data_len: usize, alt_len: usize) -> Option<(bool, usize, u64)> {
+        if alt_len == 0 || !matches!(self.op, Some(Op::Read { .. })) {
+            return None;
+        }
+        let next_progress = self.progress as usize + self.chunk_len;
+        let remaining = self.total_bytes().saturating_sub(next_progress);
+        if remaining == 0 {
+            return None;
+        }
+        let use_alt = !self.chunk_in_alt;
+        let bank_len = if use_alt { alt_len } else { data_len };
+        let len = remaining.min(bank_len);
+        if len == 0 {
+            return None;
+        }
+        Some((use_alt, len, self.next_offset() + self.chunk_len as u64))
+    }
+
+    /// Send the staged chunk together with the speculative read of the next
+    /// one, remembering where that chunk will land.
+    fn send_chunk_with_prefetch<'a>(
+        &mut self,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let peek = self.peek_prefetch(data.len(), alt.len());
+        self.next_in_alt = peek.is_some_and(|(in_alt, _, _)| in_alt);
+        self.next_len = peek.map_or(0, |(_, len, _)| len);
+        let len = self.chunk_len;
+        if self.chunk_in_alt {
+            let bytes = &alt[..len];
+            let prefetch =
+                peek.map(
+                    |(_, prefetch_len, offset)| crate::core::storage::PrefetchOp::Read {
+                        resource: 0,
+                        offset,
+                        buf: &mut data[..prefetch_len],
+                    },
+                );
+            PollStep::Send { bytes, prefetch }
+        } else {
+            let bytes = &data[..len];
+            let prefetch =
+                peek.map(
+                    |(_, prefetch_len, offset)| crate::core::storage::PrefetchOp::Read {
+                        resource: 0,
+                        offset,
+                        buf: &mut alt[..prefetch_len],
+                    },
+                );
+            PollStep::Send { bytes, prefetch }
         }
     }
 
@@ -343,7 +415,34 @@ impl MmcMedium for DvdRamMedium {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = DvdRamState::Deliver;
-                self.send_chunk(data, alt)
+                self.send_chunk_with_prefetch(data, alt)
+            }
+            (DvdRamState::Deliver, FeedbackKind::HostSentWithIo) => {
+                let chunk = self.chunk_len;
+                let (accepted, failed) = match fb.host() {
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
+                    None => (0, true),
+                };
+                if failed || accepted < chunk {
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
+                }
+                let Some(io) = fb.io() else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                if io.error().is_some() || io.confirmed() < self.next_len {
+                    // Speculative data is optional: re-read the same range as
+                    // a required read; the command outcome is unchanged.
+                    self.progress = self.progress.saturating_add(chunk as u32);
+                    return self.read_chunk(data);
+                }
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if (self.progress as usize) < total {
+                    self.chunk_in_alt = self.next_in_alt;
+                    self.chunk_len = self.next_len;
+                    self.phase = DvdRamState::Deliver;
+                    return self.send_chunk_with_prefetch(data, alt);
+                }
+                self.finish(Completion::Good)
             }
             (DvdRamState::PrefetchIo, FeedbackKind::IoDone) => {
                 let chunk = self.chunk_len;
@@ -570,7 +669,7 @@ mod tests {
                 Feedback::io_done(IoReceipt::test(2048, None, Effect::Known)),
                 &mut data
             ),
-            PollStep::Send(bytes) if bytes.len() == 2048
+            PollStep::Send { bytes, .. } if bytes.len() == 2048
         ));
         assert!(matches!(
             m.poll(
@@ -703,7 +802,7 @@ mod tests {
                         &mut data,
                     );
                 }
-                PollStep::Send(bytes) => {
+                PollStep::Send { bytes, .. } => {
                     collected.extend_from_slice(bytes);
                     let len = bytes.len();
                     step = m.poll(Feedback::host_sent(HostReceipt::test(len, None)), &mut data);
@@ -829,7 +928,7 @@ mod tests {
                 &mut data,
                 &mut alt,
             ) {
-                PollStep::Send(bytes) => {
+                PollStep::Send { bytes, .. } => {
                     assert_eq!(bytes.len(), chunk);
                     for (i, byte) in bytes.iter().enumerate() {
                         assert_eq!(*byte, ((delivered + i) & 0xFF) as u8);

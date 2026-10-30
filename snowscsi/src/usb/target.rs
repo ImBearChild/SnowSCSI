@@ -1632,7 +1632,12 @@ impl BotSession {
             },
             Stage::Exec => match self.phase {
                 Phase::Send(p) => {
-                    let (bank_offset, len) = p.staged.unwrap_or((0, 0));
+                    let Some((bank_offset, len)) = p.staged else {
+                        // The wire step already reached the host and only the
+                        // storage companion is still in flight. There is
+                        // nothing to stage until it settles.
+                        return Action::StoragePending;
+                    };
                     let base = self.bank_base(work.len(), p.bank);
                     let start = bank_offset as usize;
                     let end = start + len as usize;

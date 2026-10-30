@@ -237,6 +237,8 @@ pub enum FeedbackKind {
     HostReceived,
     /// A host send phase completed (receipt available).
     HostSent,
+    /// A host send and its speculative read-ahead settled together.
+    HostSentWithIo,
 }
 
 /// Opaque per-poll feedback.
@@ -302,26 +304,38 @@ impl Feedback {
         }
     }
 
+    /// A host send phase and its speculative read-ahead settled together.
+    #[allow(dead_code)] // minted by `Runner` in the runner card
+    pub(crate) fn host_sent_with_io(host: HostReceipt, io: IoReceipt) -> Self {
+        Self {
+            kind: FeedbackKind::HostSentWithIo,
+            io,
+            host,
+        }
+    }
+
     /// What this poll step is reporting.
     #[must_use]
     pub const fn kind(&self) -> FeedbackKind {
         self.kind
     }
 
-    /// Storage receipt, present only for [`FeedbackKind::IoDone`].
+    /// Storage receipt, present for `IoDone` and the combined host/storage kinds.
     #[must_use]
     pub const fn io(&self) -> Option<IoReceipt> {
         match self.kind {
-            FeedbackKind::IoDone => Some(self.io),
+            FeedbackKind::IoDone | FeedbackKind::HostSentWithIo => Some(self.io),
             _ => None,
         }
     }
 
-    /// Host receipt, present for `HostReceived`/`HostSent`.
+    /// Host receipt, present for `HostReceived`/`HostSent` and the combined kinds.
     #[must_use]
     pub const fn host(&self) -> Option<HostReceipt> {
         match self.kind {
-            FeedbackKind::HostReceived | FeedbackKind::HostSent => Some(self.host),
+            FeedbackKind::HostReceived | FeedbackKind::HostSent | FeedbackKind::HostSentWithIo => {
+                Some(self.host)
+            }
             _ => None,
         }
     }
@@ -347,8 +361,14 @@ pub enum PollStep<'a> {
     Prefetch(PrefetchOp<'a>),
     /// Receive host data into the caller's bank (write-style commands).
     Receive(&'a mut [u8]),
-    /// Send data to the host (read-style commands).
-    Send(&'a [u8]),
+    /// Send data to the host (read-style commands), optionally submitting the
+    /// speculative read of the next chunk in the same poll.
+    Send {
+        /// Device → host bytes for this step.
+        bytes: &'a [u8],
+        /// Speculative read-ahead for the next chunk, if any.
+        prefetch: Option<PrefetchOp<'a>>,
+    },
     /// The local completion is fixed.
     Complete(Completion),
     /// No work is ready in this step.

@@ -738,12 +738,18 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
                 fill_report_luns(self.lun_count, data, send);
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::ModeSense { ten, page, dbd, pc } => {
                 let len = self.len;
@@ -759,7 +765,10 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
@@ -773,7 +782,10 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::ReadCapacity => {
                 if !self.published {
@@ -783,7 +795,10 @@ impl<D: Device> Device for Spc<D> {
                         bytes: self.len.min(data.len()) as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
@@ -799,7 +814,10 @@ impl<D: Device> Device for Spc<D> {
                 fixed[4..].copy_from_slice(&capacity.block_len.to_be_bytes());
                 let send = self.len.min(data.len()).min(READ_CAPACITY_LEN);
                 data[..send].copy_from_slice(&fixed[..send]);
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::GetConfiguration { rt, start_feature } => {
                 let len = self.len;
@@ -815,7 +833,10 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
@@ -827,7 +848,10 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::EventStatus { class } => {
                 let len = self.len;
@@ -843,7 +867,10 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
@@ -855,7 +882,10 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 }
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::Inquiry => {
                 if self.len == 0 {
@@ -870,12 +900,18 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
                 fill_inquiry(self.inner.inquiry_data(), data, send);
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
             Query::RequestSense => {
                 if self.len == 0 {
@@ -893,7 +929,10 @@ impl<D: Device> Device for Spc<D> {
                         bytes: send as u64,
                     });
                 }
-                if fb.kind() == FeedbackKind::HostSent {
+                if matches!(
+                    fb.kind(),
+                    FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+                ) {
                     let fully_sent = fb
                         .host()
                         .map(|h| h.error().is_none() && h.accepted() == send)
@@ -917,7 +956,10 @@ impl<D: Device> Device for Spc<D> {
                     None
                 };
                 fill_sense(sense, progress, data, send);
-                PollStep::Send(&data[..send])
+                PollStep::Send {
+                    bytes: &data[..send],
+                    prefetch: None,
+                }
             }
         }
     }
@@ -1073,7 +1115,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => assert_eq!(bytes.len(), 36),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 36),
             other => panic!("expected send, got {other:?}"),
         }
         assert_eq!(data[0], 0x00, "Block PDT");
@@ -1104,7 +1146,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => assert_eq!(bytes.len(), 8),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 8),
             other => panic!("expected send, got {other:?}"),
         }
     }
@@ -1137,7 +1179,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => assert_eq!(bytes.len(), 32),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 32),
             other => panic!("expected send, got {other:?}"),
         }
         assert_eq!(&data[0..4], &24u32.to_be_bytes(), "LUN LIST LENGTH");
@@ -1178,7 +1220,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => {
+            PollStep::Send { bytes, .. } => {
                 assert_eq!(bytes.len(), 4);
                 assert_eq!(bytes, &15u32.to_be_bytes(), "last LBA fits exactly");
             }
@@ -1460,6 +1502,36 @@ mod tests {
     }
 
     #[test]
+    fn a_combined_send_kind_still_accounts_the_send() {
+        let mut spc = device();
+        let permit = permit();
+        let mut data = [0u8; 36];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 36), &inquiry_cdb(36)),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            spc.poll(&permit, Feedback::plan_accepted(), &mut data),
+            PollStep::Send { .. }
+        ));
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent_with_io(
+                    HostReceipt::test(36, None),
+                    IoReceipt::test(0, None, Effect::Known),
+                ),
+                &mut data,
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+    }
+
+    #[test]
     fn request_sense_short_send_keeps_the_saved_sense() {
         let mut spc = Spc::new(CheckDevice);
         capture_check(&mut spc);
@@ -1502,7 +1574,7 @@ mod tests {
         ));
         assert!(matches!(
             spc.poll(&permit, Feedback::plan_accepted(), &mut data),
-            PollStep::Send(_)
+            PollStep::Send { .. }
         ));
         assert!(matches!(
             spc.poll(
@@ -1550,7 +1622,7 @@ mod tests {
         ));
         assert!(matches!(
             spc.poll(&permit, Feedback::plan_accepted(), &mut data),
-            PollStep::Send(_)
+            PollStep::Send { .. }
         ));
         assert_eq!(data[0], 0x70);
         assert_eq!(data[2], 0x06);
@@ -1586,7 +1658,7 @@ mod tests {
         ));
         assert!(matches!(
             spc.poll(&permit, Feedback::plan_accepted(), &mut data),
-            PollStep::Send(_)
+            PollStep::Send { .. }
         ));
         assert!(matches!(
             spc.poll(
@@ -2012,7 +2084,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => assert_eq!(bytes, &[0x5A; 8]),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes, &[0x5A; 8]),
             other => panic!("expected send, got {other:?}"),
         }
         assert!(matches!(

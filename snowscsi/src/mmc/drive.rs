@@ -742,9 +742,10 @@ impl<M: MmcMedium> MmcDrive<M> {
                 }
             }
             // The long operation publishes no plan; ignore other feedback.
-            FeedbackKind::PlanAccepted | FeedbackKind::HostReceived | FeedbackKind::HostSent => {
-                return PollStep::Idle
-            }
+            FeedbackKind::PlanAccepted
+            | FeedbackKind::HostReceived
+            | FeedbackKind::HostSent
+            | FeedbackKind::HostSentWithIo => return PollStep::Idle,
         }
         let remaining = total.saturating_sub(done);
         if remaining == 0 {
@@ -822,7 +823,10 @@ impl<M: MmcMedium> MmcDrive<M> {
                 bytes: send as u64,
             });
         }
-        if fb.kind() == FeedbackKind::HostSent {
+        if matches!(
+            fb.kind(),
+            FeedbackKind::HostSent | FeedbackKind::HostSentWithIo
+        ) {
             self.query = Query::None;
             return PollStep::Complete(Completion::Good);
         }
@@ -830,7 +834,10 @@ impl<M: MmcMedium> MmcDrive<M> {
             self.query = Query::None;
             return PollStep::Complete(Completion::Check(INVALID_FIELD));
         }
-        PollStep::Send(&data[..send])
+        PollStep::Send {
+            bytes: &data[..send],
+            prefetch: None,
+        }
     }
 
     /// Shared command step; `alt` is the optional second caller bank that a
@@ -875,6 +882,11 @@ impl<M: MmcMedium> MmcDrive<M> {
                         self.io_issues = self.io_issues.saturating_add(1);
                     }
                     PollStep::Prefetch(_) => {
+                        self.prefetch_issues = self.prefetch_issues.saturating_add(1);
+                    }
+                    PollStep::Send {
+                        prefetch: Some(_), ..
+                    } => {
                         self.prefetch_issues = self.prefetch_issues.saturating_add(1);
                     }
                     _ => {}
@@ -1840,7 +1852,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         };
         match dev.poll(&permit, Feedback::plan_accepted(), data) {
-            PollStep::Send(bytes) => assert_eq!(bytes.len(), len),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), len),
             PollStep::Complete(completion) => return completion,
             other => panic!("expected send, got {other:?}"),
         }
@@ -2134,7 +2146,7 @@ mod tests {
         let io = Feedback::io_done(IoReceipt::test(2048, None, Effect::Known));
         assert!(matches!(
             dev.poll(&permit, io, &mut data),
-            PollStep::Send(bytes) if bytes.len() == 2048
+            PollStep::Send { bytes, .. } if bytes.len() == 2048
         ));
         assert!(matches!(
             dev.poll(
@@ -3232,7 +3244,7 @@ mod tests {
                     prefetches += 1;
                     fb = Feedback::io_done(IoReceipt::test(16, None, Effect::Known));
                 }
-                PollStep::Send(bytes) => {
+                PollStep::Send { bytes, .. } => {
                     assert_eq!(bytes.len(), 16);
                     fb = Feedback::host_sent(HostReceipt::test(16, None));
                 }
@@ -3359,7 +3371,7 @@ mod tests {
             other => panic!("expected publish, got {other:?}"),
         }
         match dev.poll(&permit, Feedback::plan_accepted(), &mut data) {
-            PollStep::Send(bytes) => assert_eq!(bytes.len(), 8),
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 8),
             other => panic!("expected send, got {other:?}"),
         }
         assert_eq!(&data[0..4], &99u32.to_be_bytes());
