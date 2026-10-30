@@ -59,6 +59,7 @@ use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableSto
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
+use stack::worker::WorkerStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 
 #[cfg(target_os = "linux")]
@@ -81,17 +82,17 @@ use usb_gadget::{udcs, Class, Config, Gadget as UsbGadget, Id, Strings, Udc};
 /// largest host transfer the initiator issues; 1 MiB covers the kernel's
 /// default iSCSI transfer cap.
 const DEFAULT_WORK_BUF_SIZE: usize = 1024 * 1024;
-/// Default `work` total for USB overlap mode (two equal 8 KiB banks).
+/// Default `work` total for USB dual-bank mode (two equal 8 KiB banks).
 ///
-/// `--overlap` treats `--work-buf-size` as the **total** of two banks, so this
-/// stays at 16 KiB: larger halves buy no prefetch benefit over the USB wire
-/// chunk while doubling the cache footprint of the session.
-const OVERLAP_WORK_BUF_SIZE: usize = 16 * 1024;
-/// Default `work` total for iSCSI overlap mode: two `BHS_SIZE + 8192` banks.
+/// `--banks dual` treats `--work-buf-size` as the **total** of two banks, so
+/// this stays at 16 KiB: larger halves buy no prefetch benefit over the USB
+/// wire chunk while doubling the cache footprint of the session.
+const DUAL_WORK_BUF_SIZE: usize = 16 * 1024;
+/// Default `work` total for iSCSI dual-bank mode: two `BHS_SIZE + 8192` banks.
 ///
 /// Each bank carries its own 48-byte BHS prefix, so the two-bank total is
 /// 2 × 8240 = 16480; this is also the minimum (two `MIN_DATA_LEN` data areas).
-const ISCSI_OVERLAP_WORK_BUF_SIZE: usize = 2 * (MIN_DATA_LEN + BHS_SIZE);
+const ISCSI_DUAL_WORK_BUF_SIZE: usize = 2 * (MIN_DATA_LEN + BHS_SIZE);
 /// Sector size for block devices exposed by the CLI (like the C CLI).
 const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
@@ -113,6 +114,42 @@ enum Cli {
     Serve(ServeArgs),
     /// Generate an ISO9660/Joliet image from a directory
     Mkisofs(MkisofsArgs),
+}
+
+/// Host transport execution model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Wire {
+    /// Run the transport loop on the calling thread.
+    Blocking,
+    /// Run the transport loop on the caller's asynchronous executor.
+    Async,
+}
+
+impl Wire {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Async => "async",
+        }
+    }
+}
+
+/// Number of data banks carved out of `work`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Banks {
+    /// One bank shared by the command path and the resident long operation.
+    Single,
+    /// Two equal banks inside `work`.
+    Dual,
+}
+
+impl Banks {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Dual => "dual",
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -180,22 +217,37 @@ struct ServeArgs {
     /// iSCSI, 512 for USB; default 1M). It bounds one data chunk, not the
     /// transfer: the SCSI data area is this size minus the 48-byte iSCSI BHS,
     /// and a larger READ/WRITE is streamed in bank-sized chunks rather than
-    /// rejected. With `--overlap` this is the **total** of two equal banks
-    /// (USB default 16K, iSCSI default 16480).
+    /// rejected. With `--banks single` this is the one bank; with `--banks
+    /// dual` it is the **total** of two equal banks (USB default 16K, iSCSI
+    /// default 16480).
     #[arg(long = "work-buf-size", value_name = "BYTES")]
     work_buf_size: Option<String>,
 
-    /// Split `work` into two equal banks (`--work-buf-size` is the total in
-    /// this mode). Enables prefetching the next chunk into the alternate bank
-    /// while the current one is on the wire, and gives the resident long
-    /// operation its own bank. The total must be even; each half must clear its
-    /// transport's floor (512 bytes for USB, 8240 with a 4-aligned data area
-    /// for iSCSI). Defaults: USB 16K, iSCSI 16480. Cannot be combined with
-    /// `--scratch-buffer`.
-    #[arg(long = "overlap")]
-    overlap: bool,
+    /// Host transport execution: `blocking` (default) or `async`.
+    ///
+    /// The asynchronous path is not implemented in this build, so `async` is
+    /// rejected before any listener is bound.
+    #[arg(long = "wire", value_name = "MODE", default_value = "blocking")]
+    wire: Wire,
 
-    /// Allocate a separate long-operation buffer (split mode).
+    /// Split `work` into two equal banks (`--work-buf-size` is the total in
+    /// this mode) or keep one bank.
+    ///
+    /// `dual` enables prefetching the next chunk into the alternate bank while
+    /// the current one is on the wire, and gives the resident long operation
+    /// its own bank. With a blocking wire the storage runs on per-LUN worker
+    /// threads, so reads and writes progress while the wire call is in flight.
+    /// The total must be even; each half must clear its transport's floor (512
+    /// bytes for USB, 8240 with a 4-aligned data area for iSCSI). Defaults:
+    /// USB 16K, iSCSI 16480. Cannot be combined with `--scratch-buffer`.
+    #[arg(long = "banks", value_name = "MODE", default_value = "single")]
+    banks: Banks,
+
+    /// Print the resolved configuration as one line and exit 0.
+    #[arg(long = "print-config")]
+    print_config: bool,
+
+    /// Allocate a separate long-operation buffer (`--banks single` only).
     ///
     /// By default one buffer is shared: a query waits at most one
     /// long-operation chunk. With this flag the resident long operation gets
@@ -235,37 +287,60 @@ fn main() -> ExitCode {
     }
 }
 
+/// Resolved serve configuration: the two switches plus the buffers they imply.
+struct ServeConfig {
+    wire: Wire,
+    banks: Banks,
+    /// `work` total: the one bank for `single`, two equal banks for `dual`.
+    work_size: usize,
+    /// Separate long-operation bank (`single` only).
+    scratch_len: Option<usize>,
+}
+
+impl ServeConfig {
+    /// Bytes of one bank: all of `work` for `single`, one half for `dual`.
+    fn per_bank(&self) -> usize {
+        match self.banks {
+            Banks::Single => self.work_size,
+            Banks::Dual => self.work_size / 2,
+        }
+    }
+
+    /// Whether the transport sessions run in two-bank mode.
+    fn overlap(&self) -> bool {
+        self.banks == Banks::Dual
+    }
+
+    /// Storage execution model derived from the two switches.
+    fn storage(&self) -> &'static str {
+        match (self.wire, self.banks) {
+            (Wire::Blocking, Banks::Dual) => "worker",
+            _ => "inline",
+        }
+    }
+
+    /// The stable one-line `--print-config` rendering.
+    fn line(&self, lun: usize) -> String {
+        format!(
+            "wire={} banks={} storage={} per_bank={} work={} scratch={} lun={lun}",
+            self.wire.as_str(),
+            self.banks.as_str(),
+            self.storage(),
+            self.per_bank(),
+            self.work_size,
+            self.scratch_len.unwrap_or(0),
+        )
+    }
+}
+
 #[allow(clippy::needless_return)]
 fn run_serve(args: ServeArgs) -> ExitCode {
     init_logging(args.verbose);
 
-    // Flag combinations the transports cannot honor: reject them before any
-    // size parsing, listener bind or gadget setup.
-    if let Err(msg) = check_overlap(&args) {
-        eprintln!("snowscsi: {msg}");
-        return ExitCode::FAILURE;
-    }
-
-    let work_size = match if args.overlap {
-        let default = if args.usb.is_none() {
-            ISCSI_OVERLAP_WORK_BUF_SIZE
-        } else {
-            OVERLAP_WORK_BUF_SIZE
-        };
-        parse_work_size_or(args.work_buf_size.as_deref(), default)
-    } else {
-        parse_work_size(args.work_buf_size.as_deref())
-    } {
-        Ok(n) => n,
-        Err(msg) => {
-            eprintln!("snowscsi: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // `None` = one buffer (shared mode); `Some` = the separate long-operation
-    // bank of the split mode.
-    let scratch_len = match parse_scratch_size(args.scratch_buffer.as_deref()) {
-        Ok(n) => n,
+    // Resolve and validate the switches before any listener bind or gadget
+    // setup.
+    let config = match resolve_config(&args) {
+        Ok(c) => c,
         Err(msg) => {
             eprintln!("snowscsi: {msg}");
             return ExitCode::FAILURE;
@@ -281,40 +356,67 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.print_config {
+        println!("{}", config.line(specs.len()));
+        return ExitCode::SUCCESS;
+    }
+
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
-        let check = if args.overlap {
-            check_iscsi_overlap_work_size(work_size)
-        } else {
-            check_iscsi_work_size(work_size)
-        };
-        if let Err(msg) = check {
-            eprintln!("snowscsi: {msg}");
-            return ExitCode::FAILURE;
-        }
-        return run_serve_iscsi(args, &specs, work_size, scratch_len);
+        return run_serve_iscsi(args, &specs, &config);
     }
     #[cfg(target_os = "linux")]
     {
-        let check = if args.overlap {
-            check_usb_overlap_work_size(work_size)
-        } else {
-            check_usb_work_size(work_size)
-        };
-        if let Err(msg) = check {
-            eprintln!("snowscsi: {msg}");
-            return ExitCode::FAILURE;
-        }
         let selector = args.usb.as_deref().unwrap_or("auto");
-        return run_serve_usb(&args, &specs, work_size, scratch_len, selector);
+        return run_serve_usb(&args, &specs, &config, selector);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (work_size, scratch_len);
         eprintln!("snowscsi: --usb is only supported on Linux");
         ExitCode::FAILURE
     }
+}
+
+/// Resolve the two switches into a [`ServeConfig`], rejecting combinations the
+/// transports cannot honor.
+fn resolve_config(args: &ServeArgs) -> Result<ServeConfig, String> {
+    // The platform-side async transport adapters do not exist yet; fail before
+    // any bind or gadget setup, for either transport.
+    if args.wire == Wire::Async {
+        return Err("async wire is not implemented in this build".to_string());
+    }
+    check_banks(args)?;
+
+    let dual = args.banks == Banks::Dual;
+    let default = if !dual {
+        DEFAULT_WORK_BUF_SIZE
+    } else if args.usb.is_none() {
+        ISCSI_DUAL_WORK_BUF_SIZE
+    } else {
+        DUAL_WORK_BUF_SIZE
+    };
+    let work_size = if dual {
+        parse_work_size_or(args.work_buf_size.as_deref(), default)?
+    } else {
+        parse_work_size(args.work_buf_size.as_deref())?
+    };
+    let scratch_len = parse_scratch_size(args.scratch_buffer.as_deref())?;
+
+    let usb = args.usb.is_some();
+    match (dual, usb) {
+        (true, true) => check_usb_dual_work_size(work_size)?,
+        (true, false) => check_iscsi_dual_work_size(work_size)?,
+        (false, true) => check_usb_work_size(work_size)?,
+        (false, false) => check_iscsi_work_size(work_size)?,
+    }
+
+    Ok(ServeConfig {
+        wire: args.wire,
+        banks: args.banks,
+        work_size,
+        scratch_len,
+    })
 }
 
 /// Build the core `Target` slot set shared by both transports.
@@ -480,12 +582,7 @@ fn build_core_slots<'a>(
 
 /// `snowscsi serve --iscsi`: bind the portal, build the core target and drive
 /// the session shell until shutdown.
-fn run_serve_iscsi(
-    args: ServeArgs,
-    specs: &[DeviceSpec],
-    work_size: usize,
-    scratch_len: Option<usize>,
-) -> ExitCode {
+fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) -> ExitCode {
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
     let mut backends: Vec<BlockBackend> = Vec::new();
     let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
@@ -509,7 +606,6 @@ fn run_serve_iscsi(
         .iter_mut()
         .map(|s| s as &mut dyn Lu<Pair = CliPair>)
         .collect();
-    let mut storage = CliStorage::new(planes);
 
     let is_auto = args.iscsi.as_deref() == Some("auto");
     let (listener, bound) = if is_auto {
@@ -560,9 +656,16 @@ fn run_serve_iscsi(
         }
     }
 
-    let mut work = vec![0u8; work_size];
-    let mut scratch = split_bank(scratch_len);
-    log::info!("listening on {bound} with {} LUN(s)", table.len());
+    let mut work = vec![0u8; config.work_size];
+    let mut scratch = split_bank(config.scratch_len);
+    log::info!(
+        "listening on {bound} with {} LUN(s) (wire={}, banks={}, storage={}, per_bank={})",
+        table.len(),
+        config.wire.as_str(),
+        config.banks.as_str(),
+        config.storage(),
+        config.per_bank(),
+    );
 
     let auto_handle = if is_auto {
         spawn_iscsi_auto_helper(bound, Arc::clone(&stop))
@@ -570,16 +673,43 @@ fn run_serve_iscsi(
         None
     };
 
-    let serve_res = serve(
-        listener,
-        &stop,
-        &mut work,
-        &mut scratch,
-        &mut table[..],
-        &mut storage,
-        Some(DEFAULT_READ_TIMEOUT),
-        args.overlap,
-    );
+    let serve_res = if config.overlap() {
+        let per_bank = config.per_bank();
+        std::thread::scope(|scope| {
+            let mut store = WorkerStore::new(scope, planes, per_bank);
+            let res = serve(
+                listener,
+                &stop,
+                &mut work,
+                &mut scratch,
+                &mut table[..],
+                &mut store,
+                Some(DEFAULT_READ_TIMEOUT),
+                true,
+            );
+            if let Err((i, e)) = store.sync() {
+                eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+            }
+            drop(store);
+            res
+        })
+    } else {
+        let mut storage = CliStorage::new(planes);
+        let res = serve(
+            listener,
+            &stop,
+            &mut work,
+            &mut scratch,
+            &mut table[..],
+            &mut storage,
+            Some(DEFAULT_READ_TIMEOUT),
+            false,
+        );
+        if let Err((i, e)) = storage.sync() {
+            eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+        }
+        res
+    };
 
     if let Some(handle) = auto_handle {
         stop.store(true, Ordering::SeqCst);
@@ -592,9 +722,6 @@ fn run_serve_iscsi(
         return ExitCode::FAILURE;
     }
 
-    if let Err((i, e)) = storage.sync() {
-        eprintln!("snowscsi: sync failed for LUN {i}: {e}");
-    }
     log::info!("shutting down");
     ExitCode::SUCCESS
 }
@@ -1139,8 +1266,7 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
 fn run_serve_usb(
     args: &ServeArgs,
     specs: &[DeviceSpec],
-    work_size: usize,
-    scratch_len: Option<usize>,
+    config: &ServeConfig,
     selector: &str,
 ) -> ExitCode {
     let mut ram_disks: Vec<Vec<u8>> = Vec::new();
@@ -1166,7 +1292,6 @@ fn run_serve_usb(
         .iter_mut()
         .map(|s| s as &mut dyn Lu<Pair = CliPair>)
         .collect();
-    let mut storage = CliStorage::new(planes);
 
     // Gadget assembly: a single MSC interface (class 08/06/50) with
     // one bulk OUT + one bulk IN endpoint.
@@ -1233,38 +1358,69 @@ fn run_serve_usb(
     };
     let lun_count = table.len();
     let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
-    if args.overlap {
+    if config.overlap() {
         // Two equal banks inside `work`: command framing/Data-Out in one,
         // prefetch and the resident long operation in the other.
         session = session.with_overlap();
     }
-    let mut work = vec![0u8; work_size];
-    let mut scratch = split_bank(scratch_len);
+    let mut work = vec![0u8; config.work_size];
+    let mut scratch = split_bank(config.scratch_len);
     let mut target = snowscsi::core::Target::new(&mut table[..]);
 
-    log::info!("serving {} LUN(s) over USB", lun_count);
-    if let Err(e) = usb_serve(
-        &mut ffs_bot,
-        &mut ffs_gadget,
-        &mut session,
-        &mut work,
-        &mut scratch,
-        &mut target,
-        &mut storage,
-        &stop,
-    ) {
-        eprintln!("snowscsi: usb serve error: {e}");
+    log::info!(
+        "serving {lun_count} LUN(s) over USB (wire={}, banks={}, storage={}, per_bank={})",
+        config.wire.as_str(),
+        config.banks.as_str(),
+        config.storage(),
+        config.per_bank(),
+    );
+    let serve_res = if config.overlap() {
+        let per_bank = config.per_bank();
+        std::thread::scope(|scope| {
+            let mut store = WorkerStore::new(scope, planes, per_bank);
+            let res = usb_serve(
+                &mut ffs_bot,
+                &mut ffs_gadget,
+                &mut session,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut store,
+                &stop,
+            );
+            if let Err((i, e)) = store.sync() {
+                eprintln!("snowscsi: sync failed for LUN {i}: {e}");
+            }
+            drop(store);
+            res
+        })
+    } else {
+        let mut storage = CliStorage::new(planes);
+        let res = usb_serve(
+            &mut ffs_bot,
+            &mut ffs_gadget,
+            &mut session,
+            &mut work,
+            &mut scratch,
+            &mut target,
+            &mut storage,
+            &stop,
+        );
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");
         }
+        res
+    };
+
+    if let Err(e) = serve_res {
+        eprintln!("snowscsi: usb serve error: {e}");
+        drop(reg);
+        release_configfs(owns_configfs);
         return ExitCode::FAILURE;
     }
 
-    // Graceful exit: flush every store plane, unregister the gadget (RAII),
-    // then unmount configfs again if the `dummy` auto-config mounted it.
-    if let Err((i, e)) = storage.sync() {
-        eprintln!("snowscsi: sync failed for LUN {i}: {e}");
-    }
+    // Graceful exit: unregister the gadget (RAII), then unmount configfs again
+    // if the `dummy` auto-config mounted it.
     drop(reg);
     release_configfs(owns_configfs);
     log::info!("shutting down");
@@ -1786,8 +1942,8 @@ fn parse_work_size(s: Option<&str>) -> Result<usize, String> {
     parse_work_size_or(s, DEFAULT_WORK_BUF_SIZE)
 }
 
-/// [`parse_work_size`] with an explicit default: USB overlap mode uses
-/// [`OVERLAP_WORK_BUF_SIZE`] (the total of two banks).
+/// [`parse_work_size`] with an explicit default: dual-bank mode uses the
+/// two-bank total ([`DUAL_WORK_BUF_SIZE`] / [`ISCSI_DUAL_WORK_BUF_SIZE`]).
 fn parse_work_size_or(s: Option<&str>, default: usize) -> Result<usize, String> {
     let bytes = match s {
         None => default as u64,
@@ -1802,20 +1958,20 @@ fn parse_work_size_or(s: Option<&str>, default: usize) -> Result<usize, String> 
     Ok(n)
 }
 
-/// Reject `--overlap` combinations the selected transport cannot honor.
+/// Reject bank combinations the selected transport cannot honor.
 ///
-/// Checked at the very top of [`run_serve`], before any listener is bound or
-/// gadget assembled, so a rejected invocation exits instead of hanging in an
+/// Checked by [`resolve_config`] before any listener is bound or gadget
+/// assembled, so a rejected invocation exits instead of hanging in an
 /// accept/serve loop:
-/// - the overlap banks live inside `work`, so a separate `--scratch-buffer`
+/// - the dual banks live inside `work`, so a separate `--scratch-buffer`
 ///   would be a third buffer with no defined owner.
-fn check_overlap(args: &ServeArgs) -> Result<(), String> {
-    if !args.overlap {
+fn check_banks(args: &ServeArgs) -> Result<(), String> {
+    if args.banks != Banks::Dual {
         return Ok(());
     }
     if args.scratch_buffer.is_some() {
         return Err(
-            "--overlap cannot be combined with --scratch-buffer: the two overlap banks \
+            "--banks dual cannot be combined with --scratch-buffer: the two banks \
              already live inside --work-buf-size (the long operation gets one of them)"
                 .to_string(),
         );
@@ -1872,22 +2028,22 @@ fn check_iscsi_work_size(n: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// iSCSI overlap `work` bounds: the total is split into two equal banks, each
-/// bank carrying its own 48-byte BHS prefix.
+/// iSCSI dual-bank `work` bounds: the total is split into two equal banks,
+/// each bank carrying its own 48-byte BHS prefix.
 ///
 /// The total must be even, each half at least [`MIN_DATA_LEN`] + [`BHS_SIZE`],
 /// and each half's data area (`half - BHS_SIZE`) a multiple of 4.
-fn check_iscsi_overlap_work_size(n: usize) -> Result<(), String> {
+fn check_iscsi_dual_work_size(n: usize) -> Result<(), String> {
     if !n.is_multiple_of(2) {
         return Err(format!(
-            "--work-buf-size {n} must be even with --overlap (two equal banks)"
+            "--work-buf-size {n} must be even with --banks dual (two equal banks)"
         ));
     }
     let half = n / 2;
     let min = MIN_DATA_LEN + BHS_SIZE;
     if half < min {
         return Err(format!(
-            "--work-buf-size {n} leaves a {half}-byte overlap bank below the iSCSI minimum \
+            "--work-buf-size {n} leaves a {half}-byte bank below the iSCSI minimum \
              {min} (total must be at least {})",
             2 * min
         ));
@@ -1911,18 +2067,18 @@ fn check_usb_work_size(n: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// USB overlap `work` bounds: the total is split into two equal banks, so it
+/// USB dual-bank `work` bounds: the total is split into two equal banks, so it
 /// must be even and each half must still clear [`MIN_DATA_AREA`].
-fn check_usb_overlap_work_size(n: usize) -> Result<(), String> {
+fn check_usb_dual_work_size(n: usize) -> Result<(), String> {
     if !n.is_multiple_of(2) {
         return Err(format!(
-            "--work-buf-size {n} must be even with --overlap (two equal banks)"
+            "--work-buf-size {n} must be even with --banks dual (two equal banks)"
         ));
     }
     let half = n / 2;
     if half < MIN_DATA_AREA {
         return Err(format!(
-            "--work-buf-size {n} leaves a {half}-byte overlap bank below the USB minimum \
+            "--work-buf-size {n} leaves a {half}-byte bank below the USB minimum \
              {MIN_DATA_AREA} (total must be at least {})",
             2 * MIN_DATA_AREA
         ));
@@ -1979,95 +2135,182 @@ mod tests {
     }
 
     #[test]
-    fn cli_overlap_flag_parses() {
-        let args = parse_serve(&["--usb", "--overlap"]);
-        assert!(args.overlap, "--overlap must set the flag");
+    fn cli_wire_and_banks_parse() {
+        let args = parse_serve(&["--usb", "--banks", "dual"]);
         assert_eq!(args.usb.as_deref(), Some("auto"));
-        assert!(check_overlap(&args).is_ok());
+        assert_eq!(args.wire, Wire::Blocking);
+        assert_eq!(args.banks, Banks::Dual);
+        assert!(!args.print_config);
 
         let args = parse_serve(&["--usb"]);
-        assert!(!args.overlap, "overlap is opt-in");
+        assert_eq!(args.wire, Wire::Blocking, "blocking is the default wire");
+        assert_eq!(args.banks, Banks::Single, "single is the default banks");
+
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--wire", "async"]);
+        assert_eq!(args.wire, Wire::Async);
     }
 
     #[test]
-    fn overlap_work_size_defaults_to_the_two_bank_total() {
-        // The overlap default is the *total* of two equal banks, not the 1M
+    fn cli_overlap_flag_is_rejected() {
+        // `--overlap` is gone, with no alias.
+        assert!(Cli::try_parse_from([
+            "snowscsi",
+            "serve",
+            "--block",
+            "ram=1M",
+            "--usb",
+            "--overlap"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn print_config_line_is_stable() {
+        let args = parse_serve(&["--usb", "--banks", "dual"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(2),
+            "wire=blocking banks=dual storage=worker per_bank=8192 work=16384 scratch=0 lun=2"
+        );
+
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--banks", "dual"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(1),
+            "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
+        );
+
+        let args = parse_serve(&["--usb"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(1),
+            format!(
+                "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+            )
+        );
+
+        let args = parse_serve(&["--usb", "--scratch-buffer", "16K"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(1),
+            format!(
+                "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
+                 work={DEFAULT_WORK_BUF_SIZE} scratch={} lun=1",
+                16 * 1024
+            )
+        );
+    }
+
+    #[test]
+    fn print_config_flag_parses() {
+        let args = parse_serve(&["--usb", "--print-config"]);
+        assert!(args.print_config);
+    }
+
+    #[test]
+    fn dual_work_size_defaults_and_bounds() {
+        // The dual default is the *total* of two equal banks, not the 1M
         // single-bank default.
-        assert_eq!(OVERLAP_WORK_BUF_SIZE, 16384);
-        assert_eq!(
-            parse_work_size_or(None, OVERLAP_WORK_BUF_SIZE).unwrap(),
-            16384
-        );
-        assert_eq!(
-            parse_work_size_or(Some("32K"), OVERLAP_WORK_BUF_SIZE).unwrap(),
-            32 * 1024
-        );
-        // Without --overlap the historical 1M default is unchanged.
-        assert_eq!(parse_work_size(None).unwrap(), DEFAULT_WORK_BUF_SIZE);
-    }
+        assert_eq!(DUAL_WORK_BUF_SIZE, 16384);
+        assert_eq!(ISCSI_DUAL_WORK_BUF_SIZE, 16480);
 
-    #[test]
-    fn overlap_work_size_bounds() {
+        let args = parse_serve(&["--usb", "--banks", "dual"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(cfg.work_size, DUAL_WORK_BUF_SIZE);
+        assert_eq!(cfg.per_bank(), 8192);
+
+        let args = parse_serve(&["--usb", "--banks", "dual", "--work-buf-size", "32K"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(cfg.work_size, 32 * 1024);
+        assert_eq!(cfg.per_bank(), 16 * 1024);
+
         // Two banks of MIN_DATA_AREA each is the floor (1024 total).
-        assert_eq!(check_usb_overlap_work_size(2 * MIN_DATA_AREA), Ok(()));
-        assert_eq!(check_usb_overlap_work_size(OVERLAP_WORK_BUF_SIZE), Ok(()));
-        assert_eq!(check_usb_overlap_work_size(2 * MIN_DATA_AREA + 2), Ok(()));
-
+        assert_eq!(check_usb_dual_work_size(2 * MIN_DATA_AREA), Ok(()));
+        assert_eq!(check_usb_dual_work_size(DUAL_WORK_BUF_SIZE), Ok(()));
+        assert_eq!(check_usb_dual_work_size(2 * MIN_DATA_AREA + 2), Ok(()));
         // Each half must clear the 512-byte USB data-area floor.
-        assert!(check_usb_overlap_work_size(2 * MIN_DATA_AREA - 2).is_err());
-        assert!(check_usb_overlap_work_size(MIN_DATA_AREA).is_err());
-
+        assert!(check_usb_dual_work_size(2 * MIN_DATA_AREA - 2).is_err());
+        assert!(check_usb_dual_work_size(MIN_DATA_AREA).is_err());
         // The total must split evenly.
-        assert!(check_usb_overlap_work_size(OVERLAP_WORK_BUF_SIZE + 1).is_err());
-        assert!(check_usb_overlap_work_size(2 * MIN_DATA_AREA - 1).is_err());
+        assert!(check_usb_dual_work_size(DUAL_WORK_BUF_SIZE + 1).is_err());
+        assert!(check_usb_dual_work_size(2 * MIN_DATA_AREA - 1).is_err());
+
+        let args = parse_serve(&["--usb", "--banks", "dual", "--work-buf-size", "1023"]);
+        assert!(resolve_config(&args).is_err(), "an odd total is rejected");
+        let args = parse_serve(&["--usb", "--banks", "dual", "--work-buf-size", "1022"]);
+        assert!(resolve_config(&args).is_err(), "a short half is rejected");
     }
 
     #[test]
-    fn iscsi_overlap_is_accepted_and_has_its_own_floor() {
-        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--overlap"]);
-        assert!(check_overlap(&args).is_ok(), "iSCSI overlap is supported");
+    fn iscsi_dual_work_size_has_its_own_floor() {
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--banks", "dual"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(cfg.work_size, ISCSI_DUAL_WORK_BUF_SIZE);
+        assert_eq!(cfg.per_bank(), MIN_DATA_LEN + BHS_SIZE);
 
-        // Default and floor are two 8240-byte banks.
-        assert_eq!(ISCSI_OVERLAP_WORK_BUF_SIZE, 16480);
         assert_eq!(
-            parse_work_size_or(None, ISCSI_OVERLAP_WORK_BUF_SIZE).unwrap(),
-            16480
-        );
-        assert_eq!(check_iscsi_overlap_work_size(16480), Ok(()));
-        // Two banks of 8 KiB data plus the two BHS prefixes is the floor.
-        assert_eq!(
-            check_iscsi_overlap_work_size(2 * (MIN_DATA_LEN + BHS_SIZE)),
+            check_iscsi_dual_work_size(2 * (MIN_DATA_LEN + BHS_SIZE)),
             Ok(())
         );
         // One byte below the floor (odd and too short) is rejected.
-        assert!(check_iscsi_overlap_work_size(16479).is_err());
-        assert!(check_iscsi_overlap_work_size(16478).is_err());
-        assert!(check_iscsi_overlap_work_size(MIN_DATA_LEN + BHS_SIZE).is_err());
+        assert!(check_iscsi_dual_work_size(16479).is_err());
+        assert!(check_iscsi_dual_work_size(16478).is_err());
+        assert!(check_iscsi_dual_work_size(MIN_DATA_LEN + BHS_SIZE).is_err());
         // Each half's data area must be 4-aligned.
-        assert!(check_iscsi_overlap_work_size(16482).is_err());
-        assert!(check_iscsi_overlap_work_size(16484).is_err());
-        assert_eq!(check_iscsi_overlap_work_size(16488), Ok(()));
+        assert!(check_iscsi_dual_work_size(16482).is_err());
+        assert!(check_iscsi_dual_work_size(16484).is_err());
+        assert_eq!(check_iscsi_dual_work_size(16488), Ok(()));
     }
 
     #[test]
-    fn overlap_conflicts_with_scratch_buffer() {
-        // The overlap banks live inside `work`, so a third scratch bank is
+    fn dual_conflicts_with_scratch_buffer() {
+        // The dual banks live inside `work`, so a third scratch bank is
         // rejected instead of silently ignored.
-        let args = parse_serve(&["--usb", "--overlap", "--scratch-buffer"]);
-        let err = check_overlap(&args).expect_err("scratch + overlap must be refused");
+        let args = parse_serve(&["--usb", "--banks", "dual", "--scratch-buffer"]);
+        let err = check_banks(&args).expect_err("scratch + dual must be refused");
         assert!(
             err.contains("--scratch-buffer"),
             "message must name the conflicting flag: {err}"
         );
-        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--overlap", "--scratch-buffer"]);
-        assert!(check_overlap(&args).is_err());
+        assert!(resolve_config(&args).is_err());
+        let args = parse_serve(&[
+            "--iscsi",
+            "127.0.0.1:0",
+            "--banks",
+            "dual",
+            "--scratch-buffer",
+        ]);
+        assert!(resolve_config(&args).is_err());
 
-        // Either alone is fine: scratch selects the split long-operation bank,
-        // overlap selects the two banks inside `work`.
+        // `single` + scratch remains the split long-operation bank.
         let args = parse_serve(&["--usb", "--scratch-buffer"]);
-        assert!(check_overlap(&args).is_ok());
+        assert!(check_banks(&args).is_ok());
         let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--scratch-buffer"]);
-        assert!(check_overlap(&args).is_ok());
+        assert!(check_banks(&args).is_ok());
+    }
+
+    #[test]
+    fn async_wire_is_rejected_before_binding() {
+        for transport in [vec!["--usb"], vec!["--iscsi", "127.0.0.1:0"]] {
+            let mut argv = vec!["--wire", "async"];
+            argv.extend(transport);
+            let args = parse_serve(&argv);
+            match resolve_config(&args) {
+                Ok(_) => panic!("async must be rejected"),
+                Err(err) => assert_eq!(err, "async wire is not implemented in this build"),
+            }
+        }
+    }
+
+    #[test]
+    fn single_work_size_uses_the_one_bank_default() {
+        let args = parse_serve(&["--usb", "--work-buf-size", "511"]);
+        assert!(resolve_config(&args).is_err(), "below the 512-byte floor");
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--work-buf-size", "8240"]);
+        assert_eq!(resolve_config(&args).unwrap().work_size, 8240);
+        let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--work-buf-size", "8241"]);
+        assert!(resolve_config(&args).is_err(), "data area not 4-aligned");
     }
 
     #[test]

@@ -35,6 +35,8 @@ use snowscsi::mmc::{DiscInfo, FlatCdMedium, MmcAttrs, MmcDrive, MmcMedium, MmcOp
 use snowscsi::scsi::backend::BlockBackend;
 use snowscsi::scsi::fs_backend::StdFsBackend;
 
+pub mod worker;
+
 /// Application backing handle: the CLI only needs an identity per LUN.
 pub type CliBacking = u32;
 

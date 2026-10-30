@@ -68,7 +68,14 @@ fn run_serve_until_ready_then_sigint(args: &[&str]) {
 #[cfg(unix)]
 fn can_simulate_read_only() -> bool {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("snowscsi_roprobe_{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Unique per call: several tests probe read-only support concurrently.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "snowscsi_roprobe_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let probe = dir.join("probe");
     if std::fs::write(&probe, b"x").is_err() {
@@ -205,7 +212,29 @@ fn run_with_timeout(args: &[&str], secs: u64) -> Output {
 }
 
 #[test]
-fn serve_rejects_iscsi_overlap_below_the_two_bank_floor() {
+fn print_config_prints_one_line_and_exits() {
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--block",
+        "ram=1M",
+        "--iscsi",
+        "127.0.0.1:0",
+        "--banks",
+        "dual",
+        "--print-config",
+    ]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=2"
+    );
+}
+
+#[test]
+fn serve_rejects_iscsi_dual_below_the_two_bank_floor() {
     // One byte below 2 × 8240 is refused before the portal is bound.
     let out = run(&[
         "serve",
@@ -213,7 +242,8 @@ fn serve_rejects_iscsi_overlap_below_the_two_bank_floor() {
         "ram=1M",
         "--iscsi",
         "127.0.0.1:0",
-        "--overlap",
+        "--banks",
+        "dual",
         "--work-buf-size",
         "16479",
     ]);
@@ -227,7 +257,7 @@ fn serve_rejects_iscsi_overlap_below_the_two_bank_floor() {
 
 #[cfg(unix)]
 #[test]
-fn serve_starts_with_iscsi_overlap() {
+fn serve_starts_with_iscsi_dual_banks() {
     // The two-bank total is accepted and the portal starts serving.
     run_serve_until_ready_then_sigint(&[
         "serve",
@@ -235,20 +265,22 @@ fn serve_starts_with_iscsi_overlap() {
         "ram=1M",
         "--iscsi",
         "127.0.0.1:0",
-        "--overlap",
+        "--banks",
+        "dual",
     ]);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn serve_rejects_overlap_with_scratch_buffer() {
+fn serve_rejects_dual_with_scratch_buffer() {
     let out = run_with_timeout(
         &[
             "serve",
             "--block",
             "ram=1M",
             "--usb",
-            "--overlap",
+            "--banks",
+            "dual",
             "--scratch-buffer",
         ],
         10,
@@ -263,7 +295,7 @@ fn serve_rejects_overlap_with_scratch_buffer() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn serve_rejects_odd_overlap_work_size_before_gadget_setup() {
+fn serve_rejects_odd_dual_work_size_before_gadget_setup() {
     // Validation runs before the UDC lookup/gadget bind, so this needs no USB
     // device.
     let out = run_with_timeout(
@@ -272,7 +304,8 @@ fn serve_rejects_odd_overlap_work_size_before_gadget_setup() {
             "--block",
             "ram=1M",
             "--usb",
-            "--overlap",
+            "--banks",
+            "dual",
             "--work-buf-size",
             "1025",
         ],
