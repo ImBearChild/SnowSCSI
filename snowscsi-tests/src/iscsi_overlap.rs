@@ -982,3 +982,111 @@ fn pending_write_after_data_out_reports_storage_pending_then_resumes() {
     drop(storage);
     assert_eq!(&ram[..TOTAL], &expected[..], "byte-exact commit");
 }
+
+/// A multi-chunk Data-Out whose command bank is `Work`: the second chunk is
+/// received at an offset inside the alternate half, the first at an offset
+/// inside the command half, and the committed bytes are exact.
+///
+/// The alternate command bank (`cmd_bank == Alt`) always comes with
+/// `cmd_alt == None` by design (a resident long token holds one bank), so no
+/// two-bank write pipeline can run with an alternate command bank.
+#[test]
+fn write_into_the_alternate_command_bank_is_byte_exact() {
+    use embedded_io::Read as _;
+    use snowscsi::iscsi::pdu::Bhs;
+
+    const BLOCKS: u16 = 32;
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const ITT: u32 = 0x21;
+
+    let mut ram = vec![0u8; TOTAL];
+    let payload: Vec<u8> = (0..TOTAL as u32)
+        .map(|i| (i.wrapping_mul(13) % 251) as u8)
+        .collect();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(u64::from(BLOCKS), 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut session = IscsiSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * BANK];
+    let mut scratch = Vec::new();
+    let mut conn = MockConn::new();
+    conn.feed_padded(&login_bhs(REQ_TEXT.len() as u32), REQ_TEXT.as_bytes());
+    conn.feed(&write10_bhs(0, BLOCKS, ITT, 0), &[]);
+
+    let mut ev = Event::Tick;
+    let mut pending_data_len = 0usize;
+    let mut data_receives = Vec::new();
+    let mut status_seen = false;
+    loop {
+        match session.poll(ev, &mut work, &mut scratch, &mut target, &mut storage) {
+            Action::HostRecv { offset, len } => {
+                let is_data = len == pending_data_len && len != 0;
+                if is_data {
+                    pending_data_len = 0;
+                    data_receives.push((offset, len));
+                }
+                let mut got = 0usize;
+                while got < len {
+                    match conn.read(&mut work[offset + got..offset + len]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                if got < len {
+                    break;
+                }
+                ev = Event::HostRecv { len };
+            }
+            Action::HostSend { bytes } => {
+                let opcode = bytes[0] & 0x3F;
+                if opcode == op::R2T {
+                    let bhs = Bhs::from_bytes(bytes[..BHS_SIZE].try_into().unwrap());
+                    let bo = bhs.buffer_offset() as usize;
+                    let desired = bhs.desired_data_len() as usize;
+                    let dout =
+                        data_out_bhs(bhs.itt(), bhs.ttt(), 0, bhs.buffer_offset(), desired as u32);
+                    conn.feed_padded(&dout, &payload[bo..bo + desired]);
+                    pending_data_len = desired;
+                }
+                embedded_io::Write::write_all(&mut conn, bytes).unwrap();
+                if opcode == op::SCSI_RESP {
+                    status_seen = bytes[3] == status::GOOD;
+                    break;
+                }
+                ev = Event::HostSent;
+            }
+            Action::StoragePending => ev = Event::Tick,
+            Action::Closed => break,
+            Action::Error(error) => panic!("session error: {error:?}"),
+        }
+    }
+
+    assert!(status_seen, "WRITE completed with GOOD status");
+    assert_eq!(data_receives.len(), 2, "two Data-Out chunks");
+    for (offset, len) in &data_receives {
+        let bank = if *offset >= BANK { 1 } else { 0 };
+        let end = *offset + *len;
+        let bank_end = if bank == 0 { BANK } else { 2 * BANK };
+        assert!(
+            end <= bank_end,
+            "Data-Out at {offset}..{end} crosses the {bank} bank boundary"
+        );
+    }
+    assert!(
+        data_receives.iter().any(|(offset, _)| *offset < BANK),
+        "the first chunk stays in the command half"
+    );
+    assert!(
+        data_receives.iter().any(|(offset, _)| *offset >= BANK),
+        "the second chunk is received in the alternate half"
+    );
+
+    let expected = payload;
+    drop(storage);
+    assert_eq!(&ram[..TOTAL], &expected[..], "byte-exact commit");
+}
