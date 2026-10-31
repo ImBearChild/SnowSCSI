@@ -40,6 +40,7 @@ from harness import (
     have_tool,
     is_root,
     mount_ext4,
+    sd_paths,
     sd_snapshot,
     sh,
     unmount,
@@ -352,6 +353,7 @@ class _UsbScenario:
         # when the test body failed before its own cleanup could run.
         try:
             reclaim_stale_gadgets()
+            wait_sd_settled(timeout=15)
         except Exception as e:  # never mask the test result
             print(f"  warning: stale gadget reclaim failed: {e}")
         _release_configfs(getattr(cls, "_configfs_mounted", False))
@@ -364,7 +366,12 @@ class _UsbScenario:
         # Snapshot the block devices before the server binds, so the device
         # usb-storage creates is unambiguously ours. Keep this snapshot for
         # the whole test: after a rebind the same device name may reappear.
+        # The previous class's gadget/device may still be tearing down; taking
+        # the snapshot too early lets a reused `sdX` name hide the new device.
+        reclaim_stale_gadgets()
+        wait_sd_settled(timeout=15)
         self.before = sd_snapshot()
+        self.before_paths = sd_paths()
         fd, self.img = tempfile.mkstemp(prefix="snowscsi-usb-", suffix=".img")
         os.close(fd)
         os.truncate(self.img, IMG_SIZE)
@@ -458,7 +465,15 @@ class _UsbScenario:
                     f"host device appeared (did the gadget bind fail?); "
                     f"server stderr:\n{self.server.log_tail()}"
                 )
-            for name in sorted(sd_snapshot() - self.before):
+            current = sd_snapshot()
+            paths = sd_paths()
+            fresh = {
+                n
+                for n in current
+                if n not in self.before
+                or paths.get(n) != self.before_paths.get(n)
+            }
+            for name in sorted(fresh):
                 dev = f"/dev/{name}"
                 try:
                     size = device_size(dev)
@@ -471,6 +486,8 @@ class _UsbScenario:
         raise AssertionError(
             f"no usable new /dev/sdX appeared within {timeout}s "
             f"(expected {IMG_SIZE} bytes; candidates seen: {seen})\n"
+            f"before: {sorted(self.before)} paths: {self.before_paths}\n"
+            f"after:  {sorted(sd_snapshot())} paths: {sd_paths()}\n"
             f"--- server stderr ---\n"
             f"{self.server.log_tail() if self.server else '<server stopped>'}"
         )

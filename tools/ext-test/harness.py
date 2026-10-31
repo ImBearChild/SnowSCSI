@@ -132,6 +132,22 @@ def sd_snapshot():
         return set()
 
 
+def sd_paths():
+    """Map each `sdX` name to its sysfs realpath.
+
+    A removed device that is re-attached can reuse the same `sdX` name; the
+    realpath (host/target/LUN) still changes, so a name diff alone can hide a
+    new device.
+    """
+    out = {}
+    for name in sd_snapshot():
+        try:
+            out[name] = os.path.realpath(os.path.join("/sys/class/block", name))
+        except OSError:
+            pass
+    return out
+
+
 def _device_size_or_none(dev):
     """`blockdev --getsize64`, or None if the node is not openable (yet)."""
     r = sh("blockdev", "--getsize64", dev, check=False)
