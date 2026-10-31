@@ -40,7 +40,7 @@ Where the time goes now (steady-state read, averaged over 500 ms windows):
 ## The pipeline (and where it breaks)
 
 ```
-host --USB HS bulk--> BOT shell (snowscsi) --Store op--> SD plane --> microSD
+host --USB HS bulk--> usb::serve::serve_async (snowscsi) --Storage op--> BlockingStorage<SdStore> --> microSD
 ```
 
 Five independent limits stack up, in this order of impact:
@@ -161,13 +161,17 @@ same trick as #7191) is the obvious next step for the write path.
 
 ## 2. The read-ahead coordinate bug: every chunk read twice
 
-The shell's async loop overlaps a storage read with the bulk send: while chunk
-_N_ is sent, chunk _N+1_ is speculatively read into an overlap buffer. The core
-emitted that read-ahead coordinate as **`(lun, sent, len)` with `sent`
-transfer-relative**, but a device's `xfer_out(transfer_offset, ..)` returns
-`StoreOp::Read { off: base_byte + transfer_offset }` — a **media-absolute**
-offset. The shell matches the following store op against the coordinate
-(`soff == *off`), so the two never agreed (except at media offset 0).
+The transport shell overlaps a storage read with the bulk send: while chunk
+_N_ is sent, chunk _N+1_ is speculatively read into the overlap bank. In the
+current core API the device emits that read-ahead as
+`PollStep::Prefetch(PrefetchOp::Read { resource, offset, buf })` and the core
+runner submits it to the LUN's `Storage` adapter with **that same `offset`**.
+The old `ScsiDevice` shell had the coordinate as **`(lun, sent, len)` with
+`sent` transfer-relative**, while the device's `xfer_out(transfer_offset, ..)`
+returned a **media-absolute** `StoreOp::Read { off: base_byte +
+transfer_offset }`; the shell matched the following store op against the
+coordinate (`soff == *off`), so the two never agreed (except at media offset
+0).
 
 Result: the speculative read was always thrown away and the chunk was read
 again serially. Measured before the fix:
@@ -178,14 +182,16 @@ SD read bytes / host bytes = 1.93x
 end-to-end read = 4.0 MB/s
 ```
 
-Fix: a new `ScsiDevice::read_ahead_offset(&self, transfer_offset) -> Option<u64>`
-(default `None`, i.e. read-ahead disabled) implemented by `BlockDevice` and
-`CdromDrive` as `base_byte + transfer_offset`; `data_in_prefetch` now emits the
-absolute address. After the fix the read-ahead matches every time (misses drop
-to zero, reads == sends) and end-to-end read went **4.0 → 7.0 MB/s**.
+Fix (then, on the old shell): a `ScsiDevice::read_ahead_offset` that returned
+`base_byte + transfer_offset`, so the prefetch was emitted at the absolute
+address. In the current core path the same invariant is structural: `MmcDrive`
+/ `DvdRamMedium` build `PrefetchOp::Read` from `lba * 2048` directly, and the
+runner hands that offset to the adapter unchanged. After the fix the read-ahead
+matches every time (misses drop to zero, reads == sends) and end-to-end read
+went **4.0 → 7.0 MB/s**.
 
-**If you write your own `ScsiDevice` over a byte plane, implement
-`read_ahead_offset`, or its reads will silently double.**
+**If you write your own storage adapter that remaps offsets, apply the same
+mapping to `PrefetchOp` as to `StorageOp`, or reads will silently double.**
 
 ## 3. SD DMA buffer alignment (this is the sneaky one)
 
@@ -552,9 +558,10 @@ dd if=/dev/zero of=/dev/sr0 bs=1M count=20 oflag=direct   # write (destructive)
 ```
 
 To separate USB from SD, set `ZERO_BACKEND = true` in `src/main.rs`: the LUN is
-then backed by `snowscsi_common::seekable_storage::ZeroBackend` (reads return
-zeros, writes are discarded), which measures the USB + BOT path with no SD I/O
-at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
+then backed by `SdStore::zero` (an
+`snowscsi_common::seekable_storage::ZeroBackend`, reads return zeros, writes
+are discarded), which measures the USB + BOT path with no SD I/O at all. That
+is how the 14.2 / 7.2 MB/s ceilings above were measured.
 
 ## Knobs that matter
 
@@ -581,8 +588,9 @@ at all. That is how the 14.2 / 7.2 MB/s ceilings above were measured.
   core hands you (§6). A partial remainder otherwise costs a whole poll
   granularity per command, and it hides as long as your host command size
   happens to divide evenly.
-- Do not rely on the shell's read-ahead unless your `ScsiDevice` implements
-  `read_ahead_offset` (otherwise you pay for two reads per chunk).
+- Do not rely on the shell's read-ahead unless your storage adapter keeps
+  `PrefetchOp` offsets media-absolute (the same coordinate `StorageOp` uses);
+  otherwise you pay for two reads per chunk.
 - Do not expect > 40 MHz from the SD bus without 1.8 V signalling support in
   both hardware and `esp-hal`.
 - Do not clear the whole panel on every refresh, and do not print on the data

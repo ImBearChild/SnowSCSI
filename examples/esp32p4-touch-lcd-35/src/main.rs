@@ -49,11 +49,11 @@ use static_cell::StaticCell;
 
 use defmt::{info, warn};
 
-use snowscsi::common::async_store::{AsyncStorePlane, Either};
-use snowscsi::common::seekable_storage::ZeroBackend;
-use snowscsi::scsi::device::ScsiDevice;
-use snowscsi::scsi::AsyncLuns;
+use snowscsi::core::storage::BlockingStorage;
+use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
+
+use store::SdStore;
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -70,6 +70,7 @@ mod msc;
 #[allow(dead_code)]
 mod pmic;
 mod sd;
+mod store;
 
 // Creates the app descriptor required by the ESP-IDF bootloader.
 // See <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -111,13 +112,14 @@ static STOP: AtomicBool = AtomicBool::new(false);
     clippy::too_many_arguments,
     reason = "the joined USB-stack + BOT-loop future is intentionally one frame and one call"
 )]
-async fn gadget<'d, D, O, I, P>(
+async fn gadget<'d, D, O, I, S>(
     device: &mut embassy_usb::UsbDevice<'d, D>,
     bot: &mut EmbassyBot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
     scratch: &mut [u8],
-    luns: &mut AsyncLuns<'_, P>,
+    target: &mut Target<S>,
+    storage: &mut BlockingStorage<SdStore<'_>>,
     stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
@@ -127,12 +129,12 @@ where
     D: embassy_usb::driver::Driver<'d>,
     O: EndpointOut,
     I: EndpointIn,
-    P: AsyncStorePlane,
+    S: RuntimeSet,
 {
     esp_println::println!("stage: gadget enter");
     embassy_futures::join::join3(
         device.run(),
-        msc::run(bot, session, work, scratch, luns, stop),
+        msc::run(bot, session, work, scratch, target, storage, stop),
         async {
             // Live status on the panel (and the same numbers over the CH343P
             // USB-UART console), delta-sampled once per 500 ms window.
@@ -182,10 +184,10 @@ where
                         sd.wr_kbps,
                         msc::tx_bytes(),
                     );
-                    // Busy shares: if the shell's `join(send, pread)` is
+                    // Busy shares: if the core's storage/host handoff is
                     // genuinely concurrent, the pipe's busy time plus the
-                    // plane's must exceed the window; if they sum to it
-                    // instead, the join is serial.
+                    // storage adapter's must exceed the window; if they sum
+                    // to it instead, the two are serial.
                     let wall = sd.wall_us.max(1) as u64;
                     let pct = |us: u32| (us as u64 * 100 / wall) as u32;
                     esp_println::println!(
@@ -323,7 +325,7 @@ async fn main(_spawner: Spawner) -> ! {
     */
 
     // ── SD card over SDMMC slot 0 (fixed IO_MUX pins, up to 40 MHz) ──────
-    let mut card = match sd::SdCard::new(
+    let card = match sd::SdCard::new(
         peripherals.SDHOST,
         peripherals.GPIO43, // SD CLK
         peripherals.GPIO44, // SD CMD
@@ -399,10 +401,10 @@ async fn main(_spawner: Spawner) -> ! {
 
     // ── Build the DVD-RAM drive over the SD card (non-destructive) ───────
     //
-    // The drive is backend-free: it caches geometry from the card and
-    // addresses it only through the LUN's asynchronous store plane, so this
-    // borrow of `card` ends here. The card content is used as-is; the media is
-    // never reformatted (the host formats the blank DVD-RAM).
+    // The drive owns only geometry, built from the card's byte capacity; the
+    // bytes come from the LUN's `Storage` adapter at operation time. The card
+    // content is used as-is; the media is never reformatted (the host formats
+    // the blank DVD-RAM).
     esp_println::println!("stage: drive");
     if let Some(display) = display.as_mut() {
         display.boot_stage("BOOT 4/5 DRV");
@@ -414,24 +416,29 @@ async fn main(_spawner: Spawner) -> ! {
     // are discarded) so the USB/BOT path is measured with no SD I/O at all.
     // `false`: the real SD card.
     const ZERO_BACKEND: bool = false;
+    // Size of the all-zero measurement plane.
+    const ZERO_CAPACITY: u64 = 64 * 1024 * 1024 * 1024;
     esp_println::println!("plane: {}", if ZERO_BACKEND { "zero" } else { "sd" });
 
-    let (mut drive, plane) = if ZERO_BACKEND {
-        let mut zero = ZeroBackend::new(64 * 1024 * 1024 * 1024);
-        let drive = drive::build(&mut zero);
-        (drive, Either::A(zero))
+    let capacity = if ZERO_BACKEND {
+        ZERO_CAPACITY
     } else {
-        let drive = drive::build(&mut card);
-        (drive, Either::B(card))
+        card.capacity_bytes()
     };
+    let mut drive = drive::build(capacity);
 
     // ── LUN view ─────────────────────────────────────────────────────────
     //
-    // One LUN: the DVD-RAM drive as the device and the chosen plane as its
-    // asynchronous store plane. Both live for the rest of `main`.
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
-    let mut planes = [Some(plane)];
-    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    // One LUN: the DVD-RAM drive as a core `Lu`, driven by a `Target` over the
+    // SD card (or the all-zero measurement plane) as its storage adapter. All
+    // of it lives for the rest of `main`.
+    let mut table: [&mut dyn Lu<Pair = drive::DvdRamPair>; 1] = [&mut drive];
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = if ZERO_BACKEND {
+        BlockingStorage::new(SdStore::zero(ZERO_CAPACITY))
+    } else {
+        BlockingStorage::new(SdStore::sd(card))
+    };
 
     // ── USB 2.0 High-Speed OTG device (internal UTMI PHY, no pins) ───────
     let usb = Usb::new_hs(peripherals.USB_HS);
@@ -540,7 +547,8 @@ async fn main(_spawner: Spawner) -> ! {
         &mut session,
         &mut *work,
         &mut *scratch,
-        &mut luns,
+        &mut target,
+        &mut storage,
         &STOP,
         &mut display,
         sd_bytes,

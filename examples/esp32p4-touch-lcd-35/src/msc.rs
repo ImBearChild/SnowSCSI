@@ -27,10 +27,12 @@ use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, End
 use embassy_usb::Handler;
 use esp_hal::time::Instant;
 
-use snowscsi::common::async_store::AsyncStorePlane;
-use snowscsi::scsi::AsyncLuns;
+use snowscsi::core::storage::BlockingStorage;
+use snowscsi::core::{RuntimeSet, Target};
 use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{BotSession, EmbassyBot, Event, ServeError, BOT_RESET, GET_MAX_LUN};
+
+use crate::store::SdStore;
 
 /// Number of LUNs presented to the host, zero-based (SPC Get Max LUN answer).
 ///
@@ -174,10 +176,10 @@ pub struct SpeedSample {
 /// the *elapsed* window (interval measured locally, so the readout stays
 /// correct even if the tick drifts).
 ///
-/// `tx_busy_us`/`rx_busy_us` are what makes the overlap observable: the shell's
-/// `join(send, pread)` is concurrent only if the pipe's busy time **plus** the
-/// plane's busy time exceeds the window. If the two roughly *sum* to the window
-/// instead, the join is running them one after the other.
+/// `tx_busy_us`/`rx_busy_us` are what makes the overlap observable: the core's
+/// storage/host handoff is concurrent only if the pipe's busy time **plus** the
+/// storage adapter's busy time exceeds the window. If the two roughly *sum* to
+/// the window instead, they are running one after the other.
 pub struct SpeedMark {
     /// Cumulative counters at the previous `take` (each may have wrapped).
     prev: (u32, u32, u32, u32),
@@ -416,23 +418,25 @@ pub fn bot<O, I>(out: O, in_: I) -> EmbassyBot<CountingOut<O>, CountingIn<I>> {
 ///
 /// `work` is the SCSI data region (must be ≥ [`snowscsi::MIN_DATA_LEN`]);
 /// `scratch` is the equal-length overlap buffer the shell pre-receives into;
-/// `luns` is the device/plane bundle; `stop` is the shared shutdown flag.
+/// `target` is the core LUN set; `storage` is the SD adapter the runner
+/// executes its storage steps on; `stop` is the shared shutdown flag.
 ///
 /// The library shell owns the protocol loop. This wrapper re-arms the session
 /// and restarts it after a host disconnect, so the gadget future never returns:
 /// a disconnect parks the next receive until the host re-enumerates.
-pub async fn run<O, I, P>(
+pub async fn run<O, I, S>(
     bot: &mut EmbassyBot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
     scratch: &mut [u8],
-    luns: &mut AsyncLuns<'_, P>,
+    target: &mut Target<S>,
+    storage: &mut BlockingStorage<SdStore<'_>>,
     stop: &AtomicBool,
 ) -> !
 where
     O: EndpointOut,
     I: EndpointIn,
-    P: AsyncStorePlane,
+    S: RuntimeSet,
 {
     assert!(
         work.len() >= snowscsi::MIN_DATA_LEN,
@@ -442,11 +446,9 @@ where
     loop {
         // Drop any transaction left over from a previous host session and
         // inject the post-reset UNIT ATTENTION, exactly like the shell's own
-        // reset path.
-        {
-            let AsyncLuns { devs, .. } = &mut *luns;
-            let _ = session.poll(Event::Reset, work, devs);
-        }
+        // reset path. The framing action is irrelevant here: `serve_async`
+        // re-derives it from the session state on its first turn.
+        let _ = session.poll(Event::Reset, work, scratch, target, storage);
 
         match serve_async(
             &mut bot.out,
@@ -455,7 +457,8 @@ where
             session,
             work,
             scratch,
-            luns,
+            target,
+            storage,
             stop,
         )
         .await

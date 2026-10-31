@@ -42,6 +42,28 @@ cargo run --release               # builds, flashes via espflash, opens the moni
 `cargo build --release` alone produces
 `target/riscv32imafc-unknown-none-elf/release/esp32p4-touch-lcd-35`.
 
+The crate is checked in-tree with `cargo +nightly check` from this directory
+(the RISC-V target is installed; no `esp` toolchain is involved on the P4).
+
+### Firmware layout
+
+The firmware builds its SCSI target from the same core seams as
+`snowscsi-cli` — there is no `AsyncLuns`/`ScsiDevice` device shell:
+
+- `src/drive.rs` — the single LUN as
+  `LuImpl<Spc<MmcDrive<DvdRamMedium>>, u32>`. The blank DVD-RAM's geometry
+  comes from the SD card's byte capacity; the host formats it.
+- `src/store.rs` — `SdStore`, a minimal `SyncStorage` over the card's
+  synchronous `FlatData`/`WritableFlatData` byte plane (which delegate to the
+  async SDMMC path with `block_on`). `BlockingStorage<SdStore>` lifts it to the
+  always-ready `Storage + AsyncWake` seam. `SdStore::zero` is the
+  `ZERO_BACKEND` measurement plane.
+- `src/main.rs` — one `Target` over `[&mut dyn Lu<Pair = DvdRamPair>; 1]`, plus
+  the `BlockingStorage`, both threaded into the gadget.
+- `src/msc.rs` — the BOT restart loop around `BotSession::poll(Event::Reset,
+  work, scratch, target, storage)` and
+  `usb::serve::serve_async(..., target, storage, stop)`.
+
 Then, on the host, the device enumerates as an optical drive (`/dev/srX`):
 
 ```bash

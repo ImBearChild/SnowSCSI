@@ -23,15 +23,13 @@
 //! and `esp-hal` only implements `sdio::MmcBus` for the `Async` slot. The card
 //! therefore speaks the **asynchronous** storage seams
 //! ([`AsyncFlatData`]/[`AsyncWritableFlatData`]) natively — each transfer is
-//! awaited directly — and the shell executes the device's `Store` ops against
-//! it.
+//! awaited directly.
 //!
-//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are also
-//! implemented, because the DVD-RAM media slot needs a synchronous geometry
-//! view ([`DvdRamMedia::open`](snowscsi::cdrom::dvdram::DvdRamMedia::open) reads
-//! `capacity()` through a `&mut dyn WritableFlatData`). They delegate to the
-//! asynchronous implementation with [`embassy_futures::block_on`]; only the
-//! capacity read is exercised on this path at runtime.
+//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are what the
+//! LUN's storage adapter builds on (`src/store.rs`): a `DvdRamMedium` needs a
+//! geometry view and every data operation runs through a `SyncStorage`, so the
+//! card is driven with [`embassy_futures::block_on`] and the library's
+//! `BlockingStorage` stays always-ready.
 
 use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
@@ -293,10 +291,9 @@ impl AsyncWritableFlatData for SdCard<'_> {
     }
 }
 
-// The synchronous seams delegate to the asynchronous implementation: only the
-// geometry read (`capacity()`) is used through them at runtime (the DVD-RAM
-// media slot's construction), so a `block_on` around the awaited transfer keeps
-// the two planes from drifting apart.
+// The synchronous seams delegate to the asynchronous implementation with
+// `block_on`, so `SdStore` (the core `SyncStorage`) and any direct async caller
+// share one code path and cannot drift apart.
 impl FlatData for SdCard<'_> {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         block_on(AsyncFlatData::read_at(self, off, buf))

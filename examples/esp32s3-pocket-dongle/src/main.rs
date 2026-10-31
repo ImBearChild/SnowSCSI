@@ -46,10 +46,11 @@ use static_cell::StaticCell;
 
 use defmt::info;
 
-use snowscsi::common::async_store::AsyncStorePlane;
-use snowscsi::scsi::device::ScsiDevice;
-use snowscsi::scsi::AsyncLuns;
+use snowscsi::core::storage::BlockingStorage;
+use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
+
+use store::SdStore;
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -62,6 +63,7 @@ mod display;
 mod drive;
 mod msc;
 mod sd;
+mod store;
 mod usb_mode;
 
 // Creates the app descriptor required by the ESP-IDF bootloader.
@@ -105,13 +107,14 @@ static STOP: AtomicBool = AtomicBool::new(false);
     clippy::too_many_arguments,
     reason = "the joined USB-stack + BOT-loop future is intentionally one frame and one call"
 )]
-async fn gadget<'d, D, O, I, P>(
+async fn gadget<'d, D, O, I, S>(
     device: &mut embassy_usb::UsbDevice<'d, D>,
     bot: &mut EmbassyBot<O, I>,
     session: &mut BotSession,
     work: &mut [u8],
     scratch: &mut [u8],
-    luns: &mut AsyncLuns<'_, P>,
+    target: &mut Target<S>,
+    storage: &mut BlockingStorage<SdStore<'_>>,
     stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
@@ -121,11 +124,11 @@ where
     D: embassy_usb::driver::Driver<'d>,
     O: EndpointOut,
     I: EndpointIn,
-    P: AsyncStorePlane,
+    S: RuntimeSet,
 {
     embassy_futures::join::join3(
         device.run(),
-        msc::run(bot, session, work, scratch, luns, stop),
+        msc::run(bot, session, work, scratch, target, storage, stop),
         async {
             // Uptime: seconds since boot, redisplayed every refresh. The
             // readout only advances because *this* loop runs, so a frozen
@@ -198,8 +201,8 @@ async fn main(spawner: Spawner) -> ! {
     let boot = Instant::now();
 
     // Nothing is spawned: the USB device and BOT loop are joined directly in
-    // `main` so their non-`'static` borrows (the session, and the LUN view's
-    // `devs`/`planes`/`luns` over `drive`/`card`) stay valid.
+    // `main` so their non-`'static` borrows (the session, the core `Target`
+    // over the LUN table, and the SD-backed `BlockingStorage`) stay valid.
     let _ = spawner;
 
     info!("esp32s3-pocket-dongle: booting (DVDRAM/USB-OTG)");
@@ -253,18 +256,18 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // The drive (single LUN) must own the card for the whole program.
-    let Some(mut card) = sd.take() else {
+    let Some(card) = sd.take() else {
         info!("no SD card; cannot start the USB gadget");
         if let Some(display) = display.as_mut() {
             display.show(
-            usb_mode::Mode::DvdRam,
-            None,
-            false,
-            uptime_s(boot),
-            None,
-            None,
-            (0, 0, 0, 0, 0, 0, 0),
-        );
+                usb_mode::Mode::DvdRam,
+                None,
+                false,
+                uptime_s(boot),
+                None,
+                None,
+                (0, 0, 0, 0, 0, 0, 0),
+            );
         }
         loop {
             Timer::after(Duration::from_secs(1)).await;
@@ -272,18 +275,18 @@ async fn main(spawner: Spawner) -> ! {
     };
 
     // Build the DVD-RAM drive over the SD card (non-destructive — the existing
-    // card content is used as-is). The drive caches geometry from the card and
-    // is otherwise backend-free, so the build borrow ends here.
-    let mut drive = drive::build(&mut card);
+    // card content is used as-is). The drive owns only geometry, built from the
+    // card's byte capacity; the bytes come from the LUN's `Storage` adapter.
+    let mut drive = drive::build(card.capacity_bytes());
 
     // ── LUN view ─────────────────────────────────────────────────────────
     //
-    // One LUN: the DVD-RAM drive as the device and the SD card as its
-    // asynchronous store plane (the shell executes every `Action::Store`
-    // against it). Both live for the rest of `main`.
-    let mut devs: [&mut dyn ScsiDevice; 1] = [&mut drive];
-    let mut planes = [Some(card)];
-    let mut luns = AsyncLuns::new(&mut devs, &mut planes);
+    // One LUN: the DVD-RAM drive as a core `Lu`, driven by a `Target` over the
+    // SD card as its storage adapter. All of it lives for the rest of `main`
+    // (across every BOOT↔DVDRAM rebuild).
+    let mut table: [&mut dyn Lu<Pair = drive::DvdRamPair>; 1] = [&mut drive];
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = BlockingStorage::new(SdStore::new(card));
 
     // ── Persistent per-program state ─────────────────────────────────────
     //
@@ -431,7 +434,8 @@ async fn main(spawner: Spawner) -> ! {
                         &mut session,
                         &mut *work,
                         &mut *scratch,
-                        &mut luns,
+                        &mut target,
+                        &mut storage,
                         &STOP,
                         &mut display,
                         sd_bytes,

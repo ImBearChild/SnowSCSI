@@ -19,9 +19,14 @@ filesystem and formats the medium (FORMAT UNIT + its own UDF `mkfs`).
 | [`esp32s3-pocket-dongle`](esp32s3-pocket-dongle/) | **ESP32-S3** (Xtensa LX7, dual-core) | **Pocket-Dongle-S3** (AliExpress "ESP32-S3 0.96 LCD dongle", vendor repo [`ronenkr/Pocket-Dongle-S3`](https://github.com/ronenkr/Pocket-Dongle-S3)) | ESP32-S3 N16R8 (16 MB flash, 8 MB PSRAM, 512 KB SRAM) |
 
 
-## Legacy state
+## Verification
 
-These examples target the removed `scsi::Luns` / `scsi::AsyncLuns` bundles and
-the old `serve_async` signature. They are detached crates (not workspace
-members) and are kept for reference only; porting them to the core
-`Target`/bank model is a separate effort.
+Both crates are detached from the workspace and drive the core
+`Target`/`Lu` path with the SD card behind a `SyncStorage` → `BlockingStorage`
+adapter (see each crate's `store.rs`).
+
+- `esp32p4-touch-lcd-35` (RISC-V): type-checked in-tree with
+  `cargo +nightly check` (the `riscv32imafc-unknown-none-elf` target plus
+  `build-std = ["core"]` from its `.cargo/config.toml`).
+- `esp32s3-pocket-dongle` (Xtensa): needs the Espressif toolchain; verify with
+  `cargo +esp check`. It mirrors the P4 port and is only rustfmt-checked here.
