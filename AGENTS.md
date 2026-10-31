@@ -109,8 +109,8 @@ git checkout legacy
   `cargo build -p snowscsi --no-default-features`,
   `cargo build -p snowscsi-iso9660 --no-default-features`,
   `cargo build -p snowscsi-common --no-default-features`.
-  (Known gap: `cargo test -p snowscsi --no-default-features --features scsi`
-  does not compile — unit tests use `Vec`/`String` without pulling in `std`.)
+  `cargo test -p snowscsi --no-default-features --features scsi` is green
+  (verified 2026-10-31; the previous std-prelude gap is closed).
 - **Transport layer**: `Conn` = blanket `embedded_io::Read + Write`; `AsyncConn`
   is the runtime-agnostic async mirror behind `async-io` and
   `serve_conn_async` awaits both the connection and a `Storage + AsyncWake`
