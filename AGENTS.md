@@ -77,6 +77,7 @@ They are not workspace members and must not be pulled into the library.
 | `snowscsi-common` | Done — capability ladder `FlatData`(① read) → `WritableFlatData`(② write+sync) → `SeekableStorage`(③ embedded-io entry; blankets lift ③ into ①/②) + erased slot refs `FlatRef`/`RwRef`; plus `FsStorage` seam and logging macros. |
 | `snowscsi-iso9660` | Done — ISO9660/Joliet live-generation (`live.rs`), moved out of the old `iso9660` module. `LiveData`/`LiveDataBuilder`/`compute_layout`. |
 | `snowscsi::scsi` | Done — seam-first rewrite: one `BlockDevice<D: FlatData>` with two profiles (`disk()` writable PDT 0x00 / `cdrom()` read-only PDT 0x05, the former `CDBlockDevice`, over ANY plane incl. user backends); transports are generic over `D: ScsiDevice` (+ blanket for `&mut T`) so users implement their own LUNs; the closed `Device` enum is removed. |
+| `snowscsi::core` | Done — seams + adapters: `BlockingStorage`/`BlockingHost` (four fixed slots), `BlockingStorage::from_plane`/`from_read_plane` (byte plane → `SyncStorage`), `Fault: From<StorageError>` + `StorageReceipt::failed_for(dir, err)`, and the runtime-free async adapter `slots::SlotPool` → `SlotStore` (`Storage` + `AsyncWake`) / `SlotTask` (`next_job`/`complete`) over one staging buffer and two wakers (dropping a `Job` returns the buffer; `reset()` clears a dropped shell's leftovers). |
 | `snowscsi::cdrom` | Done — `CdromDrive` dispatches all MMC commands; media types `FlatMedia` (full MMC), `LiveData`/`LiveDataBuilder` (livefs), `DvdRamMedia` (DVD-RAM, `dvdram`). Full MMC surface: READ TOC, GET CONFIGURATION, READ DISC INFORMATION, READ BUFFER CAPACITY, READ CAPACITY, DVD physical format, prevent/allow removal, tray exchange, pending Unit Attention. Legacy `CdromDevice`/`CdLiveFsDevice`/`DvdRamDevice` removed. |
 | `snowscsi::iscsi` | Done — PDU codec, `Conn` trait, session state machine driving `core::Target` through the host data seam, BSD `TcpStream` transport behind `std`. Data phase, R2T/Data-Out, task management, unit-attention reporting and transport-loss settlement are covered by mock, golden and libiscsi suites. |
 | `snowscsi::usb` | Done — MSC Bulk-Only Transport core: `bot.rs` (CBW/CSW), `io.rs` (`BotIo`/`recv_exact`), `gadget.rs` (`Gadget`/`CtrlReq`), `target.rs` (`BotSession` driving `core::Target` through the host data seam, all BOT data-phase cases). Linux FunctionFS bridge (`FfsBot`/`FfsGadget`) lives only in `snowscsi-cli` under `cfg(target_os = "linux")`. |
@@ -119,6 +120,14 @@ git checkout legacy
   `snowscsi::usb` — the non-blocking `BotSession` core never does platform I/O;
   the Linux FunctionFS bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives
   only in `snowscsi-cli` under `cfg(target_os = "linux")`.
+- **Async storage adapters**: `core::slots::SlotPool` is the runtime-free
+  bridge for a backend whose I/O completes elsewhere (SD card, flash, DMA).
+  Split it into `SlotStore` (implements `Storage` + `AsyncWake`) and
+  `SlotTask` (`next_job().await` / `complete(job, result)`), then `join!` both
+  futures in one task. It owns the slot table, one staging buffer and two
+  wakers; it is `!Send`, so a spawned (multi-task) store needs a
+  runtime-specific synchronisation primitive, not this type. Do not re-grow a
+  per-application copy of that state machine in examples or the CLI.
 - **Banks**: `work` is the command/data bank; an optional alternate bank holds
   a prefetched Data-In chunk. An empty `scratch` shares the command bank with
   the resident long operation; a non-empty one keeps the split long-op bank.
