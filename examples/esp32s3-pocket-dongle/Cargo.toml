@@ -35,6 +35,8 @@ embassy-executor = { version = "0.10", features = ["defmt"] }
 embassy-time = { version = "0.5", features = ["defmt"] }
 embassy-usb = { version = "0.6", default-features = false }
 embassy-usb-driver = "0.2"
+# Job/completion channels between the BOT loop and the SD worker future.
+embassy-sync = "0.8"
 
 # --- SD card protocol stack over esp-hal sdmmc ---
 sdio = "0.5"
@@ -47,7 +49,7 @@ embedded-graphics = "0.8"
 
 # --- misc ---
 static_cell = "2"
-embassy-futures = "0.1"      # block_on: drive async SDIO calls from sync seams
+embassy-futures = "0.1"      # join/select combinators; block_on for SD bring-up
 embedded-hal = "1.0"         # traits (OutputPin/SpiDevice) in scope
 embedded-hal-async = "1.0"
 embedded-io = "0.7"          # StorageError::Io(ErrorKind) for the SD seam

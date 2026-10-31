@@ -27,7 +27,6 @@ use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, End
 use embassy_usb::Handler;
 use esp_hal::time::Instant;
 
-use snowscsi::core::storage::BlockingStorage;
 use snowscsi::core::{RuntimeSet, Target};
 use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{BotSession, EmbassyBot, Event, ServeError, BOT_RESET, GET_MAX_LUN};
@@ -418,8 +417,8 @@ pub fn bot<O, I>(out: O, in_: I) -> EmbassyBot<CountingOut<O>, CountingIn<I>> {
 ///
 /// `work` is the SCSI data region (must be ≥ [`snowscsi::MIN_DATA_LEN`]);
 /// `scratch` is the equal-length overlap buffer the shell pre-receives into;
-/// `target` is the core LUN set; `storage` is the SD adapter the runner
-/// executes its storage steps on; `stop` is the shared shutdown flag.
+/// `target` is the core LUN set; `storage` is the async SD adapter the runner
+/// posts its storage steps to; `stop` is the shared shutdown flag.
 ///
 /// The library shell owns the protocol loop. This wrapper re-arms the session
 /// and restarts it after a host disconnect, so the gadget future never returns:
@@ -430,7 +429,7 @@ pub async fn run<O, I, S>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<S>,
-    storage: &mut BlockingStorage<SdStore<'_>>,
+    storage: &mut SdStore<'_, '_>,
     stop: &AtomicBool,
 ) -> !
 where

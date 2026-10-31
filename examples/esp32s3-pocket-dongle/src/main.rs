@@ -40,17 +40,17 @@ use esp_hal::usb::otg::{
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::driver::{EndpointIn, EndpointOut};
 use static_cell::StaticCell;
 
 use defmt::info;
 
-use snowscsi::core::storage::BlockingStorage;
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
 
-use store::SdStore;
+use store::{DoneChan, JobChan, SdStore, STAGE};
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -85,6 +85,14 @@ static WORK: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 /// then swaps the two. Kept off the task stack.
 static SCRATCH: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 
+/// Staging buffer for the asynchronous SD worker (one bank).
+///
+/// Same reason as [`WORK`]: [`STAGE`] bytes must not be a stack local. The
+/// buffer travels between the `Storage` adapter and the worker future, so
+/// exactly one copy exists. It is initialised once and reborrowed into every
+/// DVDRAM rebuild of the gadget.
+static SD_BUF: StaticCell<[u8; STAGE]> = StaticCell::new();
+
 /// Shutdown flag handed to the BOT serve loop.
 ///
 /// This firmware tears the gadget down by dropping its future when BOOT is
@@ -92,16 +100,19 @@ static SCRATCH: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 /// explicit stop signal alongside the future.
 static STOP: AtomicBool = AtomicBool::new(false);
 
-/// Run the whole DVDRAM gadget concurrently: USB stack, BOT loop, LCD refresh.
+/// Run the whole DVDRAM gadget concurrently: USB stack, BOT loop, async SD
+/// worker, LCD refresh.
 ///
-/// Never returns. Both `UsbDevice::run` and [`msc::run`] return `!`, so the
-/// `join3` below can only ever be *cancelled*, never completed. The caller
-/// races this future against [`button::BootButton::wait_press`]; when BOOT
-/// wins, dropping this future stops the gadget, after which the caller drops
-/// the device (disabling the OTG core) and re-muxes the PHY.
+/// Never returns. `UsbDevice::run` and [`msc::run`] return `!`, and the SD
+/// worker and LCD loops never complete, so the `join4` below can only ever be
+/// *cancelled*, never completed. The caller races this future against
+/// [`button::BootButton::wait_press`]; when BOOT wins, dropping this future
+/// stops the gadget, after which the caller drops the device (disabling the
+/// OTG core) and re-muxes the PHY.
 ///
 /// Borrows are disjoint by construction: the USB stack owns `device`, the BOT
-/// loop owns the endpoints/session/buffers/LUNs, and the refresh owns the LCD.
+/// loop owns the endpoints/session/buffers/LUNs, the SD worker borrows `card`
+/// and the staging buffer, and the refresh owns the LCD.
 #[allow(
     clippy::large_stack_frames,
     clippy::too_many_arguments,
@@ -114,7 +125,8 @@ async fn gadget<'d, D, O, I, S>(
     work: &mut [u8],
     scratch: &mut [u8],
     target: &mut Target<S>,
-    storage: &mut BlockingStorage<SdStore<'_>>,
+    card: &mut sd::SdCard<'_>,
+    sd_buf: &mut [u8; STAGE],
     stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
@@ -126,9 +138,21 @@ where
     I: EndpointIn,
     S: RuntimeSet,
 {
-    embassy_futures::join::join3(
+    // Storage plumbing. The two channels and the waker are small locals of
+    // this future; the staging buffer is the static `SD_BUF`. `msc::run` posts
+    // a job, the worker executes it on the card, and the completion wakes the
+    // `StoragePending` wait. Both sides run in this one `join4` (same
+    // executor), so the no-op-lock channels need no spawner, `Send` or
+    // `critical-section` implementation.
+    let job_chan: JobChan<'_> = Channel::new();
+    let done_chan: DoneChan<'_> = Channel::new();
+    let wake = store::storage_waker();
+    let mut storage = SdStore::new(&job_chan, &done_chan, &wake, sd_buf);
+
+    embassy_futures::join::join4(
         device.run(),
-        msc::run(bot, session, work, scratch, target, storage, stop),
+        msc::run(bot, session, work, scratch, target, &mut storage, stop),
+        store::sd_task(card, &job_chan, &done_chan, &wake),
         async {
             // Uptime: seconds since boot, redisplayed every refresh. The
             // readout only advances because *this* loop runs, so a frozen
@@ -200,9 +224,10 @@ async fn main(spawner: Spawner) -> ! {
     // clock is invalidated anyway the moment the refresh loop dies.
     let boot = Instant::now();
 
-    // Nothing is spawned: the USB device and BOT loop are joined directly in
-    // `main` so their non-`'static` borrows (the session, the core `Target`
-    // over the LUN table, and the SD-backed `BlockingStorage`) stay valid.
+    // Nothing is spawned: the USB device, BOT loop, SD worker and LCD are
+    // joined directly in `gadget`, so their non-`'static` borrows (the session,
+    // the core `Target` over the LUN table, the card and the staging buffer)
+    // stay valid and survive a BOOT↔DVDRAM rebuild.
     let _ = spawner;
 
     info!("esp32s3-pocket-dongle: booting (DVDRAM/USB-OTG)");
@@ -256,7 +281,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // The drive (single LUN) must own the card for the whole program.
-    let Some(card) = sd.take() else {
+    let Some(mut card) = sd.take() else {
         info!("no SD card; cannot start the USB gadget");
         if let Some(display) = display.as_mut() {
             display.show(
@@ -282,11 +307,13 @@ async fn main(spawner: Spawner) -> ! {
     // ── LUN view ─────────────────────────────────────────────────────────
     //
     // One LUN: the DVD-RAM drive as a core `Lu`, driven by a `Target` over the
-    // SD card as its storage adapter. All of it lives for the rest of `main`
-    // (across every BOOT↔DVDRAM rebuild).
+    // SD card as its storage backing. All of it lives for the rest of `main`
+    // (across every BOOT↔DVDRAM rebuild). The card and the worker's staging
+    // buffer are borrowed into each gadget build, so the gadget future can be
+    // cancelled and rebuilt without moving them.
     let mut table: [&mut dyn Lu<Pair = drive::DvdRamPair>; 1] = [&mut drive];
     let mut target = Target::new(&mut table[..]);
-    let mut storage = BlockingStorage::new(SdStore::new(card));
+    let sd_buf: &'static mut [u8; STAGE] = SD_BUF.init([0u8; STAGE]);
 
     // ── Persistent per-program state ─────────────────────────────────────
     //
@@ -435,7 +462,8 @@ async fn main(spawner: Spawner) -> ! {
                         &mut *work,
                         &mut *scratch,
                         &mut target,
-                        &mut storage,
+                        &mut card,
+                        &mut *sd_buf,
                         &STOP,
                         &mut display,
                         sd_bytes,

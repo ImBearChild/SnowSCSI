@@ -40,8 +40,16 @@ Where the time goes now (steady-state read, averaged over 500 ms windows):
 ## The pipeline (and where it breaks)
 
 ```
-host --USB HS bulk--> usb::serve::serve_async (snowscsi) --Storage op--> BlockingStorage<SdStore> --> microSD
+host --USB HS bulk--> usb::serve::serve_async (snowscsi) --Storage op--> SdStore
+                                                                   <-> embassy-sync channels <-> sd_task --> microSD
 ```
+
+The storage side is a single async worker future joined with the BOT loop: it
+cannot hand the caller's bank straight to the SD driver (`begin_exec` is
+metadata-only and `poll_exec` re-borrows the bank), so each operation travels
+through one bank-sized staging buffer in `.bss`. That is one extra copy per
+direction, visible as the gap between `rd`/`wr` (whole `read_at`/`write_at`)
+and `sd`/`sw` (the SD command) in the `BUSY` line below.
 
 Five independent limits stack up, in this order of impact:
 
@@ -558,7 +566,7 @@ dd if=/dev/zero of=/dev/sr0 bs=1M count=20 oflag=direct   # write (destructive)
 ```
 
 To separate USB from SD, set `ZERO_BACKEND = true` in `src/main.rs`: the LUN is
-then backed by `SdStore::zero` (an
+then backed by `Backing::zero` (an
 `snowscsi_common::seekable_storage::ZeroBackend`, reads return zeros, writes
 are discarded), which measures the USB + BOT path with no SD I/O at all. That
 is how the 14.2 / 7.2 MB/s ceilings above were measured.

@@ -53,16 +53,21 @@ The firmware builds its SCSI target from the same core seams as
 - `src/drive.rs` — the single LUN as
   `LuImpl<Spc<MmcDrive<DvdRamMedium>>, u32>`. The blank DVD-RAM's geometry
   comes from the SD card's byte capacity; the host formats it.
-- `src/store.rs` — `SdStore`, a minimal `SyncStorage` over the card's
-  synchronous `FlatData`/`WritableFlatData` byte plane (which delegate to the
-  async SDMMC path with `block_on`). `BlockingStorage<SdStore>` lifts it to the
-  always-ready `Storage + AsyncWake` seam. `SdStore::zero` is the
-  `ZERO_BACKEND` measurement plane.
-- `src/main.rs` — one `Target` over `[&mut dyn Lu<Pair = DvdRamPair>; 1]`, plus
-  the `BlockingStorage`, both threaded into the gadget.
+- `src/store.rs` — `SdStore` + `sd_task`: a native-async storage pair. The
+  BOT side implements `Storage + AsyncWake` over two `embassy-sync` channels
+  and parks the runner; the worker future awaits the card's
+  `AsyncFlatData`/`AsyncWritableFlatData` transfers and posts the completion.
+  One staging buffer (one bank) travels store → job → worker → done, so a read
+  is copied once into the caller's bank and a write once out of it.
+  `Backing::Zero` is the `ZERO_BACKEND` measurement plane (it completes
+  without awaiting).
+- `src/main.rs` — one `Target` over `[&mut dyn Lu<Pair = DvdRamPair>; 1]`, the
+  card backing and the staging buffer, all threaded into the gadget.
 - `src/msc.rs` — the BOT restart loop around `BotSession::poll(Event::Reset,
   work, scratch, target, storage)` and
   `usb::serve::serve_async(..., target, storage, stop)`.
+- `gadget()` joins four futures: the USB stack, the BOT loop, `store::sd_task`
+  and the LCD refresh (no spawned task, no `'static` bound).
 
 Then, on the host, the device enumerates as an optical drive (`/dev/srX`):
 

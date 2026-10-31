@@ -26,11 +26,11 @@
 //! ([`AsyncFlatData`]/[`AsyncWritableFlatData`]) natively — each transfer is
 //! awaited directly.
 //!
-//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are what the
-//! LUN's storage adapter builds on (`src/store.rs`): a `DvdRamMedium` needs a
-//! geometry view and every data operation runs through a `SyncStorage`, so the
-//! card is driven with [`embassy_futures::block_on`] and the library's
-//! `BlockingStorage` stays always-ready.
+//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are kept for
+//! lock-step callers (card bring-up and geometry). The data path is
+//! asynchronous: `src/store.rs` posts jobs to its `sd_task` future, which
+//! awaits [`AsyncFlatData`]/[`AsyncWritableFlatData`] directly while the BOT
+//! shell parks on the completion channel.
 #![allow(dead_code)]
 
 use aligned::{Aligned, A4};
@@ -745,9 +745,9 @@ impl SdCard<'_> {
     }
 }
 
-// The synchronous seams delegate to the asynchronous implementation with
-// `block_on`, so `SdStore` (the core `SyncStorage`) and any direct async caller
-// share one code path and cannot drift apart.
+// The synchronous seams mirror the asynchronous implementation for lock-step
+// callers (bring-up and geometry); the data path in `store.rs` awaits the
+// async traits directly.
 impl FlatData for SdCard<'_> {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         block_on(AsyncFlatData::read_at(self, off, buf))

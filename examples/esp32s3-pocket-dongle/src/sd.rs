@@ -1,8 +1,9 @@
 //! SD card storage.
 //!
 //! Bridges `esp-hal`'s SDMMC host controller + the `sdio` crate's SD memory
-//! card protocol to `snowscsi_common`'s synchronous storage seams
-//! ([`FlatData`] + [`WritableFlatData`]).
+//! card protocol to `snowscsi_common`'s storage seams ([`FlatData`] +
+//! [`WritableFlatData`] and the asynchronous [`AsyncFlatData`] +
+//! [`AsyncWritableFlatData`]).
 //!
 //! # Block geometry (512-byte SD blocks vs. 2048-byte logical sectors)
 //!
@@ -25,11 +26,11 @@
 //! ([`AsyncFlatData`]/[`AsyncWritableFlatData`]) natively — each transfer is
 //! awaited directly.
 //!
-//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are what the
-//! LUN's storage adapter builds on (`src/store.rs`): a `DvdRamMedium` needs a
-//! geometry view and every data operation runs through a `SyncStorage`, so the
-//! card is driven with [`embassy_futures::block_on`] and the library's
-//! `BlockingStorage` stays always-ready.
+//! The **synchronous** seams ([`FlatData`]/[`WritableFlatData`]) are kept for
+//! lock-step callers (card bring-up and geometry). The data path is
+//! asynchronous: `src/store.rs` posts jobs to its `sd_task` future, which
+//! awaits [`AsyncFlatData`]/[`AsyncWritableFlatData`] directly while the BOT
+//! shell parks on the completion channel.
 
 use aligned::{Aligned, A4};
 use block_device_driver::BlockDevice as _;
@@ -109,7 +110,7 @@ impl DelayNs for BusyDelay {
     }
 }
 
-/// An initialized SD card presented as a synchronous byte-addressed plane.
+/// An initialized SD card presented as a byte-addressed plane.
 ///
 /// The embedded `sdio::BlockDevice` owns the async SD bus; `batch` is the
 /// DMA-safe, 4-byte-aligned staging area every transfer passes through.
@@ -291,9 +292,9 @@ impl AsyncWritableFlatData for SdCard<'_> {
     }
 }
 
-// The synchronous seams delegate to the asynchronous implementation with
-// `block_on`, so `SdStore` (the core `SyncStorage`) and any direct async caller
-// share one code path and cannot drift apart.
+// The synchronous seams mirror the asynchronous implementation for lock-step
+// callers (bring-up and geometry); the data path in `store.rs` awaits the
+// async traits directly.
 impl FlatData for SdCard<'_> {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         block_on(AsyncFlatData::read_at(self, off, buf))
