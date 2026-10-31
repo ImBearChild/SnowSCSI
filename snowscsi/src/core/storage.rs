@@ -25,6 +25,8 @@
 
 use ::core::task::{Context, Poll};
 
+use crate::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
+
 use super::async_wake::AsyncWake;
 use super::device::{DataPlan, Direction, TargetId};
 use super::errors::{Delivery, Effect, Fault};
@@ -186,7 +188,7 @@ impl IoToken {
 }
 
 /// Whether `buf` is the legal buffer for `req`.
-const fn buf_matches(req: IoReq, buf: &IoBuf<'_>) -> bool {
+pub(crate) const fn buf_matches(req: IoReq, buf: &IoBuf<'_>) -> bool {
     match (req.dir, buf) {
         (Direction::None, IoBuf::None) => req.len == 0,
         (Direction::ToHost, IoBuf::Read(b)) => req.len as usize == b.len(),
@@ -196,7 +198,7 @@ const fn buf_matches(req: IoReq, buf: &IoBuf<'_>) -> bool {
 }
 
 /// Contract-violation receipt (`Poll::Ready` with `error = Some(Contract)`).
-const fn contract_receipt() -> StorageReceipt {
+pub(crate) const fn contract_receipt() -> StorageReceipt {
     StorageReceipt::failed(Fault::Contract, 0, Effect::Known)
 }
 
@@ -346,6 +348,148 @@ impl<S: SyncStorage> Storage for BlockingStorage<S> {
 impl<S: SyncStorage> AsyncWake for BlockingStorage<S> {
     fn poll_wake(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Ready(())
+    }
+}
+
+// ===========================================================================
+// Byte-plane adapters
+// ===========================================================================
+
+/// Read-only byte-plane adapter: lifts [`FlatData`] into [`SyncStorage`].
+///
+/// A write request is a legal request this plane refuses, so it reports
+/// [`Fault::NotWritable`] rather than [`Fault::Contract`]; the receipt still
+/// carries the direction-implied effect. A sync has nothing to flush and
+/// succeeds with zero confirmed bytes.
+pub struct ReadOnlyPlane<T: FlatData> {
+    plane: T,
+}
+
+impl<T: FlatData> ReadOnlyPlane<T> {
+    /// Wrap a read-only plane.
+    pub const fn new(plane: T) -> Self {
+        Self { plane }
+    }
+
+    /// Borrow the wrapped plane.
+    pub fn plane(&self) -> &T {
+        &self.plane
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn plane_mut(&mut self) -> &mut T {
+        &mut self.plane
+    }
+}
+
+impl<T: FlatData> SyncStorage for ReadOnlyPlane<T> {
+    fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+        let dir = req.dir;
+        match (dir, buf) {
+            (Direction::ToHost, IoBuf::Read(b)) if b.len() == req.len as usize => {
+                match self.plane.read_at(req.offset, b) {
+                    Ok(()) => StorageReceipt::ok(req.len as usize),
+                    Err(e) => StorageReceipt::failed_for(dir, e),
+                }
+            }
+            (Direction::FromHost, IoBuf::Write(b)) if b.len() == req.len as usize => {
+                StorageReceipt::failed_for(dir, StorageError::NotWritable)
+            }
+            (Direction::None, IoBuf::None) if req.len == 0 => StorageReceipt::ok(0),
+            _ => contract_receipt(),
+        }
+    }
+}
+
+/// Read/write byte-plane adapter: lifts [`WritableFlatData`] into
+/// [`SyncStorage`].
+///
+/// The plumbing of [`FlatData::read_at`] / [`WritableFlatData::write_at`] /
+/// [`WritableFlatData::sync`] is mechanical; [`BlockingStorage::from_plane`]
+/// wraps this for adapters that only need a byte plane and no custom request
+/// shaping.
+pub struct WritablePlane<T: WritableFlatData> {
+    plane: T,
+}
+
+impl<T: WritableFlatData> WritablePlane<T> {
+    /// Wrap a writable plane.
+    pub const fn new(plane: T) -> Self {
+        Self { plane }
+    }
+
+    /// Borrow the wrapped plane.
+    pub fn plane(&self) -> &T {
+        &self.plane
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn plane_mut(&mut self) -> &mut T {
+        &mut self.plane
+    }
+}
+
+impl<T: WritableFlatData> SyncStorage for WritablePlane<T> {
+    fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+        let dir = req.dir;
+        let result = match (dir, buf) {
+            (Direction::ToHost, IoBuf::Read(b)) if b.len() == req.len as usize => {
+                self.plane.read_at(req.offset, b).map(|()| b.len())
+            }
+            (Direction::FromHost, IoBuf::Write(b)) if b.len() == req.len as usize => {
+                self.plane.write_at(req.offset, b).map(|()| b.len())
+            }
+            (Direction::None, IoBuf::None) if req.len == 0 => self.plane.sync().map(|()| 0),
+            _ => return contract_receipt(),
+        };
+        match result {
+            Ok(confirmed) => StorageReceipt::ok(confirmed),
+            Err(e) => StorageReceipt::failed_for(dir, e),
+        }
+    }
+}
+
+impl<T: WritableFlatData> BlockingStorage<WritablePlane<T>> {
+    /// Serve a writable byte plane directly from a blocking adapter.
+    ///
+    /// ```no_run
+    /// # use snowscsi::common::seekable_storage::RamBackend;
+    /// # use snowscsi::core::storage::BlockingStorage;
+    /// let mut ram = [0u8; 4096];
+    /// let storage = BlockingStorage::from_plane(RamBackend::new(&mut ram));
+    /// ```
+    pub fn from_plane(plane: T) -> Self {
+        Self::new(WritablePlane::new(plane))
+    }
+
+    /// Borrow the wrapped plane.
+    pub fn plane(&self) -> &T {
+        self.inner().plane()
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn plane_mut(&mut self) -> &mut T {
+        self.inner_mut().plane_mut()
+    }
+}
+
+impl<T: FlatData> BlockingStorage<ReadOnlyPlane<T>> {
+    /// Serve a read-only byte plane directly from a blocking adapter.
+    ///
+    /// Writes are refused with [`Fault::NotWritable`], never with a contract
+    /// violation, so a read-only LUN still answers WRITE with DATA PROTECT.
+    pub fn from_read_plane(plane: T) -> Self {
+        Self::new(ReadOnlyPlane::new(plane))
+    }
+
+    /// Borrow the wrapped plane.
+    pub fn plane(&self) -> &T {
+        self.inner().plane()
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn plane_mut(&mut self) -> &mut T {
+        self.inner_mut().plane_mut()
     }
 }
 
@@ -668,6 +812,40 @@ impl StorageReceipt {
             confirmed,
             error: Some(error),
             effect,
+        }
+    }
+
+    /// Failure reported by a byte-plane backend, with the effect implied by
+    /// `dir`.
+    ///
+    /// A read is known to have left nothing behind; a failed write may have
+    /// reached the medium partially, so its remainder is reported as unknown.
+    /// A failed sync is reported as known: the error receipt was observed,
+    /// which is not the same as a settlement that was never observed.
+    pub fn failed_for(dir: Direction, error: StorageError) -> Self {
+        Self::failed(
+            Fault::from(error),
+            0,
+            match dir {
+                Direction::FromHost => Effect::UnknownRemainder,
+                _ => Effect::Known,
+            },
+        )
+    }
+}
+
+/// Map the byte-plane error vocabulary onto the core fault vocabulary.
+///
+/// The two vocabularies are otherwise disjoint, so every adapter over a
+/// [`FlatData`]/[`WritableFlatData`] plane needs the same four-arm mapping;
+/// it lives here once, next to [`StorageReceipt::failed_for`].
+impl From<StorageError> for Fault {
+    fn from(e: StorageError) -> Self {
+        match e {
+            StorageError::OutOfBounds => Self::OutOfBounds,
+            StorageError::NotWritable => Self::NotWritable,
+            StorageError::Io(_) => Self::Io,
+            StorageError::Unsupported => Self::Unsupported,
         }
     }
 }
@@ -1637,5 +1815,107 @@ mod tests {
         assert_eq!(host_receipt.accepted(), 3);
         assert_eq!(host_receipt.error(), Some(Fault::Io));
         assert_eq!(host_receipt.owner(), TargetId::UNBOUND);
+    }
+
+    #[test]
+    fn writable_plane_round_trips_and_syncs() {
+        use crate::common::seekable_storage::RamBackend;
+
+        let mut ram = [0u8; 32];
+        let mut storage = BlockingStorage::from_plane(RamBackend::new(&mut ram));
+
+        let write = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 0,
+            len: 4,
+            dir: Direction::FromHost,
+        });
+        let data = [7u8, 8, 9, 10];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        assert_eq!(receipt.error, None);
+        assert_eq!(receipt.confirmed, 4);
+
+        let read = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 0,
+            len: 4,
+            dir: Direction::ToHost,
+        });
+        let mut out = [0u8; 4];
+        let receipt = ready(storage.poll_exec(read, IoBuf::Read(&mut out)));
+        assert_eq!(receipt.error, None);
+        assert_eq!(out, data);
+
+        let sync = storage.begin_exec(sync_req());
+        let receipt = ready(storage.poll_exec(sync, IoBuf::None));
+        assert_eq!(receipt.error, None);
+        assert_eq!(receipt.confirmed, 0);
+
+        assert_eq!(storage.plane().capacity(), 32);
+    }
+
+    #[test]
+    fn read_only_plane_refuses_writes_without_a_contract_fault() {
+        use crate::common::seekable_storage::RamBackend;
+
+        let mut ram = [1u8; 16];
+        let mut storage = BlockingStorage::from_read_plane(RamBackend::new(&mut ram));
+
+        let read = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 0,
+            len: 4,
+            dir: Direction::ToHost,
+        });
+        let mut out = [0u8; 4];
+        let receipt = ready(storage.poll_exec(read, IoBuf::Read(&mut out)));
+        assert_eq!(receipt.error, None);
+        assert_eq!(out, [1u8; 4]);
+
+        let write = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 0,
+            len: 4,
+            dir: Direction::FromHost,
+        });
+        let data = [2u8; 4];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        assert_eq!(receipt.error, Some(Fault::NotWritable));
+        assert_eq!(receipt.effect, Effect::UnknownRemainder);
+        assert_eq!(receipt.confirmed, 0);
+
+        let sync = storage.begin_exec(sync_req());
+        let receipt = ready(storage.poll_exec(sync, IoBuf::None));
+        assert_eq!(receipt.error, None);
+    }
+
+    #[test]
+    fn plane_bounds_errors_keep_the_vector_direction_effect() {
+        use crate::common::seekable_storage::RamBackend;
+
+        let mut ram = [0u8; 8];
+        let mut storage = BlockingStorage::from_plane(RamBackend::new(&mut ram));
+
+        let read = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 4,
+            len: 8,
+            dir: Direction::ToHost,
+        });
+        let mut out = [0u8; 8];
+        let receipt = ready(storage.poll_exec(read, IoBuf::Read(&mut out)));
+        assert_eq!(receipt.error, Some(Fault::OutOfBounds));
+        assert_eq!(receipt.effect, Effect::Known);
+
+        let write = storage.begin_exec(IoReq {
+            resource: RES,
+            offset: 4,
+            len: 8,
+            dir: Direction::FromHost,
+        });
+        let data = [0u8; 8];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        assert_eq!(receipt.error, Some(Fault::OutOfBounds));
+        assert_eq!(receipt.effect, Effect::UnknownRemainder);
     }
 }
