@@ -226,6 +226,83 @@ fn overlap_read_alternates_banks_and_is_byte_exact() {
     assert_eq!(last.bytes[3], status::GOOD);
 }
 
+/// A device chunk split across several Data-In PDUs in `--banks dual`: every
+/// PDU after the first frames its BHS in front of the remaining payload (which
+/// stays where the device wrote it) and the bytes are still exact.
+#[test]
+fn overlap_split_chunk_frames_before_the_payload_and_stays_byte_exact() {
+    const BLOCKS: u16 = 8; // 4 KiB: one device chunk
+    const TOTAL: usize = BLOCKS as usize * 512;
+    const SEGMENT: usize = 1024;
+
+    let mut ram = vec![0u8; TOTAL];
+    for (i, b) in ram.iter_mut().enumerate() {
+        *b = (i % 253) as u8;
+    }
+    let expected = ram.clone();
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(BLOCKS as u64, 512, 0)];
+    let mut table: Vec<&mut dyn Lu<Pair = TestPair>> = slots
+        .iter_mut()
+        .map(|s| s as &mut dyn Lu<Pair = TestPair>)
+        .collect();
+    let mut target = Target::new(&mut table[..]);
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+
+    let mut session = IscsiSession::new().with_overlap();
+    let mut work = vec![0u8; 2 * BANK];
+    let mut scratch = Vec::new();
+    let mut conn = MockConn::new();
+    // Declare a segment far below the bank so the chunk must be split.
+    let mut text = String::from(REQ_TEXT);
+    let key = "MaxRecvDataSegmentLength=";
+    let start = text.find(key).unwrap() + key.len();
+    let end = text[start..].find('\0').unwrap() + start;
+    text.replace_range(start..end, &SEGMENT.to_string());
+    conn.feed_padded(&login_bhs(text.len() as u32), text.as_bytes());
+    conn.feed(&read10_bhs(0, BLOCKS, 11, 0), &[]);
+
+    let mut sent = Vec::new();
+    drive(
+        &mut session,
+        &mut conn,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &mut sent,
+    );
+
+    let data_pdus: Vec<&Sent> = sent
+        .iter()
+        .filter(|p| p.opcode() == op::SCSI_DATA_IN)
+        .collect();
+    assert_eq!(
+        data_pdus.len(),
+        TOTAL / SEGMENT,
+        "the 4 KiB chunk must span one PDU per declared segment"
+    );
+    let first_base = data_pdus[0].offset;
+    assert!(
+        first_base == 0 || first_base == BANK,
+        "the first PDU starts at a bank base"
+    );
+    for (i, pdu) in data_pdus.iter().enumerate() {
+        assert_eq!(
+            pdu.offset,
+            first_base + i * SEGMENT,
+            "PDU {i} frames its BHS immediately before its payload"
+        );
+        assert_eq!(pdu.dsl(), SEGMENT, "every PDU carries one declared segment");
+        assert_eq!(pdu.bytes.len(), BHS_SIZE + SEGMENT);
+    }
+    assert_eq!(
+        data_in_payload(&sent),
+        expected,
+        "the split chunk must reassemble byte-exactly"
+    );
+}
+
 /// The command BHS is read at the command bank, and a Data-In chunk staged from
 /// the alternate bank carries that bank's base in its deferred send.
 #[test]

@@ -1760,7 +1760,7 @@ impl IscsiSession {
             _ => BankSide::Work,
         };
         let base = self.send_base(chunk_bank);
-        let total = self.build_data_in(
+        let (base, total) = self.build_data_in(
             work,
             base,
             self.cmd_itt,
@@ -1792,7 +1792,7 @@ impl IscsiSession {
         status: u8,
     ) -> Emit {
         self.note_status(self.cmd_itt);
-        let total = self.build_data_in(
+        let (base, total) = self.build_data_in(
             work,
             base,
             self.cmd_itt,
@@ -1826,15 +1826,42 @@ impl IscsiSession {
         data_sn: u32,
         f_bit: bool,
         scsi_status: Option<u8>,
-    ) -> usize {
+    ) -> (usize, usize) {
         let len = len as usize;
-        if bank > 0 && len > 0 {
+        let bank = bank as usize;
+        // The device's send chunk starts at the head of the SCSI data area, so
+        // when an earlier PDU of the same chunk already went out the remaining
+        // bytes sit `bank` bytes further along. Framing the PDU at `base +
+        // bank` instead of moving the payload back in front of the BHS keeps
+        // the transfer copy-free: the `BHS_SIZE` bytes the header overwrites
+        // are the previous PDU's header plus the prefix of the payload that is
+        // already on the wire. `pad` is the only thing that can run past the
+        // bank; a 1-3 byte tail moves instead (unreachable for sector-multiple
+        // transfers, where `pad` is always zero).
+        let pad = pdu_pad_len(len as u32) as usize;
+        let moved = bank + len + pad > self.bank_len;
+        if moved && bank == 0 && self.bank_len != 0 {
+            // Nothing to shift, so the PDU must already fit: `phase_len <=
+            // bank_len` (the runner validates the window) and `bank_len` is a
+            // multiple of four (checked when the bank is derived), so a
+            // 1-3 byte padding can never push past the data area. Assert it
+            // instead of trusting three separate call sites to stay that way.
+            // `bank_len == 0` means no command bank was derived (a response
+            // assembled outside `drive()`, e.g. a no-LUN REQUEST SENSE), which
+            // frames at the PDU base and has no data area to overflow.
+            debug_assert!(
+                len + pad <= self.bank_len,
+                "Data-In PDU overflows the bank data area: {len}+{pad} > {}",
+                self.bank_len
+            );
+        }
+        if moved && bank > 0 && len > 0 {
             // The device's send buffer for this chunk sits at the start of the
             // SCSI data area; move it in front of the BHS.
-            let start = base + BHS_SIZE + bank as usize;
-            let end = start + len;
-            work.copy_within(start..end, base + BHS_SIZE);
+            let start = base + BHS_SIZE + bank;
+            work.copy_within(start..start + len, base + BHS_SIZE);
         }
+        let hdr = if moved { base } else { base + bank };
         let mut bhs = Bhs::new();
         bhs.set_opcode(op::SCSI_DATA_IN);
         let mut flags = if f_bit { flag::F_BIT } else { 0 };
@@ -1852,18 +1879,17 @@ impl IscsiSession {
         bhs.set_stat_sn(self.stat_sn.get());
         bhs.set_exp_cmd_sn(self.cmd_sn.wrapping_add(1));
         bhs.set_max_cmd_sn(self.cmd_sn.wrapping_add(1));
-        work[base..base + BHS_SIZE].copy_from_slice(bhs.as_bytes());
+        work[hdr..hdr + BHS_SIZE].copy_from_slice(bhs.as_bytes());
         let total = BHS_SIZE + len;
         // Every Data-In PDU is padded to a 4-byte boundary, including
         // intermediate chunks: an intermediate tail may be 1-3 bytes long.
-        let pad = pdu_pad_len(len as u32) as usize;
         if pad > 0 {
-            work[base + total..base + total + pad].fill(0);
+            work[hdr + total..hdr + total + pad].fill(0);
         }
         if scsi_status.is_some() {
             self.stat_sn.set(self.stat_sn.get().wrapping_add(1));
         }
-        total + pad
+        (hdr, total + pad)
     }
 
     fn build_r2t(&mut self, work: &mut [u8]) {
@@ -2155,7 +2181,7 @@ impl IscsiSession {
             // A Data-In carrying the fixed-format sense; the command is not
             // driven by any slot.
             self.note_status(itt);
-            let total =
+            let (base, total) =
                 self.build_data_in(work, base, itt, 0, 0, n as u32, 0, true, Some(status::GOOD));
             self.session = Session::Send {
                 len: total,
@@ -3418,7 +3444,8 @@ mod tests {
         let mut session = IscsiSession::new();
         session.cmd_itt = 1;
         let mut work = vec![0xAAu8; BHS_SIZE + 8];
-        let total = session.build_data_in(&mut work, 0, 1, 0, 0, 1, 0, false, None);
+        let (base, total) = session.build_data_in(&mut work, 0, 1, 0, 0, 1, 0, false, None);
+        assert_eq!(base, 0);
         assert_eq!(total, BHS_SIZE + 1 + 3);
         assert_eq!(&work[BHS_SIZE + 1..BHS_SIZE + 4], &[0, 0, 0]);
     }
@@ -3453,7 +3480,10 @@ mod tests {
         let payload = [1u8, 2, 3, 4, 5];
         let src = BANK + BHS_SIZE + 16;
         work[src..src + payload.len()].copy_from_slice(&payload);
-        let len = session.build_data_in(
+        // The bank has no room for the payload's padding at the shifted
+        // position, so framing falls back to moving the payload.
+        session.bank_len = 8;
+        let (base, len) = session.build_data_in(
             &mut work,
             BANK,
             session.cmd_itt,
@@ -3465,12 +3495,13 @@ mod tests {
             None,
         );
         assert_eq!(len, BHS_SIZE + payload.len() + 3, "the PDU is padded");
+        assert_eq!(base, BANK, "the fallback frames at the bank base");
 
-        let bhs = Bhs::from_bytes(work[BANK..BANK + BHS_SIZE].try_into().unwrap());
+        let bhs = Bhs::from_bytes(work[base..base + BHS_SIZE].try_into().unwrap());
         assert_eq!(bhs.opcode(), op::SCSI_DATA_IN);
         assert_eq!(bhs.data_segment_len() as usize, payload.len());
         assert_eq!(
-            &work[BANK + BHS_SIZE..BANK + BHS_SIZE + payload.len()],
+            &work[base + BHS_SIZE..base + BHS_SIZE + payload.len()],
             &payload,
             "the payload is moved directly behind the bank's BHS"
         );
@@ -3479,7 +3510,7 @@ mod tests {
             "the slot in front of the base is untouched"
         );
         assert!(
-            work[BANK + len..src].iter().all(|&b| b == 0xAA),
+            work[base + len..src].iter().all(|&b| b == 0xAA),
             "nothing between the PDU end and the source is touched"
         );
 
@@ -3491,7 +3522,7 @@ mod tests {
         let mut scratch = [0u8; 0];
         session.session = Session::Send {
             len,
-            base: BANK,
+            base,
             kind: SendKind::Continue,
         };
         match session.poll(
@@ -3533,6 +3564,54 @@ mod tests {
             }
             other => panic!("expected HostRecv, got {other:?}"),
         }
+    }
+
+    /// A later PDU of the same device chunk frames its BHS immediately in front
+    /// of the remaining payload, so the payload is never moved.
+    #[test]
+    fn a_split_chunk_frames_the_header_in_front_of_the_payload() {
+        const BANK: usize = 0;
+        const AREA: usize = 64;
+
+        let mut session = IscsiSession::new();
+        session.cmd_itt = 9;
+        session.recv_mdsl_fixed = true;
+        session.bank_len = AREA;
+        let mut work = vec![0xAAu8; BHS_SIZE + AREA];
+
+        // The device wrote the whole chunk at the head of the data area.
+        let payload: [u8; 16] = core::array::from_fn(|i| (i + 1) as u8);
+        work[BHS_SIZE..BHS_SIZE + payload.len()].copy_from_slice(&payload);
+
+        // 3 bytes of the chunk already went out: `bank` is that offset.
+        let (base, len) = session.build_data_in(
+            &mut work,
+            BANK,
+            9,
+            /* offset */ 3,
+            /* bank */ 3,
+            (payload.len() - 3) as u32,
+            1,
+            false,
+            None,
+        );
+        assert_eq!(base, BANK + 3, "the header moves in front of the payload");
+        // 13 bytes of payload plus the 3-byte padding fill the rest.
+        assert_eq!(len, BHS_SIZE + payload.len());
+
+        let bhs = Bhs::from_bytes(work[base..base + BHS_SIZE].try_into().unwrap());
+        assert_eq!(bhs.opcode(), op::SCSI_DATA_IN);
+        assert_eq!(bhs.data_segment_len() as usize, payload.len() - 3);
+        assert_eq!(bhs.buffer_offset(), 3);
+        assert_eq!(
+            &work[base + BHS_SIZE..base + BHS_SIZE + payload.len() - 3],
+            &payload[3..],
+            "the payload stays where the device wrote it"
+        );
+        assert!(
+            work[base + len..].iter().all(|&b| b == 0xAA),
+            "nothing behind the padded PDU is touched"
+        );
     }
 
     /// A declared segment plus padding that fits the whole work slice but not

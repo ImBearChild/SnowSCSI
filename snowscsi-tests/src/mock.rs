@@ -541,7 +541,8 @@ mod tests {
         let mut count = 0;
         let mut expected_bo = 0u32;
         let mut expected_dsn = 0u32;
-        while let Some((bhs, _data)) = conn.take_pdu() {
+        let mut collected = Vec::new();
+        while let Some((bhs, data)) = conn.take_pdu() {
             if bhs[0] & 0x3F != op::SCSI_DATA_IN {
                 continue;
             }
@@ -550,6 +551,9 @@ mod tests {
             let dsl = (u32::from(bhs[5]) << 16) | (u32::from(bhs[6]) << 8) | u32::from(bhs[7]);
             assert_eq!(bo, expected_bo, "BufferOffset mismatch");
             assert_eq!(dsn, expected_dsn, "DataSN mismatch");
+            // Every PDU after the first is framed in front of the remaining
+            // payload instead of being moved, so the bytes must still line up.
+            collected.extend_from_slice(&data);
             if bhs[1] & flag::F_BIT != 0 {
                 assert_ne!(bhs[1] & flag::S_BIT, 0, "final Data-In must have S bit");
                 assert_eq!(&bhs[24..28], &be32(1)); // StatSN advanced
@@ -563,6 +567,10 @@ mod tests {
             "expected >= 2 Data-In PDUs for the 4096-byte read"
         );
         assert_eq!(expected_bo, 4096);
+        assert_eq!(
+            collected, pattern,
+            "the Data-In payloads must reassemble byte-exactly"
+        );
     }
 
     // ── WRITE(10): immediate data → R2T → Data-Out → status ───────
