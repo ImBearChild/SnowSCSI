@@ -452,7 +452,7 @@ impl<'d: 'static> SdCard<'d> {
         // Restore order matters: LDO_VO4 first (the slot-0 pads are powered
         // from it and the pull-ups must settle the lines), then Q1. The card
         // then cold-boots: the bring-up's ACMD41 shows `bit24 = 1` (S18A=1,
-        // a cold card) and CMD11 runs. See `__SD_UHS_HANDOFF.md` §2.
+        // a cold card), which is what lets CMD11 run.
         {
             // High = off, Low = powered (confirmed twice: leaving the pin High
             // fails SD init, and the long-standing firmware leaves it Low and

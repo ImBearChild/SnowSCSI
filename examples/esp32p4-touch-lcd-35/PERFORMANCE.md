@@ -307,7 +307,7 @@ worth tuning.
 
 ### 5.1 SDR50 (100 MHz): the bypassed divider needs the other drive edge
 
-Once the card comes up cold (the Q1 + LDO_VO4 cut, §2 of the UHS handoff) and
+Once the card comes up cold (the Q1 + LDO_VO4 cut described in `src/sd.rs`) and
 advertises UHS-I, `sdio` runs CMD11 and the switch succeeds. Reaching SDR50 is
 then only about the clock plumbing, and the vendor driver had two blockers:
 

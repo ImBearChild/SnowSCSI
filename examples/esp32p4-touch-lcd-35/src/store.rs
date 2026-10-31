@@ -128,7 +128,7 @@ impl<'a> Backing<'a> {
 
 /// Fixed-slot asynchronous storage over the LUN's byte plane.
 ///
-/// Both the task and this adapter run in the same future (one `join3`), so the
+/// Both the task and this adapter run in the same future (one `join4`), so the
 /// same-executor `NoopRawMutex` channels need no spawner, `Send` bound or
 /// `critical-section` implementation.
 pub struct SdStore<'c, 'b> {
@@ -295,7 +295,11 @@ impl<'c, 'b> SdStore<'c, 'b> {
         }
         match self.slots[index].as_ref().unwrap().state {
             SlotState::Waiting => {
+                // `begin` only creates a `Waiting` slot for `FromHost`, and
+                // `buf_matches` already rejected a mismatched buffer, so this
+                // arm is defensive: spend the token if it is ever reached.
                 let IoBuf::Write(data) = buf else {
+                    self.release(index);
                     return Poll::Ready(contract());
                 };
                 let Some(stage) = self.buf.as_mut() else {
@@ -397,7 +401,7 @@ impl AsyncWake for SdStore<'_, '_> {
 
 /// SD worker: execute jobs until the gadget future is dropped.
 ///
-/// One future in the gadget's `join3`; it borrows the card for its lifetime.
+/// One future in the gadget's `join4`; it borrows the card for its lifetime.
 /// Each completed job posts its buffer back and wakes the `Storage` side.
 pub async fn sd_task<'b>(
     backing: &mut Backing<'_>,

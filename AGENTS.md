@@ -138,6 +138,7 @@ git checkout legacy
   uses `CliLu`/`CliPair` in `snowscsi-cli/src/stack.rs`). Per-LUN storage
   routing goes through `Storage::select_lun`. The legacy `scsi::ScsiDevice`
   path still exists for the `snowscsi::scsi` profiles but no longer drives the
-  transports. See `__SEAM_REWRITE.md` (agent memory) for the full design.
+  transports. The seam is documented in-tree (`snowscsi/src/core/lu.rs`,
+  `snowscsi/src/core/runner.rs`, `snowscsi/src/core/device.rs`).
   Dual-mount of the same path across planes is warned but permitted (each LUN
   is an independent SCSI device).

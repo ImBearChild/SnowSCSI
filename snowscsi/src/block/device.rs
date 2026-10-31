@@ -687,6 +687,8 @@ impl Device for BlockDevice {
                 self.send_chunk_with_prefetch(data, alt)
             }
             (Stage::Send, FeedbackKind::HostSent) => {
+                // Plain path: this send carried no companion, so only the host
+                // fact is settled here and the next chunk is read ahead below.
                 let len = self.chunk_len;
                 let (accepted, failed) = host_facts(fb, len);
                 self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);

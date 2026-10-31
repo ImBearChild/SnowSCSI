@@ -271,7 +271,11 @@ impl<'c, 'b> SdStore<'c, 'b> {
         }
         match self.slots[index].as_ref().unwrap().state {
             SlotState::Waiting => {
+                // `begin` only creates a `Waiting` slot for `FromHost`, and
+                // `buf_matches` already rejected a mismatched buffer, so this
+                // arm is defensive: spend the token if it is ever reached.
                 let IoBuf::Write(data) = buf else {
+                    self.release(index);
                     return Poll::Ready(contract());
                 };
                 let Some(stage) = self.buf.as_mut() else {

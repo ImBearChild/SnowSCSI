@@ -1046,6 +1046,9 @@ impl Runner {
                                 host.cancel(token);
                             }
                             state.pending = None;
+                            // Transient: the companion is polled below and the
+                            // state is only published again with a live token
+                            // (or settled here without publishing).
                             state.retained_host =
                                 Some((req, sanitize_host_receipt(req, raw, self.owner)));
                         }
@@ -1187,21 +1190,19 @@ impl Runner {
     }
 
     /// Transport end/fatal path.
+    ///
+    /// Every outcome that reaches here settles the device as `Stop`: which
+    /// terminal event fired is already carried by the returned `RunOutcome`,
+    /// and `Stop` is the only reason that means "the command did not finish on
+    /// its own".
     fn abort_active<L: Lu + ?Sized>(
         &mut self,
         lu: &mut L,
         storage: &mut dyn Storage,
         host: &mut dyn HostTransport,
-        outcome: RunOutcome,
+        _outcome: RunOutcome,
     ) -> Result<(), Fault> {
-        let reason = match outcome {
-            RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                ..
-            } => InterruptReason::Stop,
-            _ => InterruptReason::Stop,
-        };
-        self.settle_abnormally(lu, storage, host, reason)
+        self.settle_abnormally(lu, storage, host, InterruptReason::Stop)
     }
 
     /// Apply a pending `Control::Abort`: cancel the pending token, settle with
@@ -3203,6 +3204,13 @@ fn slice_offset(
 ///
 /// A combined companion must live in the bank the host step does not use; the
 /// runner rejects an overlapping window before submitting anything.
+/// Whether two step windows share bytes.
+///
+/// Defensive: a safe `PollStep` cannot produce an overlap, because the host
+/// slice and the companion buffer come from one step (so one `&[u8]` and one
+/// `&mut [u8]` would have to alias, which safe Rust forbids). The check pins
+/// the rule for adapters that build steps through `unsafe` internals and is
+/// unit-tested directly.
 fn windows_overlap(a: &[u8], b: &[u8]) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
