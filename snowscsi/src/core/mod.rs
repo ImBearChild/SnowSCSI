@@ -27,6 +27,10 @@
 //!   [`Storage`](crate::core::storage::Storage) /
 //!   [`HostTransport`](crate::core::storage::HostTransport) and their
 //!   synchronous adapters;
+//! - [`slots`](crate::core::slots) — the runtime-free asynchronous slot
+//!   adapter ([`SlotPool`](crate::core::slots::SlotPool) →
+//!   [`SlotStore`](crate::core::slots::SlotStore) /
+//!   [`SlotTask`](crate::core::slots::SlotTask));
 //! - [`collections`](crate::core::collections), [`lu`](crate::core::lu),
 //!   [`runner`](crate::core::runner), [`target`](crate::core::target) — slot
 //!   sets, the `Lu` seam, the runner state machine and the
@@ -52,6 +56,7 @@ pub mod management;
 pub mod permit;
 pub mod profile;
 pub mod runner;
+pub mod slots;
 pub mod spc;
 pub mod storage;
 pub mod target;
@@ -76,6 +81,7 @@ pub use self::management::{BoundaryReject, Change, ChangeResult, LuInfo};
 pub use self::permit::{BoundaryPermit, CommandPermit, ExecutionGuard, OwnerBindPermit};
 pub use self::profile::{Capacity, SpcProfile};
 pub use self::runner::{DriveStep, PendingKind, RunEnd, RunOutcome, Runner};
+pub use self::slots::{Job as SlotJob, SlotPool, SlotStore, SlotTask};
 pub use self::spc::Spc;
 pub use self::target::{StaticTarget, Target};
 pub use self::ua::{ClearReason, ClearRule, Ua, UaClass, UaSet};
