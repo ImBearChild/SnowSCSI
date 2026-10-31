@@ -43,7 +43,6 @@ use esp_hal::usb::otg::{
 };
 
 use embassy_executor::Spawner;
-use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::driver::{EndpointIn, EndpointOut};
 use static_cell::StaticCell;
@@ -53,7 +52,7 @@ use defmt::{info, warn};
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
 
-use store::{Backing, DoneChan, JobChan, SdStore, STAGE};
+use store::{Backing, SdPool, STAGE};
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -98,6 +97,12 @@ static SCRATCH: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 /// exactly one copy exists.
 static SD_BUF: StaticCell<[u8; STAGE]> = StaticCell::new();
 
+/// Slot table, staging buffer and wakers of the asynchronous storage adapter.
+///
+/// The pool is split into the `Storage` side (the BOT loop) and the task side
+/// (the SD worker) once, in [`gadget`].
+static SD_POOL: StaticCell<SdPool> = StaticCell::new();
+
 /// Shutdown flag handed to the BOT serve loop.
 ///
 /// This firmware never tears the gadget down, so the flag is never set; it
@@ -130,7 +135,7 @@ async fn gadget<'d, D, O, I, S>(
     scratch: &mut [u8],
     target: &mut Target<S>,
     backing: &mut Backing<'_>,
-    sd_buf: &mut [u8; STAGE],
+    sd_pool: &'static SdPool,
     stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
@@ -142,22 +147,19 @@ where
     I: EndpointIn,
     S: RuntimeSet,
 {
-    // Storage plumbing. The two channels and the waker are small locals of
-    // this future; the staging buffer is the static `SD_BUF`. `msc::run` posts
-    // a job, the worker executes it on the card, and the completion wakes the
+    // Storage plumbing. The library pool owns the slot table, the staging
+    // buffer and both wakers; `msc::run` drives the `Storage` side, the worker
+    // executes the jobs it is handed, and a completion wakes the
     // `StoragePending` wait. Both sides run in this one `join4` (same
-    // executor), so the no-op-lock channels need no spawner, `Send` or
+    // executor), which is what the pool requires: no spawner, `Send` bound or
     // `critical-section` implementation.
-    let job_chan: JobChan<'_> = Channel::new();
-    let done_chan: DoneChan<'_> = Channel::new();
-    let wake = store::storage_waker();
-    let mut storage = SdStore::new(&job_chan, &done_chan, &wake, sd_buf);
+    let (mut storage, jobs) = sd_pool.split();
 
     esp_println::println!("stage: gadget enter");
     embassy_futures::join::join4(
         device.run(),
         msc::run(bot, session, work, scratch, target, &mut storage, stop),
-        store::sd_task(backing, &job_chan, &done_chan, &wake),
+        store::sd_task(backing, &jobs),
         async {
             // Live status on the panel (and the same numbers over the CH343P
             // USB-UART console), delta-sampled once per 500 ms window.
@@ -463,8 +465,10 @@ async fn main(_spawner: Spawner) -> ! {
         Backing::sd(card)
     };
     // One staging buffer for the async SD worker. Parked in `.bss` like
-    // `WORK`/`SCRATCH`, because the main task stack is small.
-    let sd_buf: &'static mut [u8; STAGE] = SD_BUF.init([0u8; STAGE]);
+    // `WORK`/`SCRATCH`, because the main task stack is small. The pool owns it
+    // for the life of the program; each gadget build splits the pool instead of
+    // moving the buffer.
+    let sd_pool = SD_POOL.init(SdPool::new(SD_BUF.init([0u8; STAGE])));
 
     // ── USB 2.0 High-Speed OTG device (internal UTMI PHY, no pins) ───────
     let usb = Usb::new_hs(peripherals.USB_HS);
@@ -575,7 +579,7 @@ async fn main(_spawner: Spawner) -> ! {
         &mut *scratch,
         &mut target,
         &mut backing,
-        &mut *sd_buf,
+        sd_pool,
         &STOP,
         &mut display,
         sd_bytes,

@@ -436,13 +436,7 @@ impl Lu for TestLu {
 
 /// Core fault for a byte-plane error.
 pub fn map_storage_error(e: snowscsi::common::seekable_storage::StorageError) -> Fault {
-    use snowscsi::common::seekable_storage::StorageError;
-    match e {
-        StorageError::OutOfBounds => Fault::OutOfBounds,
-        StorageError::NotWritable => Fault::NotWritable,
-        StorageError::Io(_) => Fault::Io,
-        StorageError::Unsupported => Fault::Unsupported,
-    }
+    Fault::from(e)
 }
 
 /// Multi-LUN synchronous storage adapter routing by the runner's LUN hook.

@@ -40,7 +40,6 @@ use esp_hal::usb::otg::{
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
-use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::driver::{EndpointIn, EndpointOut};
 use static_cell::StaticCell;
@@ -50,7 +49,7 @@ use defmt::info;
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
 
-use store::{DoneChan, JobChan, SdStore, STAGE};
+use store::{SdPool, STAGE};
 
 // Panic handler (`esp-backtrace` with `panic-handler`).
 use esp_backtrace as _;
@@ -93,6 +92,12 @@ static SCRATCH: StaticCell<[u8; drive::WORK_LEN]> = StaticCell::new();
 /// DVDRAM rebuild of the gadget.
 static SD_BUF: StaticCell<[u8; STAGE]> = StaticCell::new();
 
+/// Slot table, staging buffer and wakers of the asynchronous storage adapter.
+///
+/// The pool is split into the `Storage` side (the BOT loop) and the task side
+/// (the SD worker) on every gadget build; the buffer stays inside it.
+static SD_POOL: StaticCell<SdPool> = StaticCell::new();
+
 /// Shutdown flag handed to the BOT serve loop.
 ///
 /// This firmware tears the gadget down by dropping its future when BOOT is
@@ -126,7 +131,7 @@ async fn gadget<'d, D, O, I, S>(
     scratch: &mut [u8],
     target: &mut Target<S>,
     card: &mut sd::SdCard<'_>,
-    sd_buf: &mut [u8; STAGE],
+    sd_pool: &'static SdPool,
     stop: &AtomicBool,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
@@ -138,21 +143,18 @@ where
     I: EndpointIn,
     S: RuntimeSet,
 {
-    // Storage plumbing. The two channels and the waker are small locals of
-    // this future; the staging buffer is the static `SD_BUF`. `msc::run` posts
-    // a job, the worker executes it on the card, and the completion wakes the
+    // Storage plumbing. The library pool owns the slot table, the staging
+    // buffer and both wakers; `msc::run` drives the `Storage` side, the worker
+    // executes the jobs it is handed, and a completion wakes the
     // `StoragePending` wait. Both sides run in this one `join4` (same
-    // executor), so the no-op-lock channels need no spawner, `Send` or
+    // executor), which is what the pool requires: no spawner, `Send` bound or
     // `critical-section` implementation.
-    let job_chan: JobChan<'_> = Channel::new();
-    let done_chan: DoneChan<'_> = Channel::new();
-    let wake = store::storage_waker();
-    let mut storage = SdStore::new(&job_chan, &done_chan, &wake, sd_buf);
+    let (mut storage, jobs) = sd_pool.split();
 
     embassy_futures::join::join4(
         device.run(),
         msc::run(bot, session, work, scratch, target, &mut storage, stop),
-        store::sd_task(card, &job_chan, &done_chan, &wake),
+        store::sd_task(card, &jobs),
         async {
             // Uptime: seconds since boot, redisplayed every refresh. The
             // readout only advances because *this* loop runs, so a frozen
@@ -313,7 +315,7 @@ async fn main(spawner: Spawner) -> ! {
     // cancelled and rebuilt without moving them.
     let mut table: [&mut dyn Lu<Pair = drive::DvdRamPair>; 1] = [&mut drive];
     let mut target = Target::new(&mut table[..]);
-    let sd_buf: &'static mut [u8; STAGE] = SD_BUF.init([0u8; STAGE]);
+    let sd_pool = SD_POOL.init(SdPool::new(SD_BUF.init([0u8; STAGE])));
 
     // ── Persistent per-program state ─────────────────────────────────────
     //
@@ -454,6 +456,13 @@ async fn main(spawner: Spawner) -> ! {
                 // Run the gadget until BOOT is pressed. `gadget` returns `!`,
                 // so only the BOOT arm is reachable; `Either::First` carries
                 // the never type and can never be constructed.
+                //
+                // Dropping the gadget future leaves the storage pool behind:
+                // an in-flight job returns its buffer when the job is dropped,
+                // but a receipt the BOT loop never polled would still hold it.
+                // `reset` clears both, so the rebuilt gadget starts from a
+                // clean slot table and the one staging buffer.
+                sd_pool.reset();
                 match select(
                     gadget(
                         &mut device,
@@ -463,7 +472,7 @@ async fn main(spawner: Spawner) -> ! {
                         &mut *scratch,
                         &mut target,
                         &mut card,
-                        &mut *sd_buf,
+                        sd_pool,
                         &STOP,
                         &mut display,
                         sd_bytes,

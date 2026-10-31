@@ -28,7 +28,7 @@ use snowscsi::common::seekable_storage::{FlatData, StorageError, WritableFlatDat
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{Direction, Effect, Fault};
 
-use super::{map_storage_error, OwnedPlane};
+use super::OwnedPlane;
 
 /// Fixed slot table size, matching the library's synchronous adapter.
 const SLOTS: usize = 4;
@@ -316,15 +316,7 @@ impl WorkerPlane {
                 }
                 match slot.result.unwrap() {
                     Ok(()) => Poll::Ready(StorageReceipt::ok(confirmed)),
-                    Err(e) => Poll::Ready(StorageReceipt::failed(
-                        map_storage_error(e),
-                        0,
-                        if req.dir == Direction::FromHost {
-                            Effect::UnknownRemainder
-                        } else {
-                            Effect::Known
-                        },
-                    )),
+                    Err(e) => Poll::Ready(StorageReceipt::failed_for(req.dir, e)),
                 }
             }
             SlotState::Cancelled => Poll::Ready(contract()),

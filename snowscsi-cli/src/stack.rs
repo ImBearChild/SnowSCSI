@@ -655,15 +655,7 @@ impl Storage for CliStorage<'_> {
         };
         match plane.do_op(op) {
             Ok(()) => Poll::Ready(StorageReceipt::ok(confirmed)),
-            Err(e) => Poll::Ready(StorageReceipt::failed(
-                map_storage_error(e),
-                0,
-                if req.dir == snowscsi::core::Direction::FromHost {
-                    Effect::UnknownRemainder
-                } else {
-                    Effect::Known
-                },
-            )),
+            Err(e) => Poll::Ready(StorageReceipt::failed_for(req.dir, e)),
         }
     }
 
@@ -682,17 +674,6 @@ impl Storage for CliStorage<'_> {
 impl snowscsi::core::async_wake::AsyncWake for CliStorage<'_> {
     fn poll_wake(&mut self, _cx: &mut core::task::Context<'_>) -> Poll<()> {
         Poll::Ready(())
-    }
-}
-
-/// Map the byte-plane error vocabulary onto the core fault vocabulary.
-pub fn map_storage_error(e: snowscsi::common::seekable_storage::StorageError) -> Fault {
-    use snowscsi::common::seekable_storage::StorageError;
-    match e {
-        StorageError::OutOfBounds => Fault::OutOfBounds,
-        StorageError::NotWritable => Fault::NotWritable,
-        StorageError::Io(_) => Fault::Io,
-        StorageError::Unsupported => Fault::Unsupported,
     }
 }
 
