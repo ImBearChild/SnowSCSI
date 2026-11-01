@@ -50,11 +50,20 @@ class ModeConfigTest(unittest.TestCase):
         self.assertEqual(int(cfg["per_bank"]) * 2, int(cfg["work"]))
 
     @unittest.skipUnless(have_async_wire(), "requires the tokio feature")
-    def test_async_dual_uses_the_worker(self):
+    def test_async_dual_over_a_file_or_ram_lun_uses_the_pool(self):
         cfg = self._config("--banks", "dual", "--wire", "async")
         self.assertEqual(cfg["wire"], "async")
-        self.assertEqual(cfg["storage"], "worker")
+        self.assertEqual(cfg["storage"], "pool")
         self.assertEqual(int(cfg["per_bank"]) * 2, int(cfg["work"]))
+
+    @unittest.skipUnless(have_async_wire(), "requires the tokio feature")
+    def test_async_dual_over_a_live_scan_keeps_the_worker(self):
+        # A live ISO scan reads through its own blocking scanner, which the
+        # slot pool cannot drive without blocking the runtime.
+        cfg = self._config(
+            "--cdrom", "live=/tmp", "--banks", "dual", "--wire", "async"
+        )
+        self.assertEqual(cfg["storage"], "worker")
 
     @unittest.skipUnless(have_async_wire(), "requires the tokio feature")
     def test_async_single_stays_inline(self):
