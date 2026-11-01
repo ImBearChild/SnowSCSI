@@ -54,6 +54,13 @@ pub fn write_all<C: Conn + ?Sized>(conn: &mut C, mut buf: &[u8]) -> Result<(), (
 /// (a short TCP read); `Ok(0)` is EOF. `write_all` must consume the whole
 /// buffer or report an error. Error kinds are deliberately coarse for the same
 /// reason as [`Conn`]: any transport failure closes the connection.
+///
+/// A TCP implementation must disable Nagle (`set_nodelay(true)`): an iSCSI
+/// exchange is request/response, so coalescing writes buys nothing, while a
+/// PDU whose tail trails earlier segments waits for a delayed ACK (~40 ms) on
+/// every command. That turns a chunked `READ` — several Data-In PDUs for one
+/// CDB — into a 20-100x slowdown; [`crate::iscsi::transport::TcpConn`] does
+/// this for the blocking transport.
 #[cfg(feature = "async-io")]
 #[allow(async_fn_in_trait)]
 pub trait AsyncConn {

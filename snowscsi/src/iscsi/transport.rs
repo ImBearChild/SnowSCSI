@@ -45,7 +45,14 @@ pub struct TcpConn {
 
 impl TcpConn {
     /// Wrap `stream`, applying `read_timeout` (`None` = no timeout).
+    ///
+    /// Nagle's algorithm is disabled: an iSCSI exchange is request/response
+    /// (the target writes a PDU only after the initiator asked for it), so
+    /// coalescing small writes buys nothing and costs a delayed-ACK stall
+    /// (~40 ms) whenever a PDU's tail trails earlier segments. A chunked
+    /// `READ` that spans several Data-In PDUs hits that path on every command.
     pub fn new(stream: TcpStream, read_timeout: Option<Duration>) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(read_timeout)?;
         Ok(Self { stream })
     }

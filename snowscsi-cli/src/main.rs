@@ -1094,6 +1094,11 @@ where
             }
         };
         log::info!("accepted connection from {peer}");
+        // Same reason as `TcpConn::new`: iSCSI is request/response, so Nagle
+        // only adds a delayed-ACK stall per Data-In tail.
+        if let Err(e) = stream.set_nodelay(true) {
+            log::warn!("failed to disable Nagle on {peer}: {e}");
+        }
         let mut conn = TokioConn::new(stream);
         let mut session = if overlap {
             IscsiSession::new().with_overlap()
