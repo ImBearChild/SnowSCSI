@@ -35,6 +35,7 @@ import time
 import unittest
 
 from harness import (
+    BADBLOCKS_BLOCK,
     device_size,
     find_binary,
     have_tool,
@@ -504,7 +505,9 @@ class _UsbScenario:
 
         # Full-disk destructive pattern test (like the iSCSI loopback).
         if have_tool("badblocks"):
-            sh("badblocks", "-wsv", dev, timeout=300)
+            # See `harness.BADBLOCKS_BLOCK`: a 1 KiB sweep is 64x the commands
+            # for the same coverage and dominates the suite's wall time.
+            sh("badblocks", "-wsv", "-b", BADBLOCKS_BLOCK, dev, timeout=300)
         else:
             print("  (badblocks not installed; skipping full-disk pattern test)")
 

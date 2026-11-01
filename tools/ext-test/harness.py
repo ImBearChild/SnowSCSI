@@ -318,10 +318,22 @@ def raw_roundtrip(dev, size, block=1 << 20):
         ) from None
 
 
+#: Block size for the destructive `badblocks -w` sweep.
+#:
+#: `badblocks -w` writes four patterns and reads each back, i.e. eight full
+#: passes over the device. Its default 1 KiB block turns a 32 MiB device into
+#: 256k SCSI commands per pass set; over five device/mode combinations that is
+#: well over a million commands and minutes of wall time, measuring initiator
+#: round-trip latency rather than the target. 64 KiB still covers every block
+#: of the device (four patterns, write + verify) at 1/64 the command count;
+#: small-transfer framing is covered by the filesystem payload tests.
+BADBLOCKS_BLOCK = os.environ.get("SNOWSCSI_EXT_BADBLOCKS_BLOCK", "65536")
+
+
 def full_disk_test(dev, size):
     """`badblocks -wsv` when available, else a raw pattern roundtrip."""
     if have_tool("badblocks"):
-        sh("badblocks", "-wsv", dev, timeout=300)
+        sh("badblocks", "-wsv", "-b", BADBLOCKS_BLOCK, dev, timeout=300)
     else:
         print("  (badblocks not installed; using a raw pattern roundtrip)")
         raw_roundtrip(dev, size)
