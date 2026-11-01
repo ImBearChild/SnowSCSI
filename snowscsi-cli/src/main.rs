@@ -50,6 +50,10 @@ use snowscsi::cdrom::media::LiveData;
 use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
+use snowscsi::common::seekable_storage::{FlatData, StorageError};
+use snowscsi::core::slots::{SlotPool, SlotTask};
+use snowscsi::core::storage::IoReq;
+use snowscsi::core::Direction;
 use snowscsi::core::{Lu, Spc, Writability};
 use snowscsi::iscsi::pdu::BHS_SIZE;
 #[cfg(feature = "tokio")]
@@ -62,7 +66,7 @@ use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{FlatCdMedium, MmcDrive};
-use snowscsi::scsi::backend::{BlockBackend, FileBackend, RamBackend, SeekableStorage};
+use snowscsi::scsi::backend::FileBackend;
 use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
 use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
@@ -70,6 +74,8 @@ use spec::{Backing, DeviceRole, DeviceSpec};
 use stack::tokio_conn::TokioConn;
 use stack::worker::WorkerStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[cfg(target_os = "linux")]
 use snowscsi::usb::{
@@ -248,7 +254,9 @@ struct ServeArgs {
     /// `dual` enables prefetching the next chunk into the alternate bank while
     /// the current one is on the wire, and gives the resident long operation
     /// its own bank. With a blocking wire the storage runs on per-LUN worker
-    /// threads, so reads and writes progress while the wire call is in flight.
+    /// threads; with `--wire async` over file or memory LUNs the library slot
+    /// pool drives it in the wire's own task (`--print-config` reports which:
+    /// `storage=pool|worker|inline`).
     /// The total must be even; each half must clear its transport's floor (512
     /// bytes for USB, 8240 with a 4-aligned data area for iSCSI). Defaults:
     /// USB 16K, iSCSI 16480. Cannot be combined with `--scratch-buffer`.
@@ -325,20 +333,26 @@ impl ServeConfig {
     }
 
     /// Storage execution model derived from the two switches.
-    fn storage(&self) -> &'static str {
+    ///
+    /// `pool` is the caller's answer to "can the library slot pool drive these
+    /// LUNs?": a dual-bank async session over file or memory planes runs
+    /// storage in the same task as the wire, everything else needs the
+    /// thread-bridged worker or the inline adapter.
+    fn storage(&self, pool: bool) -> &'static str {
         match (self.wire, self.banks) {
+            (Wire::Async, Banks::Dual) if pool => "pool",
             (_, Banks::Dual) => "worker",
             (_, Banks::Single) => "inline",
         }
     }
 
     /// The stable one-line `--print-config` rendering.
-    fn line(&self, lun: usize) -> String {
+    fn line(&self, lun: usize, pool: bool) -> String {
         format!(
             "wire={} banks={} storage={} per_bank={} work={} scratch={} lun={lun}",
             self.wire.as_str(),
             self.banks.as_str(),
-            self.storage(),
+            self.storage(pool),
             self.per_bank(),
             self.work_size,
             self.scratch_len.unwrap_or(0),
@@ -370,7 +384,10 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         }
     };
     if args.print_config {
-        println!("{}", config.line(specs.len()));
+        println!(
+            "{}",
+            config.line(specs.len(), pool_capable(&specs, &config))
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -445,13 +462,13 @@ fn resolve_config(args: &ServeArgs) -> Result<ServeConfig, String> {
 /// matching store planes. Every spec pushes exactly one slot and one plane, in
 /// spec order.
 #[allow(clippy::too_many_arguments)]
-fn build_core_slots<'a>(
+/// Build the per-LUN core slots and their storage planes.
+///
+/// One owned [`OwnedPlane`] is built per LUN in specification order; the slot
+/// keeps the geometry, the plane keeps the bytes.
+fn build_core_slots(
     specs: &[DeviceSpec],
-    ram_disks: &'a mut Vec<Vec<u8>>,
-    backends: &mut Vec<BlockBackend<'a>>,
-    lives: &mut Vec<LiveData<StdFsBackend>>,
-    bundles: &mut Vec<FlatBundle<StdFsBackend>>,
-    planes: &mut Vec<Option<OwnedPlane<'a>>>,
+    planes: &mut Vec<Option<OwnedPlane>>,
     slots: &mut Vec<CliLu>,
 ) -> Result<(), ()> {
     if specs.is_empty() {
@@ -461,67 +478,48 @@ fn build_core_slots<'a>(
     for w in spec::check_dual_mount(specs) {
         eprintln!("{w}");
     }
-    build_resources(specs, ram_disks, backends, lives, bundles)?;
+    let built = build_planes(specs)?;
 
     planes.clear();
     slots.clear();
-    // Move the owned backends out of the build pools: the planes own them now,
-    // so `CliStorage` never holds an erased (`!Send`) borrow.
-    let mut be_iter = backends.drain(..);
-    let mut live_iter = lives.drain(..);
-    #[cfg(feature = "bundle")]
-    let mut bundle_iter = bundles.drain(..);
-
+    let mut built = built.into_iter();
     for (lun, spec) in specs.iter().enumerate() {
         let backing = lun as u32;
         log::debug!("LUN {lun}: {}", spec.raw);
+        let Some(plane) = built.next() else {
+            eprintln!("snowscsi: internal: plane pool exhausted");
+            return Err(());
+        };
+        let cap = plane.capacity();
         match (spec.role, &spec.backing) {
-            #[cfg(feature = "bundle")]
-            (DeviceRole::BlockDisk, Backing::ImgDir { dir }) => {
-                let be = bundle_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
-                let cap = be.capacity();
+            (DeviceRole::BlockDisk, Backing::ImgDir { .. }) => {
                 let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
                 }
-                planes.push(Some(OwnedPlane::Bundle(be)));
+                planes.push(Some(plane));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
                 )));
                 log::debug!("LUN {lun}: bundle block device ({cap} bytes)");
-                let _ = dir;
             }
-            #[cfg(feature = "bundle")]
-            (DeviceRole::BlockCd, Backing::ImgDir { dir }) => {
-                let be = bundle_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: bundle pool exhausted"))?;
-                let cap = be.capacity();
+            (DeviceRole::BlockCd, Backing::ImgDir { .. }) => {
                 let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
                 attrs.write_mode = Writability::ReadOnly;
-                planes.push(Some(OwnedPlane::Bundle(be)));
+                planes.push(Some(plane));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
                 )));
                 log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
-                let _ = dir;
             }
             (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
                 let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
-                    planes.push(Some(OwnedPlane::BlockRo(be)));
-                } else {
-                    planes.push(Some(OwnedPlane::BlockRw(be)));
                 }
+                planes.push(Some(plane));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
@@ -529,13 +527,9 @@ fn build_core_slots<'a>(
                 log::debug!("LUN {lun}: block device ({cap} bytes)");
             }
             (DeviceRole::BlockCd, Backing::Img { .. } | Backing::Ram { .. }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
                 let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
                 attrs.write_mode = Writability::ReadOnly;
-                planes.push(Some(OwnedPlane::BlockRo(be)));
+                planes.push(Some(plane));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
@@ -543,12 +537,8 @@ fn build_core_slots<'a>(
                 log::debug!("LUN {lun}: CD profile ({cap} bytes)");
             }
             (DeviceRole::MmcCd, Backing::Img { path }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
                 let medium = CliMedium::Flat(FlatCdMedium::new(cap));
-                planes.push(Some(OwnedPlane::BlockRo(be)));
+                planes.push(Some(plane));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
@@ -556,38 +546,25 @@ fn build_core_slots<'a>(
                 log::debug!("LUN {lun}: {path} flat CD-ROM ({cap} bytes)");
             }
             (DeviceRole::MmcCd, Backing::Live { dir }) => {
-                let live = live_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: live pool exhausted"))?;
-                let total = live.layout().total;
-                let medium = CliMedium::Flat(FlatCdMedium::new(
-                    u64::from(total) * u64::from(ISO_SECTOR_SIZE),
-                ));
-                planes.push(Some(OwnedPlane::Live(live)));
+                let medium = CliMedium::Flat(FlatCdMedium::new(cap));
+                planes.push(Some(plane));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
                 )));
-                log::debug!("LUN {lun}: {dir} live ISO9660 CD-ROM ({total} sectors)");
+                log::debug!(
+                    "LUN {lun}: {dir} live ISO9660 CD-ROM ({} sectors)",
+                    cap / u64::from(ISO_SECTOR_SIZE)
+                );
             }
-            #[cfg(feature = "dvdram")]
-            (DeviceRole::MmcCd, Backing::DvdRam { path: _ }) => {
-                let be = be_iter
-                    .next()
-                    .ok_or_else(|| eprintln!("snowscsi: internal: backend pool exhausted"))?;
-                let cap = be.capacity();
+            (DeviceRole::MmcCd, Backing::DvdRam { .. }) => {
                 let medium = CliMedium::DvdRam(DvdRamMedium::new(cap / u64::from(ISO_SECTOR_SIZE)));
-                planes.push(Some(OwnedPlane::BlockRw(be)));
+                planes.push(Some(plane));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
                     Spc::new(MmcDrive::new(medium)),
                     backing,
                 )));
                 log::debug!("LUN {lun}: DvdRam DVD-RAM ({cap} bytes)");
-            }
-            #[cfg(not(feature = "dvdram"))]
-            (DeviceRole::MmcCd, Backing::DvdRam { .. }) => {
-                eprintln!("snowscsi: dvdram= requires the `dvdram` feature");
-                return Err(());
             }
             _ => {
                 eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
@@ -603,23 +580,9 @@ fn build_core_slots<'a>(
 /// `snowscsi serve --iscsi`: bind the portal, build the core target and drive
 /// the session shell until shutdown.
 fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) -> ExitCode {
-    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
-    let mut backends: Vec<BlockBackend> = Vec::new();
-    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
-    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(
-        specs,
-        &mut ram_disks,
-        &mut backends,
-        &mut lives,
-        &mut bundles,
-        &mut planes,
-        &mut slots,
-    )
-    .is_err()
-    {
+    if build_core_slots(specs, &mut planes, &mut slots).is_err() {
         return ExitCode::FAILURE;
     }
     let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
@@ -698,7 +661,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
         table.len(),
         config.wire.as_str(),
         config.banks.as_str(),
-        config.storage(),
+        config.storage(pool_capable(specs, config)),
         config.per_bank(),
     );
 
@@ -796,22 +759,202 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
     ExitCode::SUCCESS
 }
 
+/// Whether `--print-config` should report `storage=pool`.
+///
+/// The library slot pool needs a dual-bank asynchronous session over planes it
+/// can drive without blocking the runtime: a file/block device (re-registered
+/// with Tokio) or a memory plane. A live ISO scan or a chunked bundle reads
+/// through its own blocking scanner, so those configurations keep the
+/// thread-bridged worker.
+fn pool_capable(specs: &[DeviceSpec], config: &ServeConfig) -> bool {
+    if config.wire != Wire::Async || config.banks != Banks::Dual {
+        return false;
+    }
+    specs.iter().all(|spec| match &spec.backing {
+        Backing::Img { .. } | Backing::Ram { .. } => true,
+        #[cfg(feature = "dvdram")]
+        Backing::DvdRam { path } => path.is_some(),
+        #[cfg(not(feature = "dvdram"))]
+        Backing::DvdRam { .. } => false,
+        _ => false,
+    })
+}
+
+/// Whether every built plane can be handed to the asynchronous backend.
+#[cfg(feature = "tokio")]
+fn supports_async(planes: &[Option<OwnedPlane>]) -> bool {
+    planes.iter().all(|plane| {
+        matches!(
+            plane,
+            Some(OwnedPlane::BlockRo(_) | OwnedPlane::BlockRw(_) | OwnedPlane::Ram { .. })
+        )
+    })
+}
+
+/// One asynchronous byte plane behind a LUN.
+#[cfg(feature = "tokio")]
+enum AsyncPlane {
+    /// A file or block device registered with the runtime.
+    File {
+        /// The handle; every operation is positional (seek + read/write).
+        file: tokio::fs::File,
+        /// Whether the LUN may write (media policy is separate).
+        writable: bool,
+    },
+    /// An in-memory plane; nothing to await.
+    Mem {
+        /// Backing bytes.
+        bytes: Vec<u8>,
+        /// Whether the LUN may write.
+        writable: bool,
+    },
+}
+
+/// Map a `std` I/O error onto the byte-plane vocabulary.
+#[cfg(feature = "tokio")]
+fn io_err(e: std::io::Error) -> StorageError {
+    use embedded_io::ErrorKind;
+    let kind = match e.kind() {
+        std::io::ErrorKind::NotFound => ErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        std::io::ErrorKind::InvalidInput => ErrorKind::InvalidInput,
+        std::io::ErrorKind::InvalidData => ErrorKind::InvalidData,
+        _ => ErrorKind::Other,
+    };
+    StorageError::Io(kind)
+}
+
+/// Per-LUN asynchronous planes, executed by [`drive_async_backend`].
+#[cfg(feature = "tokio")]
+struct AsyncBackends {
+    luns: Vec<Option<AsyncPlane>>,
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncBackends {
+    /// Take ownership of the built planes.
+    fn new(planes: Vec<Option<OwnedPlane>>) -> Self {
+        let luns = planes
+            .into_iter()
+            .map(|plane| {
+                plane.map(|plane| match plane {
+                    OwnedPlane::BlockRo(backend) => AsyncPlane::File {
+                        file: tokio::fs::File::from_std(backend.into_file()),
+                        writable: false,
+                    },
+                    OwnedPlane::BlockRw(backend) => AsyncPlane::File {
+                        file: tokio::fs::File::from_std(backend.into_file()),
+                        writable: true,
+                    },
+                    OwnedPlane::Ram { bytes, writable } => AsyncPlane::Mem { bytes, writable },
+                    _ => unreachable!("supports_async rejects planes without an async backend"),
+                })
+            })
+            .collect();
+        Self { luns }
+    }
+
+    /// Execute one request against `lun`.
+    async fn exec(
+        &mut self,
+        lun: usize,
+        req: IoReq,
+        buf: &mut [u8],
+    ) -> Result<usize, StorageError> {
+        let Some(plane) = self.luns.get_mut(lun).and_then(Option::as_mut) else {
+            return Err(StorageError::Unsupported);
+        };
+        let len = req.len as usize;
+        match plane {
+            AsyncPlane::File { file, writable } => match req.dir {
+                Direction::ToHost => {
+                    file.seek(std::io::SeekFrom::Start(req.offset))
+                        .await
+                        .map_err(io_err)?;
+                    file.read_exact(&mut buf[..len]).await.map_err(io_err)?;
+                    Ok(len)
+                }
+                Direction::FromHost => {
+                    if !*writable {
+                        return Err(StorageError::NotWritable);
+                    }
+                    file.seek(std::io::SeekFrom::Start(req.offset))
+                        .await
+                        .map_err(io_err)?;
+                    file.write_all(&buf[..len]).await.map_err(io_err)?;
+                    Ok(len)
+                }
+                Direction::None => {
+                    file.sync_all().await.map_err(io_err)?;
+                    Ok(0)
+                }
+            },
+            AsyncPlane::Mem { bytes, writable } => match req.dir {
+                Direction::ToHost => {
+                    stack::ram_read(bytes, req.offset, &mut buf[..len]).map(|()| len)
+                }
+                Direction::FromHost => {
+                    if !*writable {
+                        return Err(StorageError::NotWritable);
+                    }
+                    stack::ram_write(bytes, req.offset, &buf[..len]).map(|()| len)
+                }
+                Direction::None => Ok(0),
+            },
+        }
+    }
+
+    /// Flush every writable file plane once the session ended.
+    async fn sync(&mut self) {
+        for (lun, plane) in self.luns.iter_mut().enumerate() {
+            if let Some(AsyncPlane::File {
+                file,
+                writable: true,
+            }) = plane
+            {
+                if let Err(e) = file.sync_all().await {
+                    eprintln!("snowscsi: sync failed for LUN {lun}: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Storage task: await a job from the pool, run it, report the result.
+///
+/// One future in the same task as the wire, so the pool's `!Send` store and
+/// this task share one executor without a thread or a channel.
+#[cfg(feature = "tokio")]
+async fn drive_async_backend(backends: &mut AsyncBackends, task: &SlotTask<'_, Vec<u8>>) -> ! {
+    loop {
+        let mut job = task.next_job().await;
+        let req = job.req();
+        let lun = job.lun();
+        let result = {
+            let data = job.data();
+            backends.exec(lun, req, data).await
+        };
+        task.complete(job, result);
+    }
+}
+
 /// `--wire async` iSCSI: serve one connection at a time on a Tokio runtime.
 ///
-/// The storage backend is the same per-plane worker the blocking dual-bank
-/// mode uses (a scoped thread, because the planes borrow `'a` storage and are
-/// not `'static`, which rules out `spawn_blocking`). `--banks single` runs the
-/// inline adapter, which never pends.
+/// Storage follows the planes: file and memory LUNs run on the library slot
+/// pool, joined with the accept loop in one task (`storage=pool`); a live ISO
+/// scan or a chunked bundle reads through its own blocking scanner, so those
+/// configurations keep the scoped-thread worker (`storage=worker`). `--banks
+/// single` runs the inline adapter, which never pends (`storage=inline`).
 #[cfg(feature = "tokio")]
 #[allow(clippy::too_many_arguments)]
-fn serve_iscsi_async<'a>(
+fn serve_iscsi_async(
     listener: TcpListener,
     stop: &Arc<AtomicBool>,
     shutdown: Arc<tokio::sync::Notify>,
     work: &mut [u8],
     scratch: &mut [u8],
     table: &mut [&mut dyn Lu<Pair = CliPair>],
-    planes: Vec<Option<OwnedPlane<'a>>>,
+    planes: Vec<Option<OwnedPlane>>,
     config: &ServeConfig,
 ) -> Result<(), TargetError> {
     if let Err(e) = listener.set_nonblocking(true) {
@@ -842,6 +985,40 @@ fn serve_iscsi_async<'a>(
     };
 
     let per_bank = config.per_bank();
+    if config.overlap() && supports_async(&planes) {
+        // The library slot pool drives storage in the *same* task as the wire:
+        // `join!` the accept loop with the backend. `SlotStore` is `!Send`, so
+        // this is the only shape that works — and one connection at a time is
+        // exactly what the serial accept loop does.
+        let pool = SlotPool::new(vec![0u8; per_bank]);
+        let (mut storage, task) = pool.split();
+        let mut backends = AsyncBackends::new(planes);
+        return runtime.block_on(async {
+            let res = {
+                let mut serve = core::pin::pin!(accept_loop(
+                    &listener,
+                    stop,
+                    &shutdown,
+                    work,
+                    scratch,
+                    table,
+                    &mut storage,
+                    true,
+                ));
+                let mut backend = core::pin::pin!(drive_async_backend(&mut backends, &task));
+                tokio::select! {
+                    res = &mut serve => res,
+                    // The backend loop never completes; it ends only when this
+                    // future is dropped.
+                    () = &mut backend => unreachable!("the storage backend runs forever"),
+                }
+            };
+            // Both futures are dropped here, so no operation is in flight and
+            // the planes can be flushed.
+            backends.sync().await;
+            res
+        });
+    }
     if config.overlap() {
         std::thread::scope(|scope| {
             let mut store = WorkerStore::new(scope, planes, per_bank);
@@ -1295,45 +1472,15 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
 /// Exactly one byte-plane backend per non-Live LUN; `Live` owns its scanner.
 /// RAM slots are consumed from `ram_disks` via a walking split cursor (no
 /// reallocation, disjoint borrows). Each `--block`/`--cdrom` spec pushes at
-/// most one backend or one live scanner, so Phase B can lend them in the same
-/// order.
-#[allow(clippy::too_many_arguments)]
-fn build_resources<'a>(
-    specs: &[DeviceSpec],
-    ram_disks: &'a mut Vec<Vec<u8>>,
-    backends: &mut Vec<BlockBackend<'a>>,
-    lives: &mut Vec<LiveData<StdFsBackend>>,
-    bundles: &mut Vec<FlatBundle<StdFsBackend>>,
-) -> Result<(), ()> {
-    // Exactly one byte-plane backend per non-Live LUN; Live owns its
-    // scanner. RAM slots are consumed from `ram_disks` via a walking
-    // split cursor (no reallocation, disjoint borrows).
-    ram_disks.clear();
-    // Pre-allocate RAM slot vectors so the cursor below can split them.
+/// Build one owned plane per LUN, in specification order.
+///
+/// Every plane owns its bytes — file handles and RAM disks included — so the
+/// same value can be moved onto a worker thread or an asynchronous backend
+/// task later.
+fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
+    let mut planes = Vec::with_capacity(specs.len());
     for spec in specs {
-        let size = match &spec.backing {
-            Backing::Ram { size } => Some(*size),
-            #[cfg(feature = "dvdram")]
-            Backing::DvdRam { path: None } => spec.plane.size,
-            _ => None,
-        };
-        if let Some(size) = size {
-            match usize::try_from(size) {
-                Ok(n) => ram_disks.push(vec![0u8; n]),
-                Err(_) => {
-                    eprintln!("snowscsi: RAM size {size} too large for this platform");
-                    return Err(());
-                }
-            }
-        }
-    }
-    backends.clear();
-    lives.clear();
-    bundles.clear();
-    let mut ram_cursor: &'a mut [Vec<u8>] = ram_disks;
-
-    for spec in specs {
-        match &spec.backing {
+        let plane = match &spec.backing {
             #[cfg(feature = "bundle")]
             Backing::ImgDir { dir } => {
                 if !Path::new(dir).is_dir() {
@@ -1390,7 +1537,7 @@ fn build_resources<'a>(
                         .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?
                     }
                 };
-                bundles.push(bundle);
+                OwnedPlane::Bundle(bundle)
             }
             #[cfg(not(feature = "bundle"))]
             Backing::ImgDir { .. } => {
@@ -1401,10 +1548,10 @@ fn build_resources<'a>(
                 let bytes = usize::try_from(*size).map_err(|_| {
                     eprintln!("snowscsi: RAM size {size} too large for this platform");
                 })?;
-                let (slot, tail) = ram_cursor.split_first_mut().unwrap();
-                ram_cursor = tail;
-                slot.resize(bytes, 0);
-                backends.push(BlockBackend::Ram(RamBackend::new(slot)));
+                OwnedPlane::Ram {
+                    bytes: vec![0u8; bytes],
+                    writable: !spec.plane.read_only,
+                }
             }
             Backing::Img { path } => {
                 if !Path::new(path).is_file() {
@@ -1415,9 +1562,13 @@ fn build_resources<'a>(
                 // `rb` (so it works on read-only media; never `r+b`), and the
                 // LUN is built with `disk_read_only` (locked write policy).
                 let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
-                let b = FileBackend::open(path, writable)
+                let backend = FileBackend::open(path, writable)
                     .map_err(|e| eprintln!("snowscsi: failed to open {path}: {e}"))?;
-                backends.push(BlockBackend::File(b));
+                if writable {
+                    OwnedPlane::BlockRw(backend)
+                } else {
+                    OwnedPlane::BlockRo(backend)
+                }
             }
             Backing::Live { dir } => {
                 let fs = StdFsBackend::new(dir);
@@ -1428,7 +1579,7 @@ fn build_resources<'a>(
                 let live = LiveData::new(fs, label).map_err(|e| {
                     eprintln!("snowscsi: failed to scan live directory {dir}: {e}");
                 })?;
-                lives.push(live);
+                OwnedPlane::Live(live)
             }
             #[cfg(feature = "dvdram")]
             Backing::DvdRam { path } => match path.as_deref() {
@@ -1449,10 +1600,10 @@ fn build_resources<'a>(
                             eprintln!("snowscsi: dvdram: failed to create {path}: {e}");
                         })?;
                     }
-                    let b = FileBackend::open(path, true).map_err(|e| {
+                    let backend = FileBackend::open(path, true).map_err(|e| {
                         eprintln!("snowscsi: dvdram: failed to open {path}: {e}");
                     })?;
-                    backends.push(BlockBackend::File(b));
+                    OwnedPlane::BlockRw(backend)
                 }
                 None => {
                     let bytes = spec.plane.size.ok_or_else(|| {
@@ -1461,10 +1612,10 @@ fn build_resources<'a>(
                     let bytes = usize::try_from(bytes).map_err(|_| {
                         eprintln!("snowscsi: dvdram=ram: size too large");
                     })?;
-                    let (slot, tail) = ram_cursor.split_first_mut().unwrap();
-                    ram_cursor = tail;
-                    slot.resize(bytes, 0);
-                    backends.push(BlockBackend::Ram(RamBackend::new(slot)));
+                    OwnedPlane::Ram {
+                        bytes: vec![0u8; bytes],
+                        writable: true,
+                    }
                 }
             },
             #[cfg(not(feature = "dvdram"))]
@@ -1472,9 +1623,10 @@ fn build_resources<'a>(
                 eprintln!("snowscsi: dvdram= requires the `dvdram` feature");
                 return Err(());
             }
-        }
+        };
+        planes.push(plane);
     }
-    Ok(())
+    Ok(planes)
 }
 
 fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
@@ -1493,23 +1645,9 @@ fn run_serve_usb(
     config: &ServeConfig,
     selector: &str,
 ) -> ExitCode {
-    let mut ram_disks: Vec<Vec<u8>> = Vec::new();
-    let mut backends: Vec<BlockBackend> = Vec::new();
-    let mut lives: Vec<LiveData<StdFsBackend>> = Vec::new();
-    let mut bundles: Vec<FlatBundle<StdFsBackend>> = Vec::new();
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(
-        specs,
-        &mut ram_disks,
-        &mut backends,
-        &mut lives,
-        &mut bundles,
-        &mut planes,
-        &mut slots,
-    )
-    .is_err()
-    {
+    if build_core_slots(specs, &mut planes, &mut slots).is_err() {
         return ExitCode::FAILURE;
     }
     let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
@@ -1595,7 +1733,7 @@ fn run_serve_usb(
         "serving {lun_count} LUN(s) over USB (wire={}, banks={}, storage={}, per_bank={})",
         config.wire.as_str(),
         config.banks.as_str(),
-        config.storage(),
+        config.storage(pool_capable(specs, config)),
         config.per_bank(),
     );
     let serve_res = if config.overlap() {
@@ -2393,21 +2531,21 @@ mod tests {
         let args = parse_serve(&["--usb", "--banks", "dual"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(2),
+            cfg.line(2, false),
             "wire=blocking banks=dual storage=worker per_bank=8192 work=16384 scratch=0 lun=2"
         );
 
         let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--banks", "dual"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1),
+            cfg.line(1, false),
             "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
         );
 
         let args = parse_serve(&["--usb"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1),
+            cfg.line(1, false),
             format!(
                 "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
                  work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
@@ -2417,7 +2555,7 @@ mod tests {
         let args = parse_serve(&["--usb", "--scratch-buffer", "16K"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1),
+            cfg.line(1, false),
             format!(
                 "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
                  work={DEFAULT_WORK_BUF_SIZE} scratch={} lun=1",
@@ -2532,7 +2670,7 @@ mod tests {
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(cfg.wire, Wire::Async);
         assert_eq!(
-            cfg.line(1),
+            cfg.line(1, false),
             format!(
                 "wire=async banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
                  work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
@@ -2549,8 +2687,17 @@ mod tests {
         ]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1),
+            cfg.line(1, false),
             "wire=async banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
+        );
+
+        // A RAM or file LUN can be driven by the library slot pool, so the
+        // derived storage model becomes `pool` (same switches, same buffers).
+        let specs = spec::parse_all(&args.block, &args.cdrom).unwrap();
+        assert!(pool_capable(&specs, &cfg));
+        assert_eq!(
+            cfg.line(specs.len(), pool_capable(&specs, &cfg)),
+            "wire=async banks=dual storage=pool per_bank=8240 work=16480 scratch=0 lun=1"
         );
     }
 
@@ -2864,5 +3011,84 @@ mod tests {
             verbose: 0,
         };
         assert_eq!(run_mkisofs(args), ExitCode::FAILURE);
+    }
+    /// The async storage path end to end: a `SlotPool` in one Tokio task
+    /// (`!Send`, no thread) driving [`AsyncBackends`] through the same
+    /// `Storage`/`AsyncWake` contract the wire side uses.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn async_backend_serves_io_through_the_slot_pool() {
+        use snowscsi::core::storage::{IoBuf, Storage};
+
+        let path = std::env::temp_dir().join(format!("snowscsi_pool_{}.img", std::process::id()));
+        std::fs::write(&path, [0u8; 4096]).expect("create image");
+        let backend = FileBackend::open(&path.to_string_lossy(), true).expect("open image");
+        let planes = vec![Some(OwnedPlane::BlockRw(backend))];
+        assert!(supports_async(&planes));
+
+        let pool = SlotPool::new(vec![0u8; 1024]);
+        let (mut store, task) = pool.split();
+        let mut backends = AsyncBackends::new(planes);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let client = async {
+                // One writable chunk, staged into the pool by `poll_exec`.
+                let write = store.begin_exec(IoReq {
+                    resource: 0,
+                    offset: 512,
+                    len: 4,
+                    dir: Direction::FromHost,
+                });
+                let data = [7u8; 4];
+                loop {
+                    match store.poll_exec(write, IoBuf::Write(&data)) {
+                        std::task::Poll::Ready(receipt) => {
+                            assert_eq!(receipt.error, None);
+                            assert_eq!(receipt.confirmed, 4);
+                            break;
+                        }
+                        std::task::Poll::Pending => {
+                            snowscsi::core::async_wake::wait(&mut store).await;
+                        }
+                    }
+                }
+
+                // Read it back through the same pool.
+                let read = store.begin_exec(IoReq {
+                    resource: 0,
+                    offset: 512,
+                    len: 4,
+                    dir: Direction::ToHost,
+                });
+                let mut out = [0u8; 4];
+                loop {
+                    match store.poll_exec(read, IoBuf::Read(&mut out)) {
+                        std::task::Poll::Ready(receipt) => {
+                            assert_eq!(receipt.error, None);
+                            break;
+                        }
+                        std::task::Poll::Pending => {
+                            snowscsi::core::async_wake::wait(&mut store).await;
+                        }
+                    }
+                }
+                out
+            };
+
+            let mut serve = core::pin::pin!(client);
+            let mut backend = core::pin::pin!(drive_async_backend(&mut backends, &task));
+            tokio::select! {
+                out = &mut serve => out,
+                () = &mut backend => unreachable!("the storage backend runs forever"),
+            }
+        });
+
+        let bytes = std::fs::read(&path).expect("read image");
+        assert_eq!(&bytes[512..516], &[7u8; 4], "the write reached the file");
+        let _ = std::fs::remove_file(&path);
     }
 }

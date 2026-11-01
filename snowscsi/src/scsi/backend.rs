@@ -140,6 +140,19 @@ impl FileBackend {
     ///
     /// A newly created file has capacity 0; writing through a writable
     /// handle extends it (see the type-level docs).
+    /// Consume the backend and hand out the file handle.
+    ///
+    /// Used by an application that re-registers the same file with an
+    /// asynchronous I/O layer; the backend's own position is dropped with it.
+    pub fn into_file(self) -> std::fs::File {
+        self.file
+    }
+
+    /// Whether this backend was opened writable.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     pub fn open(path: &str, writable: bool) -> Result<Self, StorageError> {
         let mut opts = std::fs::OpenOptions::new();
         if writable {

@@ -47,7 +47,7 @@ env_logger = { version = "0.11", optional = true }
 log = { workspace = true, optional = true }
 embedded-io.workspace = true
 heapless.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "signal", "time", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "signal", "time", "macros", "fs"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 usb-gadget = "1.1"

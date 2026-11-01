@@ -32,7 +32,7 @@ use snowscsi::core::{
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{DiscInfo, FlatCdMedium, MmcAttrs, MmcDrive, MmcMedium, MmcOp, Session, Track};
-use snowscsi::scsi::backend::BlockBackend;
+use snowscsi::scsi::backend::FileBackend;
 use snowscsi::scsi::fs_backend::StdFsBackend;
 
 #[cfg(feature = "tokio")]
@@ -44,20 +44,25 @@ pub type CliBacking = u32;
 
 /// One CLI-owned store plane.
 ///
-/// Unlike [`StorePlane`], which erases to `&mut dyn` trait objects (`!Send`),
-/// this enum owns the concrete backends. The CLI forbids `unsafe`, so owning
-/// `Send` values is what lets a future adapter move a plane into a worker
-/// thread; the synchronous path builds a temporary [`StorePlane`] borrow per
-/// operation.
+/// Every variant owns its bytes — there is no borrow — so a plane can be moved
+/// into a worker thread or an asynchronous backend task. The synchronous path
+/// still builds a temporary [`StorePlane`] borrow per operation.
 // The CLI builds one plane per LUN; the size difference is dominated by the
 // live scanner's file table, not a hot-path concern (same rationale as
 // `CliLu` below).
 #[allow(clippy::large_enum_variant)]
-pub enum OwnedPlane<'a> {
-    /// Read-only byte plane.
-    BlockRo(BlockBackend<'a>),
-    /// Writable byte plane.
-    BlockRw(BlockBackend<'a>),
+pub enum OwnedPlane {
+    /// Read-only file or block device.
+    BlockRo(FileBackend),
+    /// Writable file or block device.
+    BlockRw(FileBackend),
+    /// In-memory plane (`--block ram=`, `--dvdram=ram`).
+    Ram {
+        /// Backing bytes.
+        bytes: Vec<u8>,
+        /// Whether the LUN may write (the media policy is separate).
+        writable: bool,
+    },
     /// Directory-chunked filesystem plane (read-only or writable, as opened).
     #[cfg(feature = "bundle")]
     Bundle(FlatBundle<StdFsBackend>),
@@ -65,11 +70,12 @@ pub enum OwnedPlane<'a> {
     Live(LiveData<StdFsBackend>),
 }
 
-impl OwnedPlane<'_> {
+impl OwnedPlane {
     /// Whether this plane should be addressed as a writable plane.
     fn is_writable(&self) -> bool {
         match self {
             Self::BlockRw(_) => true,
+            Self::Ram { writable, .. } => *writable,
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => !bundle.is_read_only(),
             Self::BlockRo(_) | Self::Live(_) => false,
@@ -86,10 +92,22 @@ impl OwnedPlane<'_> {
     }
 }
 
-impl FlatData for OwnedPlane<'_> {
+/// Bounds-checked in-memory read.
+pub(crate) fn ram_read(bytes: &[u8], off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+    let start = usize::try_from(off).map_err(|_| StorageError::OutOfBounds)?;
+    let end = start
+        .checked_add(buf.len())
+        .filter(|end| *end <= bytes.len())
+        .ok_or(StorageError::OutOfBounds)?;
+    buf.copy_from_slice(&bytes[start..end]);
+    Ok(())
+}
+
+impl FlatData for OwnedPlane {
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         match self {
             Self::BlockRo(backend) | Self::BlockRw(backend) => backend.read_at(off, buf),
+            Self::Ram { bytes, .. } => ram_read(bytes, off, buf),
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => bundle.read_at(off, buf),
             Self::Live(live) => live.read_at(off, buf),
@@ -99,6 +117,7 @@ impl FlatData for OwnedPlane<'_> {
     fn capacity(&self) -> u64 {
         match self {
             Self::BlockRo(backend) | Self::BlockRw(backend) => backend.capacity(),
+            Self::Ram { bytes, .. } => bytes.len() as u64,
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => bundle.capacity(),
             Self::Live(live) => live.capacity(),
@@ -106,13 +125,17 @@ impl FlatData for OwnedPlane<'_> {
     }
 }
 
-impl WritableFlatData for OwnedPlane<'_> {
+impl WritableFlatData for OwnedPlane {
     fn write_at(&mut self, off: u64, buf: &[u8]) -> Result<(), StorageError> {
         match self {
             Self::BlockRw(backend) => backend.write_at(off, buf),
+            Self::Ram {
+                bytes,
+                writable: true,
+            } => ram_write(bytes, off, buf),
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => bundle.write_at(off, buf),
-            Self::BlockRo(_) | Self::Live(_) => Err(StorageError::NotWritable),
+            _ => Err(StorageError::NotWritable),
         }
     }
 
@@ -121,18 +144,43 @@ impl WritableFlatData for OwnedPlane<'_> {
             Self::BlockRw(backend) => backend.sync(),
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => bundle.sync(),
-            Self::BlockRo(_) | Self::Live(_) => Ok(()),
+            // A read-only plane, or memory that already is the store.
+            Self::BlockRo(_) | Self::Live(_) | Self::Ram { .. } => Ok(()),
         }
     }
 
     fn fill_at(&mut self, off: u64, len: u64, byte: u8) -> Result<(), StorageError> {
         match self {
             Self::BlockRw(backend) => backend.fill_at(off, len, byte),
+            Self::Ram {
+                bytes,
+                writable: true,
+            } => {
+                let start = usize::try_from(off).map_err(|_| StorageError::OutOfBounds)?;
+                let end = usize::try_from(len)
+                    .ok()
+                    .and_then(|len| start.checked_add(len))
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or(StorageError::OutOfBounds)?;
+                bytes[start..end].fill(byte);
+                Ok(())
+            }
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => bundle.fill_at(off, len, byte),
-            Self::BlockRo(_) | Self::Live(_) => Err(StorageError::NotWritable),
+            _ => Err(StorageError::NotWritable),
         }
     }
+}
+
+/// Bounds-checked in-memory write.
+pub(crate) fn ram_write(bytes: &mut [u8], off: u64, buf: &[u8]) -> Result<(), StorageError> {
+    let start = usize::try_from(off).map_err(|_| StorageError::OutOfBounds)?;
+    let end = start
+        .checked_add(buf.len())
+        .filter(|end| *end <= bytes.len())
+        .ok_or(StorageError::OutOfBounds)?;
+    bytes[start..end].copy_from_slice(buf);
+    Ok(())
 }
 
 /// The media member of a CLI pair: a block slot has no medium, an MMC slot
@@ -560,16 +608,16 @@ fn change_cross<P>(
 /// answers `Ready` immediately. The runner selects the addressed LUN
 /// (`Storage::select_lun`) before each entry, which keeps one adapter usable
 /// for the whole heterogeneous slot set.
-pub struct CliStorage<'a> {
-    planes: Vec<Option<OwnedPlane<'a>>>,
+pub struct CliStorage {
+    planes: Vec<Option<OwnedPlane>>,
     lun: usize,
     pending: Option<(IoReq, u32)>,
     tag: u32,
 }
 
-impl<'a> CliStorage<'a> {
+impl CliStorage {
     /// Build the adapter over one plane slot per LUN.
-    pub fn new(planes: Vec<Option<OwnedPlane<'a>>>) -> Self {
+    pub fn new(planes: Vec<Option<OwnedPlane>>) -> Self {
         Self {
             planes,
             lun: 0,
@@ -595,7 +643,7 @@ impl<'a> CliStorage<'a> {
     }
 }
 
-impl Storage for CliStorage<'_> {
+impl Storage for CliStorage {
     fn select_lun(&mut self, lun: usize) {
         self.lun = lun;
     }
@@ -671,7 +719,7 @@ impl Storage for CliStorage<'_> {
 /// Inline storage never pends, so an async shell waiting on it completes on
 /// the first poll (the same contract as the library's synchronous adapter).
 #[cfg(feature = "tokio")]
-impl snowscsi::core::async_wake::AsyncWake for CliStorage<'_> {
+impl snowscsi::core::async_wake::AsyncWake for CliStorage {
     fn poll_wake(&mut self, _cx: &mut core::task::Context<'_>) -> Poll<()> {
         Poll::Ready(())
     }
@@ -685,6 +733,6 @@ mod tests {
 
     #[test]
     fn owned_plane_is_send() {
-        assert_send::<OwnedPlane<'static>>();
+        assert_send::<OwnedPlane>();
     }
 }

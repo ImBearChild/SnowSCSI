@@ -423,14 +423,11 @@ impl WorkerStore {
     /// `per_bank` is the data-area size of one bank (`work.len() / 2` in
     /// dual-bank mode), so the staging buffer can hold any single request a
     /// bank emits.
-    pub fn new<'scope, 'a>(
+    pub fn new<'scope>(
         scope: &'scope Scope<'scope, '_>,
-        planes: Vec<Option<OwnedPlane<'a>>>,
+        planes: Vec<Option<OwnedPlane>>,
         per_bank: usize,
-    ) -> Self
-    where
-        'a: 'scope,
-    {
+    ) -> Self {
         let mut workers = Vec::with_capacity(planes.len());
         for plane in planes {
             let Some(plane) = plane else {
@@ -463,7 +460,7 @@ impl WorkerStore {
 
 /// Worker thread: execute jobs until the store is dropped.
 fn worker_loop(
-    mut plane: OwnedPlane<'_>,
+    mut plane: OwnedPlane,
     jobs: Receiver<Job>,
     done: Sender<Done>,
     wake: Arc<WorkerWake>,
@@ -533,7 +530,6 @@ impl snowscsi::core::async_wake::AsyncWake for WorkerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snowscsi::scsi::backend::{BlockBackend, RamBackend};
     use std::time::{Duration, Instant};
 
     fn invalid() -> IoToken {
@@ -593,7 +589,10 @@ mod tests {
         let mut ram = vec![0u8; 4096];
         ram[..4].copy_from_slice(b"disk");
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: true,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 1024);
 
             // `begin_exec` posts the read; a later poll reports completion.
@@ -633,9 +632,12 @@ mod tests {
 
     #[test]
     fn cancel_is_idempotent_before_and_after_completion() {
-        let mut ram = vec![0x5Au8; 1024];
+        let ram = vec![0x5Au8; 1024];
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: true,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 512);
 
             // Cancel while the worker is still running: the token is dead, and
@@ -664,9 +666,12 @@ mod tests {
 
     #[test]
     fn unknown_token_is_a_contract_violation() {
-        let mut ram = vec![0u8; 1024];
+        let ram = vec![0u8; 1024];
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRo(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: false,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 512);
             expect_contract(&mut store, IoToken::new(9, 123));
             expect_contract(&mut store, invalid());
@@ -675,9 +680,12 @@ mod tests {
 
     #[test]
     fn a_settled_read_keeps_its_buffer_until_it_is_polled() {
-        let mut ram = vec![0u8; 1024];
+        let ram = vec![0u8; 1024];
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: true,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 512);
 
             // A takes the plane's only staging buffer; B cannot start until A
@@ -739,7 +747,10 @@ mod tests {
         let mut ram = vec![0u8; 4096];
         ram[..4].copy_from_slice(b"disk");
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: true,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 1024);
 
             let woken = Arc::new(AtomicBool::new(false));
@@ -783,9 +794,12 @@ mod tests {
 
     #[test]
     fn a_full_slot_table_mints_an_invalid_token() {
-        let mut ram = vec![0u8; 1024];
+        let ram = vec![0u8; 1024];
         std::thread::scope(|scope| {
-            let plane = OwnedPlane::BlockRw(BlockBackend::Ram(RamBackend::new(&mut ram)));
+            let plane = OwnedPlane::Ram {
+                bytes: ram,
+                writable: true,
+            };
             let mut store = WorkerStore::new(scope, vec![Some(plane)], 512);
 
             // Writes wait in the table, so all four slots can be occupied
