@@ -99,6 +99,8 @@ enum SlotState {
 struct Slot<B> {
     req: IoReq,
     tag: u32,
+    /// LUN selected when the operation began.
+    lun: usize,
     state: SlotState,
     result: Option<Result<usize, StorageError>>,
     /// Staging buffer of a settled read. It stays reserved here until the token
@@ -114,6 +116,7 @@ struct Slot<B> {
 struct Pending<B> {
     tag: u32,
     req: IoReq,
+    lun: usize,
     buf: B,
 }
 
@@ -144,6 +147,7 @@ pub struct Job<'p, B> {
     pool: &'p SlotPool<B>,
     tag: u32,
     req: IoReq,
+    lun: usize,
     /// `None` once the job was completed (or abandoned).
     buf: Option<B>,
 }
@@ -152,6 +156,14 @@ impl<B: AsMut<[u8]>> Job<'_, B> {
     /// The request this job executes.
     pub fn req(&self) -> IoReq {
         self.req
+    }
+
+    /// The LUN that was selected when the operation began.
+    ///
+    /// An adapter serving several LUNs from one pool routes on this instead of
+    /// re-implementing `select_lun` bookkeeping.
+    pub fn lun(&self) -> usize {
+        self.lun
     }
 
     /// Requested length in bytes.
@@ -255,6 +267,8 @@ struct Inner<B> {
     task: Cell<Option<Waker>>,
     /// Longest request this pool accepts (`buf.len()`).
     capacity: usize,
+    /// LUN selected by the last `Storage::select_lun`.
+    lun: usize,
     next_tag: u32,
 }
 
@@ -270,6 +284,7 @@ impl<B: AsMut<[u8]>> Inner<B> {
             shell: Cell::new(None),
             task: Cell::new(None),
             capacity,
+            lun: 0,
             next_tag: 1,
         }
     }
@@ -281,6 +296,7 @@ impl<B: AsMut<[u8]>> Inner<B> {
     }
 
     fn begin(&mut self, req: IoReq, wake: &mut Wake) -> IoToken {
+        let lun = self.lun;
         if req.len as usize > self.capacity {
             return IoToken::invalid();
         }
@@ -296,6 +312,7 @@ impl<B: AsMut<[u8]>> Inner<B> {
         self.slots[index] = Some(Slot {
             req,
             tag,
+            lun,
             state,
             result: None,
             staged: None,
@@ -435,6 +452,7 @@ impl<B> Inner<B> {
         let pending = Pending {
             tag: slot.tag,
             req: slot.req,
+            lun: slot.lun,
             buf,
         };
         if let Some(slot) = self.slots[index].as_mut() {
@@ -548,6 +566,10 @@ pub struct SlotStore<'a, B> {
 }
 
 impl<B: AsMut<[u8]>> Storage for SlotStore<'_, B> {
+    fn select_lun(&mut self, lun: usize) {
+        self.pool.inner.borrow_mut().lun = lun;
+    }
+
     fn begin_exec(&mut self, req: IoReq) -> IoToken {
         let mut wake = Wake::default();
         let token = {
@@ -602,11 +624,11 @@ impl<B: AsMut<[u8]>> SlotTask<'_, B> {
     /// either taken here or wakes the fresh waker. Dropping the returned
     /// [`Job`] abandons the operation and returns the buffer.
     pub async fn next_job(&self) -> Job<'_, B> {
-        let (tag, req, buf) = poll_fn(|cx| {
+        let (tag, req, lun, buf) = poll_fn(|cx| {
             let mut inner = self.pool.inner.borrow_mut();
             inner.task.set(Some(cx.waker().clone()));
             match inner.pending.take() {
-                Some(pending) => Poll::Ready((pending.tag, pending.req, pending.buf)),
+                Some(pending) => Poll::Ready((pending.tag, pending.req, pending.lun, pending.buf)),
                 None => Poll::Pending,
             }
         })
@@ -615,6 +637,7 @@ impl<B: AsMut<[u8]>> SlotTask<'_, B> {
             pool: self.pool,
             tag,
             req,
+            lun,
             buf: Some(buf),
         }
     }
@@ -960,6 +983,34 @@ mod tests {
             assert!(store.begin_exec(req(Direction::ToHost, 0, 4)).is_valid());
         }
         assert!(!store.begin_exec(req(Direction::ToHost, 0, 4)).is_valid());
+    }
+
+    #[test]
+    fn jobs_report_the_lun_selected_at_begin() {
+        let pool = SlotPool::new([0u8; CAP]);
+        let (mut store, task) = pool.split();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        store.select_lun(2);
+        let first = store.begin_exec(req(Direction::ToHost, 0, 4));
+        store.select_lun(0);
+        let second = store.begin_exec(req(Direction::ToHost, 8, 4));
+
+        // One buffer: only the first operation is posted.
+        let mut job = expect_job(&task, &mut cx);
+        assert_eq!(job.lun(), 2);
+        job.data().copy_from_slice(b"two2");
+        task.complete(job, Ok(4));
+        let mut out = [0u8; 4];
+        let _ = store.poll_exec(first, IoBuf::Read(&mut out));
+        assert_eq!(&out, b"two2");
+
+        let mut job = expect_job(&task, &mut cx);
+        assert_eq!(job.lun(), 0, "the second job keeps its own LUN");
+        job.data().copy_from_slice(b"zero");
+        task.complete(job, Ok(4));
+        let _ = store.poll_exec(second, IoBuf::Read(&mut out));
+        assert_eq!(&out, b"zero");
     }
 
     #[test]
