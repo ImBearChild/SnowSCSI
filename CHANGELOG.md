@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ⚠️ Breaking changes
+
+- **core**: transport loops return `Result<ServeExit, _>`; `Flow` replaces the
+  `&AtomicBool` stop flag on USB; `Target::settle_transport_end` is replaced by
+  `link_lost`; `RunEnd::TransportEnded` is removed.
+- **core**: `Device` gains defaulted `admits_without_medium`; `Lu` gains
+  defaulted `take_eject_request`; `MmcDrive::empty` now takes `MmcCaps`.
+
+### Added
+
+- **core**: `Flow`/`ServeExit` and a target that outlives the transport link
+  (host eject hands the medium back through `ResourcesReady`).
+- **mmc**: `MmcCaps` (drive capabilities are LU state) and an empty tray that
+  still answers MODE SENSE/GET CONFIGURATION; `MmcDrive::empty(caps)` and
+  `LuImpl::empty(device)`.
+- **core**: `Spc::with_identity` for per-LU INQUIRY identity strings.
+- **cli**: `--cdrom empty` serves an enumerated drive with no medium.
+
 ## [0.2.0] - 2026-10-18
 
 ### ⚠️ Breaking changes

@@ -5,6 +5,8 @@
 //! encodes the media-description responses. Public query commands (MODE SENSE,
 //! READ CAPACITY, GET CONFIGURATION, GET EVENT STATUS NOTIFICATION) are served
 //! by `Spc` through `SpcProfile`; the media command table stays in the drive.
+//! [`MmcCaps`](crate::mmc::MmcCaps) is the LU's capability (profiles, 0x2A,
+//! random writable) and survives an eject; `MmcAttrs` describes the disc.
 //!
 //! Byte layouts follow the production baseline in `crate::cdrom::{common,drive}`
 //! and are re-implemented here, so this module has no runtime dependency on the

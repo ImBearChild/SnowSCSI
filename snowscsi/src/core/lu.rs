@@ -1211,6 +1211,16 @@ mod tests {
         assert_eq!(slot.admit(&[0x12]), Admission::Proceed);
         assert_eq!(slot.admit(&[0x03]), Admission::Proceed);
         assert_eq!(slot.admit(&[0xA0]), Admission::Proceed);
+        // MODE SENSE is only admitted by a device that opts in (MmcDrive does;
+        // a block LUN keeps the empty-slot reject).
+        assert_eq!(
+            slot.admit(&[0x1A, 0, 0x2A, 0, 64, 0]),
+            Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT))
+        );
+        assert_eq!(
+            slot.admit(&[0x5A, 0, 0x2A, 0, 0, 0, 0, 0, 0, 64]),
+            Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT))
+        );
         let permit = CommandPermit::new(TargetId::UNBOUND);
         let ctx = CommandContext {
             lun: 0,
