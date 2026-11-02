@@ -14,7 +14,7 @@
 //!   `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
 //!   disk, `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
-//! - `--cdrom` drives `CdromDrive` (full MMC): `img=<iso>`, `live=<dir>`
+//! - `--cdrom` drives the core `MmcDrive` profile (full MMC): `img=<iso>`, `live=<dir>`
 //!   (live ISO9660 over a directory), or
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
@@ -177,7 +177,7 @@ struct ServeArgs {
     #[arg(long = "block", value_name = "SPEC")]
     block: Vec<String>,
 
-    /// CD-ROM device (`CdromDrive`, full MMC): `img=<iso>`, `live=<dir>`
+    /// CD-ROM device (core `MmcDrive`, full MMC): `img=<iso>`, `live=<dir>`
     /// (live ISO9660 over a directory), or `dvdram=<path|ram:<size>>[,size=…]`
     /// (random-writable DVD-RAM). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]

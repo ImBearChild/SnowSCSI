@@ -248,17 +248,30 @@ pub struct LuImpl<D: Device, B> {
 }
 
 impl<D: Device, B> LuImpl<D, B> {
-    /// Build an unbound slot (owner [`TargetId::UNBOUND`]) holding `backing`.
-    pub fn new(device: D, backing: B) -> Self {
+    /// Build an unbound slot (owner [`TargetId::UNBOUND`]) with **no pair**.
+    ///
+    /// The slot is an empty logical unit: the mandatory query set answers, media
+    /// commands are `MEDIUM NOT PRESENT`, and `install_rt` supplies the first
+    /// pair. This is the starting state a drive needs to enumerate before any
+    /// medium exists.
+    pub fn empty(device: D) -> Self {
         Self {
             device,
-            backing: Some(backing),
+            backing: None,
             candidate: None,
             result: None,
             owner: TargetId::UNBOUND,
             needs_recovery: false,
             recovery: None,
             last_known: KnownEffects::NONE,
+        }
+    }
+
+    /// Build an unbound slot (owner [`TargetId::UNBOUND`]) holding `backing`.
+    pub fn new(device: D, backing: B) -> Self {
+        Self {
+            backing: Some(backing),
+            ..Self::empty(device)
         }
     }
 

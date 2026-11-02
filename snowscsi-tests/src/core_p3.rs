@@ -5484,3 +5484,50 @@ fn host_loej_detaches_the_medium_and_the_slot_stays_servable() {
         Ok(Completion::Good)
     );
 }
+
+/// A LUN can be built empty (an enumerated drive with an open tray) and filled
+/// later without an eject/rebuild cycle.
+#[test]
+fn a_lun_can_start_empty_and_be_filled_without_an_eject() {
+    let mut target = Target::new(cons(
+        LuImpl::empty(Spc::new(MmcDrive::<FlatCdMedium>::empty())),
+        Nil,
+    ));
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut work = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    // The LU enumerates and reports no medium, but IT is not dead.
+    assert!(!target.snapshot_static::<Here>().ready);
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x00, 0, 0, 0, 0, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Check(MEDIUM_NOT_PRESENT))
+    );
+
+    // The first medium is installed at a management boundary: no eject, no
+    // rebuild. (The app raises `MediumChanged` through `raise_ua_rt` on the
+    // runtime target; the static fixture has no UA entry.)
+    assert!(target
+        .install_static::<Here>(Pair {
+            medium: FlatCdMedium::read_only(16),
+            backing: 8u8,
+        })
+        .is_ok());
+    assert!(target.snapshot_static::<Here>().ready);
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x00, 0, 0, 0, 0, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Good)
+    );
+}

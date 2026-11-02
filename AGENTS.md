@@ -142,6 +142,13 @@ git checkout legacy
   PREVENT/ALLOW (its unlock-flush would sync a stale binding). A manual
   `impl Lu` wrapper must forward `take_eject_request` or host ejection is
   silently disabled.
+- **INQUIRY identity / empty LUN**: `Spc::with_identity(vendor, product, revision)`
+  sets only the strings; the PDT/removable bit stay the device's, and
+  `Spc::effective_inquiry` is the single read used by the encoder, the device
+  projection and the `LoEj` gate (an outer `Device` wrapper cannot retarget
+  INQUIRY). `MmcDrive::empty()` + `LuImpl::empty(device)` build an enumerated
+  drive with no medium (queries answer, media commands are `MEDIUM NOT
+  PRESENT`); fill it with `install_rt`, no eject/rebuild needed.
 - **Async storage adapters**: `core::slots::SlotPool` is the runtime-free
   bridge for a backend whose I/O completes elsewhere (SD card, flash, DMA).
   Split it into `SlotStore` (implements `Storage` + `AsyncWake`) and

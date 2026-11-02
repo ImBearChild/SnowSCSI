@@ -199,11 +199,9 @@ pub struct MmcDrive<M: MmcMedium> {
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
-    /// Build a drive with an installed medium.
-    #[must_use]
-    pub fn new(medium: M) -> Self {
+    fn with_medium(medium: Option<M>) -> Self {
         Self {
-            medium: Some(medium),
+            medium,
             query: Query::None,
             len: 0,
             published: false,
@@ -211,6 +209,26 @@ impl<M: MmcMedium> MmcDrive<M> {
             io_issues: 0,
             prefetch_issues: 0,
         }
+    }
+
+    /// Build a drive with an installed medium.
+    #[must_use]
+    pub fn new(medium: M) -> Self {
+        Self::with_medium(Some(medium))
+    }
+
+    /// Build a drive with an **empty tray**.
+    ///
+    /// Device-level commands stay answerable (INQUIRY through [`Spc`], START
+    /// STOP UNIT, GET CONFIGURATION), while every media command answers
+    /// `MEDIUM NOT PRESENT`. The first medium is installed by the slot
+    /// (`Target::install_rt`), so a host can enumerate a drive before any disc
+    /// exists.
+    ///
+    /// [`Spc`]: crate::core::Spc
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::with_medium(None)
     }
 
     /// Number of required storage operations issued (probe counter, not a

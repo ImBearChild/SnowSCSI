@@ -21,12 +21,12 @@
 //! - `snowscsi-cli` (no docs; a thin binary shell) — the `snowscsi`
 //!   executable: `serve` and `mkisofs`.
 //!
-//! Start at [`scsi::device::ScsiDevice`] (the LUN seam every transport
-//! drives), [`scsi::block::BlockDevice`] (disk/CD-ROM profiles over any
-//! byte plane) or [`iscsi::target::IscsiSession`] /
-//! [`usb::BotSession`] (the two transports). Each subsystem's module docs
-//! carry runnable examples: [`iscsi`], [`usb`], and — behind the `cdrom`
-//! feature — [`cdrom`].
+//! Start at [`core::Target`] / [`core::Lu`] (the LUN seam the transports
+//! drive), [`block::BlockDevice`] and [`mmc::MmcDrive`] (the two core profile
+//! devices), or [`iscsi::target::IscsiSession`] / [`usb::BotSession`] (the two
+//! transports). Each subsystem's module docs carry runnable examples:
+//! [`iscsi`], [`usb`], and — behind the `cdrom` feature — [`cdrom`]. The
+//! `scsi::` tree is the legacy `ScsiDevice` path.
 //!
 //! # One buffer or two (resident long operations)
 //!

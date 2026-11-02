@@ -41,7 +41,7 @@ pub enum DeviceRole {
     BlockDisk,
     /// `BlockDevice::cdrom` — read-only PDT 0x05 (`profile=cd`).
     BlockCd,
-    /// `CdromDrive` — full MMC optical drive (`--cdrom`).
+    /// Core `MmcDrive` — full MMC optical drive (`--cdrom`).
     MmcCd,
 }
 

@@ -75,6 +75,24 @@ impl InquiryData {
             revision: *b"P1  ",
         }
     }
+
+    /// The same device type and removable bit with different identity strings.
+    ///
+    /// The values are copied verbatim into the fixed-width fields — space-pad
+    /// `vendor` to 8, `product` to 16 and `revision` to 4 (`*b"HITACHI "`, not
+    /// `*b"HITACHI"`). `pdt` and `removable` are kept: the name is presentation,
+    /// the type is the device's capability. The standard INQUIRY response is
+    /// fixed at 36 bytes; this is not a byte-identical clone of a legacy
+    /// 96-byte response.
+    #[must_use]
+    pub const fn with_strings(self, vendor: [u8; 8], product: [u8; 16], revision: [u8; 4]) -> Self {
+        Self {
+            vendor,
+            product,
+            revision,
+            ..self
+        }
+    }
 }
 
 /// PREVENT/ALLOW encoding family.
@@ -399,15 +417,22 @@ pub enum PollStep<'a> {
 /// Device lifecycle seam.
 ///
 /// `inquiry_data`/`removal_encoding` are defaulted so existing implementations
-/// compile unchanged; `Spc<D>` uses them for profile-aware INQUIRY and
-/// PREVENT/ALLOW. `commit` is a **local** medium-metadata hook: it has no
-/// `Storage` parameter and must not issue storage IO. Durable host data is
-/// committed by the host's SYNCHRONIZE CACHE.
+/// compile unchanged. `Spc<D>` answers INQUIRY from [`Device::inquiry_data`],
+/// and an application may replace only its identity strings at construction
+/// ([`Spc::with_identity`](super::spc::Spc::with_identity)); the device type and removable bit always come from
+/// the device, because they are the LU's command-set/eject capability.
+/// `removal_encoding` selects the PREVENT/ALLOW flavour. `commit` is a **local**
+/// medium-metadata hook: it has no `Storage` parameter and must not issue
+/// storage IO. Durable host data is committed by the host's SYNCHRONIZE CACHE.
 pub trait Device {
     /// The pair's medium member. No unified trait bound.
     type Medium;
 
     /// INQUIRY's static device data. Default: direct-access block (PDT 0x00).
+    ///
+    /// This is the device's own identity. [`Spc`](super::spc::Spc) may report different strings
+    /// for the same LU (see [`Spc::with_identity`](super::spc::Spc::with_identity)); it never changes the type
+    /// or the removable bit.
     fn inquiry_data(&self) -> InquiryData {
         InquiryData::block()
     }

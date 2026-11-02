@@ -7,6 +7,12 @@
 //! truncated to `min(allocation length, data.len())` and an allocation length
 //! of 0 transfers no data at all.
 //!
+//! INQUIRY's identity strings are an LU-level property set at construction
+//! ([`Spc::with_identity`]); the peripheral device type and removable bit always
+//! come from the inner device, so the name never changes the command set or the
+//! `LoEj` eject capability. A wrapper **outside** `Spc` cannot retarget INQUIRY:
+//! the wire bytes and the `LoEj` gate both read [`Spc`]'s effective identity.
+//!
 //! The six commands are TEST UNIT READY (0x00, delegated to the inner device),
 //! INQUIRY (0x12), REQUEST SENSE (0x03), REPORT LUNS (0xA0), PREVENT/ALLOW
 //! (0x1E) and START STOP UNIT (0x1B). `0x1B` stores the start bit and records
@@ -129,6 +135,9 @@ pub struct Spc<D: Device> {
     started: bool,
     /// START STOP UNIT asked for an eject; consumed at the completion point.
     eject: bool,
+    /// This LU's identity strings, set at construction. `None` reports the
+    /// device's own identity. Type and removable bit are never taken from here.
+    identity: Option<([u8; 8], [u8; 16], [u8; 4])>,
     /// LUN count reported by REPORT LUNS (0 is treated as 1).
     lun_count: u32,
     saved_sense: Option<Sense>,
@@ -148,9 +157,45 @@ impl<D: Device> Spc<D> {
             persistent_prevent: false,
             started: true,
             eject: false,
+            identity: None,
             lun_count: 1,
             saved_sense: None,
             ua: UaSet::new(),
+        }
+    }
+
+    /// Give this LU its INQUIRY identity strings.
+    ///
+    /// Replaces `vendor`/`product`/`revision` only: the profile's peripheral
+    /// device type and removable bit are kept, so the host's driver binding and
+    /// the `LoEj` eject capability still follow the device, not the name.
+    ///
+    /// Values are copied verbatim into the fixed-width fields — space-pad
+    /// `vendor` to 8, `product` to 16, `revision` to 4 (`*b"HITACHI "`, not
+    /// `*b"HITACHI"`). The identity is set before serving; there is no runtime
+    /// setter. The standard response stays 36 bytes.
+    #[must_use]
+    pub fn with_identity(mut self, vendor: [u8; 8], product: [u8; 16], revision: [u8; 4]) -> Self {
+        self.identity = Some((vendor, product, revision));
+        self
+    }
+
+    /// The INQUIRY data this LU actually reports.
+    ///
+    /// The device's type/removable bit, with this LU's identity strings when
+    /// [`Self::with_identity`] was used.
+    #[must_use]
+    pub fn inquiry(&self) -> InquiryData {
+        self.effective_inquiry()
+    }
+
+    /// Effective INQUIRY data; the single read used by the encoder, the device
+    /// projection and the `LoEj` capability gate.
+    fn effective_inquiry(&self) -> InquiryData {
+        let base = self.inner.inquiry_data();
+        match self.identity {
+            Some((vendor, product, revision)) => base.with_strings(vendor, product, revision),
+            None => base,
         }
     }
 
@@ -508,7 +553,7 @@ impl<D: Device> Spc<D> {
                 // which is a no-op here: the application inserts media, the
                 // device never reloads a pair it handed back. SPC-3: LoEj has
                 // no effect on a non-removable medium.
-                self.eject = loej && !start && self.inner.inquiry_data().removable;
+                self.eject = loej && !start && self.effective_inquiry().removable;
                 self.query = Query::NoData;
                 Ok(())
             }
@@ -642,7 +687,7 @@ impl<D: Device> Device for Spc<D> {
     type Medium = D::Medium;
 
     fn inquiry_data(&self) -> InquiryData {
-        self.inner.inquiry_data()
+        self.effective_inquiry()
     }
 
     fn removal_encoding(&self) -> RemovalEncoding {
@@ -922,7 +967,7 @@ impl<D: Device> Device for Spc<D> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Good);
                 }
-                fill_inquiry(self.inner.inquiry_data(), data, send);
+                fill_inquiry(self.effective_inquiry(), data, send);
                 PollStep::Send {
                     bytes: &data[..send],
                     prefetch: None,
@@ -1151,6 +1196,107 @@ mod tests {
             ),
             PollStep::Complete(Completion::Good)
         ));
+    }
+
+    #[test]
+    fn with_identity_reaches_the_wire_and_keeps_the_device_type() {
+        let mut spc = device().with_identity(*b"HITACHI ", *b"CD-ROM CD-8221  ", *b"0042");
+        let permit = permit();
+        let mut data = [0u8; 36];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 36), &inquiry_cdb(36)),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        match spc.poll(&permit, Feedback::plan_accepted(), &mut data) {
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 36),
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert_eq!(&data[8..16], b"HITACHI ");
+        assert_eq!(&data[16..32], b"CD-ROM CD-8221  ");
+        assert_eq!(&data[32..36], b"0042");
+        assert_eq!(data[0], 0x00, "the block profile keeps its PDT");
+        assert_eq!(data[1] & 0x80, 0, "the block profile keeps RMB");
+        assert_eq!(data[4], 31, "additional length is unchanged");
+        assert_eq!(
+            spc.inquiry(),
+            InquiryData::block().with_strings(*b"HITACHI ", *b"CD-ROM CD-8221  ", *b"0042")
+        );
+    }
+
+    #[test]
+    fn identity_does_not_change_the_eject_capability() {
+        use crate::mmc::{FlatCdMedium, MmcDrive};
+
+        let permit = permit();
+        let mut cdb = [0u8; 6];
+        cdb[0] = 0x1B;
+        cdb[4] = 0x02; // LoEj=1, Start=0
+
+        let mut cd = Spc::new(MmcDrive::new(FlatCdMedium::read_only(16))).with_identity(
+            *b"MATSHITA",
+            *b"CD-ROM CR-588   ",
+            *b"1.0 ",
+        );
+        assert!(cd.inquiry().removable);
+        cd.prepare(&permit, ctx(Direction::None, 0), &cdb)
+            .expect("eject");
+        assert!(
+            cd.take_eject_request(),
+            "the removable bit is the capability"
+        );
+
+        let mut fixed = device().with_identity(*b"MATSHITA", *b"CD-ROM CR-588   ", *b"1.0 ");
+        assert!(!fixed.inquiry().removable);
+        fixed
+            .prepare(&permit, ctx(Direction::None, 0), &cdb)
+            .expect("no-op");
+        assert!(
+            !fixed.take_eject_request(),
+            "a fixed disk must not be ejected by LoEj"
+        );
+    }
+
+    #[test]
+    fn empty_drive_still_enumerates_and_reports_no_medium() {
+        use crate::mmc::{FlatCdMedium, MmcDrive};
+
+        let mut spc = Spc::new(MmcDrive::<FlatCdMedium>::empty());
+        let permit = permit();
+        let mut data = [0u8; 36];
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 36), &inquiry_cdb(36)),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        let _ = spc.poll(&permit, Feedback::plan_accepted(), &mut data);
+        assert_eq!(data[0], 0x05, "CD-ROM PDT before any medium exists");
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(36, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(MEDIUM_NOT_PRESENT))
+        );
+    }
+
+    #[test]
+    fn inquiry_strings_are_a_const_value() {
+        const ID: InquiryData =
+            InquiryData::block().with_strings(*b"VENDOR  ", *b"PRODUCT         ", *b"0001");
+        assert_eq!(ID.pdt, 0x00);
+        assert_eq!(&ID.vendor, b"VENDOR  ");
     }
 
     #[test]
