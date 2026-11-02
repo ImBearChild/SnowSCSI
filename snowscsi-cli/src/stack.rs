@@ -582,8 +582,10 @@ impl Lu for CliLu {
     }
 
     fn take_eject_request(&mut self) -> bool {
+        // A removable block slot asks for an eject through the same gate as
+        // the MMC drive; a fixed block slot never records one.
         match self {
-            Self::Block(_) => false,
+            Self::Block(lu) => lu.take_eject_request(),
             Self::Mmc(lu) => lu.take_eject_request(),
         }
     }
@@ -630,6 +632,18 @@ impl CliStorage {
             lun: 0,
             pending: None,
             tag: 1,
+        }
+    }
+
+    /// Replace (or drop) one LUN's plane.
+    ///
+    /// A removable block LUN drops its plane on eject and installs a freshly
+    /// opened one when the application inserts a new card. An out-of-range LUN
+    /// is a no-op. USB-only (the iSCSI path has no card-swap loop).
+    #[cfg(target_os = "linux")]
+    pub fn set_plane(&mut self, lun: usize, plane: Option<OwnedPlane>) {
+        if let Some(slot) = self.planes.get_mut(lun) {
+            *slot = plane;
         }
     }
 
@@ -741,5 +755,66 @@ mod tests {
     #[test]
     fn owned_plane_is_send() {
         assert_send::<OwnedPlane>();
+    }
+
+    /// Storage that must never be used by the no-data eject command.
+    struct NoStorage;
+
+    impl Storage for NoStorage {
+        fn begin_exec(&mut self, _req: IoReq) -> IoToken {
+            IoToken::new(u8::MAX, 0)
+        }
+
+        fn poll_exec(&mut self, _token: IoToken, _buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+            Poll::Ready(StorageReceipt::failed(Fault::Contract, 0, Effect::Known))
+        }
+
+        fn cancel(&mut self, _token: IoToken) {}
+    }
+
+    #[test]
+    fn block_lu_forwards_the_eject_request() {
+        let ctx = CommandContext {
+            lun: 0,
+            lun_count: 1,
+            host_bytes: 0,
+            host_direction: snowscsi::core::Direction::None,
+        };
+        let cdb = [0x1B, 0, 0, 0, 0x02, 0];
+        let mut work = [0u8; 64];
+        let mut scratch = [0u8; 64];
+        let mut storage = NoStorage;
+
+        let mut removable = CliLu::Block(LuImpl::new(
+            Spc::new(BlockDevice::new(
+                snowscsi::block::BlockAttrs::new(16, 512).with_removable(),
+            )),
+            1,
+        ));
+        let mut target =
+            snowscsi::core::Target::new([&mut removable as &mut dyn Lu<Pair = CliPair>]);
+        assert_eq!(
+            target.drive_rt(0, &mut storage, ctx, &cdb, &mut work, &mut scratch),
+            Ok(Completion::Good)
+        );
+        assert_eq!(
+            target.tick(),
+            snowscsi::core::RunOutcome::ResourcesReady { lun: 0 },
+            "CliLu must forward the block arm's eject request"
+        );
+
+        let mut fixed = CliLu::Block(LuImpl::new(
+            Spc::new(BlockDevice::new(snowscsi::block::BlockAttrs::new(16, 512))),
+            1,
+        ));
+        let mut target = snowscsi::core::Target::new([&mut fixed as &mut dyn Lu<Pair = CliPair>]);
+        assert_eq!(
+            target.drive_rt(0, &mut storage, ctx, &cdb, &mut work, &mut scratch),
+            Ok(Completion::Good)
+        );
+        assert_ne!(
+            target.tick(),
+            snowscsi::core::RunOutcome::ResourcesReady { lun: 0 }
+        );
     }
 }

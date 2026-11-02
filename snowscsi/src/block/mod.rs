@@ -6,6 +6,11 @@
 //! command state, while the backing bytes stay in the application's `Storage`
 //! adapter. It never sees paths, media kinds or MMC vocabulary, and it
 //! does not depend on the feature-gated `scsi`/`cdrom` modules.
+//!
+//! Removability is a slot/LUN property in
+//! [`BlockAttrs::removable`](crate::block::BlockAttrs::removable): it drives
+//! the INQUIRY RMB bit and the SPC wrapper's `LoEj` eject gate, and stays set
+//! across a medium swap.
 
 mod attrs;
 mod device;

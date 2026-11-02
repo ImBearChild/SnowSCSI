@@ -58,5 +58,8 @@ mod core_p3;
 #[cfg(test)]
 mod core_p4;
 
+#[cfg(test)]
+mod card_reader;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;

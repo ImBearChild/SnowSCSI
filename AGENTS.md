@@ -141,7 +141,26 @@ git checkout legacy
   admits START STOP UNIT (a retried eject is a no-op GOOD) but not
   PREVENT/ALLOW (its unlock-flush would sync a stale binding). A manual
   `impl Lu` wrapper must forward `take_eject_request` or host ejection is
-  silently disabled.
+  silently disabled (`CliLu` forwards it for both the block and MMC arms).
+  A **removable block LUN** gets RMB from `BlockAttrs::with_removable()`
+  (`BlockDevice::inquiry_data`); `removable` is a slot/LUN property, not a
+  medium property, so it survives a swap. Eject detaches the pair and
+  publishes `ResourcesReady`; the LUN stays enumerated as an empty slot
+  (`3A/00` for media commands including READ CAPACITY, PREVENT/ALLOW still
+  rejected) and the application installs a new pair at the same LUN. The core
+  does **not** raise `UaClass::MediumChanged` on install: the application
+  raises it (sense `06/28/00`) so the host re-reads the medium. Because
+  `BlockDevice` owns the geometry, a capacity change rebuilds the whole slot
+  device (the CLI replaces its `CliLu`). CLI demo: `--block
+  img=<file>,removable` (USB only, `profile=block`, `img=` only, at most one
+  removable slot — other non-removable LUNs may coexist — and not with
+  `--banks dual`); the serve loop drops the plane on eject, a 200 ms
+  watcher thread — armed **only while the slot is empty**, so host writes to a
+  loaded card cannot self-eject it — detects a stable new regular file and
+  calls `Flow::pause()`, and the clean `ServeExit::Paused` boundary swaps in a
+  fully built `CliLu` (pending `MediumChanged` included) before `Flow::run()`.
+  `ResourcesReady` never drops the `Target`/`Runner`: another LUN may still
+  have a resident long-operation receipt.
 - **INQUIRY identity / empty LUN**: `Spc::with_identity(vendor, product, revision)`
   sets only the strings; the PDT/removable bit stay the device's, and
   `Spc::effective_inquiry` is the single read used by the encoder, the device

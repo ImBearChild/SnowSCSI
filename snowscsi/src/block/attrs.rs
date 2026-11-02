@@ -19,6 +19,16 @@ pub struct BlockAttrs {
     pub write_protected: bool,
     /// The device reports a health failure until it is explicitly reinstalled.
     pub needs_recovery: bool,
+    /// The LUN's medium is removable (INQUIRY RMB). A slot property, not a
+    /// property of the bytes currently installed.
+    ///
+    /// When set, INQUIRY reports RMB=1 and the SPC wrapper accepts a host
+    /// START STOP UNIT (`LoEj=1, Start=0`) eject request. The slot then
+    /// detaches its pair and the application can install a new one at the same
+    /// LUN; the application is responsible for raising
+    /// [`UaClass::MediumChanged`](crate::core::UaClass::MediumChanged) on the
+    /// new pair so the host re-reads the medium.
+    pub removable: bool,
 }
 
 impl BlockAttrs {
@@ -31,7 +41,20 @@ impl BlockAttrs {
             write_mode: Writability::Writable,
             write_protected: false,
             needs_recovery: false,
+            removable: false,
         }
+    }
+
+    /// Mark the LUN's medium as removable (INQUIRY RMB).
+    ///
+    /// This is a slot property, so it stays set across a medium swap. The
+    /// application installs the replacement pair and raises
+    /// [`UaClass::MediumChanged`](crate::core::UaClass::MediumChanged); the
+    /// core does not raise it on install.
+    #[must_use]
+    pub const fn with_removable(mut self) -> Self {
+        self.removable = true;
+        self
     }
 
     /// Whether the static/latched write policy rejects a write before the
@@ -61,8 +84,18 @@ mod tests {
         assert_eq!(attrs.write_mode, Writability::Writable);
         assert!(!attrs.write_protected);
         assert!(!attrs.needs_recovery);
+        assert!(!attrs.removable, "a block LUN is fixed by default");
         assert!(!attrs.rejects_writes());
         assert_eq!(attrs.capacity_bytes(), 8192);
+    }
+
+    #[test]
+    fn with_removable_marks_the_slot() {
+        let attrs = BlockAttrs::new(16, 512).with_removable();
+        assert!(attrs.removable);
+        assert_eq!(attrs.capacity_blocks, 16);
+        assert_eq!(attrs.block_len, 512);
+        assert!(!attrs.rejects_writes());
     }
 
     #[test]

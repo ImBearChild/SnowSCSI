@@ -9,7 +9,7 @@
 //! backing := img=<file> | imgdir=<dir> | ram=<size> | live=<dir>
 //!          | dvdram=<path|ram:<size>> | empty
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
-//!          | size=<size>
+//!          | size=<size> | removable
 //! ```
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
@@ -86,6 +86,10 @@ pub struct DeviceSpec {
     pub role: DeviceRole,
     pub backing: Backing,
     pub plane: PlaneOpts,
+    /// The LUN's medium is removable (INQUIRY RMB; host START STOP UNIT
+    /// ejects it). Only legal for `--block img=<file>` without
+    /// `profile=cd`; the `--usb` demo uses it for a card reader.
+    pub removable: bool,
 }
 
 /// Parse every `--block` then every `--cdrom` value into LUN order.
@@ -152,6 +156,7 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
             chunk: opts.chunk,
             size,
         },
+        removable: opts.removable,
     })
 }
 
@@ -280,6 +285,17 @@ fn check_opts(
             "size= is only valid for --block imgdir=<dir> or --cdrom dvdram=<path>".to_string(),
         );
     }
+    if opts.removable {
+        if family != DeviceFamily::Block {
+            return Err("removable is only valid for --block".to_string());
+        }
+        if profile != Some(BlockProfile::Disk) {
+            return Err("removable requires --block profile=block".to_string());
+        }
+        if !matches!(backing, Backing::Img { .. }) {
+            return Err("removable requires --block img=<file>".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -291,6 +307,8 @@ struct RawOpts {
     sector: Option<u32>,
     chunk: Option<u64>,
     size: Option<u64>,
+    removable: bool,
+    removable_seen: bool,
 }
 
 fn parse_opts(s: &str) -> Result<RawOpts, String> {
@@ -329,6 +347,12 @@ fn parse_opts(s: &str) -> Result<RawOpts, String> {
                 return Err("duplicate size=".to_string());
             }
             o.size = Some(parse_size(v).ok_or_else(|| format!("invalid size '{v}'"))?);
+        } else if opt == "removable" {
+            if o.removable_seen {
+                return Err("duplicate removable".to_string());
+            }
+            o.removable_seen = true;
+            o.removable = true;
         } else {
             return Err(format!("unknown option '{opt}'"));
         }
@@ -458,6 +482,33 @@ mod tests {
     fn block_disk_img_read_only() {
         let s = block("img=disk.img,ro").unwrap();
         assert!(s.plane.read_only);
+    }
+
+    #[test]
+    fn block_img_honours_sector() {
+        let s = block("img=card.img,sector=2048,removable").unwrap();
+        assert_eq!(s.plane.sector, 2048);
+        assert!(s.removable);
+    }
+
+    #[test]
+    fn block_img_can_be_removable() {
+        let s = block("img=card.img,removable").unwrap();
+        assert!(s.removable);
+        assert_eq!(s.role, DeviceRole::BlockDisk);
+        let explicit = block("img=card.img,profile=block,removable,ro").unwrap();
+        assert!(explicit.removable);
+        assert_eq!(explicit.role, DeviceRole::BlockDisk);
+        assert!(!block("img=card.img").unwrap().removable);
+    }
+
+    #[test]
+    fn removable_is_only_valid_for_block_img() {
+        assert!(block("img=x,profile=cd,removable").is_err());
+        assert!(block("imgdir=tree,removable").is_err());
+        assert!(block("ram=1M,removable").is_err());
+        assert!(cdrom("img=x,removable").is_err());
+        assert!(block("img=x,removable,removable").is_err());
     }
 
     #[test]

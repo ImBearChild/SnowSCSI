@@ -1190,6 +1190,7 @@ mod tests {
             other => panic!("expected send, got {other:?}"),
         }
         assert_eq!(data[0], 0x00, "Block PDT");
+        assert_eq!(data[1] & 0x80, 0, "a fixed block LUN clears RMB");
         assert_eq!(data[2], 5);
         assert_eq!(data[4], 31);
         assert_eq!(&data[8..12], b"SNOW");
@@ -1263,6 +1264,57 @@ mod tests {
             !fixed.take_eject_request(),
             "a fixed disk must not be ejected by LoEj"
         );
+    }
+
+    #[test]
+    fn removable_block_reports_rmb_and_accepts_loej_eject() {
+        let permit = permit();
+        let mut cdb = [0u8; 6];
+        cdb[0] = START_STOP_UNIT;
+        cdb[4] = 0x02; // LoEj=1, Start=0
+
+        let mut removable = Spc::new(BlockDevice::new(BlockAttrs::new(16, 512).with_removable()));
+        assert!(removable.inquiry().removable);
+        let mut data = [0u8; 36];
+        removable
+            .prepare(&permit, ctx(Direction::ToHost, 36), &inquiry_cdb(36))
+            .expect("inquiry");
+        let _ = removable.poll(&permit, Feedback::begin(), &mut data);
+        let _ = removable.poll(&permit, Feedback::plan_accepted(), &mut data);
+        assert_eq!(data[1] & 0x80, 0x80, "RMB follows BlockAttrs");
+        assert!(matches!(
+            removable.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(36, None)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+        removable
+            .prepare(&permit, ctx(Direction::None, 0), &cdb)
+            .expect("eject");
+        assert!(
+            removable.take_eject_request(),
+            "a removable block LUN accepts LoEj"
+        );
+
+        let mut fixed = device();
+        assert!(!fixed.inquiry().removable);
+        fixed
+            .prepare(&permit, ctx(Direction::None, 0), &cdb)
+            .expect("no-op");
+        assert!(
+            !fixed.take_eject_request(),
+            "a fixed block LUN ignores LoEj"
+        );
+    }
+
+    #[test]
+    fn identity_never_changes_a_removable_block_rmb() {
+        let spc = Spc::new(BlockDevice::new(BlockAttrs::new(16, 512).with_removable()))
+            .with_identity(*b"HITACHI ", *b"VIRTUAL CARD    ", *b"1.0 ");
+        assert!(spc.inquiry().removable);
+        assert_eq!(spc.inquiry().pdt, 0x00);
     }
 
     #[test]

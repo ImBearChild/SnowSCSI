@@ -10,10 +10,11 @@
 //! Devices are declared with two repeatable flags sharing one grammar
 //! (`<backing>[=<value>][,<option>...]`): `--block` and `--cdrom`.
 //!
-//! - `--block` drives `BlockDevice`: `img=<file>[,ro]`,
+//! - `--block` drives `BlockDevice`: `img=<file>[,ro][,removable]`,
 //!   `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
 //!   disk, `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
+//!   `removable` (USB only, `img=` only) is the card-reader demo.
 //! - `--cdrom` drives the core `MmcDrive` profile (full MMC): `img=<iso>`,
 //!   `live=<dir>` (live ISO9660 over a directory),
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
@@ -38,10 +39,13 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
-use std::process::{Command, ExitCode};
+#[cfg(target_os = "linux")]
+use std::process::Command;
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use clap::{Args, Parser};
@@ -109,8 +113,6 @@ const DUAL_WORK_BUF_SIZE: usize = 16 * 1024;
 /// Each bank carries its own 48-byte BHS prefix, so the two-bank total is
 /// 2 × 8240 = 16480; this is also the minimum (two `MIN_DATA_LEN` data areas).
 const ISCSI_DUAL_WORK_BUF_SIZE: usize = 2 * (MIN_DATA_LEN + BHS_SIZE);
-/// Sector size for block devices exposed by the CLI (like the C CLI).
-const SECTOR_SIZE: u32 = 512;
 /// CD-ROM logical sector size (Mode 1 data).
 const ISO_SECTOR_SIZE: u32 = 2048;
 
@@ -171,10 +173,13 @@ impl Banks {
 #[derive(Args, Debug)]
 #[command(group = clap::ArgGroup::new("transport").required(true).multiple(false))]
 struct ServeArgs {
-    /// Block device (`BlockDevice`): `img=<file>[,ro]`, `ram=<size>`,
-    /// `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
-    /// disk), or `img=<file>,profile=cd` (read-only optical profile).
-    /// Repeatable; `--block` LUNs come first in declaration order.
+    /// Block device (`BlockDevice`): `img=<file>[,ro][,removable]`,
+    /// `ram=<size>`, `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]`
+    /// (directory-chunked disk), or `img=<file>,profile=cd` (read-only optical
+    /// profile). `removable` is a USB card-reader demo: `--block
+    /// img=<file>,removable` reports RMB and lets the host eject the card;
+    /// replacing the file installs a new card at the same LUN. Repeatable;
+    /// `--block` LUNs come first in declaration order.
     #[arg(long = "block", value_name = "SPEC")]
     block: Vec<String>,
 
@@ -385,6 +390,22 @@ fn run_serve(args: ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The return value is only consumed by the USB loop; validate on every
+    // platform so a non-Linux `--usb` build still rejects bad combinations
+    // without an unused-variable warning.
+    #[cfg(target_os = "linux")]
+    let removable_lun = match validate_removable(&args, &specs, &config) {
+        Ok(lun) => lun,
+        Err(msg) => {
+            eprintln!("snowscsi: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    if let Err(msg) = validate_removable(&args, &specs, &config) {
+        eprintln!("snowscsi: {msg}");
+        return ExitCode::FAILURE;
+    }
     if args.print_config {
         println!(
             "{}",
@@ -401,7 +422,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         let selector = args.usb.as_deref().unwrap_or("auto");
-        return run_serve_usb(&args, &specs, &config, selector);
+        return run_serve_usb(&args, &specs, &config, selector, removable_lun);
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -458,16 +479,47 @@ fn resolve_config(args: &ServeArgs) -> Result<ServeConfig, String> {
     })
 }
 
-/// Build the core `Target` slot set shared by both transports.
+/// Validate the transport/plane constraints of the `removable` demo and
+/// return the single removable LUN, if any.
 ///
-/// Produces `Spc<BlockDevice>` / `Spc<MmcDrive<CliMedium>>` slots and their
-/// matching store planes. Every spec pushes exactly one slot and one plane, in
-/// spec order.
-#[allow(clippy::too_many_arguments)]
+/// The demo is deliberately narrow: one `--block img=<file>` slot, USB only,
+/// and not in the dual-bank (`WorkerStore`) path. Spec-level legality
+/// (`profile=block`, `img=` backing) is already enforced by [`spec`].
+fn validate_removable(
+    args: &ServeArgs,
+    specs: &[DeviceSpec],
+    config: &ServeConfig,
+) -> Result<Option<usize>, String> {
+    let mut removable = None;
+    for (lun, spec) in specs.iter().enumerate() {
+        if !spec.removable {
+            continue;
+        }
+        if removable.is_some() {
+            return Err("removable supports at most one --block slot".to_string());
+        }
+        removable = Some(lun);
+    }
+    if removable.is_some() {
+        if args.usb.is_none() {
+            return Err("removable is only supported with --usb (the iSCSI path \
+                        has no pause/insert handback)"
+                .to_string());
+        }
+        if config.overlap() {
+            return Err("removable cannot be combined with --banks dual \
+                        (the worker path moves the planes out of the serve loop)"
+                .to_string());
+        }
+    }
+    Ok(removable)
+}
+
 /// Build the per-LUN core slots and their storage planes.
 ///
-/// One owned [`OwnedPlane`] is built per LUN in specification order; the slot
-/// keeps the geometry, the plane keeps the bytes.
+/// Produces `Spc<BlockDevice>` / `Spc<MmcDrive<CliMedium>>` slots and their
+/// matching store planes. One owned [`OwnedPlane`] is built per LUN in
+/// specification order; the slot keeps the geometry, the plane keeps the bytes.
 fn build_core_slots(
     specs: &[DeviceSpec],
     planes: &mut Vec<Option<OwnedPlane>>,
@@ -495,7 +547,8 @@ fn build_core_slots(
         let cap = plane.capacity();
         match (spec.role, &spec.backing) {
             (DeviceRole::BlockDisk, Backing::ImgDir { .. }) => {
-                let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
+                let mut attrs =
+                    BlockAttrs::new(cap / u64::from(spec.plane.sector), spec.plane.sector);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
                 }
@@ -517,7 +570,11 @@ fn build_core_slots(
                 log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
             }
             (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
-                let mut attrs = BlockAttrs::new(cap / u64::from(SECTOR_SIZE), SECTOR_SIZE);
+                let mut attrs =
+                    BlockAttrs::new(cap / u64::from(spec.plane.sector), spec.plane.sector);
+                if spec.removable {
+                    attrs = attrs.with_removable();
+                }
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
                 }
@@ -1150,6 +1207,7 @@ where
 
 // ── iSCSI auto-config (open-iscsi) ─────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 const ISCSI_TARGET_NAME: &str = "iqn.1970-01.local.snowscsi:target";
 const ISCSI_STANDARD_PORT: u16 = 3260;
 
@@ -1180,6 +1238,7 @@ fn bind_iscsi_auto() -> Result<(TcpListener, SocketAddr), String> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn have_tool(name: &str) -> bool {
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
@@ -1199,6 +1258,7 @@ fn have_tool(name: &str) -> bool {
                     }
                     #[cfg(not(unix))]
                     {
+                        let _ = &md;
                         return true;
                     }
                 }
@@ -1208,6 +1268,7 @@ fn have_tool(name: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn is_root() -> bool {
     // Cheap check via `id -u` to avoid a libc dependency.
     if let Ok(o) = Command::new("id").arg("-u").output() {
@@ -1218,6 +1279,7 @@ fn is_root() -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn selinux_enforcing() -> bool {
     if !have_tool("getenforce") {
         return false;
@@ -1228,6 +1290,7 @@ fn selinux_enforcing() -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn selinux_allow_port(port: u16) -> bool {
     if !selinux_enforcing() || !have_tool("semanage") {
         return false;
@@ -1257,6 +1320,7 @@ fn selinux_allow_port(port: u16) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn selinux_deny_port(port: u16) {
     if !selinux_enforcing() || !have_tool("semanage") {
         return;
@@ -1274,6 +1338,7 @@ fn selinux_deny_port(port: u16) {
         .status();
 }
 
+#[cfg(target_os = "linux")]
 fn iscsid_running() -> bool {
     if have_tool("systemctl") {
         if let Ok(o) = Command::new("systemctl")
@@ -1294,6 +1359,7 @@ fn iscsid_running() -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_iscsid() {
     if iscsid_running() {
         return;
@@ -1310,6 +1376,7 @@ fn ensure_iscsid() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn iscsi_portal(bound: SocketAddr) -> String {
     // iscsiadm expects "IP:PORT" (no brackets for IPv4 loopback).
     // For IPv6 loopback, bracket the IP.
@@ -1319,6 +1386,7 @@ fn iscsi_portal(bound: SocketAddr) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn find_iscsi_device(portal: &str) -> Option<String> {
     // /dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-*
     // portal contains ':', so escape for glob via directory read.
@@ -1488,6 +1556,24 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
     }
 }
 
+/// Open one flat image file as an owned plane.
+///
+/// `writable` selects `Rw`; a read-only image is opened `rb` so it also works
+/// on read-only media. The caller has already decided the role's policy.
+fn open_img_plane(path: &str, writable: bool) -> Result<OwnedPlane, ()> {
+    if !Path::new(path).is_file() {
+        eprintln!("snowscsi: file not found: {path}");
+        return Err(());
+    }
+    let backend = FileBackend::open(path, writable)
+        .map_err(|e| eprintln!("snowscsi: failed to open {path}: {e}"))?;
+    Ok(if writable {
+        OwnedPlane::BlockRw(backend)
+    } else {
+        OwnedPlane::BlockRo(backend)
+    })
+}
+
 /// Own every backing resource a LUN specification needs, in LUN order.
 ///
 /// Exactly one byte-plane backend per non-Live LUN; `Live` owns its scanner.
@@ -1575,21 +1661,11 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
                 }
             }
             Backing::Img { path } => {
-                if !Path::new(path).is_file() {
-                    eprintln!("snowscsi: file not found: {path}");
-                    return Err(());
-                }
                 // Read-only is enforced at BOTH layers: the plane is opened
                 // `rb` (so it works on read-only media; never `r+b`), and the
                 // LUN is built with `disk_read_only` (locked write policy).
                 let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
-                let backend = FileBackend::open(path, writable)
-                    .map_err(|e| eprintln!("snowscsi: failed to open {path}: {e}"))?;
-                if writable {
-                    OwnedPlane::BlockRw(backend)
-                } else {
-                    OwnedPlane::BlockRo(backend)
-                }
+                open_img_plane(path, writable)?
             }
             Backing::Empty => {
                 // One plane per spec keeps LUN/plane alignment; the empty-CDR
@@ -1664,6 +1740,249 @@ fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Identity of the "card" file at one observation: length and mtime.
+///
+/// A partially-written card changes on the next poll, so an install waits for
+/// two consecutive identical observations.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CardStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// One filesystem observation of the card path.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardObservation {
+    /// No path (or an unreadable one).
+    Missing,
+    /// The path exists but is not a regular file (directory, device, …).
+    NotRegular,
+    /// A regular file with its stamp.
+    Regular(CardStamp),
+}
+
+/// What the watcher should do after one observation.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardDecision {
+    /// Keep waiting (missing/not regular, first sighting, unchanged).
+    Wait,
+    /// Leave the slot empty and log this reason.
+    Reject(&'static str),
+    /// Two consecutive identical sightings of a valid new card.
+    Insert(CardStamp),
+}
+
+/// Pure watcher state machine (no filesystem, no threads).
+///
+/// It is armed only while the LUN is empty. A card swap while a card is
+/// installed is deliberately **not** detected: the host must eject first, so
+/// host WRITEs to the mounted image cannot self-eject it.
+#[cfg(target_os = "linux")]
+struct CardWatch {
+    baseline: Option<CardStamp>,
+    absent: bool,
+    candidate: Option<CardStamp>,
+    min_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl CardWatch {
+    fn new(baseline: Option<CardStamp>, min_bytes: u64) -> Self {
+        Self {
+            baseline,
+            absent: baseline.is_none(),
+            candidate: None,
+            min_bytes,
+        }
+    }
+
+    fn observe(&mut self, observation: CardObservation) -> CardDecision {
+        match observation {
+            CardObservation::Missing | CardObservation::NotRegular => {
+                self.absent = true;
+                self.candidate = None;
+                CardDecision::Wait
+            }
+            CardObservation::Regular(stamp) if stamp.len < self.min_bytes => {
+                self.absent = false;
+                self.candidate = None;
+                if self.baseline == Some(stamp) {
+                    // The same too-small file is not retried every poll; only
+                    // a changed/replaced file is tested again.
+                    CardDecision::Wait
+                } else {
+                    self.baseline = Some(stamp);
+                    CardDecision::Reject("image is smaller than one logical sector")
+                }
+            }
+            CardObservation::Regular(stamp) => {
+                if self.candidate == Some(stamp) {
+                    self.candidate = None;
+                    self.absent = false;
+                    CardDecision::Insert(stamp)
+                } else if self.absent || Some(stamp) != self.baseline {
+                    self.absent = false;
+                    self.candidate = Some(stamp);
+                    CardDecision::Wait
+                } else {
+                    self.candidate = None;
+                    CardDecision::Wait
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_card(path: &str) -> CardObservation {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => CardObservation::Regular(CardStamp {
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+        }),
+        Ok(_) => CardObservation::NotRegular,
+        Err(_) => CardObservation::Missing,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn card_stamp(path: &str) -> Option<CardStamp> {
+    match observe_card(path) {
+        CardObservation::Regular(stamp) => Some(stamp),
+        CardObservation::Missing | CardObservation::NotRegular => None,
+    }
+}
+
+/// The watcher is only meaningful while a removable slot is empty. A loaded
+/// card is watched by the host filesystem, not by us.
+#[cfg(target_os = "linux")]
+fn should_arm_card_watcher(removable: bool, slot_empty: bool) -> bool {
+    removable && slot_empty
+}
+
+/// Start the background card watcher for an **empty** slot.
+///
+/// It polls `path` every 200 ms (never in the serve loop), ignores anything
+/// that is not a regular file, and publishes an insert only after the same
+/// non-baseline stamp is seen twice in a row. On detection it sets `insert`,
+/// calls `flow.pause()` and exits; the serve loop performs the install at the
+/// next clean `ServeExit::Paused`. A same-size/same-mtime replacement is not
+/// detected (the host must still eject first).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_card_watcher(
+    path: String,
+    baseline: Option<CardStamp>,
+    min_bytes: u64,
+    insert: Arc<AtomicBool>,
+    flow: Arc<snowscsi::core::Flow>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut watch = CardWatch::new(baseline, min_bytes);
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match watch.observe(observe_card(&path)) {
+                CardDecision::Wait => {}
+                CardDecision::Reject(reason) => {
+                    log::warn!("card watcher: {path}: {reason}");
+                }
+                CardDecision::Insert(_) => {
+                    // Keep re-requesting the pause until the serve loop
+                    // consumes the flag or stops us: this closes the race with
+                    // a concurrent `flow.run()` on a non-insert pause.
+                    insert.store(true, Ordering::Release);
+                    while !stop.load(Ordering::Relaxed) && insert.load(Ordering::Acquire) {
+                        flow.pause();
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Arm the watcher only when the slot is actually empty.
+#[cfg(target_os = "linux")]
+fn arm_card_watcher(
+    path: &str,
+    sector: u32,
+    removable: bool,
+    slot_empty: bool,
+    insert: &Arc<AtomicBool>,
+    flow: &Arc<snowscsi::core::Flow>,
+) -> Option<(JoinHandle<()>, Arc<AtomicBool>)> {
+    if !should_arm_card_watcher(removable, slot_empty) {
+        return None;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = spawn_card_watcher(
+        path.to_string(),
+        card_stamp(path),
+        u64::from(sector),
+        Arc::clone(insert),
+        Arc::clone(flow),
+        Arc::clone(&stop),
+    );
+    Some((handle, stop))
+}
+
+#[cfg(target_os = "linux")]
+fn stop_card_watcher(watch: &mut Option<(JoinHandle<()>, Arc<AtomicBool>)>) {
+    if let Some((handle, stop)) = watch.take() {
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+}
+
+/// Build the block attributes for a card of `len` bytes.
+///
+/// A zero-length or sub-sector image is refused rather than becoming a
+/// zero-block device (whose `READ CAPACITY` would report one bogus sector).
+#[cfg(target_os = "linux")]
+fn card_attrs(len: u64, sector: u32, read_only: bool) -> Result<BlockAttrs, &'static str> {
+    if sector == 0 {
+        return Err("invalid zero logical sector size");
+    }
+    let sector = u64::from(sector);
+    if len < sector {
+        return Err("image is smaller than one logical sector");
+    }
+    let mut attrs = BlockAttrs::new(len / sector, sector as u32).with_removable();
+    if read_only {
+        attrs.write_mode = Writability::ReadOnly;
+    }
+    Ok(attrs)
+}
+
+/// Build the fully installed slot for a newly inserted "card".
+///
+/// The slot is replaced wholesale because `BlockDevice` owns the geometry, so a
+/// capacity change is a new device. `MediumChanged` is raised on the new `Spc`
+/// before it is wrapped/handed to the target; the caller swaps the slot and its
+/// plane at the clean pause boundary, so there is no fallible install step.
+#[cfg(target_os = "linux")]
+fn build_card_insert(
+    lun: usize,
+    spec: &DeviceSpec,
+    path: &str,
+) -> Result<(CliLu, OwnedPlane), String> {
+    let plane = open_img_plane(path, !spec.plane.read_only)
+        .map_err(|_| format!("could not open new card '{path}'"))?;
+    let attrs = card_attrs(plane.capacity(), spec.plane.sector, spec.plane.read_only)?;
+    let mut spc = Spc::new(CoreBlockDevice::new(attrs));
+    spc.raise_unit_attention(snowscsi::core::UaClass::MediumChanged);
+    let lu = CliLu::Block(snowscsi::core::LuImpl::new(spc, lun as u32));
+    Ok((lu, plane))
+}
+
 #[cfg(target_os = "linux")]
 /// `snowscsi serve --usb`: assemble the MSC FunctionFS gadget, bind it to a
 /// UDC, build the core `Target` over the parsed specs and drive the library
@@ -1673,16 +1992,13 @@ fn run_serve_usb(
     specs: &[DeviceSpec],
     config: &ServeConfig,
     selector: &str,
+    removable_lun: Option<usize>,
 ) -> ExitCode {
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
     if build_core_slots(specs, &mut planes, &mut slots).is_err() {
         return ExitCode::FAILURE;
     }
-    let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
-        .iter_mut()
-        .map(|s| s as &mut dyn Lu<Pair = CliPair>)
-        .collect();
 
     // Gadget assembly: a single MSC interface (class 08/06/50) with
     // one bulk OUT + one bulk IN endpoint.
@@ -1747,7 +2063,7 @@ fn run_serve_usb(
             return ExitCode::FAILURE;
         }
     };
-    let lun_count = table.len();
+    let lun_count = slots.len();
     let mut session = BotSession::with_luns(lun_count).with_shortfall(shortfall);
     if config.overlap() {
         // Two equal banks inside `work`: command framing/Data-Out in one,
@@ -1756,7 +2072,6 @@ fn run_serve_usb(
     }
     let mut work = vec![0u8; config.work_size];
     let mut scratch = split_bank(config.scratch_len);
-    let mut target = snowscsi::core::Target::new(&mut table[..]);
 
     log::info!(
         "serving {lun_count} LUN(s) over USB (wire={}, banks={}, storage={}, per_bank={})",
@@ -1769,28 +2084,45 @@ fn run_serve_usb(
         let per_bank = config.per_bank();
         std::thread::scope(|scope| {
             let mut store = WorkerStore::new(scope, planes, per_bank);
-            let res = loop {
-                match usb_serve(
-                    &mut ffs_bot,
-                    &mut ffs_gadget,
-                    &mut session,
-                    &mut work,
-                    &mut scratch,
-                    &mut target,
-                    &mut store,
-                    &flow,
-                ) {
-                    Ok(snowscsi::core::ServeExit::Outcome(
-                        snowscsi::core::RunOutcome::ResourcesReady { lun },
-                    )) => {
-                        // The host ejected: take the pair so the slot is not
-                        // left with a resident result, then keep serving the
-                        // now-empty drive.
-                        let _ = target.take_rt(lun);
-                        log::info!("LUN {lun}: medium ejected by the host");
+            // The target/table stay alive across `ResourcesReady` and
+            // non-rebuild `Paused` returns. This path has no slot swap, so one
+            // scoped target is the whole lifetime.
+            let res = {
+                let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
+                    .iter_mut()
+                    .map(|s| s as &mut dyn Lu<Pair = CliPair>)
+                    .collect();
+                let mut target = snowscsi::core::Target::new(&mut table[..]);
+                loop {
+                    match usb_serve(
+                        &mut ffs_bot,
+                        &mut ffs_gadget,
+                        &mut session,
+                        &mut work,
+                        &mut scratch,
+                        &mut target,
+                        &mut store,
+                        &flow,
+                    ) {
+                        Ok(snowscsi::core::ServeExit::Outcome(
+                            snowscsi::core::RunOutcome::ResourcesReady { lun },
+                        )) => {
+                            // The host ejected: take the pair so the slot is
+                            // not left with a resident result, then keep
+                            // serving with the SAME target/runner: another LUN
+                            // may still have a resident long-operation receipt.
+                            let _ = target.take_rt(lun);
+                            log::info!("LUN {lun}: medium ejected by the host");
+                        }
+                        Ok(snowscsi::core::ServeExit::Paused) => {
+                            // A pause is only a handback; there is no rebuild
+                            // in the dual-bank path, so resume immediately.
+                            if flow.state() == snowscsi::core::FlowState::Pause {
+                                flow.run();
+                            }
+                        }
+                        other => break other,
                     }
-                    Ok(snowscsi::core::ServeExit::Paused) => {}
-                    other => break other,
                 }
             };
             if let Err((i, e)) = store.sync() {
@@ -1801,26 +2133,118 @@ fn run_serve_usb(
         })
     } else {
         let mut storage = CliStorage::new(planes);
-        let res = loop {
-            match usb_serve(
-                &mut ffs_bot,
-                &mut ffs_gadget,
-                &mut session,
-                &mut work,
-                &mut scratch,
-                &mut target,
-                &mut storage,
-                &flow,
-            ) {
-                Ok(snowscsi::core::ServeExit::Outcome(
-                    snowscsi::core::RunOutcome::ResourcesReady { lun },
-                )) => {
-                    let _ = target.take_rt(lun);
-                    log::info!("LUN {lun}: medium ejected by the host");
+        let removable_path = removable_lun.and_then(|lun| match &specs[lun].backing {
+            Backing::Img { path } => Some(path.clone()),
+            _ => None,
+        });
+        let insert_pending = Arc::new(AtomicBool::new(false));
+        let mut card_watch: Option<(JoinHandle<()>, Arc<AtomicBool>)> = None;
+        let res = 'outer: loop {
+            // The target lives across `ResourcesReady` and non-rebuild
+            // `Paused` returns; dropping it would lose another LUN's resident
+            // `long_feedback`/`long_pending`. It is dropped only at the clean
+            // insert boundary below.
+            let exit = {
+                let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
+                    .iter_mut()
+                    .map(|s| s as &mut dyn Lu<Pair = CliPair>)
+                    .collect();
+                let mut target = snowscsi::core::Target::new(&mut table[..]);
+                loop {
+                    match usb_serve(
+                        &mut ffs_bot,
+                        &mut ffs_gadget,
+                        &mut session,
+                        &mut work,
+                        &mut scratch,
+                        &mut target,
+                        &mut storage,
+                        &flow,
+                    ) {
+                        Ok(snowscsi::core::ServeExit::Outcome(
+                            snowscsi::core::RunOutcome::ResourcesReady { lun },
+                        )) => {
+                            // `ResourcesReady` is not a rebuild point: take the
+                            // pair and keep the same target/runner serving.
+                            let _ = target.take_rt(lun);
+                            log::info!("LUN {lun}: medium ejected by the host");
+                            if Some(lun) == removable_lun {
+                                storage.set_plane(lun, None);
+                                insert_pending.store(false, Ordering::Release);
+                                stop_card_watcher(&mut card_watch);
+                                if let Some(path) = removable_path.as_deref() {
+                                    card_watch = arm_card_watcher(
+                                        path,
+                                        specs[lun].plane.sector,
+                                        true,
+                                        true,
+                                        &insert_pending,
+                                        &flow,
+                                    );
+                                    log::info!(
+                                    "LUN {lun}: card removed; waiting for a new image at {path}"
+                                );
+                                }
+                            }
+                        }
+                        Ok(snowscsi::core::ServeExit::Paused) => {
+                            // `Paused` is only produced when `pause_requested` saw
+                            // `management_boundary().is_ok()`, i.e. the safe point
+                            // to drop the runner and swap the slot.
+                            let insert_ready = insert_pending.load(Ordering::Acquire);
+                            if removable_lun.is_some()
+                                && insert_ready
+                                && target.management_boundary().is_ok()
+                            {
+                                insert_pending.store(false, Ordering::Release);
+                                break None;
+                            }
+                            // Do not clobber `Stop`: it must end the loop.
+                            if !insert_ready && flow.state() == snowscsi::core::FlowState::Pause {
+                                flow.run();
+                            }
+                        }
+                        other => break Some(other),
+                    }
                 }
-                Ok(snowscsi::core::ServeExit::Paused) => {}
-                other => break other,
-            }
+            };
+            let Some(result) = exit else {
+                // Clean boundary: the target/table block is closed, so `slots`
+                // is free to mutate. The new slot is fully installed (`CliLu`
+                // carries the plane's geometry and a pending MediumChanged UA),
+                // so there is no fallible install step afterwards.
+                stop_card_watcher(&mut card_watch);
+                if let (Some(lun), Some(path)) = (removable_lun, removable_path.as_deref()) {
+                    match build_card_insert(lun, &specs[lun], path) {
+                        Ok((lu, plane)) => {
+                            slots[lun] = lu;
+                            storage.set_plane(lun, Some(plane));
+                            log::info!("LUN {lun}: new card installed from {path}");
+                            // Deliberately do not re-arm: a loaded card is not
+                            // watched, so host writes cannot self-eject it.
+                        }
+                        Err(msg) => {
+                            eprintln!("snowscsi: LUN {lun}: {msg}");
+                            // The slot is still empty; keep watching for a
+                            // valid replacement.
+                            card_watch = arm_card_watcher(
+                                path,
+                                specs[lun].plane.sector,
+                                true,
+                                true,
+                                &insert_pending,
+                                &flow,
+                            );
+                        }
+                    }
+                }
+                if flow.state() == snowscsi::core::FlowState::Pause {
+                    flow.run();
+                }
+                continue 'outer;
+            };
+            stop_card_watcher(&mut card_watch);
+            break 'outer result;
         };
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");
@@ -2578,6 +3002,119 @@ mod tests {
             "--overlap"
         ])
         .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stamp(len: u64, secs: u64) -> CardStamp {
+        CardStamp {
+            len,
+            mtime: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn card_watch_decision_is_pure_and_stable() {
+        let mut watch = CardWatch::new(Some(stamp(4096, 10)), 512);
+        assert_eq!(watch.observe(CardObservation::Missing), CardDecision::Wait);
+        assert_eq!(
+            watch.observe(CardObservation::NotRegular),
+            CardDecision::Wait,
+            "a directory is not a card"
+        );
+
+        let sub_sector = stamp(511, 10);
+        assert_eq!(
+            watch.observe(CardObservation::Regular(sub_sector)),
+            CardDecision::Reject("image is smaller than one logical sector")
+        );
+        assert_eq!(
+            watch.observe(CardObservation::Regular(sub_sector)),
+            CardDecision::Wait,
+            "the same rejected file is not retried every poll"
+        );
+
+        let new = stamp(8192, 20);
+        assert_eq!(
+            watch.observe(CardObservation::Regular(new)),
+            CardDecision::Wait,
+            "one changed sighting is not enough"
+        );
+        assert_eq!(
+            watch.observe(CardObservation::Regular(new)),
+            CardDecision::Insert(new),
+            "two stable sightings install the card"
+        );
+
+        assert!(
+            !should_arm_card_watcher(true, false),
+            "a loaded card is never watched"
+        );
+        assert!(should_arm_card_watcher(true, true));
+        assert!(!should_arm_card_watcher(false, true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn card_watch_detects_a_file_after_it_was_missing() {
+        let old = stamp(4096, 10);
+        let mut watch = CardWatch::new(Some(old), 512);
+        assert_eq!(watch.observe(CardObservation::Missing), CardDecision::Wait);
+        assert_eq!(
+            watch.observe(CardObservation::Regular(old)),
+            CardDecision::Wait,
+            "reappearance resets the absent flag"
+        );
+        assert_eq!(
+            watch.observe(CardObservation::Regular(old)),
+            CardDecision::Insert(old)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn card_attrs_reject_sub_sector_images() {
+        assert!(card_attrs(0, 512, false).is_err());
+        assert!(card_attrs(511, 512, false).is_err());
+        assert_eq!(card_attrs(2048, 2048, false).unwrap().capacity_blocks, 1);
+        assert_eq!(card_attrs(2048, 512, false).unwrap().capacity_blocks, 4);
+    }
+
+    #[test]
+    fn removable_demo_is_usb_single_slot_only() {
+        let specs = spec::parse_all(&["img=/tmp/card.img,removable".to_string()], &[]).unwrap();
+        let args = parse_serve(&["--usb"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(validate_removable(&args, &specs, &cfg), Ok(Some(0)));
+
+        let iscsi = parse_serve(&["--iscsi", "127.0.0.1:0"]);
+        let cfg = resolve_config(&iscsi).unwrap();
+        assert!(
+            validate_removable(&iscsi, &specs, &cfg).is_err(),
+            "iSCSI has no pause/insert handback"
+        );
+
+        let dual = parse_serve(&["--usb", "--banks", "dual"]);
+        let cfg = resolve_config(&dual).unwrap();
+        assert!(
+            validate_removable(&dual, &specs, &cfg).is_err(),
+            "the worker path moves the planes out of the serve loop"
+        );
+
+        let two = spec::parse_all(
+            &[
+                "img=/tmp/a.img,removable".to_string(),
+                "img=/tmp/b.img,removable".to_string(),
+            ],
+            &[],
+        )
+        .unwrap();
+        let args = parse_serve(&["--usb"]);
+        let cfg = resolve_config(&args).unwrap();
+        assert!(
+            validate_removable(&args, &two, &cfg).is_err(),
+            "at most one removable card slot"
+        );
     }
 
     #[test]

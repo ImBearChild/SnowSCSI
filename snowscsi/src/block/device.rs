@@ -551,7 +551,10 @@ impl Device for BlockDevice {
     type Medium = NoMedium;
 
     fn inquiry_data(&self) -> InquiryData {
-        InquiryData::block()
+        InquiryData {
+            removable: self.attrs.removable,
+            ..InquiryData::block()
+        }
     }
 
     fn removal_encoding(&self) -> RemovalEncoding {
@@ -1229,6 +1232,16 @@ mod tests {
         BlockDevice::new(BlockAttrs::new(16, 512))
     }
 
+    #[test]
+    fn inquiry_reports_the_slot_removable_bit() {
+        let fixed = device();
+        assert!(!fixed.inquiry_data().removable);
+
+        let removable = BlockDevice::new(BlockAttrs::new(16, 512).with_removable());
+        assert!(removable.inquiry_data().removable);
+        assert_eq!(removable.inquiry_data().pdt, 0x00);
+    }
+
     fn io_receipt(confirmed: usize, error: Option<Fault>) -> Feedback {
         Feedback::io_done(IoReceipt::test(confirmed, error, Effect::Known))
     }
@@ -1541,6 +1554,7 @@ mod tests {
             write_mode: crate::core::Writability::ReadOnly,
             write_protected: false,
             needs_recovery: false,
+            removable: false,
         });
         let permit = permit();
         let cdb = cdb10(WRITE_10, 0, 1);
@@ -1755,6 +1769,7 @@ mod tests {
             write_mode: crate::core::Writability::Writable,
             write_protected: false,
             needs_recovery: true,
+            removable: false,
         });
         let permit = permit();
         assert_eq!(

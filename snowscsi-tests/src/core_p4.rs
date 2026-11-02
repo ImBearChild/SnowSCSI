@@ -1060,6 +1060,84 @@ fn sync_and_async_adapters_produce_the_same_long_operation_trace() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// An eject/take on one LUN preserves another LUN's long-operation receipt
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The CLI relies on this core guarantee: a host eject of LUN A returns
+/// `ResourcesReady` and the application takes A's pair, but the target/runner
+/// must keep B's resident long-operation receipt so the fill continues. Dropping
+/// and rebuilding the `Target` at `ResourcesReady` would lose that receipt and
+/// leave B `FORMAT_IN_PROGRESS` forever.
+#[test]
+fn host_eject_on_one_lun_preserves_another_luns_long_receipt() {
+    two_lun_target!(target, 4, c_a, c_b);
+    let mut storage = BlockingStorage::new(Plane::new(16 * 1024));
+    let mut host = BlockingHost::new(TestHost::data());
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // LUN B starts a resident foreground fill and owns a live long receipt.
+    assert_eq!(
+        start_immed_format_rt(
+            &mut target,
+            1,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        poll_long_rt(&mut target, 1, &mut storage, &mut work, &mut scratch)
+            .expect("B long entry")
+            .phase,
+        LongPhase::Foreground
+    );
+
+    // LUN A ejects through the real host command path, then the application
+    // takes A's pair exactly as the CLI does at `ResourcesReady`.
+    assert_eq!(
+        target.drive_rt(
+            0,
+            &mut storage,
+            ctx_lun(0, Direction::None, 0),
+            &[0x1B, 0, 0, 0, 0x02, 0],
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
+    let ejected = target.take_rt(0).expect("A's detached pair");
+    assert!(ejected.pair.is_some());
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "taking A clears its result barrier"
+    );
+
+    // B's fill still advances on the same target/runner and settles normally.
+    let mut entries = 0;
+    loop {
+        entries += 1;
+        assert!(entries < 16, "B's long operation did not settle");
+        let info = poll_long_rt(&mut target, 1, &mut storage, &mut work, &mut scratch)
+            .expect("B's long receipt must survive A's eject/take");
+        match info.phase {
+            LongPhase::Foreground => {}
+            LongPhase::Settled => {
+                assert_eq!(info.error, None);
+                break;
+            }
+            other => panic!("unexpected B long phase {other:?}"),
+        }
+    }
+    assert_eq!(storage.inner().syncs(), 1);
+    assert!(storage.inner().zeroed(8192));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Explicit no-medium GC/GESN through Spc
 // ═══════════════════════════════════════════════════════════════════════════
 

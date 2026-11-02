@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `link_lost`; `RunEnd::TransportEnded` is removed.
 - **core**: `Device` gains defaulted `admits_without_medium`; `Lu` gains
   defaulted `take_eject_request`; `MmcDrive::empty` now takes `MmcCaps`.
+- **block**: `BlockAttrs` gains `removable`; struct literals must add the
+  field (use `BlockAttrs::new(..)` and `with_removable()` instead).
 
 ### Added
 
@@ -25,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LuImpl::empty(device)`.
 - **core**: `Spc::with_identity` for per-LU INQUIRY identity strings.
 - **cli**: `--cdrom empty` serves an enumerated drive with no medium.
+- **block**: removable block media — `BlockAttrs::with_removable()` reports
+  INQUIRY RMB=1 and lets a host START STOP UNIT eject the pair; the LUN stays
+  enumerated as empty (`3A/00`) and the application installs a new pair at the
+  same LUN and raises `UaClass::MediumChanged`.
+- **cli**: `--block img=<file>,removable` USB card-reader demo (one removable
+  slot, `profile=block`, `img=` only, not with `--banks dual`): eject drops
+  the plane and a background watcher installs a stable replacement file.
 
 ## [0.2.0] - 2026-10-18
 
