@@ -7,7 +7,7 @@
 //! ```text
 //! SPEC    := <backing>[=<value>][,<opt>...]
 //! backing := img=<file> | imgdir=<dir> | ram=<size> | live=<dir>
-//!          | dvdram=<path|ram:<size>>
+//!          | dvdram=<path|ram:<size>> | empty
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
 //!          | size=<size>
 //! ```
@@ -59,6 +59,9 @@ pub enum Backing {
     /// `dvdram=<path>` or `dvdram=ram:<size>` — DVD-RAM (MMC only).
     /// `path = None` means memory (the size lives in [`PlaneOpts`]).
     DvdRam { path: Option<String> },
+    /// `empty` — an enumerated drive with no medium (MMC only). The first
+    /// medium is installed by the application; the LUN has no byte plane.
+    Empty,
 }
 
 /// Plane/geometry options common to a device spec.
@@ -116,6 +119,10 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
     if matches!(backing, Backing::DvdRam { path: None }) && !opts_str.is_empty() {
         return Err("dvdram=ram:<size> takes no options".to_string());
     }
+    // An empty drive has no plane, so plane/geometry options are meaningless.
+    if matches!(backing, Backing::Empty) && !opts_str.is_empty() {
+        return Err("empty takes no options".to_string());
+    }
     if implicit_size.is_some() && opts.size.is_some() {
         return Err("size= is not allowed with dvdram=ram:<size>".to_string());
     }
@@ -172,7 +179,9 @@ fn parse_block_profile(
 }
 
 fn parse_backing(expr: &str) -> Result<(Backing, Option<u64>), String> {
-    if let Some(v) = expr.strip_prefix("img=") {
+    if expr == "empty" {
+        Ok((Backing::Empty, None))
+    } else if let Some(v) = expr.strip_prefix("img=") {
         if v.is_empty() {
             return Err("empty img= path".to_string());
         }
@@ -212,7 +221,7 @@ fn parse_backing(expr: &str) -> Result<(Backing, Option<u64>), String> {
         }
     } else {
         Err(format!(
-            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, or dvdram="
+            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, dvdram=, or empty"
         ))
     }
 }
@@ -225,7 +234,7 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
         ),
         DeviceFamily::Cdrom => matches!(
             backing,
-            Backing::Img { .. } | Backing::Live { .. } | Backing::DvdRam { .. }
+            Backing::Img { .. } | Backing::Live { .. } | Backing::DvdRam { .. } | Backing::Empty
         ),
     };
     if ok {
@@ -237,6 +246,7 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
         Backing::Ram { .. } => "ram",
         Backing::Live { .. } => "live",
         Backing::DvdRam { .. } => "dvdram",
+        Backing::Empty => "empty",
     };
     Err(format!("{key}= is not valid for {}", family.flag()))
 }
@@ -370,7 +380,7 @@ pub fn mounted_paths(specs: &[DeviceSpec]) -> Vec<MountedPath<'_>> {
                 Backing::ImgDir { dir } => Some((dir.as_str(), kind)),
                 Backing::Live { dir } => Some((dir.as_str(), kind)),
                 Backing::DvdRam { path: Some(p) } => Some((p.as_str(), kind)),
-                Backing::DvdRam { path: None } | Backing::Ram { .. } => None,
+                Backing::DvdRam { path: None } | Backing::Ram { .. } | Backing::Empty => None,
             }
         })
         .collect()
@@ -639,6 +649,15 @@ mod tests {
         // Only the bundle directory carries a path.
         assert_eq!(mounted_paths(&specs), vec![("d", "block")]);
         assert!(check_dual_mount(&specs).is_empty());
+    }
+
+    #[test]
+    fn empty_is_a_cdrom_only_backing() {
+        let spec = cdrom("empty").expect("empty cdrom");
+        assert_eq!(spec.role, DeviceRole::MmcCd);
+        assert_eq!(spec.backing, Backing::Empty);
+        assert!(block("empty").is_err(), "a block LUN always has bytes");
+        assert!(cdrom("empty,ro").is_err(), "an empty tray has no plane");
     }
 
     #[test]

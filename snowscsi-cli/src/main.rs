@@ -14,11 +14,12 @@
 //!   `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
 //!   disk, `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
-//! - `--cdrom` drives the core `MmcDrive` profile (full MMC): `img=<iso>`, `live=<dir>`
-//!   (live ISO9660 over a directory), or
+//! - `--cdrom` drives the core `MmcDrive` profile (full MMC): `img=<iso>`,
+//!   `live=<dir>` (live ISO9660 over a directory),
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
-//!   never writes file-system structures).
+//!   never writes file-system structures), or `empty` (an enumerated drive
+//!   with no medium; the application installs the first one).
 //!
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
@@ -178,8 +179,9 @@ struct ServeArgs {
     block: Vec<String>,
 
     /// CD-ROM device (core `MmcDrive`, full MMC): `img=<iso>`, `live=<dir>`
-    /// (live ISO9660 over a directory), or `dvdram=<path|ram:<size>>[,size=…]`
-    /// (random-writable DVD-RAM). Repeatable; these LUNs follow the `--block` LUNs.
+    /// (live ISO9660 over a directory), `dvdram=<path|ram:<size>>[,size=…]`
+    /// (random-writable DVD-RAM), or `empty` (an enumerated drive with no
+    /// medium). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -556,6 +558,13 @@ fn build_core_slots(
                     "LUN {lun}: {dir} live ISO9660 CD-ROM ({} sectors)",
                     cap / u64::from(ISO_SECTOR_SIZE)
                 );
+            }
+            (DeviceRole::MmcCd, Backing::Empty) => {
+                planes.push(None);
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::empty(Spc::new(
+                    MmcDrive::<CliMedium>::empty(),
+                ))));
+                log::debug!("LUN {lun}: empty CD-ROM tray (no medium)");
             }
             (DeviceRole::MmcCd, Backing::DvdRam { .. }) => {
                 let medium = CliMedium::DvdRam(DvdRamMedium::new(cap / u64::from(ISO_SECTOR_SIZE)));
@@ -1580,6 +1589,14 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
                     OwnedPlane::BlockRw(backend)
                 } else {
                     OwnedPlane::BlockRo(backend)
+                }
+            }
+            Backing::Empty => {
+                // One plane per spec keeps LUN/plane alignment; the empty-CDR
+                // arm in `build_core_slots` drops it and pushes `None`.
+                OwnedPlane::Ram {
+                    bytes: Vec::new(),
+                    writable: false,
                 }
             }
             Backing::Live { dir } => {
