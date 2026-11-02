@@ -472,6 +472,11 @@ where
             Ok(ServeExit::Outcome(RunOutcome::ResourcesReady { lun })) => {
                 let _ = target.take_rt(lun);
             }
+            // A fatal target is sticky; restarting the loop would spin.
+            Ok(ServeExit::Outcome(RunOutcome::Ended { .. })) => {
+                warn!("bot: target ended");
+                core::future::pending::<()>().await;
+            }
             Ok(_) => {}
             Err(_) => {
                 RESTARTS.fetch_add(1, Ordering::Relaxed);

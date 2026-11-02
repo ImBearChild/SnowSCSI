@@ -117,7 +117,7 @@ impl AsyncBotSend for GoldenAsyncBotIo {
 ///
 /// Mirrors the synchronous [`crate::golden_drive::serve_usb`] replay: the
 /// script ends at a command boundary, where the seam reports EOF and the shell
-/// surfaces [`ServeError::Closed`] — a clean end for a finite wire script.
+/// surfaces `ServeExit::WireGone` — a clean end for a finite wire script.
 #[allow(clippy::too_many_arguments)]
 pub fn serve_usb_async<S: RuntimeSet>(
     io: Rc<RefCell<RecBotIo>>,

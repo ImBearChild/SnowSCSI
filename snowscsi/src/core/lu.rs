@@ -220,14 +220,12 @@ fn admitted_during_foreground(opcode: u8) -> bool {
 /// Device-level commands that stay answerable on an **empty** slot.
 ///
 /// START STOP UNIT is how the host closes a tray it already opened (and how
-/// Windows retries an eject); PREVENT/ALLOW is a device latch. Neither touches
-/// the medium, so an empty slot answers them instead of `MEDIUM NOT PRESENT`.
+/// Windows retries an eject); it touches no medium, so an empty slot answers it
+/// instead of `MEDIUM NOT PRESENT`. PREVENT/ALLOW is deliberately **not** in
+/// this set: clearing the normal latch issues a storage `Sync`, which must not
+/// reach a stale adapter binding after the medium was removed.
 fn admitted_without_medium(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x1B // START STOP UNIT
-            | 0x1E // PREVENT/ALLOW MEDIUM REMOVAL
-    )
+    opcode == 0x1B // START STOP UNIT
 }
 
 /// Canonical slot: a [`Device`] plus the application's backing handle.
@@ -816,11 +814,10 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         // result is produced**. A host eject is ordered as
         // commit → detach/result → send the full status → `ResourcesReady`, so
         // when this result appears the status has not been sent yet:
-        // `Delivery::Pending` is the truthful snapshot. `NotApplicable` would
-        // claim "no delivery duty" (an EJECT does owe a status) and `Complete`
-        // would claim the transport already accepted it. A later
-        // `finish_delivery` books the real outcome; a failed status never rolls
-        // back this commit/detach, and `take_rt` still hands the pair back once.
+        // `Delivery::Pending` is the truthful snapshot. The snapshot is not
+        // rewritten later (the command's `finish_delivery` runs before the
+        // detach); a failed status never rolls back this commit/detach, and
+        // `take_rt` still hands the pair back once.
         self.result = Some(ChangeResult {
             pair: Some(Pair { medium, backing }),
             local: Ok(()),

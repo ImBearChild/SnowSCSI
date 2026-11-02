@@ -1200,7 +1200,7 @@ impl Runner {
         Ok(())
     }
 
-    /// Transport end/fatal path.
+    /// Terminal (`stop` drain / `fatal` cancel) path.
     ///
     /// Every outcome that reaches here settles the device as `Stop`: which
     /// terminal event fired is already carried by the returned `RunOutcome`,
@@ -2264,15 +2264,29 @@ impl Runner {
 
     /// Gate for [`Self::take_rt`].
     ///
-    /// The authoritative boundary, with **only** the long-phase rejection
-    /// relaxed for a LUN whose long operation a force already cancelled
+    /// The authoritative command/host boundary. The long-operation obligations
+    /// are checked **per LUN** (a retained token on another LUN must not block
+    /// this take); the long-phase rejection is relaxed only for a LUN whose
+    /// long operation a force already cancelled
     /// ([`Self::force_long_cancelled`]): the device keeps its `Foreground`
     /// projection until the pair is detached, so the handback booked by the
-    /// force (including `unknown_remainder`) must stay deliverable. A live
-    /// token, command, retained input, unconsumed completion, result barrier or
-    /// live borrow still blocks.
+    /// force (including `unknown_remainder`) must stay deliverable.
     fn take_boundary_of<L: Lu + ?Sized>(&self, lun: usize, slot: &L) -> Result<(), BoundaryReject> {
-        self.boundary_checks(slot, !self.force_long_cancelled(lun), true)
+        // The command/host side is global (one command at a time), but the
+        // long-operation obligations are **per LUN**: a retained token on
+        // another LUN must never block this take, otherwise a handback and
+        // that LUN's long entry each wait for the other (the long entry is
+        // blocked by the global `await_take` barrier).
+        self.boundary_checks(slot, false, false)?;
+        if self.long_pending.is_some_and(|(owner, _)| owner == lun) {
+            return Err(BoundaryReject::RequiredIoInFlight);
+        }
+        if !self.force_long_cancelled(lun)
+            && !matches!(slot.long_info().phase, LongPhase::Idle | LongPhase::Settled)
+        {
+            return Err(BoundaryReject::LongOperationActive);
+        }
+        Ok(())
     }
 
     /// Whether [`Self::take_rt`] would accept `lun` right now.
@@ -2663,50 +2677,62 @@ impl Runner {
         if let Err(fault) = self.settle_abnormally(lu, storage, host, InterruptReason::Stop) {
             self.set_fatal(fault);
         }
+        // A control queued for the command that no longer exists (`Abort`) must
+        // not wedge the next link: `tick` never consumes an idle `Abort`.
+        self.pending_control = None;
+        self.eject_pending = None;
     }
 
-    /// Cancel the resident long operation's retained token for `lun`.
+    /// Cancel the resident long operation's retained token for `lun` and settle
+    /// the device with a synthesized cancelled receipt.
     ///
     /// The link that owned the token is gone, so no later `poll_long_entry` can
-    /// reach it. The caller must pass the slot that owns the operation (see
-    /// [`Self::long_lun`]); a token on another LUN is never inherited.
+    /// reach it. Cancelling alone is not enough: a device (an MMC fill) keeps
+    /// its `Foreground` phase until it observes the terminal receipt, which
+    /// would leave every media command `FORMAT IN PROGRESS` forever on a target
+    /// that is supposed to outlive the link. The receipt is fed with an empty
+    /// bank: a cancelled operation never reads or writes data.
     pub(crate) fn cancel_long_token<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
         lu: &mut L,
         storage: &mut dyn Storage,
+        data: &mut [u8],
     ) {
-        self.cancel_long_at_link_loss(lu, storage, Some(lun));
+        self.cancel_long_at_link_loss(lun, lu, storage, data);
     }
 
     /// Cancel the resident long operation's retained token because the wire is
-    /// gone.
+    /// gone and feed the device its terminal receipt.
     ///
     /// No later `poll_long_entry` can reach the token, so it must be cancelled
     /// here instead of being dropped. The facts follow the same rules as the
     /// long-entry cancellation path: a read (or a speculative prefetch) never
     /// fabricates a write remainder, while an unobserved write/sync reports
-    /// `unknown_remainder`. Only a slot that owns the token is notified; a
-    /// query command on another LUN can be the one that was live, and its
-    /// device must not inherit another LUN's effects.
+    /// `unknown_remainder`. Only the slot that owns the token is notified.
     fn cancel_long_at_link_loss<L: Lu + ?Sized>(
         &mut self,
+        lun: usize,
         lu: &mut L,
         storage: &mut dyn Storage,
-        command_lun: Option<usize>,
+        data: &mut [u8],
     ) {
-        let Some((lun, pending)) = self.long_pending else {
+        let Some((_, pending)) = self.long_pending else {
             return;
         };
         storage.cancel(pending.token);
         self.clear_long_token();
         self.clear_long_feedback(lun);
+        let receipt = Self::cancelled_receipt(pending.req.dir);
         let known = Self::known_unobserved(pending.req.dir);
-        if known == KnownEffects::NONE || command_lun.is_some_and(|owner| owner != lun) {
-            return;
-        }
+        let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
         let permit = self.command_permit();
-        let _ = lu.interrupt(&permit, InterruptReason::Stop, known);
+        // A device that still asks for IO after the cancelled receipt is
+        // stopped so it cannot keep a phantom in-flight operation. The caller
+        // supplies the long-operation bank: a device may still probe it before
+        // it settles.
+        let stopped = known == KnownEffects::NONE;
+        let _ = self.feed_long_terminal(lun, lu, &permit, feedback, data, stopped, known);
     }
 
     /// Enter the fatal state; the next settled `tick` reports `Ended{Fatal}`.
@@ -2721,9 +2747,8 @@ impl Runner {
 
     /// One service entry: at most one reason, never a queued event.
     ///
-    /// Order: fatal → transport ended → stopped → await take →
-    /// pending `Nop` → `ServiceReady`. A live command is never reported as
-    /// `Ended`.
+    /// Order: fatal → stopped → await take → pending `Nop` →
+    /// `ServiceReady`. A live command is never reported as `Ended`.
     #[allow(dead_code)] // `Target::tick`; driven by tests here
     pub(crate) fn tick(&mut self) -> RunOutcome {
         if let Some(outcome) = self.settled_terminal_outcome() {
@@ -2832,7 +2857,8 @@ impl Runner {
         let permit = self.command_permit();
 
         // 0. A terminal flag with a retained token: drain (Stop) or cancel
-        //    (transport end / fatal) before the normal gate. With no token the
+        //    (fatal) before the normal gate. A lost link is not terminal; it
+        //    settles the token through `Target::link_lost`. With no token the
         //    gate below rejects the entry.
         if self.long_pending.is_some() {
             if let Some(outcome) = self.terminal_outcome() {
@@ -3002,7 +3028,15 @@ impl Runner {
                 self.clear_long_token();
                 let receipt = Self::cancelled_receipt(pending.req.dir);
                 let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
-                return self.feed_long_terminal(lun, lu, permit, feedback, data, false);
+                return self.feed_long_terminal(
+                    lun,
+                    lu,
+                    permit,
+                    feedback,
+                    data,
+                    false,
+                    KnownEffects::NONE,
+                );
             };
             match storage.poll_exec(pending.token, buf) {
                 Poll::Pending => return Ok(lu.long_info()),
@@ -3017,7 +3051,7 @@ impl Runner {
             Self::cancelled_receipt(pending.req.dir)
         };
         let feedback = Feedback::io_done(IoReceipt::from_storage(receipt, self.owner));
-        self.feed_long_terminal(lun, lu, permit, feedback, data, stopped)
+        self.feed_long_terminal(lun, lu, permit, feedback, data, stopped, KnownEffects::NONE)
     }
 
     /// Feed one terminal receipt to the device with a single bounded
@@ -3027,6 +3061,7 @@ impl Runner {
     /// issues no more IO; `force_remove_*` remains the escape). On transport
     /// end/fatal a device that still asks for IO is stopped with one bounded
     /// `interrupt(Stop, NONE)` so it cannot keep a phantom in-flight operation.
+    #[allow(clippy::too_many_arguments)]
     fn feed_long_terminal<L: Lu + ?Sized>(
         &mut self,
         lun: usize,
@@ -3035,12 +3070,13 @@ impl Runner {
         feedback: Feedback,
         data: &mut [u8],
         stopped: bool,
+        known: KnownEffects,
     ) -> Result<LongInfo, Fault> {
         self.long_feedback = Some((lun, feedback));
         match lu.poll_long(permit, feedback, data) {
             PollStep::Io(_) | PollStep::Prefetch(_) => {
                 if !stopped {
-                    let _ = lu.interrupt(permit, InterruptReason::Stop, KnownEffects::NONE);
+                    let _ = lu.interrupt(permit, InterruptReason::Stop, known);
                 }
             }
             PollStep::Complete(_)
@@ -4406,6 +4442,61 @@ mod tests {
     }
 
     #[test]
+    fn link_loss_clears_a_queued_abort() {
+        let mut bench = Bench::new(write_script(512), 1);
+        bench.start(ctx(Direction::FromHost, 512)).expect("start");
+        assert_eq!(bench.step(), Ok(DriveStep::Pending));
+        bench
+            .runner
+            .request_control(Control::Abort)
+            .expect("abort is accepted while a command is active");
+        // The link dies before the next step consumes the Abort. Settling the
+        // command must drop the abort: `tick` never consumes an idle Abort, so
+        // leaving it queued would reject every later command with ControlPending.
+        {
+            let Bench {
+                slot,
+                runner,
+                storage,
+                host,
+                ..
+            } = &mut bench;
+            runner.settle_link_command(slot, storage, host);
+        }
+        assert!(bench.runner.pending_control.is_none());
+        assert_eq!(bench.runner.tick(), RunOutcome::ServiceReady);
+        assert!(bench.start(ctx(Direction::FromHost, 512)).is_ok());
+    }
+
+    #[test]
+    fn take_boundary_ignores_another_luns_long_token() {
+        let mut slot0 = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 1u8);
+        let slot1 = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 2u8);
+        let mut runner = Runner::new();
+        let mut storage = HoldStorage::new(usize::MAX);
+        let mut bank = [0u8; 64];
+
+        let info = runner
+            .poll_long_entry(0, &mut slot0, &mut storage, &mut bank)
+            .expect("long entry");
+        assert_eq!(info.phase, LongPhase::Foreground);
+        assert!(runner.long_pending.is_some());
+
+        // A handback on another LUN is claimable while LUN 0 holds its token;
+        // otherwise the handback (which blocks the long entry) and the token
+        // (which used to block the take) would wait for each other forever.
+        runner.host_eject_succeeded(1).expect("handback");
+        assert!(
+            runner.take_ready(1, &slot1),
+            "another LUN's long token must not block this take"
+        );
+        assert!(
+            !runner.take_ready(0, &slot0),
+            "the LUN that owns the token is still busy"
+        );
+    }
+
+    #[test]
     fn io_directions_map_to_the_matching_storage_buffers() {
         let script = [
             Some(Script::Publish(DataPlan {
@@ -4720,12 +4811,11 @@ mod tests {
     }
 
     #[test]
-    fn transport_end_cancels_a_retained_long_operation() {
+    fn link_loss_settles_a_retained_long_operation() {
         // A write whose end is never observed keeps the unknown remainder.
         let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleIo), 1u8);
         let mut runner = Runner::new();
         let mut storage = HoldStorage::new(usize::MAX);
-        let mut host = HoldHost::new();
         let mut bank = [0u8; 64];
 
         let info = runner
@@ -4737,7 +4827,7 @@ mod tests {
         assert!(runner.long_feedback.is_some());
         assert_eq!(storage.cancels, 0);
 
-        runner.cancel_long_token(0, &mut slot, &mut storage);
+        runner.cancel_long_token(0, &mut slot, &mut storage, &mut bank);
         assert_eq!(storage.cancels, 1, "the retained token is cancelled");
         assert!(runner.long_pending.is_none(), "the long state is idle");
         assert!(runner.long_feedback.is_none());
@@ -4749,14 +4839,13 @@ mod tests {
         );
 
         // Idempotent: nothing is left to cancel.
-        runner.cancel_long_token(0, &mut slot, &mut storage);
+        runner.cancel_long_token(0, &mut slot, &mut storage, &mut bank);
         assert_eq!(storage.cancels, 1);
 
         // A read never fabricates a write remainder (and needs no interrupt).
         let mut slot = LuImpl::new(ProbeLong::new(ProbeMode::SettleRead), 1u8);
         let mut runner = Runner::new();
         let mut storage = HoldStorage::new(usize::MAX);
-        let mut host = HoldHost::new();
         let mut bank = [0u8; 64];
 
         let info = runner
@@ -4766,7 +4855,7 @@ mod tests {
         runner.claim_long_feedback(0, info);
         assert_eq!(storage.cancels, 0);
 
-        runner.cancel_long_token(0, &mut slot, &mut storage);
+        runner.cancel_long_token(0, &mut slot, &mut storage, &mut bank);
         assert_eq!(storage.cancels, 1);
         assert!(runner.long_pending.is_none(), "the long state is idle");
         assert!(runner.long_feedback.is_none());

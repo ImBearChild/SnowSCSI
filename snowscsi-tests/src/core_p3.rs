@@ -1842,8 +1842,8 @@ fn host_eject_commit_failure_keeps_the_slot_ready() {
 }
 
 /// A failed status send after the detach does not roll back the
-/// commit/detach; the result stays resident and is takeable once even after the
-/// transport ends.
+/// commit/detach; the result stays resident and is takeable once even after a
+/// lost link.
 #[test]
 fn a_failed_host_status_keeps_the_result_takeable() {
     let mut target = script_target(ScriptedDevice::ready(), 3);
@@ -3525,7 +3525,7 @@ fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
 /// `interrupt`; a write remainder becomes unknown; the service ends only after
 /// the settlement.
 #[test]
-fn transport_end_cancels_the_pending_write_before_the_interrupt() {
+fn link_loss_cancels_the_pending_write_before_the_interrupt() {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let mut target = settle_target(SettleDevice::new(log.clone(), write_steps()), 9);
     let mut storage = SettleStorage::pending_then(log.clone(), 1, StorageReceipt::ok(512));
@@ -3541,9 +3541,9 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
         Ok(DriveStep::Pending)
     );
 
-    target.link_lost_static::<Here>(&mut storage, &mut host);
+    target.link_lost_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch);
 
-    assert_eq!(storage.cancels, 1, "transport end cancels exactly once");
+    assert_eq!(storage.cancels, 1, "link loss cancels exactly once");
     assert_eq!(
         storage.polls, 1,
         "the token is cancelled, not polled to Ready"
@@ -3587,7 +3587,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
 /// *read* settles with no write/sync remainder and no confirmed write prefix,
 /// even though the cancelled token is reported exactly once.
 #[test]
-fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
+fn link_loss_cancels_a_pending_read_without_an_unknown_remainder() {
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let mut target = settle_target(
         SettleDevice::new(
@@ -3618,7 +3618,7 @@ fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
         Ok(DriveStep::Pending)
     );
 
-    target.link_lost_static::<Here>(&mut storage, &mut host);
+    target.link_lost_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch);
 
     assert_eq!(
         (storage.begins, storage.polls),
@@ -3915,7 +3915,7 @@ fn a_pool_exhausted_token_settles_without_an_adapter_operation() {
 
 /// (`Ready(Err(n))`): the receipt error reaches the device exactly once;
 /// the operation is never replayed, and a command that completed normally is
-/// never interrupted afterwards — a late transport end does not roll back an
+/// never interrupted afterwards — a late link loss does not roll back an
 /// already booked status.
 #[test]
 fn a_receipt_error_is_fed_back_once_and_never_replayed() {
@@ -3974,7 +3974,7 @@ fn a_receipt_error_is_fed_back_once_and_never_replayed() {
 
     // The full-status-sent hook already ran; a later transport failure must not
     // re-book delivery or interrupt the device again.
-    target.link_lost_static::<Here>(&mut storage, &mut host);
+    target.link_lost_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch);
     assert_eq!(target.tick(), RunOutcome::ServiceReady);
     let device = slot0(&target).device_ref();
     assert_eq!(device.deliveries, vec![Delivery::Complete]);

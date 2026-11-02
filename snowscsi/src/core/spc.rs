@@ -506,8 +506,9 @@ impl<D: Device> Spc<D> {
                 // LoEj=1,Start=0 asks for an eject; the runner performs the
                 // detach at the completion point. LoEj=1,Start=1 is a load,
                 // which is a no-op here: the application inserts media, the
-                // device never reloads a pair it handed back.
-                self.eject = loej && !start;
+                // device never reloads a pair it handed back. SPC-3: LoEj has
+                // no effect on a non-removable medium.
+                self.eject = loej && !start && self.inner.inquiry_data().removable;
                 self.query = Query::NoData;
                 Ok(())
             }

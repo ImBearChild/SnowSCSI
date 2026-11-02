@@ -123,7 +123,7 @@ pub fn serve_conn<C: Conn, S: RuntimeSet>(
     // clean target. A handback return deliberately does not come here.
     if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
         session.connection_lost();
-        target.link_lost(storage, session);
+        target.link_lost(storage, session, work, scratch);
     }
     result
 }
@@ -400,7 +400,7 @@ where
     // clean target. A handback return deliberately does not come here.
     if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
         session.connection_lost();
-        target.link_lost(&mut *storage, session);
+        target.link_lost(&mut *storage, session, work, scratch);
     }
     result
 }
@@ -486,6 +486,11 @@ pub fn serve<P>(
         let mut target = Target::new(&mut *table);
         let exit = serve_conn(&mut conn, work, scratch, &mut session, &mut target, storage)?;
         crate::info!("connection from {} ended ({:?})", peer, exit);
+        // A handback is unreachable on the next connection (the target is
+        // recreated), so take it here to clear the slot's resident result.
+        if let ServeExit::Outcome(RunOutcome::ResourcesReady { lun }) = exit {
+            let _ = target.take_rt(lun);
+        }
     }
 }
 

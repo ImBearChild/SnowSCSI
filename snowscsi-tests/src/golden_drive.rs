@@ -80,7 +80,7 @@ pub fn serve_usb<S: RuntimeSet>(
     let stop = Flow::new();
     let mut io = GoldenBotIo::new(io);
     // The replay script ends at a command boundary: the adapter reports EOF,
-    // which `usb::serve` surfaces as `ServeError::Closed` — a clean end for a
+    // which `usb::serve` surfaces as `ServeExit::WireGone` — a clean end for a
     // finite wire script, exactly like `serve_conn`'s iSCSI EOF.
     match serve(
         &mut io, gadget, session, work, scratch, target, storage, &stop,

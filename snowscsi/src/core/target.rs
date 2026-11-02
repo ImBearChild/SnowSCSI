@@ -146,10 +146,13 @@ impl<S: SlotSet> Target<S> {
 
     /// Whether a management call would be accepted right now.
     ///
-    /// This is the authoritative conjunction the management entries use: no
-    /// terminal state, no queued control, no eject transaction, no unclaimed
-    /// handback (`await_take`), every resident slot at its boundary, and no
-    /// slot holding a resident management result.
+    /// This is a **conservative** conjunction: it is no weaker than the gates
+    /// of the management entries, so an accepted boundary never fails for a
+    /// boundary reason. It is deliberately stronger than a per-LUN entry in one
+    /// dimension: every resident slot must be at its boundary, so an operation
+    /// or result on another LUN also defers it. That is what a transport pause
+    /// wants (hand the whole target back), while a direct `install_rt(lun)`
+    /// only checks that LUN.
     ///
     /// It answers *when*, not *what*: whether a medium is present is the
     /// application's own bookkeeping ([`Self::snapshot_rt`]'s `ready` for a
@@ -195,6 +198,8 @@ impl<S: RuntimeSet> Target<S> {
         &mut self,
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
+        work: &mut [u8],
+        scratch: &mut [u8],
     ) {
         let Self {
             runner,
@@ -211,7 +216,10 @@ impl<S: RuntimeSet> Target<S> {
         if let Some(lun) = runner.long_lun() {
             storage.select_lun(lun);
             if let Some(slot) = slots.get(lun) {
-                runner.cancel_long_token(lun, slot, storage);
+                // The long operation's data bank: `scratch` when the caller
+                // keeps the two-bank split, `work` when it is shared.
+                let data: &mut [u8] = if scratch.is_empty() { work } else { scratch };
+                runner.cancel_long_token(lun, slot, storage, data);
             }
         }
     }
@@ -773,6 +781,8 @@ pub trait StaticTarget<S: SlotSet> {
         &mut self,
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
+        work: &mut [u8],
+        scratch: &mut [u8],
     ) where
         I: Index,
         S: At<I>,
@@ -1081,6 +1091,8 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         &mut self,
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
+        work: &mut [u8],
+        scratch: &mut [u8],
     ) where
         I: Index,
         S: At<I>,
@@ -1094,8 +1106,9 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         }
         if self.runner.long_lun() == Some(I::INDEX) {
             storage.select_lun(I::INDEX);
+            let data: &mut [u8] = if scratch.is_empty() { work } else { scratch };
             let Self { runner, slots, .. } = self;
-            runner.cancel_long_token(I::INDEX, slots.slot_mut(), storage);
+            runner.cancel_long_token(I::INDEX, slots.slot_mut(), storage, data);
         }
     }
 

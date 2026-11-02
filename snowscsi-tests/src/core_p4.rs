@@ -1547,7 +1547,7 @@ fn stop_drains_a_pending_long_token_before_reporting_ended() {
 /// Link loss = cancel: the retained long token is cancelled through the
 /// adapter and the slot stays serviceable (no terminal state).
 #[test]
-fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
+fn link_loss_cancels_a_pending_long_write_and_settles_the_device() {
     let mut target = target(2);
     // Never leaves Pending: only a terminal cancel can end this token.
     let mut storage = PendingStorage::new(Plane::new(8 * 1024), usize::MAX);
@@ -1570,9 +1570,15 @@ fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
         .expect("long entry");
     assert_eq!(storage.polls, 1);
 
-    target.link_lost_static::<Here>(&mut storage, &mut host);
+    target.link_lost_static::<Here>(&mut storage, &mut host, &mut work, &mut scratch);
     assert_eq!(storage.cancels, 1, "cancelled exactly once");
     assert_eq!(storage.polls, 1, "the cancelled token is never polled");
+    // The synthesized cancelled receipt must settle the device: leaving it
+    // `Foreground` would make every media command FORMAT IN PROGRESS forever on
+    // a target that is supposed to outlive the link.
+    let info = target.snapshot_static::<Here>();
+    assert_eq!(info.long.phase, LongPhase::Settled);
+    assert_eq!(info.long.error, Some(Fault::Contract));
     assert_eq!(
         target.tick(),
         RunOutcome::ServiceReady,
@@ -1580,7 +1586,7 @@ fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
     );
 }
 
-/// Fatal = cancel: same shape as transport end, but the fatal fault is
+/// Fatal = cancel: same shape as a link loss, but the fatal fault is
 /// what `Ended` reports; the long op records its own cancelled receipt.
 #[test]
 fn fatal_cancels_a_pending_long_write_and_records_the_fault() {

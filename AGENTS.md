@@ -125,16 +125,23 @@ git checkout legacy
   back at a point where no I/O is in flight (the action is re-emitted on
   re-entry), `Stopped`/`WireGone` settle the live command first. Only
   `Target::stop()` and `fatal` end a target; a lost link calls
-  `Target::link_lost` (no terminal latch) so the same target serves the next
-  link. Application → loop control is `core::Flow` (`Run`/`Pause`/`Stop`);
-  `Pause` waits for `Target::management_boundary()`. `serve_conn*` has no Flow
-  yet (iSCSI pause needs a read wake); a `ResourcesReady` handback is only
-  reported when `Target::take_ready(lun)` accepts it.
+  `Target::link_lost(storage, host, work, scratch)` (no terminal latch) so the
+  same target serves the next link. It also feeds a retained long operation its
+  cancelled receipt (with the caller's bank), otherwise the device would stay
+  `Foreground` forever. Application → loop control is `core::Flow`
+  (`Run`/`Pause`/`Stop`); `Pause` waits for `Target::management_boundary()`.
+  `serve_conn*` has no Flow yet (iSCSI pause needs a read wake); a
+  `ResourcesReady` handback is only reported when `Target::take_ready(lun)`
+  accepts it (the long-token/command checks are per LUN, so another LUN's token
+  never blocks the take).
 - **Media change**: a host `START STOP UNIT` with `LoEj=1, Start=0` records an
   eject intent on the `Device` (`take_eject_request`); the runner detaches the
   pair at the completion point and publishes `ResourcesReady`. `LoEj=1,
-  Start=1` (load) is a no-op. A manual `impl Lu` wrapper must forward
-  `take_eject_request` or host ejection is silently disabled.
+  Start=1` (load) is a no-op, as is `LoEj` on non-removable media. An empty slot
+  admits START STOP UNIT (a retried eject is a no-op GOOD) but not
+  PREVENT/ALLOW (its unlock-flush would sync a stale binding). A manual
+  `impl Lu` wrapper must forward `take_eject_request` or host ejection is
+  silently disabled.
 - **Async storage adapters**: `core::slots::SlotPool` is the runtime-free
   bridge for a backend whose I/O completes elsewhere (SD card, flash, DMA).
   Split it into `SlotStore` (implements `Storage` + `AsyncWake`) and

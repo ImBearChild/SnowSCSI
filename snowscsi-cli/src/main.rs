@@ -1110,7 +1110,7 @@ where
         // the connection: the `Notify` may already have fired.
         if stop.load(Ordering::SeqCst) {
             session.connection_lost();
-            target.link_lost(&mut *storage, &mut session);
+            target.link_lost(&mut *storage, &mut session, work, scratch);
             return Ok(());
         }
         tokio::select! {
@@ -1121,10 +1121,17 @@ where
                 &mut session,
                 &mut target,
                 &mut *storage,
-            ) => r.map(|_| ())?,
+            ) => if let snowscsi::core::ServeExit::Outcome(
+                snowscsi::core::RunOutcome::ResourcesReady { lun },
+            ) = r?
+            {
+                // The target is per-connection here; take the detached pair so
+                // the slot does not keep a resident result.
+                let _ = target.take_rt(lun);
+            },
             _ = shutdown.notified() => {
                 session.connection_lost();
-                target.link_lost(&mut *storage, &mut session);
+                target.link_lost(&mut *storage, &mut session, work, scratch);
                 return Ok(());
             }
         }
@@ -1745,16 +1752,30 @@ fn run_serve_usb(
         let per_bank = config.per_bank();
         std::thread::scope(|scope| {
             let mut store = WorkerStore::new(scope, planes, per_bank);
-            let res = usb_serve(
-                &mut ffs_bot,
-                &mut ffs_gadget,
-                &mut session,
-                &mut work,
-                &mut scratch,
-                &mut target,
-                &mut store,
-                &flow,
-            );
+            let res = loop {
+                match usb_serve(
+                    &mut ffs_bot,
+                    &mut ffs_gadget,
+                    &mut session,
+                    &mut work,
+                    &mut scratch,
+                    &mut target,
+                    &mut store,
+                    &flow,
+                ) {
+                    Ok(snowscsi::core::ServeExit::Outcome(
+                        snowscsi::core::RunOutcome::ResourcesReady { lun },
+                    )) => {
+                        // The host ejected: take the pair so the slot is not
+                        // left with a resident result, then keep serving the
+                        // now-empty drive.
+                        let _ = target.take_rt(lun);
+                        log::info!("LUN {lun}: medium ejected by the host");
+                    }
+                    Ok(snowscsi::core::ServeExit::Paused) => {}
+                    other => break other,
+                }
+            };
             if let Err((i, e)) = store.sync() {
                 eprintln!("snowscsi: sync failed for LUN {i}: {e}");
             }
@@ -1763,16 +1784,27 @@ fn run_serve_usb(
         })
     } else {
         let mut storage = CliStorage::new(planes);
-        let res = usb_serve(
-            &mut ffs_bot,
-            &mut ffs_gadget,
-            &mut session,
-            &mut work,
-            &mut scratch,
-            &mut target,
-            &mut storage,
-            &flow,
-        );
+        let res = loop {
+            match usb_serve(
+                &mut ffs_bot,
+                &mut ffs_gadget,
+                &mut session,
+                &mut work,
+                &mut scratch,
+                &mut target,
+                &mut storage,
+                &flow,
+            ) {
+                Ok(snowscsi::core::ServeExit::Outcome(
+                    snowscsi::core::RunOutcome::ResourcesReady { lun },
+                )) => {
+                    let _ = target.take_rt(lun);
+                    log::info!("LUN {lun}: medium ejected by the host");
+                }
+                Ok(snowscsi::core::ServeExit::Paused) => {}
+                other => break other,
+            }
+        };
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");
         }

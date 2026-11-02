@@ -24,7 +24,7 @@ use std::thread;
 
 use snowscsi::common::seekable_storage::RamBackend;
 use snowscsi::common::store::StorePlane;
-use snowscsi::core::{Lu, ServeExit, Target};
+use snowscsi::core::{Lu, RunOutcome, ServeExit, Target};
 use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::target::{IscsiSession, TargetError};
 use snowscsi::iscsi::transport::{serve_conn, TcpConn, DEFAULT_READ_TIMEOUT};
@@ -547,7 +547,7 @@ fn start_target_serving(
             let mut scratch = vec![0u8; MIN_DATA_LEN];
             let mut session = IscsiSession::new();
             let mut target = Target::new(&mut table[..]);
-            let _ = serve_conn(
+            let exit = serve_conn(
                 &mut conn,
                 &mut work,
                 &mut scratch,
@@ -555,6 +555,9 @@ fn start_target_serving(
                 &mut target,
                 &mut storage,
             )?;
+            if let ServeExit::Outcome(RunOutcome::ResourcesReady { lun }) = exit {
+                let _ = target.take_rt(lun);
+            }
         }
         Ok(ServeExit::WireGone)
     });

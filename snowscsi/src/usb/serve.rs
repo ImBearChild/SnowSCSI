@@ -45,11 +45,10 @@ const CTRL_POLL_GRANULARITY: Duration = BOT_POLL_GRANULARITY;
 /// Error returned by [`serve`] (no_std).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeError {
-    /// The bulk link closed (zero-length receive or unrecoverable I/O).
-    Closed,
-    /// The BOT core reported an error.
+    /// The BOT core reported an error (a caller/contract bug, not a link).
     Core(BotTargetError),
-    /// The control-plane reply (Get Max LUN) failed.
+    /// The control-plane reply (Get Max LUN) failed because the link is gone.
+    /// The loop maps it to [`ServeExit::WireGone`].
     Control,
     /// The core target is in an unusable terminal state.
     Internal,
@@ -61,7 +60,6 @@ pub enum ServeError {
 impl core::fmt::Display for ServeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Closed => write!(f, "bulk link closed"),
             Self::Core(e) => write!(f, "BOT core error: {e}"),
             Self::Control => write!(f, "control-plane reply failed"),
             Self::Internal => write!(f, "internal BOT serve error"),
@@ -179,11 +177,17 @@ where
     S: RuntimeSet,
 {
     let result = serve_loop(io, gadget, session, work, scratch, target, storage, flow);
-    // A lost link (or a caller bug) leaves the wire unusable: settle the live
-    // command so the next link finds a clean target. A pause/handback return
-    // deliberately does not come here.
-    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
-        target.link_lost(storage, session);
+    // A lost link (or a control-plane reply that failed because the link is
+    // gone) leaves the wire unusable: reset the session to a clean CBW
+    // boundary and settle the live command so the next link finds a reusable
+    // target. A pause/handback return deliberately does not come here.
+    if matches!(&result, Ok(ServeExit::WireGone)) || matches!(&result, Err(ServeError::Control)) {
+        let _ = session.poll(Event::Reset, work, scratch, target, storage);
+        target.link_lost(storage, session, work, scratch);
+        return Ok(ServeExit::WireGone);
+    }
+    if result.is_err() {
+        target.link_lost(storage, session, work, scratch);
     }
     result
 }
@@ -238,14 +242,6 @@ where
     // long token. Shared mode still owns `work` while the token is in flight.
     let shared = scratch.is_empty() && !session.overlap();
     loop {
-        if flow.state() == FlowState::Stop {
-            // The application is done with this loop. Settle the live command
-            // so the target is immediately reusable; the target itself is not
-            // stopped.
-            target.link_lost(storage, session);
-            return Ok(ServeExit::Stopped);
-        }
-
         // Shared bank: while the resident long operation holds an adapter
         // token, `work` is its data bank. Drive it one step per turn and defer
         // every input (control requests included) until it settles; the
@@ -294,6 +290,12 @@ where
             }
             if pause_requested(flow, target) {
                 return Ok(ServeExit::Paused);
+            }
+            if flow.state() == FlowState::Stop {
+                // The carried event was consumed and the action was not
+                // executed, so stopping here cannot lose a completion.
+                target.link_lost(storage, session, work, scratch);
+                return Ok(ServeExit::Stopped);
             }
         }
         match action {
@@ -416,11 +418,6 @@ where
         let mut ev = Event::Tick;
         let shared = scratch.is_empty() && !session.overlap();
         loop {
-            if flow.state() == FlowState::Stop {
-                target.link_lost(&mut *storage, session);
-                return Ok(ServeExit::Stopped);
-            }
-
             // Shared bank: drive the resident long operation one step per turn
             // and defer every input (control requests included) until its token
             // settles. The deferral is bounded by one long-operation chunk.
@@ -482,6 +479,12 @@ where
                 }
                 if pause_requested(flow, target) {
                     return Ok(ServeExit::Paused);
+                }
+                if flow.state() == FlowState::Stop {
+                    // The carried event was consumed and the action was not
+                    // executed, so stopping here cannot lose a completion.
+                    target.link_lost(&mut *storage, session, work, scratch);
+                    return Ok(ServeExit::Stopped);
                 }
             }
             match action {
@@ -587,8 +590,13 @@ where
         }
     }
     .await;
-    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
-        target.link_lost(&mut *storage, session);
+    if matches!(&result, Ok(ServeExit::WireGone)) || matches!(&result, Err(ServeError::Control)) {
+        let _ = session.poll(Event::Reset, work, scratch, target, &mut *storage);
+        target.link_lost(&mut *storage, session, work, scratch);
+        return Ok(ServeExit::WireGone);
+    }
+    if result.is_err() {
+        target.link_lost(&mut *storage, session, work, scratch);
     }
     result
 }
