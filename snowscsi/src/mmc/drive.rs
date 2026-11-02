@@ -93,6 +93,56 @@ const NO_MEDIUM_ATTRS: MmcAttrs = MmcAttrs {
     needs_recovery: false,
 };
 
+/// Drive (LU) capabilities: what this drive supports with **no** medium.
+///
+/// These are not medium attributes. An empty DVD-RAM drive still lists profile
+/// `0x12`, reports the recorder capability page (0x2A) and advertises the
+/// random-writable feature. The installed medium only supplies the facts that
+/// describe the disc (capacity, write protection, current write mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmcCaps {
+    /// Profiles the drive supports, in Profile List order.
+    pub profiles: &'static [u16],
+    /// Mode page 0x2A: the drive's capability page (fixed bytes).
+    pub capabilities_page: &'static [u8],
+    /// Whether random writing (profile 0x12 and features 0x20/0x24) is part of
+    /// the drive's command set.
+    pub random_writable: bool,
+}
+
+impl MmcCaps {
+    /// A read-only CD-ROM drive.
+    #[must_use]
+    pub const fn cdrom() -> Self {
+        Self {
+            profiles: &CDROM_PROFILES,
+            capabilities_page: &CDROM_CAPABILITIES_PAGE,
+            random_writable: false,
+        }
+    }
+
+    /// A DVD-RAM capable recorder (also reads CD-ROM).
+    #[must_use]
+    pub const fn dvdram() -> Self {
+        Self {
+            profiles: &DVDRAM_PROFILES,
+            capabilities_page: &DVDRAM_CAPABILITIES_PAGE,
+            random_writable: true,
+        }
+    }
+
+    /// Compatibility derivation for [`MmcDrive::new`]: the medium class is the
+    /// default drive class. This is a shortcut, not the definition.
+    const fn from_write_mode(mode: MmcWriteMode) -> Self {
+        match mode {
+            MmcWriteMode::ReadOnly => Self::cdrom(),
+            MmcWriteMode::WriteOnce | MmcWriteMode::Rewritable | MmcWriteMode::Blank => {
+                Self::dvdram()
+            }
+        }
+    }
+}
+
 /// Resident zero-fill state (MMC-internal; only projected through `LongInfo`).
 ///
 /// Only the **foreground** FORMAT/BLANK fill exists. `LongPhase::Background`
@@ -185,6 +235,9 @@ enum Query {
 /// MMC drive over a replaceable medium.
 pub struct MmcDrive<M: MmcMedium> {
     medium: Option<M>,
+    /// Drive (LU) capabilities. Independent of the installed medium: they
+    /// survive an eject and are what an empty drive still reports.
+    caps: MmcCaps,
     query: Query,
     /// Bytes selected for a drive-encoded response.
     len: usize,
@@ -199,9 +252,10 @@ pub struct MmcDrive<M: MmcMedium> {
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
-    fn with_medium(medium: Option<M>) -> Self {
+    fn with_medium(medium: Option<M>, caps: MmcCaps) -> Self {
         Self {
             medium,
+            caps,
             query: Query::None,
             len: 0,
             published: false,
@@ -212,23 +266,39 @@ impl<M: MmcMedium> MmcDrive<M> {
     }
 
     /// Build a drive with an installed medium.
+    ///
+    /// The drive capabilities are derived from the medium class as a
+    /// compatibility shortcut; that is a default, not the definition. Use
+    /// [`Self::new_with_caps`] to state them explicitly.
     #[must_use]
     pub fn new(medium: M) -> Self {
-        Self::with_medium(Some(medium))
+        let caps = MmcCaps::from_write_mode(medium.attrs().write_mode);
+        Self::with_medium(Some(medium), caps)
     }
 
-    /// Build a drive with an **empty tray**.
-    ///
-    /// Device-level commands stay answerable (INQUIRY through [`Spc`], START
-    /// STOP UNIT, GET CONFIGURATION), while every media command answers
-    /// `MEDIUM NOT PRESENT`. The first medium is installed by the slot
-    /// (`Target::install_rt`), so a host can enumerate a drive before any disc
-    /// exists.
-    ///
-    /// [`Spc`]: crate::core::Spc
+    /// Build a drive with an installed medium and explicit drive capabilities.
     #[must_use]
-    pub fn empty() -> Self {
-        Self::with_medium(None)
+    pub fn new_with_caps(medium: M, caps: MmcCaps) -> Self {
+        Self::with_medium(Some(medium), caps)
+    }
+
+    /// Build a drive with an **empty tray** and explicit drive capabilities.
+    ///
+    /// The capabilities are the LU's, not the medium's: an empty DVD-RAM drive
+    /// still lists profile `0x12` and reports the recorder capability page.
+    /// Device-level commands stay answerable (INQUIRY through `Spc`, START STOP
+    /// UNIT, MODE SENSE, GET CONFIGURATION), while every media command answers
+    /// `MEDIUM NOT PRESENT`. The first medium is installed by the slot
+    /// (`Target::install_rt`).
+    #[must_use]
+    pub fn empty(caps: MmcCaps) -> Self {
+        Self::with_medium(None, caps)
+    }
+
+    /// The drive's capabilities.
+    #[must_use]
+    pub const fn caps(&self) -> MmcCaps {
+        self.caps
     }
 
     /// Number of required storage operations issued (probe counter, not a
@@ -1130,6 +1200,13 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         RemovalEncoding::Mmc
     }
 
+    fn admits_without_medium(&self, cdb: &[u8]) -> bool {
+        // MODE SENSE(6/10) describes the drive (pages 0x01/0x0E/0x2A/…); the
+        // media-description commands stay NOT READY. 0x1B is admitted globally
+        // by the slot gate.
+        matches!(cdb.first().copied(), Some(0x1A) | Some(0x5A))
+    }
+
     fn spc_profile(&self) -> Option<&dyn SpcProfile> {
         Some(self)
     }
@@ -1301,28 +1378,25 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         pc: u8,
         out: Option<&mut [u8]>,
     ) -> Option<usize> {
-        let attrs = self.attrs()?;
         if pc == 3 {
             // Saved pages are unsupported; `Spc` rejects PC=11b before this.
             return None;
         }
-        // The 0x2A view follows the medium facts, never a device class: a
-        // rewritable or blank DVD-RAM advertises the recorder page.
-        let rewritable = matches!(
-            attrs.write_mode,
-            MmcWriteMode::Rewritable | MmcWriteMode::Blank
-        );
+        // Every page is drive-level, including 0x2A (the recorder capability
+        // page) and 0x05 (defaults when no medium is loaded). Only commands
+        // that describe *the mounted disc* are NOT READY.
+        let caps = self.caps;
         let mut pages = [0u8; ALL_PAGES_LEN];
         let plen = if page == 0x3F {
             let mut at = 0usize;
             for code in ALL_PAGE_ORDER {
-                let bytes = page_bytes(code, rewritable)?;
+                let bytes = page_bytes(code, caps)?;
                 pages[at..at + bytes.len()].copy_from_slice(bytes);
                 at += bytes.len();
             }
             at
         } else {
-            let bytes = page_bytes(page, rewritable)?;
+            let bytes = page_bytes(page, caps)?;
             pages[..bytes.len()].copy_from_slice(bytes);
             bytes.len()
         };
@@ -1383,14 +1457,15 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         // than delegating (`Spc` would turn `None` into an unrelated reject).
         let attrs = self.attrs().unwrap_or(NO_MEDIUM_ATTRS);
         let present = attrs.sectors != 0;
-        let rewritable = matches!(
+        let current_writable = matches!(
             attrs.write_mode,
-            MmcWriteMode::Rewritable | MmcWriteMode::WriteOnce
+            MmcWriteMode::Rewritable | MmcWriteMode::WriteOnce | MmcWriteMode::Blank
         );
-        // MMC-6 Table 87: no current profile while no medium is active.
+        // MMC-6 Table 87: no current profile while no medium is active. The
+        // *supported* profile list is a drive property and always present.
         let current_profile = if !present {
             0x0000u16
-        } else if rewritable {
+        } else if self.caps.random_writable && current_writable {
             0x0012u16
         } else {
             0x0008u16
@@ -1406,27 +1481,17 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         let mut buf = [0u8; GET_CONFIG_LEN];
         let mut off = 8usize;
         if include(0x0000, true) {
-            // Profile List: the active profile first, then the always-present
-            // CD-ROM profile for a rewritable drive.
-            let mut entries = [0u8; 2];
-            let mut count = 0usize;
-            if rewritable {
-                entries[count] = 0x12;
-                count += 1;
-            }
-            entries[count] = 0x08;
-            count += 1;
+            // Profile List: the drive's supported profiles; only the mounted
+            // medium's profile is Current.
+            let entries = self.caps.profiles;
+            let count = entries.len();
             buf[off..off + 2].copy_from_slice(&0x0000u16.to_be_bytes());
             buf[off + 2] = 0x03; // version 0, persistent, current
             buf[off + 3] = (4 * count) as u8;
-            for (i, code) in entries[..count].iter().enumerate() {
+            for (i, code) in entries.iter().enumerate() {
                 let at = off + 4 + 4 * i;
-                buf[at..at + 2].copy_from_slice(&u16::from(*code).to_be_bytes());
-                buf[at + 3] = if u16::from(*code) == current_profile {
-                    0x01
-                } else {
-                    0x00
-                };
+                buf[at..at + 2].copy_from_slice(&code.to_be_bytes());
+                buf[at + 3] = if *code == current_profile { 0x01 } else { 0x00 };
             }
             off += 4 + 4 * count;
         }
@@ -1470,7 +1535,7 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             buf[off + 3] = 0x04;
             off += 8;
         }
-        if rewritable && include(0x0020, present) {
+        if self.caps.random_writable && include(0x0020, present) {
             // Random Writable (MMC-6 Table 113): version 1, last LBA,
             // block size, blocking, PP + reserved.
             buf[off..off + 2].copy_from_slice(&0x0020u16.to_be_bytes());
@@ -1483,7 +1548,7 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             buf[off + 14] = 0x00; // PP
             off += 16;
         }
-        if rewritable && include(0x0024, present) {
+        if self.caps.random_writable && include(0x0024, present) {
             // Defect Management (MMC-6 Table 123): version 1.
             buf[off..off + 2].copy_from_slice(&0x0024u16.to_be_bytes());
             buf[off + 2] = if present { 0x05 } else { 0x04 };
@@ -1562,6 +1627,10 @@ const POWER_CONDITION_PAGE: [u8; 12] = [
 ];
 /// Timeout and Protect page 0x1D (cdrom/common.rs:145).
 const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Profiles a read-only CD-ROM drive supports (MMC-6 Profile List).
+const CDROM_PROFILES: [u16; 1] = [0x08];
+/// Profiles a DVD-RAM recorder supports; the non-current one is still listed.
+const DVDRAM_PROFILES: [u16; 2] = [0x12, 0x08];
 /// CD/DVD Capabilities page 0x2A, fixed 64-byte CD-ROM view
 /// (`CDROM_CAPABILITIES`, cdrom/common.rs:446).
 const CDROM_CAPABILITIES_PAGE: [u8; 64] = [
@@ -1600,7 +1669,7 @@ const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A,
 /// by any device/media class match). The page length byte describes each one
 /// completely, so `0x3F` concatenation never carries padding that a host
 /// could parse as another page.
-fn page_bytes(page: u8, rewritable: bool) -> Option<&'static [u8]> {
+fn page_bytes(page: u8, caps: MmcCaps) -> Option<&'static [u8]> {
     match page {
         0x00 => Some(&VENDOR_PAGE),
         0x01 => Some(&READ_WRITE_ERROR_RECOVERY_PAGE),
@@ -1610,8 +1679,7 @@ fn page_bytes(page: u8, rewritable: bool) -> Option<&'static [u8]> {
         0x0E => Some(&CDROM_AUDIO),
         0x1A => Some(&POWER_CONDITION_PAGE),
         0x1D => Some(&TIMEOUT_PROTECT_PAGE),
-        0x2A if rewritable => Some(&DVDRAM_CAPABILITIES_PAGE),
-        0x2A => Some(&CDROM_CAPABILITIES_PAGE),
+        0x2A => Some(caps.capabilities_page),
         _ => None,
     }
 }
@@ -3341,7 +3409,7 @@ mod tests {
     }
 
     #[test]
-    fn no_medium_rejects_media_queries_and_install_is_exclusive() {
+    fn no_medium_answers_drive_queries_and_rejects_media_commands() {
         let mut dev = drive(100);
         let boundary = boundary();
         let removed = dev.take_medium(&boundary).expect("medium");
@@ -3355,7 +3423,13 @@ mod tests {
         );
         let profile = dev.spc_profile().expect("profile");
         assert_eq!(profile.read_capacity(), None);
-        assert_eq!(profile.mode_sense(false, 0x08, false, 0, None), None);
+        // MODE SENSE describes the drive: it answers with no medium. Only the
+        // page that describes the mounted disc's write parameters would be
+        // medium-specific; it answers defaults (MMC-6 §7.4.1) too.
+        assert_eq!(profile.mode_sense(false, 0x08, false, 0, None), Some(24));
+        assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(68));
+        assert_eq!(profile.mode_sense(false, 0x05, false, 0, None), Some(56));
+        assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
         // GC/GESN answer explicitly with the zero-sector view instead of
         // delegating to `Spc` (which would reject for an unrelated reason).
         assert_eq!(profile.get_configuration(0, 0, None), Some(60));
@@ -3373,6 +3447,45 @@ mod tests {
             dev.install_medium(&boundary, FlatCdMedium::read_only(1)),
             Err((_, Fault::Contract))
         ));
+    }
+
+    #[test]
+    fn empty_cd_drive_reports_cd_caps() {
+        let cd = MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom());
+        let profile = cd.spc_profile().expect("profile");
+        assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(68));
+        let mut buf = [0u8; 128];
+        let n = profile
+            .get_configuration(0, 0, Some(&mut buf))
+            .expect("GC on an empty CD drive");
+        assert!(n > 12);
+        assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
+        assert_eq!(&buf[12..14], &0x08u16.to_be_bytes());
+        assert_eq!(buf[15], 0);
+    }
+
+    #[cfg(feature = "dvdram")]
+    #[test]
+    fn empty_recorder_reports_recorder_caps() {
+        use crate::mmc::DvdRamMedium;
+
+        // The capabilities are the LU's: an empty recorder still lists 0x12,
+        // reports the 36-byte recorder page and advertises 0x20/0x24 with
+        // Current=0 (Linux's cdrom_probe_write_features consumes 0x20).
+        let ram = MmcDrive::<DvdRamMedium>::empty(MmcCaps::dvdram());
+        let profile = ram.spc_profile().expect("profile");
+        assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(40));
+        let mut buf = [0u8; 128];
+        let n = profile
+            .get_configuration(0, 0, Some(&mut buf))
+            .expect("GC on an empty recorder");
+        assert!(n > 32);
+        assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
+        // Profile List: [0x12, 0x08], both Current=0.
+        assert_eq!(&buf[12..14], &0x12u16.to_be_bytes());
+        assert_eq!(buf[15], 0);
+        assert_eq!(&buf[16..18], &0x08u16.to_be_bytes());
+        assert_eq!(buf[19], 0);
     }
 
     #[test]

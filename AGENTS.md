@@ -146,9 +146,19 @@ git checkout legacy
   sets only the strings; the PDT/removable bit stay the device's, and
   `Spc::effective_inquiry` is the single read used by the encoder, the device
   projection and the `LoEj` gate (an outer `Device` wrapper cannot retarget
-  INQUIRY). `MmcDrive::empty()` + `LuImpl::empty(device)` build an enumerated
+  INQUIRY). `MmcDrive::empty(caps)` + `LuImpl::empty(device)` build an enumerated
   drive with no medium (queries answer, media commands are `MEDIUM NOT
   PRESENT`); fill it with `install_rt`, no eject/rebuild needed.
+- **Drive vs medium**: `mmc::MmcCaps` is the **LU's** capability (supported
+  profiles, mode page 0x2A, random-writable features) and lives on `MmcDrive`;
+  `MmcAttrs` is the **disc** (capacity, write protection, current write mode).
+  `MmcDrive::new(medium)` derives caps from the medium class as a compatibility
+  shortcut; `new_with_caps`/`empty(caps)` state them explicitly. MODE SENSE is a
+  drive query and answers on an empty tray (all pages, 0x05 with defaults);
+  `Device::admits_without_medium` (default `false`, `MmcDrive` opts in for
+  0x1A/0x5A, `Spc` forwards) keeps the empty-slot gate from rejecting it, while
+  media-description commands stay `MEDIUM NOT PRESENT`. Empty DVD-RAM still
+  lists profile 0x12/0x08 and features 0x20/0x24 with Current=0.
 - **Async storage adapters**: `core::slots::SlotPool` is the runtime-free
   bridge for a backend whose I/O completes elsewhere (SD card, flash, DMA).
   Split it into `SlotStore` (implements `Storage` + `AsyncWake`) and

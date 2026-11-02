@@ -694,6 +694,11 @@ impl<D: Device> Device for Spc<D> {
         self.inner.removal_encoding()
     }
 
+    fn admits_without_medium(&self, cdb: &[u8]) -> bool {
+        // The profile decides which of its commands are drive-level.
+        self.inner.admits_without_medium(cdb)
+    }
+
     fn removal_locks(&self) -> Option<RemovalLocks> {
         Some(RemovalLocks {
             prevent: self.prevent,
@@ -1262,9 +1267,9 @@ mod tests {
 
     #[test]
     fn empty_drive_still_enumerates_and_reports_no_medium() {
-        use crate::mmc::{FlatCdMedium, MmcDrive};
+        use crate::mmc::{FlatCdMedium, MmcCaps, MmcDrive};
 
-        let mut spc = Spc::new(MmcDrive::<FlatCdMedium>::empty());
+        let mut spc = Spc::new(MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom()));
         let permit = permit();
         let mut data = [0u8; 36];
         assert_eq!(
@@ -1289,6 +1294,38 @@ mod tests {
             spc.prepare(&permit, ctx(Direction::None, 0), &[0x00, 0, 0, 0, 0, 0]),
             Err(Completion::Check(MEDIUM_NOT_PRESENT))
         );
+
+        // MODE SENSE is a drive query and answers on the empty tray.
+        let mut mode = [0u8; 68];
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x5A;
+        cdb[2] = 0x2A;
+        cdb[7] = 0;
+        cdb[8] = 68;
+        assert_eq!(
+            spc.prepare(&permit, ctx(Direction::ToHost, 68), &cdb),
+            Ok(())
+        );
+        assert!(matches!(
+            spc.poll(&permit, Feedback::begin(), &mut mode),
+            PollStep::Publish(_)
+        ));
+        match spc.poll(&permit, Feedback::plan_accepted(), &mut mode) {
+            PollStep::Send { bytes, .. } => assert_eq!(bytes.len(), 68),
+            other => panic!("expected send, got {other:?}"),
+        }
+        assert_eq!(
+            mode[8], 0x2A,
+            "page code after the 8-byte MODE SENSE(10) header"
+        );
+        assert!(matches!(
+            spc.poll(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(68, None)),
+                &mut mode
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
     }
 
     #[test]

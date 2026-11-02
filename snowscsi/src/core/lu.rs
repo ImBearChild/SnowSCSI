@@ -370,6 +370,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         if self.backing.is_none()
             && !admitted_during_foreground(opcode)
             && !admitted_without_medium(opcode)
+            && !self.device.admits_without_medium(cdb)
             && self.device.pending_ua().is_none()
         {
             return Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT));
@@ -402,6 +403,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             let opcode = cdb.first().copied().unwrap_or(0xFF);
             if !admitted_during_foreground(opcode)
                 && !admitted_without_medium(opcode)
+                && !self.device.admits_without_medium(cdb)
                 && self.device.pending_ua().is_none()
             {
                 return Err(Completion::Check(MEDIUM_NOT_PRESENT));
@@ -1219,6 +1221,27 @@ mod tests {
         assert_eq!(
             slot.prepare(&permit, ctx, &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]),
             Err(Completion::Check(MEDIUM_NOT_PRESENT))
+        );
+    }
+
+    #[test]
+    fn empty_slot_admits_a_device_level_mode_sense() {
+        use crate::core::Spc;
+        use crate::mmc::{FlatCdMedium, MmcCaps, MmcDrive};
+
+        let slot: LuImpl<_, u8> =
+            LuImpl::empty(Spc::new(MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom())));
+        // MODE SENSE is a drive query: the empty gate must let it through so
+        // `Spc`/`MmcDrive` can answer the drive pages.
+        assert_eq!(
+            slot.admit(&[0x5A, 0, 0x2A, 0, 0, 0, 0, 0, 0, 1]),
+            Admission::Proceed
+        );
+        assert_eq!(slot.admit(&[0x1A, 0, 0x00, 0, 64, 0]), Admission::Proceed);
+        // A media command is still refused.
+        assert_eq!(
+            slot.admit(&[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]),
+            Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT))
         );
     }
 

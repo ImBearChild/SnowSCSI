@@ -1089,7 +1089,32 @@ fn no_medium_gc_and_gesn_answer_explicitly_through_spc() {
         "GC must answer explicitly, not delegate"
     );
     assert_eq!(&work[6..8], &0x0000u16.to_be_bytes(), "no current profile");
-    assert_eq!(work[11], 4, "one CD-ROM profile entry");
+    assert_eq!(work[11], 8, "recorder + CD-ROM profiles stay listed");
+    assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
+    assert_eq!(work[15], 0, "no profile is current");
+    assert_eq!(&work[16..18], &0x0008u16.to_be_bytes());
+    assert_eq!(work[19], 0, "no profile is current");
+
+    // MODE SENSE 0x2A is a drive query: it answers while the tray is empty,
+    // from the drive capabilities rather than the (absent) medium.
+    let mut mode = [0u8; 10];
+    mode[0] = 0x5A;
+    mode[2] = 0x2A;
+    mode[8] = 64;
+    assert_eq!(
+        target.drive_static_host::<Here>(
+            &mut storage,
+            &mut host,
+            ctx(Direction::ToHost, 64),
+            &mode,
+            &mut work,
+            &mut scratch,
+        ),
+        Ok(Completion::Good),
+        "MODE SENSE must answer on the empty tray"
+    );
+    assert_eq!(work[8], 0x2A, "page code after the MODE SENSE(10) header");
+    assert_eq!(work[9], 0x22, "the 36-byte recorder capability page");
 
     assert_eq!(
         target.drive_static_host::<Here>(

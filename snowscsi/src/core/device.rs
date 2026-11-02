@@ -437,6 +437,17 @@ pub trait Device {
         InquiryData::block()
     }
 
+    /// Whether `cdb` is answerable with **no** medium installed.
+    ///
+    /// The slot's empty gate rejects media commands with `MEDIUM NOT PRESENT`
+    /// before the device sees them. A device whose command set contains
+    /// drive-level commands (MMC MODE SENSE is the current case) opts in per
+    /// CDB; every other device keeps the default reject. Default: no command.
+    fn admits_without_medium(&self, cdb: &[u8]) -> bool {
+        let _ = cdb;
+        false
+    }
+
     /// PREVENT/ALLOW encoding family. Default: SBC / SPC-3 Table 119.
     fn removal_encoding(&self) -> RemovalEncoding {
         RemovalEncoding::Scsi

@@ -28,7 +28,7 @@ pub mod vendor;
 pub use self::attrs::{
     DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackKind,
 };
-pub use self::drive::MmcDrive;
+pub use self::drive::{MmcCaps, MmcDrive};
 #[cfg(feature = "dvdram")]
 pub use self::dvdram::{DvdRamMedium, DvdRamState};
 pub use self::flat::{FlatCdMedium, FlatState};
