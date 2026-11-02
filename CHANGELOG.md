@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
-- **mmc**: `MmcCaps` (drive capabilities are LU state) and an empty tray that
-  still answers MODE SENSE/GET CONFIGURATION; `MmcDrive::empty(caps)` and
+- **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`
+  is a Hyper-Multi recorder) and an empty tray that still answers MODE
+  SENSE/GET CONFIGURATION; `MmcDrive::empty(caps)` and
   `LuImpl::empty(device)`.
 - **core**: `Spc::with_identity` for per-LU INQUIRY identity strings.
 - **cli**: `--cdrom empty` serves an enumerated drive with no medium.

@@ -1269,7 +1269,7 @@ mod tests {
     fn empty_drive_still_enumerates_and_reports_no_medium() {
         use crate::mmc::{FlatCdMedium, MmcCaps, MmcDrive};
 
-        let mut spc = Spc::new(MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom()));
+        let mut spc = Spc::new(MmcDrive::<FlatCdMedium>::empty(MmcCaps::hyper_multi()));
         let permit = permit();
         let mut data = [0u8; 36];
         assert_eq!(

@@ -928,7 +928,13 @@ type MmcFlatTarget = Target<Cons<LuImpl<Spc<MmcDrive<FlatCdMedium>>, u8>, Nil>>;
 
 fn dvd_target(sectors: u64) -> DvdTarget {
     Target::new(cons(
-        LuImpl::new(Spc::new(MmcDrive::new(DvdRamMedium::new(sectors))), 1u8),
+        LuImpl::new(
+            Spc::new(MmcDrive::new_with_caps(
+                DvdRamMedium::new(sectors),
+                snowscsi::mmc::MmcCaps::dvdram(),
+            )),
+            1u8,
+        ),
         Nil,
     ))
 }

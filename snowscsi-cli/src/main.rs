@@ -562,7 +562,7 @@ fn build_core_slots(
             (DeviceRole::MmcCd, Backing::Empty) => {
                 planes.push(None);
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::empty(Spc::new(
-                    MmcDrive::<CliMedium>::empty(snowscsi::mmc::MmcCaps::cdrom()),
+                    MmcDrive::<CliMedium>::empty(snowscsi::mmc::MmcCaps::hyper_multi()),
                 ))));
                 log::debug!("LUN {lun}: empty CD-ROM tray (no medium)");
             }

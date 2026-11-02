@@ -5491,7 +5491,7 @@ fn host_loej_detaches_the_medium_and_the_slot_stays_servable() {
 fn a_lun_can_start_empty_and_be_filled_without_an_eject() {
     let mut target = Target::new(cons(
         LuImpl::empty(Spc::new(MmcDrive::<FlatCdMedium>::empty(
-            snowscsi::mmc::MmcCaps::cdrom(),
+            snowscsi::mmc::MmcCaps::hyper_multi(),
         ))),
         Nil,
     ));

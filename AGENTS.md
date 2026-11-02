@@ -152,8 +152,10 @@ git checkout legacy
 - **Drive vs medium**: `mmc::MmcCaps` is the **LU's** capability (supported
   profiles, mode page 0x2A, random-writable features) and lives on `MmcDrive`;
   `MmcAttrs` is the **disc** (capacity, write protection, current write mode).
-  `MmcDrive::new(medium)` derives caps from the medium class as a compatibility
-  shortcut; `new_with_caps`/`empty(caps)` state them explicitly. MODE SENSE is a
+  `MmcDrive::new(medium)` is a **Hyper-Multi** drive by default (reads
+  CD/DVD, writes CD-R/RW and DVD±R/RAM); the installed medium only drives the
+  Current bits (current profile/features, capacity). Use
+  `new_with_caps`/`empty(caps)` to narrow the drive class. MODE SENSE is a
   drive query and answers on an empty tray (all pages, 0x05 with defaults);
   `Device::admits_without_medium` (default `false`, `MmcDrive` opts in for
   0x1A/0x5A, `Spc` forwards) keeps the empty-slot gate from rejecting it, while

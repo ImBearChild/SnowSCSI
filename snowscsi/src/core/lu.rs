@@ -1239,8 +1239,9 @@ mod tests {
         use crate::core::Spc;
         use crate::mmc::{FlatCdMedium, MmcCaps, MmcDrive};
 
-        let slot: LuImpl<_, u8> =
-            LuImpl::empty(Spc::new(MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom())));
+        let slot: LuImpl<_, u8> = LuImpl::empty(Spc::new(MmcDrive::<FlatCdMedium>::empty(
+            MmcCaps::hyper_multi(),
+        )));
         // MODE SENSE is a drive query: the empty gate must let it through so
         // `Spc`/`MmcDrive` can answer the drive pages.
         assert_eq!(

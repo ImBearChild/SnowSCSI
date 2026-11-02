@@ -168,29 +168,23 @@ impl MmcCaps {
         self.random_writable
     }
 
-    /// A read-only CD-ROM drive.
+    /// The **default** LU: a Hyper-Multi optical drive.
+    ///
+    /// Reads CD/CD-R/CD-RW and DVD-ROM/R/RAM/RW/+R/+RW, writes CD-R/CD-RW and
+    /// DVD-R/RAM/RW/+R; this is the drive's capability, independent of the
+    /// mounted disc. The medium only drives the Current bits (current profile,
+    /// current features, capacity).
     #[must_use]
-    pub const fn cdrom() -> Self {
-        Self::new(&CDROM_PROFILES, &CDROM_CAPABILITIES_PAGE, false)
+    pub const fn hyper_multi() -> Self {
+        Self::new(&DVDRAM_PROFILES, &CDROM_CAPABILITIES_PAGE, true)
     }
 
-    /// A DVD-RAM capable recorder (also reads CD-ROM).
+    /// The 36-byte DVD-RAM legacy view (fewer write-speed descriptors) with the
+    /// same recorder capability bits. Kept for applications that want the
+    /// medium-specific 2Ah variant; the default is [`Self::hyper_multi`].
     #[must_use]
     pub const fn dvdram() -> Self {
         Self::new(&DVDRAM_PROFILES, &DVDRAM_CAPABILITIES_PAGE, true)
-    }
-
-    /// Compatibility derivation for [`MmcDrive::new`]: the medium class is the
-    /// default drive class. This is a shortcut, not the definition.
-    ///
-    /// A `WriteOnce` medium (CD-R/DVD-R) is **not** a DVD-RAM recorder: it gets
-    /// the CD view. Use [`MmcDrive::new_with_caps`] to state a different drive
-    /// class explicitly.
-    const fn from_write_mode(mode: MmcWriteMode) -> Self {
-        match mode {
-            MmcWriteMode::ReadOnly | MmcWriteMode::WriteOnce => Self::cdrom(),
-            MmcWriteMode::Rewritable | MmcWriteMode::Blank => Self::dvdram(),
-        }
     }
 }
 
@@ -316,15 +310,14 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
     }
 
-    /// Build a drive with an installed medium.
+    /// Build a **Hyper-Multi** drive with an installed medium.
     ///
-    /// The drive capabilities are derived from the medium class as a
-    /// compatibility shortcut; that is a default, not the definition. Use
-    /// [`Self::new_with_caps`] to state them explicitly.
+    /// The drive is a full multi-format recorder by default; the medium only
+    /// supplies the disc facts (capacity, write protection, current profile).
+    /// Use [`Self::new_with_caps`] for a deliberately narrower drive.
     #[must_use]
     pub fn new(medium: M) -> Self {
-        let caps = MmcCaps::from_write_mode(medium.attrs().write_mode);
-        Self::with_medium(Some(medium), caps)
+        Self::with_medium(Some(medium), MmcCaps::hyper_multi())
     }
 
     /// Build a drive with an installed medium and explicit drive capabilities.
@@ -1684,7 +1677,9 @@ const POWER_CONDITION_PAGE: [u8; 12] = [
 ];
 /// Timeout and Protect page 0x1D (cdrom/common.rs:145).
 const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-/// Profiles a read-only CD-ROM drive supports (MMC-6 Profile List).
+/// A read-only CD-ROM profile list, used by tests that build a deliberately
+/// narrow capability set.
+#[cfg(test)]
 const CDROM_PROFILES: [u16; 1] = [0x08];
 /// Profiles a DVD-RAM recorder supports; the non-current one is still listed.
 const DVDRAM_PROFILES: [u16; 2] = [0x12, 0x08];
@@ -2190,23 +2185,30 @@ mod tests {
         let dev = drive(100);
         let profile = dev.spc_profile().expect("profile");
         let mut buf = [0u8; 128];
-        assert_eq!(profile.get_configuration(0, 0, Some(&mut buf)), Some(60));
-        assert_eq!(&buf[0..4], &56u32.to_be_bytes());
+        let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
+        assert_eq!(n, 88);
+        assert_eq!(&buf[0..4], &84u32.to_be_bytes());
         assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
-        // Profile List: one current CD-ROM profile.
+        // Profile List: the Hyper-Multi drive supports [0x12, 0x08]; only the
+        // mounted CD-ROM profile is Current.
         assert_eq!(&buf[8..10], &[0x00, 0x00]);
         assert_eq!(buf[10], 0x03);
-        assert_eq!(buf[11], 4);
-        assert_eq!(&buf[12..14], &0x0008u16.to_be_bytes());
-        assert_eq!(buf[15], 0x01);
-        // Core, Removable Medium, Random Readable, MultiRead, CD Read.
-        assert_eq!(&buf[16..18], &[0x00, 0x01]);
-        assert_eq!(&buf[28..30], &[0x00, 0x03]);
-        assert_eq!(&buf[36..38], &[0x00, 0x10]);
-        assert_eq!(&buf[40..44], &2048u32.to_be_bytes());
-        assert_eq!(buf[45], 0x01);
-        assert_eq!(&buf[48..50], &[0x00, 0x1D]);
-        assert_eq!(&buf[52..54], &[0x00, 0x1E]);
+        assert_eq!(buf[11], 8);
+        assert_eq!(&buf[12..14], &0x0012u16.to_be_bytes());
+        assert_eq!(buf[15], 0);
+        assert_eq!(&buf[16..18], &0x0008u16.to_be_bytes());
+        assert_eq!(buf[19], 0x01);
+        // Core, Removable Medium, Random Readable, MultiRead, CD Read,
+        // Random Writable + Defect Management (Current=0 on a read-only disc).
+        assert_eq!(&buf[20..22], &[0x00, 0x01]);
+        assert_eq!(&buf[32..34], &[0x00, 0x03]);
+        assert_eq!(&buf[40..42], &[0x00, 0x10]);
+        assert_eq!(&buf[44..48], &2048u32.to_be_bytes());
+        assert_eq!(buf[49], 0x01);
+        assert_eq!(&buf[52..54], &[0x00, 0x1D]);
+        assert_eq!(&buf[56..58], &[0x00, 0x1E]);
+        let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
+        assert_eq!(buf[at20 + 2] & 1, 0);
 
         // RT=10b returns only the identified feature.
         let mut only = [0u8; 64];
@@ -3239,50 +3241,21 @@ mod tests {
     }
 
     #[test]
-    fn mode_sense_2a_follows_the_write_mode() {
+    fn default_drive_is_hyper_multi_and_dvdram_is_an_explicit_view() {
+        // The medium class is not the drive class: `new` is Hyper-Multi for a
+        // read-only CD and for a rewritable DVD-RAM alike.
         let read_only = MmcDrive::new(SpyMedium::read_only(4));
         let rewritable = MmcDrive::new(SpyMedium::rewritable(4));
-        let mut cd = [0u8; 68];
-        let mut ram = [0u8; 68];
-        assert_eq!(
-            read_only.spc_profile().expect("profile").mode_sense(
-                false,
-                0x2A,
-                false,
-                0,
-                Some(&mut cd)
-            ),
-            Some(68)
-        );
-        assert_eq!(
-            rewritable.spc_profile().expect("profile").mode_sense(
-                false,
-                0x2A,
-                false,
-                0,
-                Some(&mut ram)
-            ),
-            Some(40)
-        );
-        assert_eq!(&cd[4..6], &[0x2A, 0x3E]);
-        assert_eq!(&ram[4..6], &[0x2A, 0x22]);
-        assert_ne!(&cd[4..68], &ram[4..40]);
-        // The 0x3F total follows the selected 0x2A variant; no padding bytes
-        // are inserted that a host could parse as a following page.
-        assert_eq!(
-            read_only
-                .spc_profile()
-                .expect("profile")
-                .mode_sense(false, 0x3F, false, 0, None),
-            Some(198)
-        );
-        assert_eq!(
-            rewritable
-                .spc_profile()
-                .expect("profile")
-                .mode_sense(false, 0x3F, false, 0, None),
-            Some(170)
-        );
+        for dev in [&read_only, &rewritable] {
+            let profile = dev.spc_profile().expect("profile");
+            assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(68));
+            assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
+        }
+        // The 36-byte DVD-RAM view is an explicit capability preset.
+        let explicit = MmcDrive::new_with_caps(SpyMedium::rewritable(4), MmcCaps::dvdram());
+        let profile = explicit.spc_profile().expect("profile");
+        assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(40));
+        assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(170));
     }
 
     #[test]
@@ -3432,7 +3405,11 @@ mod tests {
             &0x0000u16.to_be_bytes(),
             "no current profile"
         );
-        assert_eq!(absent[11], 4, "one CD-ROM profile entry");
+        assert_eq!(absent[11], 8, "recorder + CD-ROM profiles stay listed");
+        assert_eq!(&absent[12..14], &0x0012u16.to_be_bytes());
+        assert_eq!(absent[15], 0);
+        assert_eq!(&absent[16..18], &0x0008u16.to_be_bytes());
+        assert_eq!(absent[19], 0);
         // RT=10b and RT=01b also answer from the absent default.
         assert!(profile.get_configuration(2, 0x0050, None).is_some());
         assert!(profile.get_configuration(1, 0x0010, None).is_some());
@@ -3502,7 +3479,7 @@ mod tests {
         assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
         // GC/GESN answer explicitly with the zero-sector view instead of
         // delegating to `Spc` (which would reject for an unrelated reason).
-        assert_eq!(profile.get_configuration(0, 0, None), Some(60));
+        assert_eq!(profile.get_configuration(0, 0, None), Some(88));
         assert_eq!(profile.event_status(0x10, None), Some(8));
 
         let mut cdb = [0u8; 10];
@@ -3520,20 +3497,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_cd_drive_reports_cd_caps() {
-        let cd = MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom());
+    fn empty_default_drive_reports_hyper_multi_caps() {
+        // The default drive is a Hyper-Multi recorder; an empty tray keeps
+        // every drive capability (only Current bits are cleared).
+        let cd = MmcDrive::<FlatCdMedium>::empty(MmcCaps::hyper_multi());
         let profile = cd.spc_profile().expect("profile");
         assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(68));
         let mut buf = [0u8; 128];
         let n = profile
             .get_configuration(0, 0, Some(&mut buf))
-            .expect("GC on an empty CD drive");
-        assert!(n > 12);
+            .expect("GC on an empty drive");
+        assert_eq!(n, 88);
         assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
-        assert_eq!(&buf[12..14], &0x08u16.to_be_bytes());
+        assert_eq!(&buf[12..14], &0x12u16.to_be_bytes());
         assert_eq!(buf[15], 0);
-        assert!(feature_at(&buf, n, 0x0020).is_none());
-        assert!(feature_at(&buf, n, 0x0024).is_none());
+        assert_eq!(&buf[16..18], &0x08u16.to_be_bytes());
+        assert_eq!(buf[19], 0);
+        let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
+        assert_eq!(buf[at20 + 2] & 1, 0);
+        assert!(buf[at20 + 4..at20 + 16].iter().all(|b| *b == 0));
+        let at24 = feature_at(&buf, n, 0x0024).expect("Defect Management listed");
+        assert_eq!(buf[at24 + 2] & 1, 0);
     }
 
     #[cfg(feature = "dvdram")]
@@ -3589,7 +3573,10 @@ mod tests {
         #[cfg(feature = "dvdram")]
         {
             use crate::mmc::DvdRamMedium;
-            let mixed = MmcDrive::new_with_caps(DvdRamMedium::new(16), MmcCaps::cdrom());
+            let mixed = MmcDrive::new_with_caps(
+                DvdRamMedium::new(16),
+                MmcCaps::new(&CDROM_PROFILES, &CDROM_CAPABILITIES_PAGE, false),
+            );
             let profile = mixed.spc_profile().expect("profile");
             let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
             assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
@@ -3599,7 +3586,7 @@ mod tests {
 
     #[test]
     fn admits_drive_commands_without_medium() {
-        let dev = MmcDrive::<FlatCdMedium>::empty(MmcCaps::cdrom());
+        let dev = MmcDrive::<FlatCdMedium>::empty(MmcCaps::hyper_multi());
         assert!(dev.admits_without_medium(&[0x1A]));
         assert!(dev.admits_without_medium(&[0x5A, 0, 0x2A]));
         assert!(!dev.admits_without_medium(&[0x12]));
@@ -3811,8 +3798,9 @@ mod tests {
     }
 
     #[test]
-    fn blank_write_mode_selects_the_recorder_page() {
-        let dev = MmcDrive::new(SpyMedium::new(MmcWriteMode::Blank, 4));
+    fn explicit_recorder_caps_select_the_recorder_page() {
+        let dev =
+            MmcDrive::new_with_caps(SpyMedium::new(MmcWriteMode::Blank, 4), MmcCaps::dvdram());
         let profile = dev.spc_profile().expect("profile");
         assert_eq!(profile.mode_sense(false, 0x2A, false, 0, None), Some(40));
     }

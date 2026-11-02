@@ -1114,7 +1114,7 @@ fn no_medium_gc_and_gesn_answer_explicitly_through_spc() {
         "MODE SENSE must answer on the empty tray"
     );
     assert_eq!(work[8], 0x2A, "page code after the MODE SENSE(10) header");
-    assert_eq!(work[9], 0x22, "the 36-byte recorder capability page");
+    assert_eq!(work[9], 0x3E, "the 64-byte Hyper-Multi capability page");
 
     assert_eq!(
         target.drive_static_host::<Here>(
