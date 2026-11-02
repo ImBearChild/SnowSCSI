@@ -14,7 +14,7 @@
 //! a plain `async fn` with no runtime dependency.
 
 use core::cell::RefCell;
-use core::sync::atomic::AtomicBool;
+use snowscsi::core::{Flow, ServeExit};
 use std::rc::Rc;
 
 use snowscsi::common::store::StorePlane;
@@ -128,7 +128,7 @@ pub fn serve_usb_async<S: RuntimeSet>(
     target: &mut Target<S>,
     storage: &mut PlaneSet<'_>,
 ) {
-    let stop = AtomicBool::new(false);
+    let stop = Flow::new();
     let mut recv = GoldenAsyncBotIo::new(Rc::clone(&io));
     let mut send = GoldenAsyncBotIo::new(io);
     block_on(async {
@@ -137,7 +137,8 @@ pub fn serve_usb_async<S: RuntimeSet>(
         )
         .await
         {
-            Ok(()) | Err(ServeError::Closed) => {}
+            Ok(ServeExit::WireGone) => {}
+            Ok(other) => panic!("unexpected serve exit: {other:?}"),
             Err(e) => panic!("usb::serve_async failed: {e}"),
         }
     });

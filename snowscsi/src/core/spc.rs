@@ -9,8 +9,10 @@
 //!
 //! The six commands are TEST UNIT READY (0x00, delegated to the inner device),
 //! INQUIRY (0x12), REQUEST SENSE (0x03), REPORT LUNS (0xA0), PREVENT/ALLOW
-//! (0x1E) and START STOP UNIT (0x1B). `0x1B` stores only the start bit; it
-//! never ejects or handles `LoEj`.
+//! (0x1E) and START STOP UNIT (0x1B). `0x1B` stores the start bit and records
+//! an eject request for `LoEj=1, Start=0`; the runner performs the detach after
+//! the completion is fixed, so the status is never produced by a half-detached
+//! slot. `LoEj=1, Start=1` (load) is a no-op.
 //!
 //! The public query commands MODE SENSE(6/10) (0x1A/0x5A), READ
 //! CAPACITY(10) (0x25), GET CONFIGURATION (0x46) and GET EVENT STATUS
@@ -125,6 +127,8 @@ pub struct Spc<D: Device> {
     prevent: bool,
     persistent_prevent: bool,
     started: bool,
+    /// START STOP UNIT asked for an eject; consumed at the completion point.
+    eject: bool,
     /// LUN count reported by REPORT LUNS (0 is treated as 1).
     lun_count: u32,
     saved_sense: Option<Sense>,
@@ -143,6 +147,7 @@ impl<D: Device> Spc<D> {
             prevent: false,
             persistent_prevent: false,
             started: true,
+            eject: false,
             lun_count: 1,
             saved_sense: None,
             ua: UaSet::new(),
@@ -203,6 +208,8 @@ impl<D: Device> Spc<D> {
         if self.query != Query::None {
             return Err(Completion::Busy);
         }
+        // Per-command intent: a request never outlives the command that set it.
+        self.eject = false;
         let Some(opcode) = cdb.first().copied() else {
             return Err(Completion::Check(INVALID_FIELD));
         };
@@ -493,7 +500,14 @@ impl<D: Device> Spc<D> {
                 if cdb.len() < 6 {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
-                self.started = cdb[4] & 0x01 != 0;
+                let start = cdb[4] & 0x01 != 0;
+                let loej = cdb[4] & 0x02 != 0;
+                self.started = start;
+                // LoEj=1,Start=0 asks for an eject; the runner performs the
+                // detach at the completion point. LoEj=1,Start=1 is a load,
+                // which is a no-op here: the application inserts media, the
+                // device never reloads a pair it handed back.
+                self.eject = loej && !start;
                 self.query = Query::NoData;
                 Ok(())
             }
@@ -1041,6 +1055,12 @@ impl<D: Device> Device for Spc<D> {
         // latch is never implicitly cleared.
         self.prevent = false;
         self.inner.host_eject_succeeded(permit);
+    }
+
+    fn take_eject_request(&mut self) -> bool {
+        let eject = self.eject;
+        self.eject = false;
+        eject
     }
 
     fn take_medium(&mut self, permit: &BoundaryPermit) -> Option<Self::Medium> {

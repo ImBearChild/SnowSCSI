@@ -1853,16 +1853,7 @@ fn a_failed_host_status_keeps_the_result_takeable() {
     let takes = slot0(&target).device_ref().takes;
     assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
 
-    // The application's full-status send failed and the transport ended; the
-    // library must not re-commit, re-detach or discard the fixed result.
-    target.transport_ended();
-    assert_eq!(
-        target.tick(),
-        RunOutcome::Ended {
-            reason: RunEnd::TransportEnded,
-            error: None,
-        }
-    );
+    // A lost link must not re-commit, re-detach or discard the fixed result.
     let result = target
         .take_static_at::<Here>(0)
         .expect("the result survives the failed status");
@@ -3528,9 +3519,9 @@ fn a_step_with_a_changed_work_bank_cancels_the_retained_token_once() {
     );
 }
 
-// ── Row 2: `transport_ended` / `fatal` / `Abort` cancel ─────────────────────
+// ── Row 2: link loss / `fatal` / `Abort` cancel ─────────────────────────────
 
-/// (transport_ended): the pending token is cancelled **before**
+/// (link loss): the pending token is cancelled **before**
 /// `interrupt`; a write remainder becomes unknown; the service ends only after
 /// the settlement.
 #[test]
@@ -3550,19 +3541,7 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
         Ok(DriveStep::Pending)
     );
 
-    target.transport_ended();
-    assert_eq!(
-        target.tick(),
-        RunOutcome::ServiceReady,
-        "the settle is still owed, so the end is not reported yet"
-    );
-    assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
-        Ok(DriveStep::Control(RunOutcome::Ended {
-            reason: RunEnd::TransportEnded,
-            error: None,
-        }))
-    );
+    target.link_lost_static::<Here>(&mut storage, &mut host);
 
     assert_eq!(storage.cancels, 1, "transport end cancels exactly once");
     assert_eq!(
@@ -3592,10 +3571,8 @@ fn transport_end_cancels_the_pending_write_before_the_interrupt() {
 
     assert_eq!(
         target.tick(),
-        RunOutcome::Ended {
-            reason: RunEnd::TransportEnded,
-            error: None,
-        }
+        RunOutcome::ServiceReady,
+        "a lost link does not end the target"
     );
     // A late event cannot act on a settled command or a new medium.
     assert_eq!(
@@ -3641,14 +3618,7 @@ fn transport_end_cancels_a_pending_read_without_an_unknown_remainder() {
         Ok(DriveStep::Pending)
     );
 
-    target.transport_ended();
-    assert_eq!(
-        target.drive_step_static::<Here>(&mut storage, &mut host, &mut work, &mut [], &mut scratch),
-        Ok(DriveStep::Control(RunOutcome::Ended {
-            reason: RunEnd::TransportEnded,
-            error: None,
-        }))
-    );
+    target.link_lost_static::<Here>(&mut storage, &mut host);
 
     assert_eq!(
         (storage.begins, storage.polls),
@@ -4004,14 +3974,8 @@ fn a_receipt_error_is_fed_back_once_and_never_replayed() {
 
     // The full-status-sent hook already ran; a later transport failure must not
     // re-book delivery or interrupt the device again.
-    target.transport_ended();
-    assert_eq!(
-        target.tick(),
-        RunOutcome::Ended {
-            reason: RunEnd::TransportEnded,
-            error: None,
-        }
-    );
+    target.link_lost_static::<Here>(&mut storage, &mut host);
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
     let device = slot0(&target).device_ref();
     assert_eq!(device.deliveries, vec![Delivery::Complete]);
     assert_eq!(device.interrupts, 0);
@@ -5433,5 +5397,90 @@ fn abort_with_both_data_out_tokens_cancels_the_companion_first() {
             &mut scratch
         ),
         Ok(DriveStep::Pending)
+    );
+}
+
+/// START STOP UNIT `LoEj=1, Start=0` is the host's own eject: the runner
+/// detaches the pair after the completion is fixed, publishes
+/// `ResourcesReady`, and the empty slot answers `MEDIUM_NOT_PRESENT` until the
+/// application installs a new medium.
+#[test]
+fn host_loej_detaches_the_medium_and_the_slot_stays_servable() {
+    let mut target = Target::new(cons(
+        LuImpl::new(Spc::new(MmcDrive::new(FlatCdMedium::read_only(16))), 7u8),
+        Nil,
+    ));
+    let mut storage = BlockingStorage::new(Plane::new());
+    let mut work = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    // LoEj=1, Start=0 (eject), no data phase.
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x1B, 0, 0, 0, 0x02, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ResourcesReady { lun: 0 },
+        "the detach is published once the completion is fixed"
+    );
+    let taken = target
+        .take_static_at::<Here>(0)
+        .expect("the ejected pair is resident");
+    assert_eq!(taken.local, Ok(()));
+    assert!(taken.pair.is_some());
+
+    // Empty slot: TUR is NOT READY / MEDIUM NOT PRESENT, not a dead device.
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x00, 0, 0, 0, 0, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Check(MEDIUM_NOT_PRESENT))
+    );
+    assert_eq!(target.tick(), RunOutcome::ServiceReady);
+
+    // A second eject on the empty tray is a no-op GOOD (Windows retries it).
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x1B, 0, 0, 0, 0x02, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Good)
+    );
+    assert_eq!(
+        target.tick(),
+        RunOutcome::ServiceReady,
+        "no handback, no death"
+    );
+
+    // Insert a fresh, larger disc: geometry comes from the medium.
+    assert!(target
+        .install_static::<Here>(Pair {
+            medium: FlatCdMedium::read_only(64),
+            backing: 8u8,
+        })
+        .is_ok());
+    assert_eq!(
+        target.drive_static::<Here>(
+            &mut storage,
+            ctx(),
+            &[0x00, 0, 0, 0, 0, 0],
+            &mut work,
+            &mut scratch
+        ),
+        Ok(Completion::Good)
     );
 }

@@ -1110,7 +1110,7 @@ where
         // the connection: the `Notify` may already have fired.
         if stop.load(Ordering::SeqCst) {
             session.connection_lost();
-            let _ = target.settle_transport_end(&mut *storage, &mut session);
+            target.link_lost(&mut *storage, &mut session);
             return Ok(());
         }
         tokio::select! {
@@ -1121,10 +1121,10 @@ where
                 &mut session,
                 &mut target,
                 &mut *storage,
-            ) => r?,
+            ) => r.map(|_| ())?,
             _ = shutdown.notified() => {
                 session.connection_lost();
-                let _ = target.settle_transport_end(&mut *storage, &mut session);
+                target.link_lost(&mut *storage, &mut session);
                 return Ok(());
             }
         }
@@ -1697,10 +1697,10 @@ fn run_serve_usb(
         }
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let flow = Arc::new(snowscsi::core::Flow::new());
     {
-        let stop = Arc::clone(&stop);
-        if let Err(e) = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst)) {
+        let flow = Arc::clone(&flow);
+        if let Err(e) = ctrlc::set_handler(move || flow.stop()) {
             eprintln!("snowscsi: failed to install signal handler: {e}");
             return ExitCode::FAILURE;
         }
@@ -1753,7 +1753,7 @@ fn run_serve_usb(
                 &mut scratch,
                 &mut target,
                 &mut store,
-                &stop,
+                &flow,
             );
             if let Err((i, e)) = store.sync() {
                 eprintln!("snowscsi: sync failed for LUN {i}: {e}");
@@ -1771,7 +1771,7 @@ fn run_serve_usb(
             &mut scratch,
             &mut target,
             &mut storage,
-            &stop,
+            &flow,
         );
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");

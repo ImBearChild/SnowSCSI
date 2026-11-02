@@ -432,6 +432,13 @@ impl Lu for TestLu {
             Self::Mmc(l) => l.eject_rt(permit),
         }
     }
+
+    fn take_eject_request(&mut self) -> bool {
+        match self {
+            Self::Block(_) => false,
+            Self::Mmc(l) => l.take_eject_request(),
+        }
+    }
 }
 
 /// Core fault for a byte-plane error.

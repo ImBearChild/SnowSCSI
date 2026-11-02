@@ -114,6 +114,16 @@ pub trait SlotSet {
     fn check_boundary(&self, _runner: &Runner) -> Result<(), BoundaryReject> {
         Ok(())
     }
+
+    /// Management gate: no resident slot may hold an unclaimed result.
+    ///
+    /// [`Self::check_boundary`] covers the command/IO/long-operation boundary;
+    /// a produced-but-unclaimed pair is the other half of "management may
+    /// proceed". The default accepts (safe for an empty set); a custom
+    /// `SlotSet` that owns resident slots must override it.
+    fn check_result_absent(&self) -> Result<(), BoundaryReject> {
+        Ok(())
+    }
 }
 
 impl SlotSet for Nil {
@@ -142,6 +152,13 @@ impl<H: Lu, T: SlotSet> SlotSet for Cons<H, T> {
         runner.boundary::<H::Pair>(&self.head)?;
         self.tail.check_boundary(runner)
     }
+
+    fn check_result_absent(&self) -> Result<(), BoundaryReject> {
+        if self.head.has_result() {
+            return Err(BoundaryReject::AwaitingResourceTake);
+        }
+        self.tail.check_result_absent()
+    }
 }
 
 impl<P, const N: usize> SlotSet for [&mut dyn Lu<Pair = P>; N] {
@@ -161,6 +178,15 @@ impl<P, const N: usize> SlotSet for [&mut dyn Lu<Pair = P>; N] {
         }
         Ok(())
     }
+
+    fn check_result_absent(&self) -> Result<(), BoundaryReject> {
+        for slot in self.iter() {
+            if slot.has_result() {
+                return Err(BoundaryReject::AwaitingResourceTake);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<P> SlotSet for &mut [&mut dyn Lu<Pair = P>] {
@@ -177,6 +203,15 @@ impl<P> SlotSet for &mut [&mut dyn Lu<Pair = P>] {
     fn check_boundary(&self, runner: &Runner) -> Result<(), BoundaryReject> {
         for slot in self.iter() {
             runner.boundary::<P>(&**slot)?;
+        }
+        Ok(())
+    }
+
+    fn check_result_absent(&self) -> Result<(), BoundaryReject> {
+        for slot in self.iter() {
+            if slot.has_result() {
+                return Err(BoundaryReject::AwaitingResourceTake);
+            }
         }
         Ok(())
     }

@@ -193,6 +193,15 @@ pub trait Lu {
     /// result, leave the slot empty. The runner then publishes `ResourcesReady`;
     /// the application takes the pair exactly once.
     fn eject_rt(&mut self, permit: &BoundaryPermit) -> Result<(), Fault>;
+
+    /// Consume the eject request of the last completed command.
+    ///
+    /// The runner calls this at the completion point of a GOOD command and
+    /// performs the detach itself. Default: no request (a device that cannot
+    /// eject, or an inner device that does not implement it).
+    fn take_eject_request(&mut self) -> bool {
+        false
+    }
 }
 
 /// MMC-6 §6.4.4.3 foreground-FORMAT allow list, plus REPORT LUNS, which SPC-3
@@ -205,6 +214,19 @@ fn admitted_during_foreground(opcode: u8) -> bool {
             | 0x46 // GET CONFIGURATION (MMC)
             | 0x4A // GET EVENT STATUS NOTIFICATION (MMC)
             | 0xA0 // REPORT LUNS (SPC-3, target level)
+    )
+}
+
+/// Device-level commands that stay answerable on an **empty** slot.
+///
+/// START STOP UNIT is how the host closes a tray it already opened (and how
+/// Windows retries an eject); PREVENT/ALLOW is a device latch. Neither touches
+/// the medium, so an empty slot answers them instead of `MEDIUM NOT PRESENT`.
+fn admitted_without_medium(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x1B // START STOP UNIT
+            | 0x1E // PREVENT/ALLOW MEDIUM REMOVAL
     )
 }
 
@@ -336,6 +358,7 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         // must deliver it before the device can report MEDIUM NOT PRESENT.
         if self.backing.is_none()
             && !admitted_during_foreground(opcode)
+            && !admitted_without_medium(opcode)
             && self.device.pending_ua().is_none()
         {
             return Admission::Reject(Completion::Check(MEDIUM_NOT_PRESENT));
@@ -366,7 +389,10 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
         // A pending unit attention still has to be delivered first.
         if self.backing.is_none() {
             let opcode = cdb.first().copied().unwrap_or(0xFF);
-            if !admitted_during_foreground(opcode) && self.device.pending_ua().is_none() {
+            if !admitted_during_foreground(opcode)
+                && !admitted_without_medium(opcode)
+                && self.device.pending_ua().is_none()
+            {
                 return Err(Completion::Check(MEDIUM_NOT_PRESENT));
             }
         }
@@ -804,6 +830,10 @@ impl<D: Device, B> Lu for LuImpl<D, B> {
             effects: self.force_effects(),
         });
         Ok(())
+    }
+
+    fn take_eject_request(&mut self) -> bool {
+        self.device.take_eject_request()
     }
 }
 

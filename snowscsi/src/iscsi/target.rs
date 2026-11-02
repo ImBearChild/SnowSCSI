@@ -916,9 +916,7 @@ impl IscsiSession {
             && !self.cmd_active
             && (!shared || matches!(ev, Event::Tick))
         {
-            if let Some(out) = self.idle_entry(work, scratch, target, storage) {
-                return out;
-            }
+            self.idle_entry(work, scratch, target, storage);
         }
         match ev {
             Event::Tick => {
@@ -949,11 +947,7 @@ impl IscsiSession {
                 // shared mode `idle_entry` is never run at the top of a
                 // `HostRecv`/`HostSent` entry.
                 if self.session == Session::RecvPdu && !self.cmd_active {
-                    if let Some(out) = self.idle_entry(work, scratch, target, storage) {
-                        if matches!(out, Emit::Closed | Emit::Error(_)) {
-                            return out;
-                        }
-                    }
+                    self.idle_entry(work, scratch, target, storage);
                 }
                 emit
             }
@@ -1010,19 +1004,22 @@ impl IscsiSession {
         }
     }
 
-    /// Advance a resident long operation and the target lifecycle once per
-    /// idle entry.
+    /// Advance a resident long operation once per idle entry.
     ///
     /// With an empty `scratch` the long operation shares `work` as its data
     /// bank: `poll_long_entry_rt` ignores its `work` argument, so the empty
     /// slice goes there and `work` is the bank.
+    ///
+    /// The target lifecycle (`tick`) is deliberately **not** consulted here:
+    /// the transport loop owns it and reports the outcome at a point where no
+    /// I/O is in flight.
     fn idle_entry<S: RuntimeSet>(
         &mut self,
         work: &mut [u8],
         scratch: &mut [u8],
         target: &mut Target<S>,
         storage: &mut dyn Storage,
-    ) -> Option<Emit> {
+    ) {
         if let Some(lun) = self.long_lun {
             let mut empty = [0u8; 0];
             let polled = if scratch.is_empty() {
@@ -1042,13 +1039,6 @@ impl IscsiSession {
                 }
             }
         }
-        match target.tick() {
-            crate::core::RunOutcome::Ended { .. } => {
-                self.session = Session::Closed;
-                Some(Emit::Closed)
-            }
-            _ => None,
-        }
     }
 
     /// Overlap-mode long entry: lend the resident long operation one bank of
@@ -1065,13 +1055,7 @@ impl IscsiSession {
                 Some(bank) => bank,
                 // A live token must never be re-borrowed from a guessed bank.
                 None if target.long_io_in_flight() => {
-                    return match target.tick() {
-                        crate::core::RunOutcome::Ended { .. } => {
-                            self.session = Session::Closed;
-                            Some(Emit::Closed)
-                        }
-                        _ => None,
-                    };
+                    return None;
                 }
                 None => self.alternate_bank(),
             };
@@ -1101,13 +1085,7 @@ impl IscsiSession {
                 }
             }
         }
-        match target.tick() {
-            crate::core::RunOutcome::Ended { .. } => {
-                self.session = Session::Closed;
-                Some(Emit::Closed)
-            }
-            _ => None,
-        }
+        None
     }
 
     fn on_recv<S: RuntimeSet>(
@@ -1347,11 +1325,8 @@ impl IscsiSession {
             self.settle_long(target);
             self.expectation()
         } else if !scratch.is_empty() {
-            if let Some(out) = self.idle_entry(work, scratch, target, storage) {
-                out
-            } else {
-                self.expectation()
-            }
+            self.idle_entry(work, scratch, target, storage);
+            self.expectation()
         } else {
             // Shared bank (empty `scratch`): reached from `on_sent` after the
             // response was written to the wire. Progress is deferred to the

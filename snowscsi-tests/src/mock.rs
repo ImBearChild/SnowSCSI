@@ -13,7 +13,7 @@ mod tests {
     use snowscsi::common::seekable_storage::RamBackend;
     use snowscsi::common::store::{StoreOp, StorePlane};
     use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-    use snowscsi::core::{Delivery, Direction, Lu, PendingKind, RuntimeSet, Target};
+    use snowscsi::core::{Delivery, Direction, Lu, PendingKind, RuntimeSet, ServeExit, Target};
     use snowscsi::iscsi::conn::write_all;
     use snowscsi::iscsi::pdu::{flag, op, reject, stage, status, tmf, tmf_response, BHS_SIZE};
     use snowscsi::iscsi::target::{Action, Event, IscsiSession, LoginStage, TargetError};
@@ -3930,7 +3930,11 @@ mod tests {
                 &mut target,
                 &mut storage,
             );
-            assert_eq!(result, Ok(()), "the scripted host closes the connection");
+            assert_eq!(
+                result,
+                Ok(ServeExit::WireGone),
+                "the scripted host closes the connection"
+            );
             writes = storage.writes;
         }
         assert!(

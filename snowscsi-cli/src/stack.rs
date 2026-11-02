@@ -580,6 +580,13 @@ impl Lu for CliLu {
             Self::Mmc(lu) => lu.eject_rt(permit),
         }
     }
+
+    fn take_eject_request(&mut self) -> bool {
+        match self {
+            Self::Block(_) => false,
+            Self::Mmc(lu) => lu.take_eject_request(),
+        }
+    }
 }
 
 /// Convert a `Change<CliPair>` into the slot-specific pair, keeping the

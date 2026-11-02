@@ -126,13 +126,12 @@ impl<S: SlotSet> Target<S> {
 
     /// Close new submission; the active command is drained by the next
     /// `drive_step_*` (**not** a cancel).
+    ///
+    /// This is the **target** lifecycle end (the application is done with the
+    /// device). Ending one transport loop is [`Flow::stop`](super::Flow::stop),
+    /// which leaves the target intact.
     pub fn stop(&mut self) {
         self.runner.request_stop();
-    }
-
-    /// Transport ended (reset/disconnect); not recoverable.
-    pub fn transport_ended(&mut self) {
-        self.runner.transport_ended();
     }
 
     /// Enter the fatal state; the next settled `tick` reports `Ended{Fatal}`.
@@ -143,6 +142,32 @@ impl<S: SlotSet> Target<S> {
     /// One service entry.
     pub fn tick(&mut self) -> RunOutcome {
         self.runner.tick()
+    }
+
+    /// Whether a management call would be accepted right now.
+    ///
+    /// This is the authoritative conjunction the management entries use: no
+    /// terminal state, no queued control, no eject transaction, no unclaimed
+    /// handback (`await_take`), every resident slot at its boundary, and no
+    /// slot holding a resident management result.
+    ///
+    /// It answers *when*, not *what*: whether a medium is present is the
+    /// application's own bookkeeping ([`Self::snapshot_rt`]'s `ready` for a
+    /// runtime LUN). `install` additionally requires an empty slot; `replace`
+    /// and `eject` require a present medium.
+    pub fn management_boundary(&self) -> Result<(), BoundaryReject> {
+        if self.runner.terminal_outcome().is_some() {
+            return Err(BoundaryReject::Ended);
+        }
+        if self.runner.has_pending_control() {
+            return Err(BoundaryReject::ControlPending);
+        }
+        if self.runner.has_pending_eject() {
+            return Err(BoundaryReject::EjectPending);
+        }
+        self.runner.result_barrier()?;
+        self.slots.check_boundary(&self.runner)?;
+        self.slots.check_result_absent()
     }
 }
 
@@ -155,34 +180,53 @@ impl<S: RuntimeSet> Target<S> {
             .ok_or(BoundaryReject::WrongSlot)
     }
 
-    /// Settle the command left live by a transport end and report the terminal
-    /// outcome.
+    /// Settle the command left live by a lost transport link.
     ///
-    /// [`Self::transport_ended`] only raises the terminal flag: without a later
-    /// command step the slot would stay active and every command on the next
-    /// connection would answer BUSY. This entry cancels the retained token (the
-    /// wire is gone), settles the device with `InterruptReason::Stop`, and books
-    /// the failed delivery. It is idempotent and is a no-op when no command was
-    /// active.
+    /// A link going away is **not** a target lifecycle event: the live
+    /// command's retained token is cancelled through the adapter, the device is
+    /// settled with `InterruptReason::Stop`, its delivery is booked as failed,
+    /// and a retained long-operation token is cancelled too. No terminal flag
+    /// is latched, so the same target serves the next link. Idempotent.
     ///
-    /// The host seam is expected to be dead (typically after
-    /// `IscsiSession::connection_lost`): no PDU is staged or sent here.
-    pub fn settle_transport_end(
+    /// This also cancels the long token when no command is live: at a command
+    /// boundary `active_lun` is `None`, and a resident FORMAT/BLANK must not
+    /// outlive the wire that owned it.
+    pub fn link_lost(
         &mut self,
         storage: &mut dyn super::storage::Storage,
         host: &mut dyn HostTransport,
-    ) -> RunOutcome {
-        self.runner.transport_ended();
-        if let Some(lun) = self.active_lun.take() {
+    ) {
+        let Self {
+            runner,
+            slots,
+            active_lun,
+            ..
+        } = self;
+        if let Some(lun) = active_lun.take() {
             storage.select_lun(lun);
-            if let Some(slot) = self.slots.get(lun) {
-                let Self { runner, .. } = self;
-                return runner.settle_transport_end(slot, storage, host);
+            if let Some(slot) = slots.get(lun) {
+                runner.settle_link_command(slot, storage, host);
             }
         }
-        self.runner
-            .terminal_outcome()
-            .unwrap_or(RunOutcome::ServiceReady)
+        if let Some(lun) = runner.long_lun() {
+            storage.select_lun(lun);
+            if let Some(slot) = slots.get(lun) {
+                runner.cancel_long_token(lun, slot, storage);
+            }
+        }
+    }
+
+    /// Whether a take would be accepted for `lun` right now.
+    ///
+    /// Read-only projection of the [`Self::take_rt`] gate. A transport loop
+    /// consults it before reporting [`RunOutcome::ResourcesReady`], so a
+    /// handback is never announced while another LUN's command still blocks
+    /// the take.
+    pub fn take_ready(&self, lun: usize) -> bool {
+        match self.slots.get_ref(lun) {
+            Some(slot) => self.runner.take_ready(lun, slot),
+            None => false,
+        }
     }
 
     /// Start a command on a runtime LUN.
@@ -720,6 +764,20 @@ pub trait StaticTarget<S: SlotSet> {
         S: At<I>,
         <S as At<I>>::Slot: Lu;
 
+    /// Settle a command (and a held long token) left live by a lost link.
+    ///
+    /// The static mirror of [`Target::link_lost`]: it settles the selected
+    /// slot and never latches a terminal state, so the same target serves the
+    /// next link.
+    fn link_lost_static<I>(
+        &mut self,
+        storage: &mut dyn super::storage::Storage,
+        host: &mut dyn HostTransport,
+    ) where
+        I: Index,
+        S: At<I>,
+        <S as At<I>>::Slot: Lu;
+
     /// Advance a resident long operation on the static slot.
     ///
     /// `work` serves the current command; `scratch` is the resident long
@@ -1017,6 +1075,28 @@ impl<S: SlotSet> StaticTarget<S> for Target<S> {
         let Self { runner, slots, .. } = self;
         storage.select_lun(I::INDEX);
         runner.force_remove_rt(I::INDEX, slots.slot_mut(), storage, host)
+    }
+
+    fn link_lost_static<I>(
+        &mut self,
+        storage: &mut dyn super::storage::Storage,
+        host: &mut dyn HostTransport,
+    ) where
+        I: Index,
+        S: At<I>,
+        <S as At<I>>::Slot: Lu,
+    {
+        if self.active_lun == Some(I::INDEX) {
+            self.active_lun = None;
+            storage.select_lun(I::INDEX);
+            let Self { runner, slots, .. } = self;
+            runner.settle_link_command(slots.slot_mut(), storage, host);
+        }
+        if self.runner.long_lun() == Some(I::INDEX) {
+            storage.select_lun(I::INDEX);
+            let Self { runner, slots, .. } = self;
+            runner.cancel_long_token(I::INDEX, slots.slot_mut(), storage);
+        }
     }
 
     fn poll_long_entry_static<I>(

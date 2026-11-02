@@ -33,7 +33,7 @@
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those holding buffers for the duration of a data transfer."
 )]
 
-use core::sync::atomic::AtomicBool;
+use snowscsi::core::Flow;
 
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
@@ -103,12 +103,12 @@ static SD_BUF: StaticCell<[u8; STAGE]> = StaticCell::new();
 /// (the SD worker) once, in [`gadget`].
 static SD_POOL: StaticCell<SdPool> = StaticCell::new();
 
-/// Shutdown flag handed to the BOT serve loop.
+/// Flow request handed to the BOT serve loop.
 ///
 /// This firmware never tears the gadget down, so the flag is never set; it
 /// exists because the shell requires an explicit stop signal alongside the
 /// future.
-static STOP: AtomicBool = AtomicBool::new(false);
+static FLOW: Flow = Flow::new();
 
 /// Run the whole DVD-RAM gadget concurrently: USB stack, BOT loop, async SD
 /// worker, status LCD.
@@ -136,7 +136,7 @@ async fn gadget<'d, D, O, I, S>(
     target: &mut Target<S>,
     backing: &mut Backing<'_>,
     sd_pool: &'static SdPool,
-    stop: &AtomicBool,
+    flow: &Flow,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
     boot: Instant,
@@ -158,7 +158,7 @@ where
     esp_println::println!("stage: gadget enter");
     embassy_futures::join::join4(
         device.run(),
-        msc::run(bot, session, work, scratch, target, &mut storage, stop),
+        msc::run(bot, session, work, scratch, target, &mut storage, flow),
         store::sd_task(backing, &jobs),
         async {
             // Live status on the panel (and the same numbers over the CH343P
@@ -580,7 +580,7 @@ async fn main(_spawner: Spawner) -> ! {
         &mut target,
         &mut backing,
         sd_pool,
-        &STOP,
+        &FLOW,
         &mut display,
         sd_bytes,
         boot,

@@ -21,6 +21,7 @@ use std::task::Wake;
 use snowscsi::core::async_wake::{wait, AsyncWake};
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{Direction, Fault, Lu, Target};
+use snowscsi::core::{Flow, ServeExit};
 use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{
     AsyncBotRecv, AsyncBotSend, BotIoErr, BotSession, CtrlAck, CtrlReply, CtrlReq, Gadget,
@@ -319,7 +320,7 @@ fn serve_async_awaits_deferred_storage_without_spinning() {
         wire: Rc::clone(&wire),
     };
     let mut gadget = NoGadget;
-    let stop = AtomicBool::new(false);
+    let stop = Flow::new();
 
     let wakes = Arc::new(AtomicUsize::new(0));
     let waker = Waker::from(Arc::new(CountingWake(Arc::clone(&wakes))));
@@ -350,7 +351,8 @@ fn serve_async_awaits_deferred_storage_without_spinning() {
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
 
     match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(Ok(())) | Poll::Ready(Err(ServeError::Closed)) => {}
+        Poll::Ready(Ok(ServeExit::WireGone)) => {}
+        Poll::Ready(Ok(other)) => panic!("unexpected serve exit: {other:?}"),
         Poll::Ready(Err(e)) => panic!("serve_async failed: {e}"),
         Poll::Pending => panic!("storage completion must finish the read"),
     }

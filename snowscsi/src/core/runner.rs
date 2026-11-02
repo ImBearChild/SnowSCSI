@@ -13,9 +13,11 @@
 //! - lifecycle settlement: **Stop is a drain, everything else cancels**
 //!
 //!
-//! `stop`, `transport_ended` and `fatal` may be requested while a command is
-//! live. `tick` reports `Ended` only after a `step_command` call settled the
-//! command; until then it keeps returning `ServiceReady`.
+//! `stop` and `fatal` may be requested while a command is live. `tick` reports
+//! `Ended` only after a `step_command` call settled the command; until then it
+//! keeps returning `ServiceReady`. A lost transport link is not a target state:
+//! the transport loop settles the live command through `Target::link_lost` and
+//! keeps the target reusable.
 //!
 //! `Target` (the next card) is the only public owner of a `Runner`: every entry
 //! here is crate-private except [`Runner::enter_execution_borrow`].
@@ -50,13 +52,15 @@ pub enum PendingKind {
     Host,
 }
 
-/// Why the service loop ended.
+/// Why the service ended.
+///
+/// This is a **target** state, not a transport one: a link going away is
+/// [`ServeExit::WireGone`](super::serve::ServeExit::WireGone), reported by the
+/// transport loop, and never reaches this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEnd {
     /// `Target::stop`: new submission closed, pending work drained.
     Stopped,
-    /// The transport ended (reset/disconnect); not recoverable.
-    TransportEnded,
     /// A fatal service error.
     Fatal,
 }
@@ -229,7 +233,6 @@ pub struct Runner {
     execution_borrow: Cell<u32>,
     pending_control: Option<Control>,
     stop: bool,
-    transport_end: bool,
     fatal: Option<Fault>,
     await_take: Option<usize>,
     /// Host-eject transaction in flight (AwaitDelivery): commit/detach may be
@@ -311,7 +314,6 @@ impl Runner {
             execution_borrow: Cell::new(0),
             pending_control: None,
             stop: false,
-            transport_end: false,
             fatal: None,
             await_take: None,
             eject_pending: None,
@@ -335,9 +337,23 @@ impl Runner {
         self.owner
     }
 
-    /// Whether a control request is queued (used by `Target`'s control gate).
+    /// Whether a control request or an eject transaction is queued (used by
+    /// `Target`'s management-boundary projection).
     pub(crate) const fn has_pending_control(&self) -> bool {
         self.pending_control.is_some()
+    }
+
+    /// Whether a host-eject transaction is in flight.
+    pub(crate) const fn has_pending_eject(&self) -> bool {
+        self.eject_pending.is_some()
+    }
+
+    /// LUN owning the retained long-operation token, if any.
+    pub(crate) const fn long_lun(&self) -> Option<usize> {
+        match self.long_pending {
+            Some((lun, _)) => Some(lun),
+            None => None,
+        }
     }
 
     fn permit(&self) -> BoundaryPermit {
@@ -531,17 +547,12 @@ impl Runner {
     }
 
     /// Terminal outcome regardless of in-flight work, in the fixed order
-    /// fatal → transport end → stopped.
+    /// fatal → stopped.
     pub(crate) fn terminal_outcome(&self) -> Option<RunOutcome> {
         if let Some(fault) = self.fatal {
             Some(RunOutcome::Ended {
                 reason: RunEnd::Fatal,
                 error: Some(fault),
-            })
-        } else if self.transport_end {
-            Some(RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                error: None,
             })
         } else if self.stop {
             Some(RunOutcome::Ended {
@@ -1948,6 +1959,23 @@ impl Runner {
                     lu.finish_delivery(&permit, delivery);
                     self.note_command_finished();
                     self.drive_state.set(None);
+                    // A completed host EJECT commits, detaches the pair and
+                    // publishes the handback exactly once. The status is already
+                    // fixed GOOD, so a failed detach (empty slot, resident
+                    // result, long operation) leaves the medium installed and
+                    // produces no `ResourcesReady`; the host retries.
+                    if completion == Completion::Good && lu.take_eject_request() {
+                        let lun = state.ctx.lun as usize;
+                        let boundary = self.permit();
+                        if self.begin_eject(lun).is_ok() {
+                            match lu.eject_rt(&boundary) {
+                                Ok(()) => {
+                                    let _ = self.finish_eject(lun);
+                                }
+                                Err(_) => self.eject_failed(),
+                            }
+                        }
+                    }
                     return Ok(DriveStep::Done(completion));
                 }
                 PollStep::Idle => {
@@ -2245,6 +2273,16 @@ impl Runner {
     /// live borrow still blocks.
     fn take_boundary_of<L: Lu + ?Sized>(&self, lun: usize, slot: &L) -> Result<(), BoundaryReject> {
         self.boundary_checks(slot, !self.force_long_cancelled(lun), true)
+    }
+
+    /// Whether [`Self::take_rt`] would accept `lun` right now.
+    ///
+    /// Read-only: same gate as `take_rt`, no state change. A transport loop
+    /// uses it to avoid reporting a handback that the application could not
+    /// claim yet (another LUN's command still live).
+    #[allow(dead_code)] // `Target::take_ready`
+    pub(crate) fn take_ready<L: Lu + ?Sized>(&self, lun: usize, slot: &L) -> bool {
+        self.take_boundary_of(lun, slot).is_ok()
     }
 
     /// Bit for `lun` in the deferred-force mask, or `Fault::Contract` for a
@@ -2609,35 +2647,36 @@ impl Runner {
         self.stop = true;
     }
 
-    /// Transport ended (link reset/disconnect); not recoverable.
-    #[allow(dead_code)] // `Target::transport_ended`; driven by tests here
-    pub(crate) fn transport_ended(&mut self) {
-        self.transport_end = true;
-    }
-
-    /// Settle the command left live by a transport end.
+    /// Settle the command left live by a lost transport link.
     ///
-    /// The terminal flag alone leaves the slot's command active: this cancels
-    /// the retained token (the wire is gone), settles the device with
-    /// [`InterruptReason::Stop`] and books the failed delivery. The resident
-    /// long operation's retained token is cancelled too, even though no
-    /// `poll_long_entry` can run after the transport is gone. Idempotent: a
-    /// second call with no live command or long token changes nothing.
-    pub(crate) fn settle_transport_end<L: Lu + ?Sized>(
+    /// This is **not** a target lifecycle event: the link is gone, so the
+    /// command is settled with [`InterruptReason::Stop`], its retained token is
+    /// cancelled through the adapter and its delivery is booked as failed. The
+    /// slot is immediately reusable by the next link, and no terminal flag is
+    /// latched. Idempotent: with no live command it changes nothing.
+    pub(crate) fn settle_link_command<L: Lu + ?Sized>(
         &mut self,
         lu: &mut L,
         storage: &mut dyn Storage,
         host: &mut dyn HostTransport,
-    ) -> RunOutcome {
-        self.transport_end = true;
-        // Captured before settling: the slot this entry was given belongs to
-        // the live command's LUN, which may differ from the long operation's.
-        let command_lun = self.drive_state.get().map(|state| state.ctx.lun as usize);
+    ) {
         if let Err(fault) = self.settle_abnormally(lu, storage, host, InterruptReason::Stop) {
             self.set_fatal(fault);
         }
-        self.cancel_long_at_transport_end(lu, storage, command_lun);
-        self.terminal_outcome().unwrap_or(RunOutcome::ServiceReady)
+    }
+
+    /// Cancel the resident long operation's retained token for `lun`.
+    ///
+    /// The link that owned the token is gone, so no later `poll_long_entry` can
+    /// reach it. The caller must pass the slot that owns the operation (see
+    /// [`Self::long_lun`]); a token on another LUN is never inherited.
+    pub(crate) fn cancel_long_token<L: Lu + ?Sized>(
+        &mut self,
+        lun: usize,
+        lu: &mut L,
+        storage: &mut dyn Storage,
+    ) {
+        self.cancel_long_at_link_loss(lu, storage, Some(lun));
     }
 
     /// Cancel the resident long operation's retained token because the wire is
@@ -2650,7 +2689,7 @@ impl Runner {
     /// `unknown_remainder`. Only a slot that owns the token is notified; a
     /// query command on another LUN can be the one that was live, and its
     /// device must not inherit another LUN's effects.
-    fn cancel_long_at_transport_end<L: Lu + ?Sized>(
+    fn cancel_long_at_link_loss<L: Lu + ?Sized>(
         &mut self,
         lu: &mut L,
         storage: &mut dyn Storage,
@@ -2760,7 +2799,7 @@ impl Runner {
     /// the token is pending. This entry then runs *before* the normal
     /// gate, keyed to the owning LUN: `stop` **drains** the token (one poll per
     /// entry, then one bounded device poll with the receipt);
-    /// `transport_ended`/`fatal` **cancel** it (one `storage.cancel`, then a
+    /// link loss/fatal **cancel** it (one `storage.cancel`, then a
     /// synthesized cancelled receipt fed to the device so it settles/records
     /// the fault). With no token, the normal gate rejects new entries — a
     /// terminal target never issues new IO. `Stop` neither detaches nor ejects;
@@ -2932,7 +2971,7 @@ impl Runner {
     /// `Stop` drains: one adapter poll per entry until `Ready`,
     /// then one bounded device poll with the returned receipt. A bank mismatch
     /// cannot advance the drain, so it cancels and books the unobserved effect
-    /// instead. `transport_ended`/`fatal` cancel immediately: one
+    /// instead. link loss/fatal cancel immediately: one
     /// `storage.cancel`, then a synthesized cancelled receipt
     /// ([`Self::cancelled_receipt`]) fed to the device so it settles/records the
     /// fault. Neither path issues new IO.
@@ -4321,30 +4360,27 @@ mod tests {
     }
 
     #[test]
-    fn transport_end_and_abort_cancel_immediately() {
+    fn link_loss_and_abort_cancel_immediately() {
         let mut bench = Bench::new(write_script(512), 1);
         bench.start(ctx(Direction::FromHost, 512)).expect("start");
         assert_eq!(bench.step(), Ok(DriveStep::Pending));
-        bench.runner.transport_ended();
-        assert_eq!(bench.runner.tick(), RunOutcome::ServiceReady);
-        assert_eq!(
-            bench.step(),
-            Ok(DriveStep::Control(RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                error: None,
-            }))
-        );
-        assert_eq!(bench.storage.cancels, 1, "transport end cancels");
+        // A lost link settles the live command but never latches a terminal
+        // state: the same target serves the next link.
+        {
+            let Bench {
+                slot,
+                runner,
+                storage,
+                host,
+                ..
+            } = &mut bench;
+            runner.settle_link_command(slot, storage, host);
+        }
+        assert_eq!(bench.storage.cancels, 1, "link loss cancels");
         let device = bench.slot.device_ref();
         assert!(device.last_known.unknown_remainder);
         assert_eq!(device.last_delivery, Some(Delivery::Failed));
-        assert_eq!(
-            bench.runner.tick(),
-            RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                error: None,
-            }
-        );
+        assert_eq!(bench.runner.tick(), RunOutcome::ServiceReady);
 
         let mut bench = Bench::new(write_script(512), 1);
         bench.start(ctx(Direction::FromHost, 512)).expect("start");
@@ -4701,13 +4737,7 @@ mod tests {
         assert!(runner.long_feedback.is_some());
         assert_eq!(storage.cancels, 0);
 
-        assert_eq!(
-            runner.settle_transport_end(&mut slot, &mut storage, &mut host),
-            RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                error: None,
-            }
-        );
+        runner.cancel_long_token(0, &mut slot, &mut storage);
         assert_eq!(storage.cancels, 1, "the retained token is cancelled");
         assert!(runner.long_pending.is_none(), "the long state is idle");
         assert!(runner.long_feedback.is_none());
@@ -4719,13 +4749,7 @@ mod tests {
         );
 
         // Idempotent: nothing is left to cancel.
-        assert_eq!(
-            runner.settle_transport_end(&mut slot, &mut storage, &mut host),
-            RunOutcome::Ended {
-                reason: RunEnd::TransportEnded,
-                error: None,
-            }
-        );
+        runner.cancel_long_token(0, &mut slot, &mut storage);
         assert_eq!(storage.cancels, 1);
 
         // A read never fabricates a write remainder (and needs no interrupt).
@@ -4742,7 +4766,7 @@ mod tests {
         runner.claim_long_feedback(0, info);
         assert_eq!(storage.cancels, 0);
 
-        let _ = runner.settle_transport_end(&mut slot, &mut storage, &mut host);
+        runner.cancel_long_token(0, &mut slot, &mut storage);
         assert_eq!(storage.cancels, 1);
         assert!(runner.long_pending.is_none(), "the long state is idle");
         assert!(runner.long_feedback.is_none());

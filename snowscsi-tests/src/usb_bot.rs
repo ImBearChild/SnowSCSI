@@ -13,7 +13,7 @@ use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};
 use crate::mock_bot::{MockAck, MockBotIo, MockGadget, MockReply};
 use snowscsi::common::store::{StoreOp, StorePlane};
 use snowscsi::core::storage::{BankSide, IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-use snowscsi::core::{LongPhase, Lu, PendingKind, RuntimeSet, Target};
+use snowscsi::core::{Flow, LongPhase, Lu, PendingKind, RuntimeSet, ServeExit, Target};
 use snowscsi::scsi::backend::RamBackend;
 use snowscsi::usb::{
     serve, Action, BotIo, BotIoErr, BotSession, BotTargetError, CtrlAck, CtrlReply, CtrlReq, Event,
@@ -98,6 +98,40 @@ fn table<L: Lu<Pair = TestPair>>(slots: &mut [L]) -> Vec<&mut dyn Lu<Pair = Test
         .iter_mut()
         .map(|s| s as &mut dyn Lu<Pair = TestPair>)
         .collect()
+}
+
+/// `MockBotIo` that ends the serve loop once the scripted host has nothing
+/// left to send after a completed command.
+struct StopWhenIdle {
+    inner: MockBotIo,
+    flow: Arc<snowscsi::core::Flow>,
+}
+
+impl BotIo for StopWhenIdle {
+    fn try_recv_out(&mut self, buf: &mut [u8]) -> Result<usize, BotIoErr> {
+        self.inner.try_recv_out(buf)
+    }
+    fn recv_out(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> Result<usize, BotIoErr> {
+        match self.inner.recv_out(buf, timeout) {
+            Err(BotIoErr::WouldBlock) if self.inner.in_sends > 0 => {
+                self.flow.stop();
+                Err(BotIoErr::WouldBlock)
+            }
+            other => other,
+        }
+    }
+    fn send_in(&mut self, buf: &[u8]) -> Result<(), BotIoErr> {
+        self.inner.send_in(buf)
+    }
+    fn stall_both(&mut self) -> Result<(), ()> {
+        self.inner.stall_both()
+    }
+    fn stall_in(&mut self) -> Result<(), ()> {
+        self.inner.stall_in()
+    }
+    fn can_stall_in(&self) -> bool {
+        self.inner.can_stall_in()
+    }
 }
 
 /// Poll the core once with `ev` and classify its `Action`. A `HostSend` is
@@ -501,7 +535,7 @@ struct SharedBankIo {
     stop_tag: u32,
     need_fill_done: bool,
     saw_close_csw: bool,
-    stop: Arc<AtomicBool>,
+    stop: Arc<snowscsi::core::Flow>,
 }
 
 impl SharedBankIo {
@@ -513,7 +547,7 @@ impl SharedBankIo {
         if q.is_empty() {
             let filled = !self.need_fill_done || self.fill_done.load(Ordering::SeqCst);
             if self.saw_close_csw && filled {
-                self.stop.store(true, Ordering::SeqCst);
+                self.stop.stop();
             }
             return Err(BotIoErr::WouldBlock);
         }
@@ -612,7 +646,7 @@ fn shared_bank_defers_the_tur_until_the_long_token_settles() {
     let in_flight = Arc::new(AtomicBool::new(false));
     let fill_done = Arc::new(AtomicBool::new(false));
     let violated = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(snowscsi::core::Flow::new());
 
     // FORMAT UNIT (FmtData=1, Format Code 1) with Immed=1 in the Format List
     // Header: the command completes GOOD and leaves a resident fill.
@@ -667,7 +701,11 @@ fn shared_bank_defers_the_tur_until_the_long_token_settles() {
             &mut storage,
             &stop,
         );
-        assert_eq!(result, Ok(()), "the scripted host ends the session");
+        assert_eq!(
+            result,
+            Ok(ServeExit::Stopped),
+            "the scripted host ends the session"
+        );
     }
 
     assert!(
@@ -696,7 +734,7 @@ fn shared_bank_512_streams_a_two_mib_read() {
     let expected = ram[..TOTAL].to_vec();
 
     let out = Arc::new(Mutex::new(VecDeque::new()));
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(snowscsi::core::Flow::new());
     let in_flight = Arc::new(AtomicBool::new(false));
     let fill_done = Arc::new(AtomicBool::new(false));
     let violated = Arc::new(AtomicBool::new(false));
@@ -746,7 +784,11 @@ fn shared_bank_512_streams_a_two_mib_read() {
             &mut storage,
             &stop,
         );
-        assert_eq!(result, Ok(()), "the scripted host ends the session");
+        assert_eq!(
+            result,
+            Ok(ServeExit::Stopped),
+            "the scripted host ends the session"
+        );
     }
 
     assert!(!violated.load(Ordering::SeqCst));
@@ -3096,7 +3138,7 @@ fn overlap_long_token_does_not_defer_the_tur() {
     let in_flight = Arc::new(AtomicBool::new(false));
     let fill_done = Arc::new(AtomicBool::new(false));
     let violated = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(snowscsi::core::Flow::new());
 
     let mut params = [0u8; 12];
     params[1] = 0x02; // Immed
@@ -3147,7 +3189,11 @@ fn overlap_long_token_does_not_defer_the_tur() {
             &mut storage,
             &stop,
         );
-        assert_eq!(result, Ok(()), "the scripted host ends the session");
+        assert_eq!(
+            result,
+            Ok(ServeExit::Stopped),
+            "the scripted host ends the session"
+        );
     }
 
     assert!(
@@ -3469,4 +3515,131 @@ fn storage_pending_after_data_in_send_then_tick_delivers_the_next_chunk() {
     let sent = io.take_sent();
     assert_eq!(&sent[..TOTAL], &expected[..], "byte-exact read");
     assert_eq!(csw_fields(&sent), (TAG, 0, 0x00));
+}
+
+// ── Media change over the serve loop ─────────────────────────────────
+
+/// `serve` hands the target back on the host's own eject and keeps serving the
+/// now-empty slot, with no session reset and no target rebuild.
+#[test]
+fn host_loej_over_serve_hands_back_then_serves_an_empty_slot() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::dvdram(16, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let flow = Arc::new(Flow::new());
+    let mut io = StopWhenIdle {
+        inner: MockBotIo::new(),
+        flow: Arc::clone(&flow),
+    };
+    let mut gadget = MockGadget::new();
+
+    // START STOP UNIT LoEj=1, Start=0: the host ejects.
+    io.inner
+        .feed_out(&raw_cbw(1, 0, 0, 0, &[0x1B, 0, 0, 0, 0x02, 0]));
+    let exit = serve(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &flow,
+    )
+    .expect("serve returns the handback");
+    assert_eq!(
+        exit,
+        ServeExit::Outcome(snowscsi::core::RunOutcome::ResourcesReady { lun: 0 })
+    );
+    let sent = io.inner.take_sent();
+    assert_eq!(csw_fields(&sent).2, 0x00, "the eject command is GOOD");
+
+    // The application takes the pair; the slot is empty but alive.
+    let pair = target.take_rt(0).expect("take the ejected pair").pair;
+    assert!(pair.is_some());
+
+    // The next command still reaches the device: INQUIRY needs no medium.
+    io.inner
+        .feed_out(&raw_cbw(2, 36, 0x80, 0, &[0x12, 0, 0, 0, 36, 0]));
+    let exit = serve(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &flow,
+    )
+    .expect("serve keeps running");
+    assert_eq!(exit, ServeExit::Stopped);
+    let sent = io.inner.take_sent();
+    assert_eq!(sent[0] & 0x1F, 0x05, "CD-ROM PDT on the empty slot");
+    assert_eq!(csw_fields(&sent).2, 0x00, "INQUIRY is GOOD");
+    assert_eq!(target.tick(), snowscsi::core::RunOutcome::ServiceReady);
+}
+
+/// `Pause` returns before the pending receive is performed: the CBW is still on
+/// the wire, and re-entry with `Run` serves it instead of dropping it.
+#[test]
+fn pause_does_not_consume_a_pending_cbw() {
+    let mut ram = vec![0u8; 64 * 1024];
+    let mut backend = RamBackend::new(&mut ram);
+    let mut slots = [TestLu::block(128, 512, 0)];
+    let mut storage = PlaneSet::new(vec![Some(StorePlane::BlockRw(&mut backend))]);
+    let mut table = table(&mut slots);
+    let mut target = Target::new(&mut table[..]);
+    let mut session = BotSession::new();
+    let mut work = [0u8; snowscsi::MIN_DATA_LEN];
+    let mut scratch = [0u8; snowscsi::MIN_DATA_LEN];
+    let flow = Arc::new(Flow::new());
+    let mut io = StopWhenIdle {
+        inner: MockBotIo::new(),
+        flow: Arc::clone(&flow),
+    };
+    let mut gadget = MockGadget::new();
+
+    io.inner
+        .feed_out(&raw_cbw(1, 36, 0x80, 0, &[0x12, 0, 0, 0, 36, 0]));
+    flow.pause();
+    let exit = serve(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &flow,
+    )
+    .expect("serve pauses");
+    assert_eq!(exit, ServeExit::Paused);
+    assert!(io.inner.in_.is_empty(), "nothing was sent before the pause");
+
+    flow.run();
+    let exit = serve(
+        &mut io,
+        &mut gadget,
+        &mut session,
+        &mut work,
+        &mut scratch,
+        &mut target,
+        &mut storage,
+        &flow,
+    )
+    .expect("serve resumes");
+    assert_eq!(exit, ServeExit::Stopped);
+    let sent = io.inner.take_sent();
+    assert_eq!(
+        sent[0] & 0x1F,
+        0x00,
+        "the paused CBW is served after the resume"
+    );
+    assert_eq!(csw_fields(&sent).2, 0x00);
 }

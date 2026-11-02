@@ -24,7 +24,7 @@ use std::thread;
 
 use snowscsi::common::seekable_storage::RamBackend;
 use snowscsi::common::store::StorePlane;
-use snowscsi::core::{Lu, Target};
+use snowscsi::core::{Lu, ServeExit, Target};
 use snowscsi::iscsi::pdu::BHS_SIZE;
 use snowscsi::iscsi::target::{IscsiSession, TargetError};
 use snowscsi::iscsi::transport::{serve_conn, TcpConn, DEFAULT_READ_TIMEOUT};
@@ -409,7 +409,7 @@ impl Drop for Task {
 
 /// Start the in-process target on an ephemeral loopback port. Returns the
 /// port and the server thread join handle.
-fn start_target() -> (u16, thread::JoinHandle<Result<(), TargetError>>) {
+fn start_target() -> (u16, thread::JoinHandle<Result<ServeExit, TargetError>>) {
     let (port, handle, _rams) = start_target_n_luns(1);
     (port, handle)
 }
@@ -425,7 +425,7 @@ fn start_target_n_luns(
     n: usize,
 ) -> (
     u16,
-    thread::JoinHandle<Result<(), TargetError>>,
+    thread::JoinHandle<Result<ServeExit, TargetError>>,
     Vec<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
 ) {
     use std::sync::{Arc, Mutex};
@@ -521,7 +521,7 @@ fn connect_forced_r2t(port: u16) -> IscsiCtx {
 fn start_target_serving(
     connections: usize,
     work_len: usize,
-) -> (u16, thread::JoinHandle<Result<(), TargetError>>) {
+) -> (u16, thread::JoinHandle<Result<ServeExit, TargetError>>) {
     assert!(work_len >= MIN_DATA_LEN + BHS_SIZE, "bank too small");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().unwrap().port();
@@ -547,7 +547,7 @@ fn start_target_serving(
             let mut scratch = vec![0u8; MIN_DATA_LEN];
             let mut session = IscsiSession::new();
             let mut target = Target::new(&mut table[..]);
-            serve_conn(
+            let _ = serve_conn(
                 &mut conn,
                 &mut work,
                 &mut scratch,
@@ -556,13 +556,13 @@ fn start_target_serving(
                 &mut storage,
             )?;
         }
-        Ok(())
+        Ok(ServeExit::WireGone)
     });
     (port, handle)
 }
 
 /// Drop the connection and assert the target loop exited cleanly.
-fn teardown(iscsi: &IscsiCtx, server: thread::JoinHandle<Result<(), TargetError>>) {
+fn teardown(iscsi: &IscsiCtx, server: thread::JoinHandle<Result<ServeExit, TargetError>>) {
     iscsi.disconnect();
     server
         .join()

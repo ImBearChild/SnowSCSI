@@ -1544,8 +1544,8 @@ fn stop_drains_a_pending_long_token_before_reporting_ended() {
     assert_eq!(storage.polls, polls, "the token is never polled again");
 }
 
-/// Transport end = cancel: one `storage.cancel`, a synthesized cancelled
-/// receipt fed to the device (`LongInfo.error` records it), then `Ended`.
+/// Link loss = cancel: the retained long token is cancelled through the
+/// adapter and the slot stays serviceable (no terminal state).
 #[test]
 fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
     let mut target = target(2);
@@ -1570,34 +1570,14 @@ fn transport_end_cancels_a_pending_long_write_and_records_the_fault() {
         .expect("long entry");
     assert_eq!(storage.polls, 1);
 
-    target.transport_ended();
-    assert_eq!(target.tick(), RunOutcome::ServiceReady);
-
-    let info = target
-        .poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch)
-        .expect("cancel entry");
+    target.link_lost_static::<Here>(&mut storage, &mut host);
     assert_eq!(storage.cancels, 1, "cancelled exactly once");
     assert_eq!(storage.polls, 1, "the cancelled token is never polled");
-    assert_eq!(info.phase, LongPhase::Settled);
-    assert_eq!(
-        info.error,
-        Some(Fault::Contract),
-        "the device settles from the synthesized cancelled receipt"
-    );
     assert_eq!(
         target.tick(),
-        RunOutcome::Ended {
-            reason: snowscsi::core::RunEnd::TransportEnded,
-            error: None,
-        }
+        RunOutcome::ServiceReady,
+        "a lost link does not end the target"
     );
-    let polls = storage.polls;
-    assert_eq!(
-        target.poll_long_entry_static::<Here>(&mut storage, &mut work, &mut scratch),
-        Err(Fault::Boundary)
-    );
-    assert_eq!(storage.polls, polls);
-    assert_eq!(storage.cancels, 1);
 }
 
 /// Fatal = cancel: same shape as transport end, but the fatal fault is

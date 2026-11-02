@@ -19,13 +19,12 @@
 //! MPS-multiple buffer) live in the platform's `BotIo` implementation, not
 //! here — the loops are platform-agnostic.
 
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 #[cfg(feature = "async-io")]
 use crate::core::async_wake::{self, AsyncWake};
 use crate::core::storage::Storage;
-use crate::core::{RuntimeSet, Target};
+use crate::core::{Flow, FlowState, RunOutcome, RuntimeSet, ServeExit, Target};
 use crate::usb::gadget::{CtrlAck, CtrlReply, CtrlReq, Gadget};
 use crate::usb::io::{BotIo, BotIoErr};
 use crate::usb::target::{Action, BotSession, BotTargetError, Event, ShortfallPolicy};
@@ -139,6 +138,27 @@ where
 /// **not** deferred. `target` owns the LUN slots and `storage` executes the
 /// device's storage operations.
 ///
+/// Serve a USB BOT session until the application asks it to pause or stop, the
+/// core needs the application, or the link closes.
+///
+/// Each turn polls the control plane first ([`CtrlReq::BotReset`] /
+/// [`CtrlReq::LinkReset`] ⇒ [`Event::Reset`] + ack; [`CtrlReq::GetMaxLun`] ⇒
+/// reply `session.max_lun()`), then executes the pending [`Action`] once.
+/// `work` is the transport data bank (see [`BotSession::poll`]); `scratch` is
+/// the long-operation bank, and an **empty** `scratch` selects the shared
+/// bank: the loop drives the long operation one `Tick` step per turn and
+/// defers bulk and control input while its token is in flight (at most one
+/// long-operation chunk). An overlap session keeps both banks inside `work`,
+/// so the long operation takes the bank the command is not using and input is
+/// **not** deferred. `target` owns the LUN slots and `storage` executes the
+/// device's storage operations.
+///
+/// The loop owns **no device lifetime**: [`ServeExit::Paused`] and
+/// [`ServeExit::Outcome`] are returned at a point where no I/O is in flight
+/// (the pending action is re-emitted on re-entry), while
+/// [`ServeExit::Stopped`] and [`ServeExit::WireGone`] settle a live command
+/// first. The caller decides whether the target is finished.
+///
 /// `Action::StallBoth` (invalid CBW) STALLs both endpoints and keeps receiving:
 /// the core has already returned to the Command phase and a new CBW clears the
 /// halt, so there is **no** `stalled` gate (the fix for the invalid-CBW wedge).
@@ -151,18 +171,39 @@ pub fn serve<B, G, S>(
     scratch: &mut [u8],
     target: &mut Target<S>,
     storage: &mut dyn Storage,
-    stop: &AtomicBool,
-) -> Result<(), ServeError>
+    flow: &Flow,
+) -> Result<ServeExit, ServeError>
 where
     B: BotIo,
     G: for<'a> Gadget<'a>,
     S: RuntimeSet,
 {
-    let result = serve_loop(io, gadget, session, work, scratch, target, storage, stop);
-    // Whatever ended the loop, the wire is gone: settle a live command before
-    // the slots are served again.
-    let _ = target.settle_transport_end(storage, session);
+    let result = serve_loop(io, gadget, session, work, scratch, target, storage, flow);
+    // A lost link (or a caller bug) leaves the wire unusable: settle the live
+    // command so the next link finds a clean target. A pause/handback return
+    // deliberately does not come here.
+    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
+        target.link_lost(storage, session);
+    }
     result
+}
+
+/// Return to the application if the core has something for it.
+///
+/// `ResourcesReady` is only reported when a take would actually be accepted
+/// ([`Target::take_ready`]): another LUN's live command must not leave the
+/// application with a handback it cannot claim.
+fn boundary_exit<S: RuntimeSet>(target: &mut Target<S>) -> Option<ServeExit> {
+    match target.tick() {
+        RunOutcome::ServiceReady => None,
+        RunOutcome::ResourcesReady { lun } if !target.take_ready(lun) => None,
+        outcome => Some(ServeExit::Outcome(outcome)),
+    }
+}
+
+/// Whether the application asked to pause at a real management boundary.
+fn pause_requested<S: RuntimeSet>(flow: &Flow, target: &Target<S>) -> bool {
+    flow.state() == FlowState::Pause && target.management_boundary().is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,8 +215,8 @@ fn serve_loop<B, G, S>(
     scratch: &mut [u8],
     target: &mut Target<S>,
     storage: &mut dyn Storage,
-    stop: &AtomicBool,
-) -> Result<(), ServeError>
+    flow: &Flow,
+) -> Result<ServeExit, ServeError>
 where
     B: BotIo,
     G: for<'a> Gadget<'a>,
@@ -197,8 +238,12 @@ where
     // long token. Shared mode still owns `work` while the token is in flight.
     let shared = scratch.is_empty() && !session.overlap();
     loop {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
+        if flow.state() == FlowState::Stop {
+            // The application is done with this loop. Settle the live command
+            // so the target is immediately reusable; the target itself is not
+            // stopped.
+            target.link_lost(storage, session);
+            return Ok(ServeExit::Stopped);
         }
 
         // Shared bank: while the resident long operation holds an adapter
@@ -231,7 +276,27 @@ where
         // once. The action is the *result* of the event, so a transient
         // `StallBoth` / `Error` is executed here (re-fetching via `Tick` would
         // lose it); the next completion is carried in `ev`.
-        match session.poll(ev, work, scratch, target, storage) {
+        //
+        // The carried event has now been consumed: this is the only point where
+        // the loop may return to the application. The action is re-emitted from
+        // session state on re-entry with `Event::Tick`, so nothing is lost.
+        let action = session.poll(ev, work, scratch, target, storage);
+        // A pending wire write (a status or a stalled response) goes out first:
+        // the host's status is never withheld just to hand the target back.
+        // The next entry re-emits the action from session state otherwise.
+        let wire_pending = matches!(
+            action,
+            Action::HostSend { .. } | Action::StallBoth | Action::StallIn
+        );
+        if !wire_pending {
+            if let Some(exit) = boundary_exit(target) {
+                return Ok(exit);
+            }
+            if pause_requested(flow, target) {
+                return Ok(ServeExit::Paused);
+            }
+        }
+        match action {
             Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
                 // The step above started the resident long operation; its token
                 // now owns `work`. The receive is re-emitted on the next entry,
@@ -254,20 +319,20 @@ where
                 if probe {
                     // Non-blocking overrun drain: one try, then HostIdle ends it.
                     ev = match io.try_recv_out(&mut work[offset..end]) {
-                        Ok(0) => return Err(ServeError::Closed),
+                        Ok(0) => return Ok(ServeExit::WireGone),
                         Ok(n) => Event::HostRecv { len: n },
                         Err(BotIoErr::WouldBlock) => Event::HostIdle,
                         Err(BotIoErr::Disconnected) => Event::Reset,
-                        Err(BotIoErr::Io) => return Err(ServeError::Closed),
+                        Err(BotIoErr::Io) => return Ok(ServeExit::WireGone),
                     };
                 } else {
                     ev = match io.recv_out(&mut work[offset..end], Some(BOT_POLL_GRANULARITY)) {
-                        Ok(0) => return Err(ServeError::Closed),
+                        Ok(0) => return Ok(ServeExit::WireGone),
                         Ok(n) => Event::HostRecv { len: n },
-                        // Timeout: re-check the control plane and stop flag.
+                        // Timeout: re-check the control plane and flow.
                         Err(BotIoErr::WouldBlock) => Event::Tick,
                         Err(BotIoErr::Disconnected) => Event::Reset,
-                        Err(BotIoErr::Io) => return Err(ServeError::Closed),
+                        Err(BotIoErr::Io) => return Ok(ServeExit::WireGone),
                     };
                 }
             }
@@ -275,7 +340,7 @@ where
                 ev = match io.send_in(bytes) {
                     Ok(()) => Event::HostSent,
                     Err(BotIoErr::Disconnected) => Event::Reset,
-                    Err(_) => return Err(ServeError::Closed),
+                    Err(_) => return Ok(ServeExit::WireGone),
                 };
             }
             Action::StoragePending => {
@@ -332,8 +397,8 @@ pub async fn serve_async<R, S, G, T, W>(
     scratch: &mut [u8],
     target: &mut Target<T>,
     storage: &mut W,
-    stop: &AtomicBool,
-) -> Result<(), ServeError>
+    flow: &Flow,
+) -> Result<ServeExit, ServeError>
 where
     R: AsyncBotRecv,
     S: AsyncBotSend,
@@ -351,8 +416,9 @@ where
         let mut ev = Event::Tick;
         let shared = scratch.is_empty() && !session.overlap();
         loop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
+            if flow.state() == FlowState::Stop {
+                target.link_lost(&mut *storage, session);
+                return Ok(ServeExit::Stopped);
             }
 
             // Shared bank: drive the resident long operation one step per turn
@@ -400,8 +466,25 @@ where
             let mut fresh_recv: Option<usize> = None;
 
             // 2) Feed the carried event, execute the returned action, and
-            // carry the completion in `ev`.
-            match session.poll(ev, work, scratch, target, &mut *storage) {
+            // carry the completion in `ev`. The event has been consumed here,
+            // so this is the only point where the loop may return to the
+            // application; re-entry re-emits the action from session state.
+            let action = session.poll(ev, work, scratch, target, &mut *storage);
+            // A pending wire write goes out before any handback (see the sync
+            // loop).
+            let wire_pending = matches!(
+                action,
+                Action::HostSend { .. } | Action::StallBoth | Action::StallIn
+            );
+            if !wire_pending {
+                if let Some(exit) = boundary_exit(target) {
+                    return Ok(exit);
+                }
+                if pause_requested(flow, target) {
+                    return Ok(ServeExit::Paused);
+                }
+            }
+            match action {
                 Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
                     // The step above started the resident long operation; its
                     // token now owns `work`. The receive is re-emitted on the
@@ -423,11 +506,11 @@ where
                     }
                     if probe {
                         ev = match recv.recv_probe(&mut work[offset..end]).await {
-                            Ok(0) => return Err(ServeError::Closed),
+                            Ok(0) => return Ok(ServeExit::WireGone),
                             Ok(n) => Event::HostRecv { len: n },
                             Err(BotIoErr::WouldBlock) => Event::HostIdle,
                             Err(BotIoErr::Disconnected) => Event::Reset,
-                            Err(BotIoErr::Io) => return Err(ServeError::Closed),
+                            Err(BotIoErr::Io) => return Ok(ServeExit::WireGone),
                         };
                     } else {
                         ev = match recv
@@ -437,14 +520,14 @@ where
                             )
                             .await
                         {
-                            Ok(0) => return Err(ServeError::Closed),
+                            Ok(0) => return Ok(ServeExit::WireGone),
                             Ok(n) => {
                                 fresh_recv = Some(n);
                                 Event::HostRecv { len: n }
                             }
                             Err(BotIoErr::WouldBlock) => Event::Tick,
                             Err(BotIoErr::Disconnected) => Event::Reset,
-                            Err(BotIoErr::Io) => return Err(ServeError::Closed),
+                            Err(BotIoErr::Io) => return Ok(ServeExit::WireGone),
                         };
                     }
                 }
@@ -452,7 +535,7 @@ where
                     ev = match send.send(bytes).await {
                         Ok(()) => Event::HostSent,
                         Err(BotIoErr::Disconnected) => Event::Reset,
-                        Err(_) => return Err(ServeError::Closed),
+                        Err(_) => return Ok(ServeExit::WireGone),
                     };
                 }
                 Action::StoragePending => {
@@ -479,7 +562,7 @@ where
             // Drain it now, before the completion is fed back, so a reset
             // supersedes the just-completed I/O (its event is replaced by
             // `Event::Tick`).
-            while !stop.load(Ordering::Relaxed) {
+            while flow.state() != FlowState::Stop {
                 if !handle_ctrl(
                     gadget,
                     session,
@@ -504,7 +587,9 @@ where
         }
     }
     .await;
-    let _ = target.settle_transport_end(&mut *storage, session);
+    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
+        target.link_lost(&mut *storage, session);
+    }
     result
 }
 
@@ -570,10 +655,15 @@ mod tests {
 
     type Slot = crate::core::LuImpl<crate::block::BlockDevice, u8>;
 
-    /// Drive `serve` with `stop` already set: the policy check runs before the
-    /// loop, so a compatible combination returns `Ok(())` immediately and an
-    /// incompatible one is rejected up front.
-    fn run(policy: ShortfallPolicy, can_stall: bool, stop_set: bool) -> Result<(), ServeError> {
+    /// Drive `serve` with the flow already stopped: the policy check runs
+    /// before the loop, so a compatible combination returns
+    /// `Ok(ServeExit::Stopped)` immediately and an incompatible one is
+    /// rejected up front.
+    fn run(
+        policy: ShortfallPolicy,
+        can_stall: bool,
+        stop_set: bool,
+    ) -> Result<ServeExit, ServeError> {
         let mut io = StubIo { can_stall };
         let mut gadget = NoGadget;
         let mut session = BotSession::new().with_shortfall(policy);
@@ -586,7 +676,10 @@ mod tests {
         let table: &mut [&mut dyn Lu<Pair = Pair<NoMedium, u8>>] = &mut [&mut slot];
         let mut target = Target::new(table);
         let mut storage = crate::core::storage::BlockingStorage::new(Passthrough);
-        let stop = AtomicBool::new(stop_set);
+        let flow = Flow::new();
+        if stop_set {
+            flow.stop();
+        }
         serve(
             &mut io,
             &mut gadget,
@@ -595,7 +688,7 @@ mod tests {
             &mut scratch,
             &mut target,
             &mut storage,
-            &stop,
+            &flow,
         )
     }
 
@@ -626,12 +719,18 @@ mod tests {
 
     #[test]
     fn short_policy_with_stall_capability_is_accepted() {
-        assert_eq!(run(ShortfallPolicy::Short, true, true), Ok(()));
+        assert_eq!(
+            run(ShortfallPolicy::Short, true, true),
+            Ok(ServeExit::Stopped)
+        );
     }
 
     #[test]
     fn non_short_policy_without_stall_capability_is_accepted() {
-        assert_eq!(run(ShortfallPolicy::ShortNoStall, false, true), Ok(()));
+        assert_eq!(
+            run(ShortfallPolicy::ShortNoStall, false, true),
+            Ok(ServeExit::Stopped)
+        );
     }
 
     // ── Asynchronous shell ──────────────────────────────────────────────
@@ -686,7 +785,7 @@ mod tests {
         policy: ShortfallPolicy,
         can_stall: bool,
         stop_set: bool,
-    ) -> Result<(), ServeError> {
+    ) -> Result<ServeExit, ServeError> {
         let mut recv = StubAsyncRecv;
         let mut send = StubAsyncSend { can_stall };
         let mut gadget = NoGadget;
@@ -700,7 +799,10 @@ mod tests {
         let table: &mut [&mut dyn Lu<Pair = Pair<NoMedium, u8>>] = &mut [&mut slot];
         let mut target = Target::new(table);
         let mut storage = crate::core::storage::BlockingStorage::new(Passthrough);
-        let stop = AtomicBool::new(stop_set);
+        let flow = Flow::new();
+        if stop_set {
+            flow.stop();
+        }
         block_on(serve_async(
             &mut recv,
             &mut send,
@@ -710,7 +812,7 @@ mod tests {
             &mut scratch,
             &mut target,
             &mut storage,
-            &stop,
+            &flow,
         ))
     }
 
@@ -726,7 +828,10 @@ mod tests {
     #[cfg(feature = "async-io")]
     #[test]
     fn async_short_policy_with_stall_capability_is_accepted() {
-        assert_eq!(run_async(ShortfallPolicy::Short, true, true), Ok(()));
+        assert_eq!(
+            run_async(ShortfallPolicy::Short, true, true),
+            Ok(ServeExit::Stopped)
+        );
     }
 
     /// Asynchronous bulk-OUT source that delivers one CBW and then EOF.
@@ -821,7 +926,7 @@ mod tests {
         let table: &mut [&mut dyn Lu<Pair = Pair<NoMedium, u8>>] = &mut [&mut slot];
         let mut target = Target::new(table);
         let mut storage = crate::core::storage::BlockingStorage::new(Passthrough);
-        let stop = AtomicBool::new(false);
+        let flow = Flow::new();
 
         let result = block_on(serve_async(
             &mut recv,
@@ -832,9 +937,9 @@ mod tests {
             &mut scratch,
             &mut target,
             &mut storage,
-            &stop,
+            &flow,
         ));
-        assert!(matches!(result, Ok(()) | Err(ServeError::Closed)));
+        assert!(matches!(result, Ok(ServeExit::WireGone)));
 
         // The INQUIRY response and its CSW were sent: the CBW survived the
         // reset drained after the await.

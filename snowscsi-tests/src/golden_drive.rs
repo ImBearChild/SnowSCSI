@@ -11,8 +11,8 @@
 //! exhaustion into EOF, exactly as [`crate::golden::RecConn`]'s byte stream
 //! returns EOF for the iSCSI replay.
 
-use core::sync::atomic::AtomicBool;
 use core::time::Duration;
+use snowscsi::core::{Flow, ServeExit};
 
 use snowscsi::core::storage::Storage;
 use snowscsi::core::{RuntimeSet, Target};
@@ -77,7 +77,7 @@ pub fn serve_usb<S: RuntimeSet>(
     target: &mut Target<S>,
     storage: &mut dyn Storage,
 ) {
-    let stop = AtomicBool::new(false);
+    let stop = Flow::new();
     let mut io = GoldenBotIo::new(io);
     // The replay script ends at a command boundary: the adapter reports EOF,
     // which `usb::serve` surfaces as `ServeError::Closed` — a clean end for a
@@ -85,7 +85,8 @@ pub fn serve_usb<S: RuntimeSet>(
     match serve(
         &mut io, gadget, session, work, scratch, target, storage, &stop,
     ) {
-        Ok(()) | Err(ServeError::Closed) => {}
+        Ok(ServeExit::WireGone) => {}
+        Ok(other) => panic!("unexpected serve exit: {other:?}"),
         Err(e) => panic!("usb::serve failed: {e}"),
     }
 }

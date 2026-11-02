@@ -120,6 +120,21 @@ git checkout legacy
   `snowscsi::usb` — the non-blocking `BotSession` core never does platform I/O;
   the Linux FunctionFS bridge (`FfsBot`/`FfsGadget`, `usb-gadget` crate) lives
   only in `snowscsi-cli` under `cfg(target_os = "linux")`.
+- **Serve-loop contract**: the transport loops own **no device lifetime**. They
+  return `Result<ServeExit, _>` (`core::serve`): `Paused`/`Outcome` are handed
+  back at a point where no I/O is in flight (the action is re-emitted on
+  re-entry), `Stopped`/`WireGone` settle the live command first. Only
+  `Target::stop()` and `fatal` end a target; a lost link calls
+  `Target::link_lost` (no terminal latch) so the same target serves the next
+  link. Application → loop control is `core::Flow` (`Run`/`Pause`/`Stop`);
+  `Pause` waits for `Target::management_boundary()`. `serve_conn*` has no Flow
+  yet (iSCSI pause needs a read wake); a `ResourcesReady` handback is only
+  reported when `Target::take_ready(lun)` accepts it.
+- **Media change**: a host `START STOP UNIT` with `LoEj=1, Start=0` records an
+  eject intent on the `Device` (`take_eject_request`); the runner detaches the
+  pair at the completion point and publishes `ResourcesReady`. `LoEj=1,
+  Start=1` (load) is a no-op. A manual `impl Lu` wrapper must forward
+  `take_eject_request` or host ejection is silently disabled.
 - **Async storage adapters**: `core::slots::SlotPool` is the runtime-free
   bridge for a backend whose I/O completes elsewhere (SD card, flash, DMA).
   Split it into `SlotStore` (implements `Storage` + `AsyncWake`) and

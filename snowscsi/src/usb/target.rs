@@ -92,7 +92,7 @@ use crate::core::storage::{
 };
 use crate::core::{
     CommandContext, Completion, Control, DataPlan, Delivery, Direction, Fault, LongPhase,
-    PendingKind, RunOutcome, RuntimeSet, Target, UaClass,
+    PendingKind, RuntimeSet, Target, UaClass,
 };
 use crate::scsi::scsi::{op as scsi_op, opcode_from_cdb};
 use crate::usb::bot::{BotDir, Cbw, Csw, CswStatus};
@@ -701,17 +701,12 @@ impl BotSession {
             } else {
                 !shared || matches!(ev, Event::Tick)
             };
-            let ended = if advance_long {
+            if advance_long {
                 if self.overlap {
-                    self.overlap_idle_entry(work, target, storage)
+                    self.overlap_idle_entry(work, target, storage);
                 } else {
-                    self.idle_entry(work, scratch, target, storage)
+                    self.idle_entry(work, scratch, target, storage);
                 }
-            } else {
-                false
-            };
-            if ended {
-                return Action::Error(BotTargetError::Io);
             }
         }
 
@@ -760,11 +755,8 @@ impl BotSession {
                     Action::StallIn => return Action::StallIn,
                     Action::Error(e) => return Action::Error(e),
                 }
-                if !self.cmd_active
-                    && matches!(self.stage, Stage::Command { .. })
-                    && self.idle_entry(work, scratch, target, storage)
-                {
-                    return Action::Error(BotTargetError::Io);
+                if !self.cmd_active && matches!(self.stage, Stage::Command { .. }) {
+                    self.idle_entry(work, scratch, target, storage);
                 }
                 self.pending(work)
             }
@@ -773,20 +765,22 @@ impl BotSession {
         }
     }
 
-    /// Advance a resident long operation and the target lifecycle once per
-    /// idle entry. Returns `true` when the target reported its terminal
-    /// outcome.
+    /// Advance a resident long operation once per idle entry.
     ///
     /// With an empty `scratch` the long operation shares `work` as its data
     /// bank: `poll_long_entry_rt` ignores its `work` argument, so the empty
     /// slice goes there and `work` is the bank.
+    ///
+    /// The target lifecycle (`tick`) is deliberately **not** consulted here:
+    /// the serve loop owns it and reports `ResourcesReady`/`Ended` at a point
+    /// where no I/O is in flight.
     fn idle_entry<S: RuntimeSet>(
         &mut self,
         work: &mut [u8],
         scratch: &mut [u8],
         target: &mut Target<S>,
         storage: &mut dyn Storage,
-    ) -> bool {
+    ) {
         if let Some(lun) = self.long_lun {
             let mut empty = [0u8; 0];
             let polled = if scratch.is_empty() {
@@ -812,7 +806,6 @@ impl BotSession {
                 }
             }
         }
-        matches!(target.tick(), RunOutcome::Ended { .. })
     }
 
     /// Overlap-mode long entry: lend the resident long operation one bank of
@@ -823,13 +816,13 @@ impl BotSession {
         work: &mut [u8],
         target: &mut Target<S>,
         storage: &mut dyn Storage,
-    ) -> bool {
+    ) {
         if let Some(lun) = self.long_lun {
             let bank = match self.long_bank {
                 Some(bank) => bank,
                 // A live token must never be re-borrowed from a guessed bank.
                 None if target.long_io_in_flight() => {
-                    return matches!(target.tick(), RunOutcome::Ended { .. });
+                    return;
                 }
                 None => self.alternate_bank(),
             };
@@ -865,7 +858,6 @@ impl BotSession {
                 }
             }
         }
-        matches!(target.tick(), RunOutcome::Ended { .. })
     }
 
     fn on_sent<'a, S: RuntimeSet>(

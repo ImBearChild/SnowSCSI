@@ -12,7 +12,7 @@ use std::task::Poll;
 use snowscsi::common::seekable_storage::RamBackend;
 use snowscsi::common::store::StorePlane;
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
-use snowscsi::core::{Lu, Target};
+use snowscsi::core::{Lu, ServeExit, Target};
 use snowscsi::iscsi::pdu::{flag, op, stage, status, BHS_SIZE};
 use snowscsi::iscsi::target::{Action, Event, IscsiSession};
 use snowscsi::MIN_DATA_LEN;
@@ -698,7 +698,7 @@ fn overlap_shell_does_not_defer_input_for_a_long_token() {
             &mut target,
             &mut storage,
         ),
-        Ok(())
+        Ok(ServeExit::WireGone)
     );
 
     assert!(

@@ -19,7 +19,7 @@ use snowscsi::core::async_wake::AsyncWake;
 use snowscsi::core::storage::{
     BlockingStorage, IoBuf, IoReq, IoToken, Storage, StorageReceipt, SyncStorage,
 };
-use snowscsi::core::{Direction, Effect, Fault, Lu, Target};
+use snowscsi::core::{Direction, Effect, Fault, Lu, ServeExit, Target};
 use snowscsi::iscsi::conn::{read_exact_async, AsyncConn};
 use snowscsi::iscsi::pdu::{flag, op, stage, status, BHS_SIZE};
 use snowscsi::iscsi::target::IscsiSession;
@@ -462,7 +462,10 @@ fn serve_conn_async_awaits_deferred_storage() {
     complete(&gate);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
 
-    assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(ServeExit::WireGone))
+    );
     assert_login_read_output(&wire.borrow().output, &expected);
 }
 
@@ -496,7 +499,7 @@ fn serve_conn_async_completes_across_short_reads() {
         &mut target,
         &mut storage,
     ));
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Ok(ServeExit::WireGone));
     assert_login_read_output(&wire.borrow().output, &expected);
 }
 

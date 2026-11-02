@@ -554,6 +554,16 @@ pub trait Device {
         let _ = permit;
     }
 
+    /// Consume the eject requested by the last completed command.
+    ///
+    /// START STOP UNIT (`0x1B`) with `LoEj=1, Start=0` asks the device to
+    /// remove its medium. The device only records the intent; the runner
+    /// performs the detach after the completion is fixed, so the host's status
+    /// is never produced by a half-detached slot. Default: no request.
+    fn take_eject_request(&mut self) -> bool {
+        false
+    }
+
     /// Detach the resident medium at a management boundary.
     fn take_medium(&mut self, permit: &BoundaryPermit) -> Option<Self::Medium>;
 

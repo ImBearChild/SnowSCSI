@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::core::storage::Storage;
-use crate::core::{RuntimeSet, Target};
+use crate::core::{RunOutcome, RuntimeSet, ServeExit, Target};
 use crate::iscsi::conn::{read_exact, write_all, Conn};
 use crate::iscsi::pdu::BHS_SIZE;
 use crate::iscsi::target::{Action, Event, IscsiSession, TargetError};
@@ -89,15 +89,17 @@ impl embedded_io::Write for TcpConn {
     }
 }
 
-/// Drive one iSCSI connection to completion over any byte stream.
+/// Drive one iSCSI connection until the session closes it or the core needs
+/// the application.
 ///
 /// The shell is protocol-agnostic: it stores received bytes at the offset the
 /// session asked for, writes complete PDUs, and hands the completion back as
 /// an [`Event`]. The session owns all framing and drives the core [`Target`]
 /// (with `storage` executing the device's storage operations).
 ///
-/// Returns `Ok(())` when the session closes the connection or the peer hangs
-/// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
+/// The loop owns **no device lifetime**: [`ServeExit::Outcome`] is returned at
+/// a point where no I/O is in flight, and [`ServeExit::WireGone`] settles the
+/// live command first. The same target may serve the next connection.
 ///
 /// `scratch` is the resident long-operation bank: an **empty** `scratch`
 /// selects the shared bank (`work` serves both paths), and the loop drives the
@@ -113,14 +115,26 @@ pub fn serve_conn<C: Conn, S: RuntimeSet>(
     session: &mut IscsiSession,
     target: &mut Target<S>,
     storage: &mut dyn Storage,
-) -> Result<(), TargetError> {
+) -> Result<ServeExit, TargetError> {
     let result = serve_conn_loop(conn, work, scratch, session, target, storage);
-    // Whatever ended the loop, the wire is gone: a live command must be settled
-    // before the slots can be served by the next connection. `connection_lost`
-    // makes the session's host seam fail closed (no PDU can be staged).
-    session.connection_lost();
-    let _ = target.settle_transport_end(storage, session);
+    // A lost connection (or a caller bug) leaves the wire unusable:
+    // `connection_lost` makes the session's host seam fail closed, and
+    // `link_lost` settles the live command so the next connection finds a
+    // clean target. A handback return deliberately does not come here.
+    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
+        session.connection_lost();
+        target.link_lost(storage, session);
+    }
     result
+}
+
+/// Return to the application if the core has something for it.
+fn boundary_exit<S: RuntimeSet>(target: &mut Target<S>) -> Option<ServeExit> {
+    match target.tick() {
+        RunOutcome::ServiceReady => None,
+        RunOutcome::ResourcesReady { lun } if !target.take_ready(lun) => None,
+        outcome => Some(ServeExit::Outcome(outcome)),
+    }
 }
 
 fn serve_conn_loop<C: Conn, S: RuntimeSet>(
@@ -130,7 +144,7 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
     session: &mut IscsiSession,
     target: &mut Target<S>,
     storage: &mut dyn Storage,
-) -> Result<(), TargetError> {
+) -> Result<ServeExit, TargetError> {
     if session.overlap() {
         let total = work.len();
         if !total.is_multiple_of(2)
@@ -167,7 +181,7 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                 // A response is staged in `work`, which the long token owns:
                 // dropping it (or sending it) would lose or corrupt output.
                 Action::HostSend { .. } => return Err(TargetError::Internal),
-                Action::Closed => return Ok(()),
+                Action::Closed => return Ok(ServeExit::WireGone),
                 Action::Error(e) => return Err(e),
             }
         }
@@ -178,12 +192,22 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
         if !shared && session.overlap() && matches!(ev, Event::HostRecv { .. }) {
             match session.poll(Event::Tick, work, scratch, target, storage) {
                 Action::HostRecv { .. } | Action::StoragePending => {}
-                Action::Closed => return Ok(()),
+                Action::Closed => return Ok(ServeExit::WireGone),
                 Action::Error(e) => return Err(e),
                 Action::HostSend { .. } => return Err(TargetError::Internal),
             }
         }
-        match session.poll(ev, work, scratch, target, storage) {
+        let action = session.poll(ev, work, scratch, target, storage);
+        // The carried event has been consumed: this is the only point where
+        // the loop may return to the application. A pending wire write (a PDU)
+        // goes out first; the next entry re-emits it from session state.
+        let wire_pending = matches!(action, Action::HostSend { .. });
+        if !wire_pending {
+            if let Some(exit) = boundary_exit(target) {
+                return Ok(exit);
+            }
+        }
+        match action {
             Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
                 // The step above started the resident long operation; its token
                 // now owns `work`. The receive is re-emitted on the next entry,
@@ -202,15 +226,15 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                 }
                 // Exact read of the framing length the session asked for, at
                 // the offset it chose. EOF or an I/O failure ends the
-                // connection (settled by the caller).
+                // connection (settled by the wrapper).
                 if read_exact(conn, &mut work[offset..offset + len]).is_err() {
-                    return Ok(());
+                    return Ok(ServeExit::WireGone);
                 }
                 ev = Event::HostRecv { len };
             }
             Action::HostSend { bytes, .. } => {
                 if write_all(conn, bytes).is_err() {
-                    return Ok(());
+                    return Ok(ServeExit::WireGone);
                 }
                 ev = Event::HostSent;
             }
@@ -220,7 +244,7 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
                 ev = Event::Tick;
             }
             Action::Closed => {
-                return Ok(());
+                return Ok(ServeExit::WireGone);
             }
             Action::Error(e) => {
                 return Err(e);
@@ -229,17 +253,14 @@ fn serve_conn_loop<C: Conn, S: RuntimeSet>(
     }
 }
 
-/// Drive one iSCSI connection to completion over an asynchronous byte stream
-/// (feature `async-io`).
+/// Drive one iSCSI connection until the session closes it or the core needs
+/// the application, over an asynchronous byte stream (feature `async-io`).
 ///
 /// The awaited mirror of [`serve_conn`]: the same `Action`/`Event` protocol,
 /// the same bank checks and the same connection-loss settlement, but reads and
 /// writes are awaited and a [`Action::StoragePending`] step awaits the
 /// [`AsyncWake`] adapter instead of spinning. Runtime binding is the caller's
 /// concern; this crate only serves one connection and owns no listener.
-///
-/// Returns `Ok(())` when the session closes the connection or the peer hangs
-/// up; only caller bugs (`WorkBufTooSmall`) and session errors propagate.
 #[cfg(feature = "async-io")]
 pub async fn serve_conn_async<C, S, W>(
     conn: &mut C,
@@ -248,7 +269,7 @@ pub async fn serve_conn_async<C, S, W>(
     session: &mut IscsiSession,
     target: &mut Target<S>,
     storage: &mut W,
-) -> Result<(), TargetError>
+) -> Result<ServeExit, TargetError>
 where
     C: AsyncConn,
     S: RuntimeSet,
@@ -296,7 +317,7 @@ where
                     // owns: dropping it (or sending it) would lose or corrupt
                     // output.
                     Action::HostSend { .. } => return Err(TargetError::Internal),
-                    Action::Closed => return Ok(()),
+                    Action::Closed => return Ok(ServeExit::WireGone),
                     Action::Error(e) => return Err(e),
                 }
             }
@@ -307,12 +328,22 @@ where
             if !shared && session.overlap() && matches!(ev, Event::HostRecv { .. }) {
                 match session.poll(Event::Tick, work, scratch, target, &mut *storage) {
                     Action::HostRecv { .. } | Action::StoragePending => {}
-                    Action::Closed => return Ok(()),
+                    Action::Closed => return Ok(ServeExit::WireGone),
                     Action::Error(e) => return Err(e),
                     Action::HostSend { .. } => return Err(TargetError::Internal),
                 }
             }
-            match session.poll(ev, work, scratch, target, &mut *storage) {
+            let action = session.poll(ev, work, scratch, target, &mut *storage);
+            // The carried event has been consumed: this is the only point
+            // where the loop may return to the application. A pending PDU goes
+            // out first (see the sync loop).
+            let wire_pending = matches!(action, Action::HostSend { .. });
+            if !wire_pending {
+                if let Some(exit) = boundary_exit(target) {
+                    return Ok(exit);
+                }
+            }
+            match action {
                 Action::HostRecv { .. } if shared && target.long_io_in_flight() => {
                     // The step above started the resident long operation; its
                     // token now owns `work`. The receive is re-emitted on the
@@ -336,13 +367,13 @@ where
                         .await
                         .is_err()
                     {
-                        return Ok(());
+                        return Ok(ServeExit::WireGone);
                     }
                     ev = Event::HostRecv { len };
                 }
                 Action::HostSend { bytes, .. } => {
                     if conn.write_all(bytes).await.is_err() {
-                        return Ok(());
+                        return Ok(ServeExit::WireGone);
                     }
                     ev = Event::HostSent;
                 }
@@ -353,7 +384,7 @@ where
                     ev = Event::Tick;
                 }
                 Action::Closed => {
-                    return Ok(());
+                    return Ok(ServeExit::WireGone);
                 }
                 Action::Error(e) => {
                     return Err(e);
@@ -363,11 +394,14 @@ where
     }
     .await;
 
-    // Whatever ended the loop, the wire is gone: a live command must be settled
-    // before the slots can be served by the next connection. `connection_lost`
-    // makes the session's host seam fail closed (no PDU can be staged).
-    session.connection_lost();
-    let _ = target.settle_transport_end(&mut *storage, session);
+    // A lost connection (or a caller bug) leaves the wire unusable:
+    // `connection_lost` makes the session's host seam fail closed, and
+    // `link_lost` settles the live command so the next connection finds a
+    // clean target. A handback return deliberately does not come here.
+    if matches!(&result, Ok(ServeExit::WireGone)) || result.is_err() {
+        session.connection_lost();
+        target.link_lost(&mut *storage, session);
+    }
     result
 }
 
@@ -450,10 +484,8 @@ pub fn serve<P>(
             IscsiSession::new()
         };
         let mut target = Target::new(&mut *table);
-        match serve_conn(&mut conn, work, scratch, &mut session, &mut target, storage) {
-            Ok(()) => crate::info!("connection from {} ended", peer),
-            Err(e) => return Err(e),
-        }
+        let exit = serve_conn(&mut conn, work, scratch, &mut session, &mut target, storage)?;
+        crate::info!("connection from {} ended ({:?})", peer, exit);
     }
 }
 
@@ -693,7 +725,7 @@ mod tests {
                 &mut target,
                 &mut storage
             ),
-            Ok(()),
+            Ok(ServeExit::WireGone),
             "the floor bank is accepted; the peer EOF closes the connection"
         );
     }

@@ -29,7 +29,7 @@
     reason = "mem::forget is generally not safe to do with esp_hal types, especially those holding buffers for the duration of a data transfer."
 )]
 
-use core::sync::atomic::AtomicBool;
+use snowscsi::core::Flow;
 
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
@@ -98,12 +98,12 @@ static SD_BUF: StaticCell<[u8; STAGE]> = StaticCell::new();
 /// (the SD worker) on every gadget build; the buffer stays inside it.
 static SD_POOL: StaticCell<SdPool> = StaticCell::new();
 
-/// Shutdown flag handed to the BOT serve loop.
+/// Flow request handed to the BOT serve loop.
 ///
 /// This firmware tears the gadget down by dropping its future when BOOT is
-/// pressed, so the flag is never set; it exists because the shell requires an
-/// explicit stop signal alongside the future.
-static STOP: AtomicBool = AtomicBool::new(false);
+/// pressed, so the request is never set; it exists because the shell always
+/// takes one alongside the future.
+static FLOW: Flow = Flow::new();
 
 /// Run the whole DVDRAM gadget concurrently: USB stack, BOT loop, async SD
 /// worker, LCD refresh.
@@ -132,7 +132,7 @@ async fn gadget<'d, D, O, I, S>(
     target: &mut Target<S>,
     card: &mut sd::SdCard<'_>,
     sd_pool: &'static SdPool,
-    stop: &AtomicBool,
+    flow: &Flow,
     display: &mut Option<display::Display<'_>>,
     sd_bytes: Option<u64>,
     boot: Instant,
@@ -153,7 +153,7 @@ where
 
     embassy_futures::join::join4(
         device.run(),
-        msc::run(bot, session, work, scratch, target, &mut storage, stop),
+        msc::run(bot, session, work, scratch, target, &mut storage, flow),
         store::sd_task(card, &jobs),
         async {
             // Uptime: seconds since boot, redisplayed every refresh. The
@@ -473,7 +473,7 @@ async fn main(spawner: Spawner) -> ! {
                         &mut target,
                         &mut card,
                         sd_pool,
-                        &STOP,
+                        &FLOW,
                         &mut display,
                         sd_bytes,
                         boot,

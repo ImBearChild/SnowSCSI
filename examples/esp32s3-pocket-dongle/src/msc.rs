@@ -23,9 +23,9 @@ use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestT
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointInfo, EndpointOut};
 use embassy_usb::Handler;
 
-use snowscsi::core::{RuntimeSet, Target};
+use snowscsi::core::{Flow, FlowState, RunOutcome, RuntimeSet, ServeExit, Target};
 use snowscsi::usb::serve::serve_async;
-use snowscsi::usb::{BotSession, EmbassyBot, Event, ServeError, BOT_RESET, GET_MAX_LUN};
+use snowscsi::usb::{BotSession, EmbassyBot, Event, BOT_RESET, GET_MAX_LUN};
 
 use crate::store::SdStore;
 
@@ -60,7 +60,7 @@ static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static TX_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// Number of times the serve loop returned and was re-armed (any
-/// [`ServeError`] other than a clean stop). A rising count while a host is
+/// `ServeError`). A rising count while a host is
 /// attached means the BOT loop is erroring out (link closed, core error,
 /// control failure) instead of serving — the LCD shows it as `F<n>` next to
 /// the USB state.
@@ -348,7 +348,7 @@ pub async fn run<O, I, S>(
     scratch: &mut [u8],
     target: &mut Target<S>,
     storage: &mut SdStore<'_, '_>,
-    stop: &AtomicBool,
+    flow: &Flow,
 ) -> !
 where
     O: EndpointOut,
@@ -376,22 +376,28 @@ where
             scratch,
             target,
             storage,
-            stop,
+            flow,
         )
         .await
         {
-            // `Ok` only on a set stop flag; a closed link restarts the loop.
-            Ok(()) => {}
-            Err(ServeError::Closed) => {
+            // The flow asked the loop to end (this firmware has no shutdown).
+            Ok(ServeExit::Stopped) => {}
+            // The host went away: restart on the same target.
+            Ok(ServeExit::WireGone) => {
                 RESTARTS.fetch_add(1, Ordering::Relaxed);
             }
+            // Media change: hand the pair back so the slot is not wedged.
+            Ok(ServeExit::Outcome(RunOutcome::ResourcesReady { lun })) => {
+                let _ = target.take_rt(lun);
+            }
+            Ok(_) => {}
             Err(_) => {
                 RESTARTS.fetch_add(1, Ordering::Relaxed);
                 warn!("bot: serve loop stopped; restarting");
             }
         }
 
-        if stop.load(Ordering::Relaxed) {
+        if flow.state() == FlowState::Stop {
             // This firmware has no shutdown path; park so a set flag cannot
             // spin the restart loop.
             core::future::pending::<()>().await;
