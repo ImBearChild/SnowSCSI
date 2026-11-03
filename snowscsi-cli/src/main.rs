@@ -364,9 +364,9 @@ impl ServeConfig {
     }
 
     /// The stable one-line `--print-config` rendering.
-    fn line(&self, lun: usize, pool: bool) -> String {
+    fn line(&self, lun: usize, backing: &str, pool: bool) -> String {
         format!(
-            "wire={} banks={} storage={} per_bank={} work={} scratch={} lun={lun}",
+            "wire={} banks={} storage={} per_bank={} work={} scratch={} lun={lun} backing={backing}",
             self.wire.as_str(),
             self.banks.as_str(),
             self.storage(pool),
@@ -419,7 +419,11 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     if args.print_config {
         println!(
             "{}",
-            config.line(specs.len(), pool_capable(&specs, &config))
+            config.line(
+                specs.len(),
+                &backing_names(&specs),
+                pool_capable(&specs, &config)
+            )
         );
         return ExitCode::SUCCESS;
     }
@@ -861,6 +865,26 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
 
     log::info!("shutting down");
     ExitCode::SUCCESS
+}
+
+/// `--print-config`'s `backing=` token: the CLI backing key of every LUN, in
+/// LUN order (`ram`, `img`, `bundle`, …), so a smoke check can tell which
+/// plane kind the resolved configuration will build.
+fn backing_names(specs: &[DeviceSpec]) -> String {
+    specs
+        .iter()
+        .map(|spec| match &spec.backing {
+            Backing::Img { .. } => "img",
+            Backing::ImgDir { .. } => "imgdir",
+            Backing::Ram { .. } => "ram",
+            Backing::Live { .. } => "live",
+            Backing::DvdRam { .. } => "dvdram",
+            #[cfg(feature = "cdr-bundle")]
+            Backing::CdrBundle { .. } => "bundle",
+            Backing::Empty => "empty",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Whether `--print-config` should report `storage=pool`.
@@ -3195,34 +3219,36 @@ mod tests {
         let args = parse_serve(&["--usb", "--banks", "dual"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(2, false),
-            "wire=blocking banks=dual storage=worker per_bank=8192 work=16384 scratch=0 lun=2"
+            cfg.line(2, "ram", false),
+            "wire=blocking banks=dual storage=worker per_bank=8192 work=16384 scratch=0 lun=2 \
+             backing=ram"
         );
 
         let args = parse_serve(&["--iscsi", "127.0.0.1:0", "--banks", "dual"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1, false),
-            "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
+            cfg.line(1, "ram", false),
+            "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1 \
+             backing=ram"
         );
 
         let args = parse_serve(&["--usb"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1, false),
+            cfg.line(1, "ram", false),
             format!(
                 "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
-                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1 backing=ram"
             )
         );
 
         let args = parse_serve(&["--usb", "--scratch-buffer", "16K"]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1, false),
+            cfg.line(1, "ram", false),
             format!(
                 "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
-                 work={DEFAULT_WORK_BUF_SIZE} scratch={} lun=1",
+                 work={DEFAULT_WORK_BUF_SIZE} scratch={} lun=1 backing=ram",
                 16 * 1024
             )
         );
@@ -3254,10 +3280,10 @@ mod tests {
         assert_eq!(specs[0].role, DeviceRole::MmcCd);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(specs.len(), pool_capable(&specs, &cfg)),
+            cfg.line(specs.len(), "bundle", pool_capable(&specs, &cfg)),
             format!(
                 "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
-                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1 backing=bundle"
             )
         );
 
@@ -3270,6 +3296,44 @@ mod tests {
             scratch_len: None,
         };
         assert!(!pool_capable(&specs, &async_dual));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_help_and_print_config_mention_the_backing() {
+        use clap::CommandFactory;
+
+        // `serve --help` documents the persistent CD-R backing, its medium
+        // presets, and the directory artifacts the CLI owns.
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("the serve subcommand");
+        let help = serve.render_long_help().to_string();
+        assert!(help.contains("bundle=<dir>"), "help text:\n{help}");
+        assert!(help.contains("toc.0"), "help text:\n{help}");
+        assert!(help.contains("track_<n>.bin"), "help text:\n{help}");
+
+        // `--print-config` resolves the same backing without touching the
+        // filesystem: the token lists every LUN's backing in LUN order.
+        let args = parse_serve(&[
+            "--usb",
+            "--print-config",
+            "--cdrom",
+            "bundle=/tmp/disc,medium=cdr80",
+        ]);
+        let specs = spec::parse_all(&args.block, &args.cdrom).unwrap();
+        assert_eq!(backing_names(&specs), "ram,bundle");
+        let cfg = resolve_config(&args).unwrap();
+        let line = cfg.line(
+            specs.len(),
+            &backing_names(&specs),
+            pool_capable(&specs, &cfg),
+        );
+        assert!(
+            line.ends_with("lun=2 backing=ram,bundle"),
+            "print-config line: {line}"
+        );
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -3415,10 +3479,10 @@ mod tests {
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(cfg.wire, Wire::Async);
         assert_eq!(
-            cfg.line(1, false),
+            cfg.line(1, "ram", false),
             format!(
                 "wire=async banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
-                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1 backing=ram"
             )
         );
 
@@ -3432,8 +3496,9 @@ mod tests {
         ]);
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(
-            cfg.line(1, false),
-            "wire=async banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1"
+            cfg.line(1, "ram", false),
+            "wire=async banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=1 \
+             backing=ram"
         );
 
         // A RAM or file LUN can be driven by the library slot pool, so the
@@ -3441,8 +3506,13 @@ mod tests {
         let specs = spec::parse_all(&args.block, &args.cdrom).unwrap();
         assert!(pool_capable(&specs, &cfg));
         assert_eq!(
-            cfg.line(specs.len(), pool_capable(&specs, &cfg)),
-            "wire=async banks=dual storage=pool per_bank=8240 work=16480 scratch=0 lun=1"
+            cfg.line(
+                specs.len(),
+                &backing_names(&specs),
+                pool_capable(&specs, &cfg)
+            ),
+            "wire=async banks=dual storage=pool per_bank=8240 work=16480 scratch=0 lun=1 \
+             backing=ram"
         );
     }
 

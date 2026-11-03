@@ -106,6 +106,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend can expose resource reuse without a new store-op variant.
 - **mmc**: `cdr_bundle::max_tracks_for_slot` exposes the TOC track capacity, so
   applications can bound `16 + n` resource ids to the configured slot.
+- **tests**: `cdr_cdrkit_tao_trace` replays the `wodim -tao` command sequence
+  (GET CONFIGURATION, disc/track information, MODE SELECT page 0x05, SET CD
+  SPEED, SEND OPC, a NWA write without RESERVE TRACK, SYNCHRONIZE CACHE and
+  CLOSE TRACK/SESSION), pins the payload resource/offset and restores both
+  saved TOC slots through `open_at`. `HACKING.md` gains a manual CD-R bundle
+  burn/read-back recipe with its troubleshooting notes.
+- **cli**: `--print-config` reports the resolved backing per LUN after the
+  existing fields (`… backing=ram,bundle`); a smoke test pins the `bundle=`
+  help text and the backing token.
 
 ## [0.2.0] - 2026-10-18
 

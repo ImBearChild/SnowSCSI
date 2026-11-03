@@ -229,7 +229,8 @@ fn print_config_prints_one_line_and_exits() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         stdout.trim_end(),
-        "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=2"
+        "wire=blocking banks=dual storage=worker per_bank=8240 work=16480 scratch=0 lun=2 \
+         backing=ram,ram"
     );
 }
 
@@ -251,7 +252,42 @@ fn print_config_reports_the_async_wire() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         stdout.trim_end(),
-        "wire=async banks=single storage=inline per_bank=1048576 work=1048576 scratch=0 lun=1"
+        "wire=async banks=single storage=inline per_bank=1048576 work=1048576 scratch=0 \
+         lun=1 backing=ram"
+    );
+}
+
+/// The `bundle=` CD-R backing is discoverable from both surfaces: `serve
+/// --help` documents it, and `--print-config` names it without building (or
+/// creating) the directory.
+#[cfg(feature = "cdr-bundle")]
+#[test]
+fn cdr_bundle_help_and_print_config_mention_the_backing() {
+    let out = run(&["serve", "--help"]);
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("bundle=<dir>"), "help text:\n{help}");
+    assert!(help.contains("toc.0"), "help text:\n{help}");
+    assert!(help.contains("track_<n>.bin"), "help text:\n{help}");
+
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M",
+        "--cdrom",
+        "bundle=/tmp/disc,medium=cdr80",
+        "--usb",
+        "--print-config",
+    ]);
+    assert!(
+        out.status.success(),
+        "print-config failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim_end().ends_with("lun=2 backing=ram,bundle"),
+        "print-config line:\n{stdout}"
     );
 }
 

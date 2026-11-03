@@ -262,6 +262,88 @@ Design notes:
   (`iso9660-no-std`) prefers the Joliet SVD, so only external tools exercise
   the PVD tree.
 
+### Manual CD-R bundle check
+
+`--cdrom bundle=<dir>` serves a persistent CD-R. The medium model, the
+recorder-control commands and the alternating TOC slots are covered in-process
+(`cdr_cdrkit_tao_trace` follows the exact `wodim -tao` sequence), but a manual
+burn catches host/driver interaction the harness cannot.
+
+Serve the disc over USB (FunctionFS; `<udc>` is a controller name, `auto`
+picks one, `dummy` auto-loads `dummy_hcd`):
+
+```bash
+cargo run -p snowscsi-cli -- serve --usb <udc> \
+    --cdrom bundle=/tmp/cdr,medium=cdr80
+```
+
+or over iSCSI (`auto` binds the loopback portal and logs in through
+open-iscsi; an explicit `--iscsi 127.0.0.1:3260` needs a manual `iscsiadm`
+login):
+
+```bash
+cargo run -p snowscsi-cli -- serve --iscsi auto \
+    --cdrom bundle=/tmp/cdr,medium=cdr80
+```
+
+`medium=`/`slot=` only describe a **new blank** bundle; once a TOC exists the
+stored geometry wins.
+
+Burn with cdrkit in Track-at-Once:
+
+```bash
+wodim -v -tao dev=/dev/sr0 /path/image.iso
+```
+
+`-tao` is mandatory: `-dao` (SAO), packet/raw write modes and `-dummy` (Test
+Write) are rejected by MODE SELECT page 0x05 with ILLEGAL REQUEST. Make sure
+the host has completed `SYNCHRONIZE CACHE` / `CLOSE TRACK SESSION` before
+ejecting — on eject the server drops the LUN plane and any state not already
+saved to a TOC slot.
+
+Read the disc back:
+
+```bash
+dmesg | tail                  # kernel SCSI/optical messages
+isoinfo -d -i /dev/sr0        # PVD: volume id, block size, volume space
+blkid /dev/sr0                # ISO9660 signature / label
+mount -o ro /dev/sr0 /mnt     # or mount the raw device
+```
+
+The bundle directory holds the durable state:
+
+| Path | Content |
+|------|---------|
+| `toc.0`, `toc.1` | Alternating TOC slots; the newer valid one wins |
+| `track_1.bin`, … | Track payload (`16 + n` storage resource) |
+
+Stop the server and start it again on the same directory to prove the TOC is
+re-read (`open_at` checks each slot against its physical index, so a copied
+slot is rejected). The server never deletes orphan `track_<n>.bin` files;
+`CdrBundleMedium::track_numbers` is the reconciliation source.
+
+Troubleshooting:
+
+- **Profile** — GET CONFIGURATION must report current profile `0x09` (CD-R),
+  with `0x21` (Incremental Streaming) and `0x2D` (CD Track at Once) Current;
+  `0x20` (Random Writable) and `0x24` (Defect Management) are not.
+- **`Cannot init drive`** at burn startup — MODE SELECT page 0x05 was
+  rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
+  (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet,
+  raw and Test Write are refused.
+- **`SET CD SPEED`** — accepted and remembered, but the emulated drive has
+  no spindle to retune; SEND OPC tables are consumed and discarded.
+- **TOC corrupt or missing** — the two slots alternate, so a torn save leaves
+  the other valid slot usable. An unreadable/malformed slot is an error
+  unless the other is valid. A missing directory starts a blank disc with a
+  warning; `recovery=readonly` requires an existing TOC and never creates
+  one.
+- **`recovery=readonly`** — restores the written prefix as complete tracks,
+  finalizes the disc and rejects later writes (`WRITE PROTECTED`).
+- **Geometry presets** — `medium=cdr74|cdr80|cdr90|cdr99` and `slot=<bytes>`
+  (4 KiB..64 KiB) only apply to a new blank bundle; the number of track
+  files is bounded by `max_tracks_for_slot(slot)`.
+
 ## Browsing Documentation
 
 ```bash

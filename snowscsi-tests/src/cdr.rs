@@ -11,10 +11,11 @@ use snowscsi::core::storage::{
 };
 use snowscsi::core::{
     cons, CommandContext, Completion, Cons, DataPlan, Delivery, Direction, Fault, Here, LuImpl,
-    Nil, Spc, StaticTarget, Target, INVALID_FIELD, LBA_OUT_OF_RANGE, WRITE_PROTECTED,
+    Nil, Sense, Spc, StaticTarget, Target, INVALID_FIELD, LBA_OUT_OF_RANGE, WRITE_PROTECTED,
 };
 use snowscsi::mmc::{CdrBundleMedium, CdrCapacity, CdrDiscState, MmcDrive, MmcMedium, Recovery};
 
+const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2A;
 const SYNC_CACHE_10: u8 = 0x35;
 const READ_CAPACITY_10: u8 = 0x25;
@@ -23,12 +24,17 @@ const GET_CONFIGURATION: u8 = 0x46;
 const READ_DISC_INFORMATION: u8 = 0x51;
 const READ_TRACK_INFORMATION: u8 = 0x52;
 const RESERVE_TRACK: u8 = 0x53;
+const SEND_OPC: u8 = 0x54;
 const CLOSE_TRACK_SESSION: u8 = 0x5B;
 const FORMAT_UNIT: u8 = 0x04;
 const BLANK: u8 = 0xA1;
 const MODE_SENSE_10: u8 = 0x5A;
 const MODE_SELECT_10: u8 = 0x55;
 const SET_CD_SPEED: u8 = 0xBB;
+
+/// ILLEGAL REQUEST / INVALID ADDRESS FOR WRITE: a TAO write must start at the
+/// next writable address.
+const INVALID_ADDRESS_FOR_WRITE: Sense = Sense::new(0x05, 0x21, 0x02);
 
 const BLOCK: usize = 2048;
 const SECTORS: u64 = 333_000;
@@ -254,6 +260,23 @@ fn write10(lba: u32, blocks: u16) -> [u8; 10] {
     cdb
 }
 
+fn read10(lba: u32, blocks: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = READ_10;
+    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+    cdb[7..9].copy_from_slice(&blocks.to_be_bytes());
+    cdb
+}
+
+/// SEND OPC INFORMATION with a parameter table of `len` bytes.
+fn send_opc(len: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = SEND_OPC;
+    cdb[7] = (len >> 8) as u8;
+    cdb[8] = len as u8;
+    cdb
+}
+
 fn sync_cache() -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = SYNC_CACHE_10;
@@ -292,6 +315,21 @@ fn mode_select10(length: u16) -> [u8; 10] {
     cdb[7] = (length >> 8) as u8;
     cdb[8] = length as u8;
     cdb
+}
+
+/// The MODE SELECT(10) parameter list a TAO recorder sends: a mode header with
+/// no block descriptors, then Write Parameters page 0x05 asking for
+/// Track-at-Once, data track mode 4 and Data Block Type 8 (Mode 1, 2048-byte
+/// blocks).
+fn tao_mode_page() -> Vec<u8> {
+    let mut page = vec![0u8; 60];
+    page[0..2].copy_from_slice(&58u16.to_be_bytes());
+    page[8] = 0x05;
+    page[9] = 0x32;
+    page[10] = 0x01; // Write Type = Track-at-Once
+    page[11] = 0x04; // Track Mode = data
+    page[12] = 0x08; // Data Block Type = Mode 1
+    page
 }
 
 fn set_cd_speed(read: u16, write: u16) -> [u8; 12] {
@@ -1012,6 +1050,397 @@ fn cdr_recorder_control_sequence_returns_good_before_a_write() {
         &mut write_host,
         &mut work,
         &mut scratch,
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// cdrkit `wodim -tao` trace: no RESERVE TRACK, write at the NWA
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The command order `wodim -tao` uses on a blank CD-R (cdrkit does not
+/// reserve a track when the host driver already reports the next writable
+/// address): query the recorder, accept its TAO page, set the speed, send an
+/// OPC table, write at the NWA, flush, and close the session.
+///
+/// This pins the whole path a real burner walks, including the two TOC saves
+/// (`SYNCHRONIZE CACHE` closes the track, `CLOSE TRACK/SESSION` finalizes it)
+/// and the persistent medium restored from a slot.
+#[test]
+fn cdr_cdrkit_tao_trace() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // 1. GET CONFIGURATION: the drive reports CD-R as its current profile and
+    //    lists the read/write feature set a TAO recorder needs.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &get_configuration(128),
+            Direction::ToHost,
+            128,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[0..4], &104u32.to_be_bytes());
+    assert_eq!(
+        &work[6..8],
+        &0x0009u16.to_be_bytes(),
+        "current CD-R profile"
+    );
+    // Profile list: CD-ROM (0x08) and CD-R (0x09) are Current; the
+    // read-compatible CD-RW profile (0x12) is listed but not Current.
+    assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
+    assert_eq!(work[15], 0, "0x12 not Current on a CD-R");
+    assert_eq!(&work[16..18], &0x0009u16.to_be_bytes());
+    assert_eq!(work[19], 1, "0x09 Current");
+    assert_eq!(&work[20..22], &0x0008u16.to_be_bytes());
+    assert_eq!(work[23], 1, "0x08 Current");
+    let listed = 108usize;
+    let at21 = feature_at(&work, listed, 0x0021).expect("Incremental Streaming");
+    assert_eq!(work[at21 + 2] & 1, 1, "0x21 Current");
+    let at2d = feature_at(&work, listed, 0x002D).expect("CD Track at Once");
+    assert_eq!(work[at2d + 2] & 1, 1, "0x2D Current");
+    let at20 = feature_at(&work, listed, 0x0020).expect("Random Writable");
+    assert_eq!(work[at20 + 2] & 1, 0, "0x20 not Current for a CD-R");
+    let at24 = feature_at(&work, listed, 0x0024).expect("Defect Management");
+    assert_eq!(work[at24 + 2] & 1, 0, "0x24 not Current for a CD-R");
+
+    // 2. READ DISC INFORMATION: empty, one session, not erasable, with the
+    //    lead-in and last-possible-lead-out addresses in MSF.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x00, "Empty disc");
+    assert_eq!(work[2] & 0x10, 0, "not erasable");
+    assert_eq!(work[4], 1, "one session");
+    assert_eq!(&work[16..20], &msf(97, 34, 23), "lead-in MSF");
+    assert_eq!(&work[20..24], &msf(74, 1, 73), "last possible lead-out MSF");
+
+    // 3. READ TRACK INFORMATION type 1, track 0xFF: the invisible next track
+    //    has a valid NWA at LBA 0.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_track_information(1, 0xFF, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 1);
+    assert_eq!(work[3], 1);
+    assert_eq!(work[6] & 0x40, 0x40, "invisible (blank) track");
+    assert_eq!(work[7] & 0x01, 0x01, "NWA valid");
+    assert_eq!(&work[12..16], &0u32.to_be_bytes(), "NWA 0");
+
+    // 4. MODE SENSE(10) page 0x05: TAO with data track mode 4 and Mode 1
+    //    (2048-byte) blocks.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mode_sense10(0x05, 64),
+            Direction::ToHost,
+            64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[0..2], &58u16.to_be_bytes(), "8 + 52 bytes");
+    assert_eq!(work[8], 0x05, "Write Parameters page");
+    assert_eq!(work[9], 0x32, "page length");
+    assert_eq!(work[10], 0x01, "Write Type = Track-at-Once");
+    assert_eq!(work[11], 0x04, "Track Mode = data");
+    assert_eq!(work[12], 0x08, "Data Block Type = Mode 1");
+
+    // 5. MODE SELECT(10): the recorder accepts the TAO page it just reported.
+    let mut select_host = BlockingHost::new(TestHost::new(tao_mode_page()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 6. SET CD SPEED: accepted (the emulated spindle has no speed to set).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &set_cd_speed(0xFFFF, 0xFFFF),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 7. SEND OPC INFORMATION: one eight-byte table entry is accepted and
+    //    discarded.
+    let mut opc_host = BlockingHost::new(TestHost::new(vec![0u8; 8]));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut opc_host,
+            &send_opc(8),
+            Direction::FromHost,
+            8,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 8. WRITE(10) at the NWA (LBA 0) without RESERVE TRACK: the medium opens
+    //    track 1 implicitly and records one block.
+    let payload: Vec<u8> = (0..BLOCK).map(|i| (i % 251) as u8).collect();
+    let mut write_host = BlockingHost::new(TestHost::new(payload.clone()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &write10(0, 1),
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &read_track_information(1, 1, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[12..16], &1u32.to_be_bytes(), "NWA advanced to 1");
+    assert_eq!(&work[28..32], &0u32.to_be_bytes(), "last recorded LBA 0");
+    // The payload is the first block of track 1's resource, at offset 0.
+    let writes: Vec<_> = storage
+        .inner()
+        .log
+        .iter()
+        .filter_map(|event| match event {
+            Ev::Write(resource, offset, len) => Some((*resource, *offset, *len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        vec![(snowscsi::mmc::cdr_bundle::track_resource(1), 0, BLOCK)],
+        "exactly one payload write, into track 1 at offset 0"
+    );
+
+    // 9. SYNCHRONIZE CACHE pads and closes the track. A later TAO write may
+    //    not restart at block 0: the next writable address moved past the
+    //    padded track.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &read_track_information(1, 1, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[6], 0x81, "RT=1, Data Mode 1");
+    assert_eq!(work[7], 0x00, "a closed track has no NWA");
+    assert_eq!(&work[24..28], &300u32.to_be_bytes(), "padded to 300 blocks");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &write10(0, 1),
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(INVALID_ADDRESS_FOR_WRITE),
+        "the write must resume at the new NWA, never overwrite track 1"
+    );
+
+    // 10. CLOSE TRACK/SESSION function 2 finalizes the disc.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 0x0E, "finalized, last session complete");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 0, 0, 20),
+            Direction::ToHost,
+            20,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[0..2], [0x00, 0x12], "18 bytes of TOC data");
+    assert_eq!(work[2], 1, "first track");
+    assert_eq!(work[3], 1, "last track");
+    assert_eq!(work[6], 1, "track number");
+    assert_eq!(&work[8..12], &0u32.to_be_bytes(), "track 1 start");
+    assert_eq!(work[14], 0xAA, "lead-out descriptor");
+    assert_eq!(&work[16..20], &300u32.to_be_bytes(), "lead-out start");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_capacity(),
+            Direction::ToHost,
+            8,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[0..4], &299u32.to_be_bytes(), "last recorded block");
+
+    // 11. Both saves restore through their physical slot. Slot 0 is the
+    //     SYNCHRONIZE CACHE snapshot (track closed, session still open); slot
+    //     1 is the finalized disc CLOSE wrote. Both keep track 1 at its
+    //     padded length and point its data at resource `16 + 1`.
+    let slot0 = storage.inner().slot(0);
+    let slot1 = storage.inner().slot(1);
+    let synced = CdrBundleMedium::open_at(0, &slot0, SECTORS, Recovery::Delete)
+        .expect("toc.0 restores the SYNCHRONIZE CACHE snapshot");
+    assert_eq!(
+        synced.disc_state(),
+        CdrDiscState::Appendable,
+        "the sync closed the track but did not finalize the disc"
+    );
+    assert_eq!(synced.track_numbers().collect::<Vec<_>>(), vec![1]);
+    let info = synced
+        .track_info(snowscsi::mmc::TrackInfoRequest::Number(1))
+        .expect("track 1");
+    assert_eq!(info.length, 300);
+    assert_eq!(info.nwa, 300);
+
+    let finalized = CdrBundleMedium::open_at(1, &slot1, SECTORS, Recovery::Delete)
+        .expect("toc.1 restores the finalized disc");
+    assert_eq!(finalized.disc_state(), CdrDiscState::Finalized);
+    assert_eq!(finalized.track_numbers().collect::<Vec<_>>(), vec![1]);
+    let info = finalized
+        .track_info(snowscsi::mmc::TrackInfoRequest::Number(1))
+        .expect("track 1");
+    assert_eq!(info.length, 300);
+    assert_eq!(info.nwa, 300);
+
+    // The restored medium reads the recorded block through track 1's payload
+    // resource, and the bytes are the ones the host wrote.
+    storage.inner_mut().log.clear();
+    let mut reopened_target: CdrTarget = Target::new(cons(
+        LuImpl::new(Spc::new(MmcDrive::new(finalized)), 1u8),
+        Nil,
+    ));
+    assert_eq!(
+        run(
+            &mut reopened_target,
+            &mut storage,
+            &mut host,
+            &read10(0, 1),
+            Direction::ToHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[..BLOCK], &payload[..]);
+    assert_eq!(
+        storage.inner().log,
+        vec![Ev::Read(
+            snowscsi::mmc::cdr_bundle::track_resource(1),
+            0,
+            BLOCK
+        )],
+        "the read is served from track 1 at offset 0"
     );
 }
 
