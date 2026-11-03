@@ -3,6 +3,8 @@
 //! `MmcDrive` decodes a CDB into one `MmcOp`; the medium owns the semantics.
 //! `Commit` (SYNCHRONIZE CACHE) and `Close` (CLOSE TRACK SESSION) are
 //! deliberately separate: commit persists, close changes the write state.
+//! `ReserveTrack` (RESERVE TRACK) reserves space for a future track and, like
+//! `Close`, is the drive's write-state vocabulary rather than a data transfer.
 
 use super::attrs::SectorKind;
 
@@ -53,8 +55,17 @@ pub enum MmcOp {
         /// Number of blocks to format.
         blocks: u64,
     },
-    /// CLOSE TRACK SESSION: changes the write state and commits as needed.
-    Close,
+    /// CLOSE TRACK SESSION: close function `001b` (track) or `010b` (session)
+    /// on CD; changes the write state and commits as needed.
+    Close {
+        /// Close Function bits from CDB byte 2.
+        function: u8,
+    },
+    /// RESERVE TRACK: reserve `size` logical blocks for the next track.
+    ReserveTrack {
+        /// Number of logical blocks to reserve.
+        size: u32,
+    },
     /// SYNCHRONIZE CACHE class: persist only; never changes the write state.
     Commit,
 }
@@ -65,7 +76,12 @@ mod tests {
 
     #[test]
     fn commit_and_close_are_distinct() {
-        assert_ne!(MmcOp::Commit, MmcOp::Close);
+        assert_ne!(MmcOp::Commit, MmcOp::Close { function: 0 });
+        assert_ne!(MmcOp::Close { function: 0 }, MmcOp::Close { function: 1 });
+        assert_eq!(
+            MmcOp::ReserveTrack { size: 16 },
+            MmcOp::ReserveTrack { size: 16 }
+        );
         assert_eq!(
             MmcOp::ReadSectors {
                 lba: 1,

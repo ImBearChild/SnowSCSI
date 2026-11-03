@@ -16,9 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaulted `take_eject_request`; `MmcDrive::empty` now takes `MmcCaps`.
 - **block**: `BlockAttrs` gains `removable`; struct literals must add the
   field (use `BlockAttrs::new(..)` and `with_removable()` instead).
+- **mmc**: `MmcOp::Close` carries the close function and `MmcOp::ReserveTrack`
+  is added; `MmcAttrs` gains `profile`/`current_features`; `DiscInfo` gains the
+  recordable-media fields. The default Hyper-Multi drive now lists the CD-R
+  profile (`0x09`) in its profile list.
 
 ### Added
 
+- **mmc**: recordable-medium vocabulary — `TrackStatus`, `TrackInfo`,
+  `TrackInfoRequest`, and the defaulted `MmcMedium::track_info`; the
+  `cdr-bundle` feature gate for a sequential CD-R medium.
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
 - **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`

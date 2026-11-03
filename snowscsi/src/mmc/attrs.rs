@@ -20,6 +20,11 @@ pub struct MmcAttrs {
     pub write_protected: bool,
     /// The medium reports a health failure until it is explicitly reinstalled.
     pub needs_recovery: bool,
+    /// Current MMC profile of the mounted medium (`0x08` CD-ROM, `0x09` CD-R,
+    /// `0x12` DVD-RAM).
+    pub profile: u16,
+    /// Features that are Current for the mounted medium (feature codes).
+    pub current_features: &'static [u16],
 }
 
 impl MmcAttrs {
@@ -83,6 +88,56 @@ pub enum TrackKind {
     Audio,
 }
 
+/// State of one track on a recordable medium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackStatus {
+    /// The track is not on the medium yet; its start and next writable
+    /// address are still valid for the first write.
+    Invisible,
+    /// The track is reserved but carries no recorded data yet.
+    Reserved,
+    /// The track is partially recorded.
+    Incomplete,
+    /// The track is closed.
+    Complete,
+}
+
+/// Semantic track description used by READ TRACK INFORMATION.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// Track number (1-based).
+    pub number: u16,
+    /// Session the track belongs to.
+    pub session: u16,
+    /// First user block of the track (after the pre-gap).
+    pub start_lba: u64,
+    /// Recorded length in blocks (padded after a close).
+    pub length: u64,
+    /// Reserved length in blocks (`0` when not reserved).
+    pub allocated: u64,
+    /// Next writable address in blocks.
+    pub nwa: u64,
+    /// Remaining writable blocks in the track.
+    pub free_blocks: u64,
+    /// Track state.
+    pub status: TrackStatus,
+    /// Data or audio.
+    pub kind: TrackKind,
+    /// The track uses fixed-size packets.
+    pub packet: bool,
+}
+
+/// What a READ TRACK INFORMATION request addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackInfoRequest {
+    /// The track containing the given logical block.
+    Lba(u64),
+    /// The track with the given number.
+    Number(u16),
+    /// The first track of the given session.
+    Session(u16),
+}
+
 /// One session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Session {
@@ -107,6 +162,24 @@ pub struct DiscInfo {
     pub last_session_lba: u64,
     /// Whether the medium accepts random writes.
     pub writable: bool,
+    /// Whether the medium is rewritable (the Erasable bit of READ DISC
+    /// INFORMATION); a write-once medium reports `false`.
+    pub erasable: bool,
+    /// Number of the first track on the disc.
+    pub first_track: u16,
+    /// First track of the last session.
+    pub first_track_last_session: u16,
+    /// Last track of the last session.
+    pub last_track_last_session: u16,
+    /// State of the last session: `0` empty, `1` incomplete, `3` complete.
+    pub last_session_state: u8,
+    /// Start address of the last session lead-in, or `None` for "not
+    /// applicable" (`FF FF FF FF`).
+    pub last_session_lead_in: Option<u64>,
+    /// Last possible lead-out address, or `None` for "not applicable".
+    pub last_possible_lead_out: Option<u64>,
+    /// Disc type: `0` for CD-DA/CD-ROM, `0xFF` for unknown.
+    pub disc_type: u8,
 }
 
 /// Disc state (MMC-6 Table 367).
@@ -135,6 +208,8 @@ mod tests {
             sessions: 1,
             write_protected: false,
             needs_recovery: false,
+            profile: 0x0008,
+            current_features: &[0x0010, 0x001D, 0x001E],
         }
     }
 
@@ -179,8 +254,54 @@ mod tests {
             sessions: 1,
             last_session_lba: 15,
             writable: false,
+            erasable: false,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 3,
+            last_session_lead_in: None,
+            last_possible_lead_out: None,
+            disc_type: 0,
         };
         assert_eq!(info.status, DiscStatus::Finalized);
         assert_ne!(DiscStatus::Other(2), DiscStatus::Finalized);
+        assert_eq!(info.first_track, 1);
+        assert_eq!(info.last_session_state, 3);
+        assert_eq!(info.last_session_lead_in, None);
+        assert_eq!(info.disc_type, 0);
+    }
+
+    #[test]
+    fn track_info_values_are_copyable() {
+        let info = TrackInfo {
+            number: 2,
+            session: 1,
+            start_lba: 100,
+            length: 20,
+            allocated: 32,
+            nwa: 120,
+            free_blocks: 12,
+            status: TrackStatus::Incomplete,
+            kind: TrackKind::Data,
+            packet: false,
+        };
+        let copy = info;
+        assert_eq!(copy, info);
+        assert_eq!(info.status, TrackStatus::Incomplete);
+        assert_ne!(TrackStatus::Incomplete, TrackStatus::Complete);
+        assert_ne!(TrackStatus::Reserved, TrackStatus::Invisible);
+    }
+
+    #[test]
+    fn attrs_carry_the_medium_profile_and_current_features() {
+        let attrs = attrs(MmcWriteMode::ReadOnly);
+        assert_eq!(attrs.profile, 0x0008);
+        assert_eq!(attrs.current_features, &[0x0010, 0x001D, 0x001E]);
+    }
+
+    #[test]
+    fn track_info_request_addresses_a_track() {
+        assert_ne!(TrackInfoRequest::Lba(0), TrackInfoRequest::Number(1));
+        assert_eq!(TrackInfoRequest::Session(1), TrackInfoRequest::Session(1));
     }
 }

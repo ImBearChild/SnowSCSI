@@ -93,6 +93,8 @@ impl FlatCdMedium {
                 sessions: 1,
                 write_protected: false,
                 needs_recovery: false,
+                profile: 0x0008,
+                current_features: &[0x0010, 0x001D, 0x001E],
             },
             op: None,
             phase: FlatState::Idle,
@@ -330,9 +332,11 @@ impl MmcMedium for FlatCdMedium {
             }
             MmcOp::Commit => Op::Sync,
             // Drive-owned descriptor/format operations never reach the medium.
-            MmcOp::Format { .. } | MmcOp::Close | MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
-                return Err(Completion::Check(INVALID_FIELD))
-            }
+            MmcOp::Format { .. }
+            | MmcOp::Close { .. }
+            | MmcOp::ReserveTrack { .. }
+            | MmcOp::TrackInfo { .. }
+            | MmcOp::DiscInfo => return Err(Completion::Check(INVALID_FIELD)),
         };
         self.op = Some(action);
         self.phase = FlatState::Publish;
@@ -505,6 +509,14 @@ impl MmcMedium for FlatCdMedium {
             sessions: 1,
             last_session_lba: self.attrs.sectors.saturating_sub(1),
             writable: false,
+            erasable: false,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 3,
+            last_session_lead_in: None,
+            last_possible_lead_out: None,
+            disc_type: 0,
         }
     }
 }

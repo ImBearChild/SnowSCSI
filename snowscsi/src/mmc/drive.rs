@@ -95,6 +95,8 @@ const NO_MEDIUM_ATTRS: MmcAttrs = MmcAttrs {
     sessions: 0,
     write_protected: false,
     needs_recovery: false,
+    profile: 0x0000,
+    current_features: &[],
 };
 
 /// Drive (LU) capabilities: what this drive supports with **no** medium.
@@ -176,7 +178,7 @@ impl MmcCaps {
     /// current features, capacity).
     #[must_use]
     pub const fn hyper_multi() -> Self {
-        Self::new(&DVDRAM_PROFILES, &CDROM_CAPABILITIES_PAGE, true)
+        Self::new(&HYPER_MULTI_PROFILES, &CDROM_CAPABILITIES_PAGE, true)
     }
 
     /// The 36-byte DVD-RAM legacy view (fewer write-speed descriptors) with the
@@ -271,8 +273,11 @@ enum Query {
         /// Requested track number.
         track: u16,
     },
-    /// CLOSE TRACK SESSION: validated, no medium operation.
-    Close,
+    /// CLOSE TRACK SESSION: validated; the drive still owns the transition.
+    Close {
+        /// Decoded close operation (`function` is only 0 for now).
+        op: MmcOp,
+    },
     /// FORMAT UNIT / BLANK zero-fill state machine.
     Format(FormatCmd),
 }
@@ -661,7 +666,11 @@ impl<M: MmcMedium> MmcDrive<M> {
         if self.medium.is_none() {
             return Err(Completion::Check(MEDIUM_NOT_PRESENT));
         }
-        self.query = Query::Close;
+        self.query = Query::Close {
+            op: MmcOp::Close {
+                function: cdb[2] & 0x07,
+            },
+        };
         Ok(())
     }
 
@@ -1092,8 +1101,14 @@ impl<M: MmcMedium> MmcDrive<M> {
                     None => false,
                 })
             }
-            Query::Close => {
+            Query::Close { op } => {
                 self.query = Query::None;
+                // Validation admits only close function 0, so the decoded
+                // operation is a no-op for the medium until a recordable
+                // medium owns the close transition.
+                if let MmcOp::Close { function } = op {
+                    debug_assert_eq!(function, 0, "only close function 0 is admitted");
+                }
                 // CLOSE is the write-state transition; a writable medium gets
                 // its local metadata commit hook (no storage IO). A failure is
                 // reported as the command's CHECK.
@@ -1681,7 +1696,11 @@ const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00
 /// narrow capability set.
 #[cfg(test)]
 const CDROM_PROFILES: [u16; 1] = [0x08];
-/// Profiles a DVD-RAM recorder supports; the non-current one is still listed.
+/// Profiles the default Hyper-Multi drive supports, in descending order; the
+/// non-current ones are still listed.
+const HYPER_MULTI_PROFILES: [u16; 3] = [0x12, 0x09, 0x08];
+/// Profiles the narrower DVD-RAM recorder view supports; the non-current one
+/// is still listed.
 const DVDRAM_PROFILES: [u16; 2] = [0x12, 0x08];
 /// CD/DVD Capabilities page 0x2A, fixed 64-byte CD-ROM view
 /// (`CDROM_CAPABILITIES`, cdrom/common.rs:446).
@@ -2186,27 +2205,29 @@ mod tests {
         let profile = dev.spc_profile().expect("profile");
         let mut buf = [0u8; 128];
         let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
-        assert_eq!(n, 88);
-        assert_eq!(&buf[0..4], &84u32.to_be_bytes());
+        assert_eq!(n, 92);
+        assert_eq!(&buf[0..4], &88u32.to_be_bytes());
         assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
-        // Profile List: the Hyper-Multi drive supports [0x12, 0x08]; only the
-        // mounted CD-ROM profile is Current.
+        // Profile List: the Hyper-Multi drive supports [0x12, 0x09, 0x08];
+        // only the mounted CD-ROM profile is Current.
         assert_eq!(&buf[8..10], &[0x00, 0x00]);
         assert_eq!(buf[10], 0x03);
-        assert_eq!(buf[11], 8);
+        assert_eq!(buf[11], 12);
         assert_eq!(&buf[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(buf[15], 0);
-        assert_eq!(&buf[16..18], &0x0008u16.to_be_bytes());
-        assert_eq!(buf[19], 0x01);
+        assert_eq!(&buf[16..18], &0x0009u16.to_be_bytes());
+        assert_eq!(buf[19], 0);
+        assert_eq!(&buf[20..22], &0x0008u16.to_be_bytes());
+        assert_eq!(buf[23], 0x01);
         // Core, Removable Medium, Random Readable, MultiRead, CD Read,
         // Random Writable + Defect Management (Current=0 on a read-only disc).
-        assert_eq!(&buf[20..22], &[0x00, 0x01]);
-        assert_eq!(&buf[32..34], &[0x00, 0x03]);
-        assert_eq!(&buf[40..42], &[0x00, 0x10]);
-        assert_eq!(&buf[44..48], &2048u32.to_be_bytes());
-        assert_eq!(buf[49], 0x01);
-        assert_eq!(&buf[52..54], &[0x00, 0x1D]);
-        assert_eq!(&buf[56..58], &[0x00, 0x1E]);
+        assert_eq!(&buf[24..26], &[0x00, 0x01]);
+        assert_eq!(&buf[36..38], &[0x00, 0x03]);
+        assert_eq!(&buf[44..46], &[0x00, 0x10]);
+        assert_eq!(&buf[48..52], &2048u32.to_be_bytes());
+        assert_eq!(buf[53], 0x01);
+        assert_eq!(&buf[56..58], &[0x00, 0x1D]);
+        assert_eq!(&buf[60..62], &[0x00, 0x1E]);
         let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
         assert_eq!(buf[at20 + 2] & 1, 0);
 
@@ -2402,6 +2423,16 @@ mod tests {
                     sessions: 1,
                     write_protected: false,
                     needs_recovery: false,
+                    profile: if matches!(write_mode, MmcWriteMode::Rewritable) {
+                        0x0012
+                    } else {
+                        0x0008
+                    },
+                    current_features: if matches!(write_mode, MmcWriteMode::Rewritable) {
+                        &[0x0010, 0x001D, 0x001E, 0x0020, 0x0024]
+                    } else {
+                        &[0x0010, 0x001D, 0x001E]
+                    },
                 },
                 attrs_calls: Cell::new(0),
                 begin_calls: Cell::new(0),
@@ -2485,6 +2516,14 @@ mod tests {
                 sessions: 1,
                 last_session_lba: self.attrs.sectors.saturating_sub(1),
                 writable: false,
+                erasable: false,
+                first_track: 1,
+                first_track_last_session: 1,
+                last_track_last_session: 1,
+                last_session_state: 3,
+                last_session_lead_in: None,
+                last_possible_lead_out: None,
+                disc_type: 0,
             }
         }
     }
@@ -3405,11 +3444,13 @@ mod tests {
             &0x0000u16.to_be_bytes(),
             "no current profile"
         );
-        assert_eq!(absent[11], 8, "recorder + CD-ROM profiles stay listed");
+        assert_eq!(absent[11], 12, "recorder, CD-R and CD-ROM stay listed");
         assert_eq!(&absent[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(absent[15], 0);
-        assert_eq!(&absent[16..18], &0x0008u16.to_be_bytes());
+        assert_eq!(&absent[16..18], &0x0009u16.to_be_bytes());
         assert_eq!(absent[19], 0);
+        assert_eq!(&absent[20..22], &0x0008u16.to_be_bytes());
+        assert_eq!(absent[23], 0);
         // RT=10b and RT=01b also answer from the absent default.
         assert!(profile.get_configuration(2, 0x0050, None).is_some());
         assert!(profile.get_configuration(1, 0x0010, None).is_some());
@@ -3479,7 +3520,7 @@ mod tests {
         assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
         // GC/GESN answer explicitly with the zero-sector view instead of
         // delegating to `Spc` (which would reject for an unrelated reason).
-        assert_eq!(profile.get_configuration(0, 0, None), Some(88));
+        assert_eq!(profile.get_configuration(0, 0, None), Some(92));
         assert_eq!(profile.event_status(0x10, None), Some(8));
 
         let mut cdb = [0u8; 10];
@@ -3507,12 +3548,14 @@ mod tests {
         let n = profile
             .get_configuration(0, 0, Some(&mut buf))
             .expect("GC on an empty drive");
-        assert_eq!(n, 88);
+        assert_eq!(n, 92);
         assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
         assert_eq!(&buf[12..14], &0x12u16.to_be_bytes());
         assert_eq!(buf[15], 0);
-        assert_eq!(&buf[16..18], &0x08u16.to_be_bytes());
+        assert_eq!(&buf[16..18], &0x09u16.to_be_bytes());
         assert_eq!(buf[19], 0);
+        assert_eq!(&buf[20..22], &0x08u16.to_be_bytes());
+        assert_eq!(buf[23], 0);
         let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
         assert_eq!(buf[at20 + 2] & 1, 0);
         assert!(buf[at20 + 4..at20 + 16].iter().all(|b| *b == 0));
@@ -3721,6 +3764,8 @@ mod tests {
                 sessions: 1,
                 write_protected: false,
                 needs_recovery: false,
+                profile: 0x0012,
+                current_features: &[0x0010, 0x001D, 0x001E, 0x0020, 0x0024],
             }
         }
 
@@ -3767,6 +3812,14 @@ mod tests {
                 sessions: 1,
                 last_session_lba: 3,
                 writable: true,
+                erasable: true,
+                first_track: 1,
+                first_track_last_session: 1,
+                last_track_last_session: 1,
+                last_session_state: 3,
+                last_session_lead_in: None,
+                last_possible_lead_out: None,
+                disc_type: 0xFF,
             }
         }
     }
@@ -3861,12 +3914,14 @@ mod tests {
             .expect("configuration");
         assert_eq!(&buf[0..4], &((total - 4) as u32).to_be_bytes());
         assert_eq!(&buf[6..8], &0x0012u16.to_be_bytes());
-        // Two profile-list entries: DVD-RAM first (current), CD-ROM second.
-        assert_eq!(buf[11], 8);
+        // Three profile-list entries: DVD-RAM (current), CD-R, CD-ROM.
+        assert_eq!(buf[11], 12);
         assert_eq!(&buf[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(buf[15], 0x01);
-        assert_eq!(&buf[16..18], &0x0008u16.to_be_bytes());
+        assert_eq!(&buf[16..18], &0x0009u16.to_be_bytes());
         assert_eq!(buf[19], 0x00);
+        assert_eq!(&buf[20..22], &0x0008u16.to_be_bytes());
+        assert_eq!(buf[23], 0x00);
 
         let mut at = 8usize;
         let mut codes = [0u16; 8];
@@ -3881,16 +3936,16 @@ mod tests {
         assert!(codes[..n].contains(&0x0024), "Defect Management");
         // Descriptor arithmetic: profile list (2), core, removable, readable,
         // multiread, CD read -> Random Writable at 64, Defect Management at 80.
-        assert_eq!(&buf[64..66], &[0x00, 0x20]);
-        assert_eq!(buf[66], 0x05); // version 1, current
-        assert_eq!(buf[67], 0x0C);
-        assert_eq!(&buf[68..72], &3u32.to_be_bytes());
-        assert_eq!(&buf[72..76], &2048u32.to_be_bytes());
-        assert_eq!(&buf[76..78], &16u16.to_be_bytes());
-        assert_eq!(buf[78], 0x00); // PP
-        assert_eq!(&buf[80..82], &[0x00, 0x24]);
-        assert_eq!(buf[82], 0x05);
-        assert_eq!(buf[83], 0x04);
+        assert_eq!(&buf[68..70], &[0x00, 0x20]);
+        assert_eq!(buf[70], 0x05); // version 1, current
+        assert_eq!(buf[71], 0x0C);
+        assert_eq!(&buf[72..76], &3u32.to_be_bytes());
+        assert_eq!(&buf[76..80], &2048u32.to_be_bytes());
+        assert_eq!(&buf[80..82], &16u16.to_be_bytes());
+        assert_eq!(buf[82], 0x00); // PP
+        assert_eq!(&buf[84..86], &[0x00, 0x24]);
+        assert_eq!(buf[86], 0x05);
+        assert_eq!(buf[87], 0x04);
     }
 
     #[test]

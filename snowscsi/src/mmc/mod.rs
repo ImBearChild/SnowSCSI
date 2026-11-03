@@ -7,6 +7,10 @@
 //! by `Spc` through `SpcProfile`; the media command table stays in the drive.
 //! [`MmcCaps`](crate::mmc::MmcCaps) is the LU's capability (profiles, 0x2A,
 //! random writable) and survives an eject; `MmcAttrs` describes the disc.
+//! [`TrackInfo`](crate::mmc::TrackInfo) and
+//! [`TrackInfoRequest`](crate::mmc::TrackInfoRequest) describe one track and
+//! the READ TRACK INFORMATION address modes; recordable media use them to
+//! expose reserved and partially recorded tracks.
 //!
 //! Byte layouts follow the production baseline in `crate::cdrom::{common,drive}`
 //! and are re-implemented here, so this module has no runtime dependency on the
@@ -28,7 +32,8 @@ pub mod op;
 pub mod vendor;
 
 pub use self::attrs::{
-    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackKind,
+    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
+    TrackInfoRequest, TrackKind, TrackStatus,
 };
 pub use self::drive::{MmcCaps, MmcDrive};
 #[cfg(feature = "dvdram")]

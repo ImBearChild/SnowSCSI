@@ -14,7 +14,7 @@ categories = ["embedded", "no-std", "hardware-support"]
 [package.metadata.docs.rs]
 # `log` and `defmt` are mutually exclusive, so no `all-features`: build every
 # transport/media feature with the `log` backend.
-features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "log", "async-io"]
+features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle", "log", "async-io"]
 
 [features]
 default = ["std"]
@@ -26,6 +26,8 @@ cdrom = ["scsi"]
 livefs = ["cdrom"]
 usb = ["scsi"]
 bundle = ["snowscsi-common/bundle"]
+# Recordable-media support; the INI parser backs the medium's metadata bundle.
+cdr-bundle = ["dep:ini_core"]
 log = ["dep:log", "snowscsi-common/log"]
 defmt = ["dep:defmt", "embedded-io/defmt", "snowscsi-common/defmt"]
 # Async facade: model-agnostic async seams (no runtime binding).
@@ -40,6 +42,7 @@ snowscsi-common.workspace = true
 snowscsi-iso9660.workspace = true
 log = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
+ini_core = { version = "0.2", default-features = false, optional = true }
 embassy-usb = { workspace = true, optional = true }
 embassy-time = { workspace = true, optional = true }
 

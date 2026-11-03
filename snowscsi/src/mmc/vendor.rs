@@ -90,6 +90,8 @@ impl VendorMedium {
                 sessions: 1,
                 write_protected: false,
                 needs_recovery: false,
+                profile: 0x0008,
+                current_features: &[0x0010, 0x001D, 0x001E],
             },
             op: None,
             phase: VendorState::Idle,
@@ -327,7 +329,8 @@ impl MmcMedium for VendorMedium {
             MmcOp::Format { .. } | MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
                 return Err(Completion::Check(INVALID_FIELD))
             }
-            MmcOp::Close => return Err(Completion::Good),
+            MmcOp::Close { .. } => return Err(Completion::Good),
+            MmcOp::ReserveTrack { .. } => return Err(Completion::Check(INVALID_FIELD)),
         };
         self.op = Some(action);
         self.phase = VendorState::Publish;
@@ -501,6 +504,14 @@ impl MmcMedium for VendorMedium {
             sessions: 1,
             last_session_lba: self.attrs.sectors.saturating_sub(1),
             writable: false,
+            erasable: false,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 3,
+            last_session_lead_in: None,
+            last_possible_lead_out: None,
+            disc_type: 0,
         }
     }
 }

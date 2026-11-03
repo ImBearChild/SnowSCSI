@@ -8,7 +8,7 @@
 //! `commit` is a local metadata hook only (no storage IO); durable host data is
 //! committed by `MmcOp::Commit` (SYNCHRONIZE CACHE).
 
-use super::attrs::{DiscInfo, MmcAttrs, Session, Track};
+use super::attrs::{DiscInfo, MmcAttrs, Session, Track, TrackInfo, TrackInfoRequest, TrackStatus};
 use super::op::MmcOp;
 use crate::core::{Completion, Feedback, InterruptReason, KnownEffects, PollStep};
 
@@ -65,6 +65,115 @@ pub trait MmcMedium {
     /// Read-only session description for TOC format 1.
     fn session(&self, number: u16) -> Option<Session>;
 
+    /// Track description for READ TRACK INFORMATION.
+    ///
+    /// The default projects [`Self::track`], [`Self::session`] and
+    /// [`Self::attrs`] as a closed, fully recorded medium: every selected
+    /// track is [`TrackStatus::Complete`], its recorded and allocated length
+    /// are its block count, the next writable address is one past its end and
+    /// nothing remains free. A recordable medium overrides this to expose
+    /// partial, reserved and invisible tracks.
+    ///
+    /// `Number(0)` and `Number(0xFF)` select no track here; those encodings
+    /// only have meaning on recordable media.
+    fn track_info(&self, request: TrackInfoRequest) -> Option<TrackInfo> {
+        match request {
+            TrackInfoRequest::Number(0 | 0xFF) => None,
+            TrackInfoRequest::Number(number) => self.track(number).map(recorded_track_info),
+            TrackInfoRequest::Lba(lba) => {
+                let attrs = self.attrs();
+                (1..=attrs.tracks)
+                    .filter_map(|number| self.track(number))
+                    .find(|track| {
+                        lba >= track.start_lba && lba < track.start_lba.saturating_add(track.blocks)
+                    })
+                    .map(recorded_track_info)
+            }
+            TrackInfoRequest::Session(number) => {
+                let session = self.session(number)?;
+                self.track(session.first_track).map(recorded_track_info)
+            }
+        }
+    }
+
     /// Disc-information summary for READ DISC INFORMATION.
     fn disc_info(&self) -> DiscInfo;
+}
+
+/// Project a closed, fully recorded track into the track-information view.
+fn recorded_track_info(track: Track) -> TrackInfo {
+    TrackInfo {
+        number: track.number,
+        session: track.session,
+        start_lba: track.start_lba,
+        length: track.blocks,
+        allocated: track.blocks,
+        nwa: track.start_lba.saturating_add(track.blocks),
+        free_blocks: 0,
+        status: TrackStatus::Complete,
+        kind: track.kind,
+        packet: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmc::attrs::TrackKind;
+    use crate::mmc::flat::FlatCdMedium;
+
+    #[test]
+    fn default_track_info_describes_the_recorded_track() {
+        let medium = FlatCdMedium::read_only(16);
+        let info = medium
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.number, 1);
+        assert_eq!(info.session, 1);
+        assert_eq!(info.start_lba, 0);
+        assert_eq!(info.length, 16);
+        assert_eq!(info.allocated, 16);
+        assert_eq!(info.nwa, 16);
+        assert_eq!(info.free_blocks, 0);
+        assert_eq!(info.status, TrackStatus::Complete);
+        assert_eq!(info.kind, TrackKind::Data);
+        assert!(!info.packet);
+    }
+
+    #[test]
+    fn default_track_info_selects_by_lba() {
+        let medium = FlatCdMedium::read_only(16);
+        assert_eq!(
+            medium
+                .track_info(TrackInfoRequest::Lba(15))
+                .map(|i| i.number),
+            Some(1)
+        );
+        assert_eq!(medium.track_info(TrackInfoRequest::Lba(16)), None);
+        assert_eq!(
+            medium
+                .track_info(TrackInfoRequest::Lba(0))
+                .map(|i| i.number),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn default_track_info_selects_the_first_track_of_a_session() {
+        let medium = FlatCdMedium::read_only(16);
+        assert_eq!(
+            medium
+                .track_info(TrackInfoRequest::Session(1))
+                .map(|i| i.number),
+            Some(1)
+        );
+        assert_eq!(medium.track_info(TrackInfoRequest::Session(2)), None);
+    }
+
+    #[test]
+    fn default_track_info_has_no_zero_or_lead_out_track() {
+        let medium = FlatCdMedium::read_only(16);
+        assert_eq!(medium.track_info(TrackInfoRequest::Number(0)), None);
+        assert_eq!(medium.track_info(TrackInfoRequest::Number(0xFF)), None);
+    }
 }

@@ -883,6 +883,7 @@ dependencies = [
  "embassy-usb",
  "embedded-io 0.7.1",
  "heapless 0.8.0",
+ "ini_core",
  "log",
  "snowscsi-common",
  "snowscsi-iso9660",

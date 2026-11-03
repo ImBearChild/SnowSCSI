@@ -155,6 +155,8 @@ impl SpyMedium {
                 sessions: 1,
                 write_protected: false,
                 needs_recovery: false,
+                profile: 0x0012,
+                current_features: &[0x0010, 0x001D, 0x001E, 0x0020, 0x0024],
             },
             counters,
         }
@@ -222,6 +224,14 @@ impl MmcMedium for SpyMedium {
             sessions: 1,
             last_session_lba: self.attrs.sectors.saturating_sub(1),
             writable: true,
+            erasable: true,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 3,
+            last_session_lead_in: None,
+            last_possible_lead_out: None,
+            disc_type: 0xFF,
         }
     }
 }
@@ -1167,11 +1177,13 @@ fn no_medium_gc_and_gesn_answer_explicitly_through_spc() {
         "GC must answer explicitly, not delegate"
     );
     assert_eq!(&work[6..8], &0x0000u16.to_be_bytes(), "no current profile");
-    assert_eq!(work[11], 8, "recorder + CD-ROM profiles stay listed");
+    assert_eq!(work[11], 12, "recorder, CD-R and CD-ROM stay listed");
     assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
     assert_eq!(work[15], 0, "no profile is current");
-    assert_eq!(&work[16..18], &0x0008u16.to_be_bytes());
+    assert_eq!(&work[16..18], &0x0009u16.to_be_bytes());
     assert_eq!(work[19], 0, "no profile is current");
+    assert_eq!(&work[20..22], &0x0008u16.to_be_bytes());
+    assert_eq!(work[23], 0, "no profile is current");
 
     // MODE SENSE 0x2A is a drive query: it answers while the tray is empty,
     // from the drive capabilities rather than the (absent) medium.

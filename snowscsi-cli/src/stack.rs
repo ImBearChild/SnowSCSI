@@ -593,6 +593,7 @@ impl Lu for CliLu {
 
 /// Convert a `Change<CliPair>` into the slot-specific pair, keeping the
 /// original on a type mismatch (the caller returns it unchanged).
+#[allow(clippy::result_large_err)]
 fn change_cross<P>(
     change: Change<CliPair>,
     f: impl Fn(CliPair) -> Result<P, CliPair>,

@@ -104,6 +104,8 @@ impl DvdRamMedium {
                 sessions: 1,
                 write_protected: false,
                 needs_recovery: false,
+                profile: 0x0012,
+                current_features: &[0x0010, 0x001D, 0x001E, 0x0020, 0x0024],
             },
             op: None,
             phase: DvdRamState::Idle,
@@ -375,7 +377,9 @@ impl MmcMedium for DvdRamMedium {
             MmcOp::Format { .. } => Op::Format,
             // CLOSE TRACK SESSION changes the drive-level write state; a
             // DVD-RAM has no track/session to close and is already writable.
-            MmcOp::Close => return Err(Completion::Good),
+            MmcOp::Close { .. } => return Err(Completion::Good),
+            // Track reservation is sequential-media vocabulary.
+            MmcOp::ReserveTrack { .. } => return Err(Completion::Check(INVALID_FIELD)),
             MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
                 return Err(Completion::Check(INVALID_FIELD))
             }
@@ -781,6 +785,14 @@ impl MmcMedium for DvdRamMedium {
             sessions: 1,
             last_session_lba: self.attrs.sectors.saturating_sub(1),
             writable: true,
+            erasable: true,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 3,
+            last_session_lead_in: None,
+            last_possible_lead_out: None,
+            disc_type: 0xFF,
         }
     }
 }
@@ -805,6 +817,11 @@ mod tests {
         assert_eq!(a.sessions, 1);
         assert!(!a.write_protected);
         assert!(a.write_accessible());
+        assert_eq!(a.profile, 0x0012);
+        assert_eq!(
+            a.current_features,
+            &[0x0010, 0x001D, 0x001E, 0x0020, 0x0024]
+        );
         assert_eq!(DvdRamMedium::from_bytes(4095).attrs().sectors, 1);
     }
 
@@ -823,9 +840,13 @@ mod tests {
             }),
             Err(Completion::Check(INVALID_FIELD))
         );
-        assert_eq!(m.begin(MmcOp::Close), Err(Completion::Good));
+        assert_eq!(m.begin(MmcOp::Close { function: 0 }), Err(Completion::Good));
         assert_eq!(
             m.begin(MmcOp::DiscInfo),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            m.begin(MmcOp::ReserveTrack { size: 16 }),
             Err(Completion::Check(INVALID_FIELD))
         );
         assert!(!m.active());
