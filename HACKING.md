@@ -117,13 +117,13 @@ storage with these resource ids:
 - Any other id is a contract fault; the medium never emits one.
 
 A track resource is created/truncated by its first write at offset `0`, and a
-short read zero-fills. A TOC save pre-opens/truncates the target slot once;
-the medium then writes the body/padding first (offset 256) and the 256-byte
-header at offset 0 last, so a plain write at offset 0 must **not** truncate an
-existing resource. A FUA write syncs its data, and both CLOSE TRACK SESSION and
-SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`) before
-writing and syncing the TOC slot. The medium never deletes track files; the
-application reconciles orphans with `CdrBundleMedium::track_numbers`.
+short read zero-fills. A TOC save creates the target slot lazily with the
+body/padding write at offset 256, rewrites the 256-byte header at offset 0
+last, and then fsyncs the slot, so a plain write at offset 0 must **not**
+truncate an existing resource. A FUA write syncs its data, and both CLOSE TRACK
+SESSION and SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`)
+before writing and syncing the TOC slot. The medium never deletes track files;
+the application reconciles orphans with `CdrBundleMedium::track_numbers`.
 
 The CLI application maps that contract onto a host directory with
 `--cdrom bundle=<dir>` (`cdr-bundle` feature):
@@ -142,13 +142,14 @@ The CLI application maps that contract onto a host directory with
   passes capacity `0` on reopen and warns when the hint differs, so `medium=`
   and `slot=` only describe a new blank bundle. A missing directory is created
   with a warning for `recovery=delete`; `recovery=readonly` requires an
-  existing TOC and never creates one. `Sync` reaches the filesystem seam's
-  page-cache flush only (no fsync). Orphan track files are not removed in v1;
-  stale tails are ignored because the TOC bounds every read. On host eject the
-  LUN plane is dropped and unsaved state is lost, so the host must
-  CLOSE/SYNCHRONIZE CACHE before ejecting; the LUN stays empty (no automatic
-  reinsert). The same `exec` drives the inline and `--banks dual` worker paths,
-  so a bundle LUN is resource-correct on both.
+  existing TOC and never creates one. A resource `Sync` fsyncs the addressed
+  track or TOC slot, and the aggregate `Sync { resource: 0 }` fsyncs every
+  dirty track and TOC file before `SYNCHRONIZE CACHE`/`CLOSE` reports GOOD.
+  Orphan track files are not removed in v1; stale tails are ignored because the
+  TOC bounds every read. On host eject the LUN plane is dropped and unsaved
+  state is lost, so the host must CLOSE/SYNCHRONIZE CACHE before ejecting; the
+  LUN stays empty (no automatic reinsert). The same `exec` drives the inline and
+  `--banks dual` worker paths, so a bundle LUN is resource-correct on both.
 
 ## Commit Messages
 

@@ -10,10 +10,10 @@
 //! - any other resource id is a contract fault, never a valid request.
 //!
 //! A track resource is created/truncated by its first write at offset `0`;
-//! short reads zero-fill. For a TOC save the application opens/truncates the
-//! target slot once, then the medium writes the body at offset 256 first and
-//! the 256-byte header at offset 0 last: a plain write at offset 0 must not
-//! truncate an existing resource. The track/session layout (the TOC) is
+//! short reads zero-fill. A TOC save creates the target slot lazily with the
+//! body/padding write at offset 256, rewrites the 256-byte header at offset 0
+//! last, and then fsyncs the slot: a plain write at offset 0 must not truncate
+//! an existing resource. The track/session layout (the TOC) is
 //! persisted in two alternating slots so an interrupted save leaves the
 //! previous document intact. The header binds the body by length and CRC-32,
 //! so the last valid slot is only replaced after the whole new slot has been
@@ -3578,8 +3578,10 @@ end = 1
     #[test]
     fn toc_reserve_rolls_back_when_the_save_fails() {
         let mut medium = CdrBundleMedium::with_capacity(4096);
-        let mut store = StoreMock::default();
-        store.fail_write = true;
+        let mut store = StoreMock {
+            fail_write: true,
+            ..Default::default()
+        };
         assert_eq!(
             reserve_medium(&mut medium, &mut store, 500),
             Completion::Check(WRITE_ERROR)
@@ -3597,8 +3599,10 @@ end = 1
 
         // A slot-sync failure rolls the reservation back too.
         let mut medium = CdrBundleMedium::with_capacity(4096);
-        let mut store = StoreMock::default();
-        store.fail_sync_resource = Some(TOC_RESOURCE_0);
+        let mut store = StoreMock {
+            fail_sync_resource: Some(TOC_RESOURCE_0),
+            ..Default::default()
+        };
         assert_eq!(
             reserve_medium(&mut medium, &mut store, 500),
             Completion::Check(MEDIUM_ERROR)

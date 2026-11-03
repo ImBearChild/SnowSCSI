@@ -14,7 +14,7 @@ use core::future::Future;
 use core::task::{Context, Poll, Waker};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Wake;
 
@@ -25,7 +25,7 @@ use snowscsi::core::{Flow, ServeExit};
 use snowscsi::usb::serve::serve_async;
 use snowscsi::usb::{
     AsyncBotRecv, AsyncBotSend, BotIoErr, BotSession, CtrlAck, CtrlReply, CtrlReq, Gadget,
-    RecvMode, ServeError, CSW_LEN,
+    RecvMode, CSW_LEN,
 };
 
 use crate::iscsi_harness::{TestLu, TestPair};

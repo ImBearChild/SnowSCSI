@@ -86,6 +86,75 @@ pub enum OwnedPlane {
     Live(LiveData<StdFsBackend>),
 }
 
+/// Paths whose bytes were written but not yet fsynced.
+///
+/// The filesystem seam stays separate from this bookkeeping so the ordering
+/// rules (mark once, drop after a successful sync) are unit-testable without a
+/// mock filesystem.
+#[cfg(feature = "cdr-bundle")]
+#[derive(Default)]
+struct DirtyPaths {
+    paths: Vec<String>,
+}
+
+#[cfg(feature = "cdr-bundle")]
+impl DirtyPaths {
+    /// Mark `path` dirty once, preserving first-dirty order.
+    fn mark(&mut self, path: &str) {
+        if !self.paths.iter().any(|p| p == path) {
+            self.paths.push(path.to_string());
+        }
+    }
+
+    /// Remove `path` after it was synced.
+    fn take(&mut self, path: &str) -> bool {
+        match self.paths.iter().position(|p| p == path) {
+            Some(i) => {
+                self.paths.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fsync every dirty path once, in first-dirty order.
+    ///
+    /// A path is dropped only after its sync succeeded, so a failure leaves the
+    /// remaining work for the next aggregate sync.
+    fn sync_all<F>(&mut self, mut sync: F) -> Result<(), FsError>
+    where
+        F: FnMut(&str) -> Result<(), FsError>,
+    {
+        while let Some(path) = self.paths.first().cloned() {
+            sync(&path)?;
+            self.take(&path);
+        }
+        Ok(())
+    }
+
+    /// Fsync `path` only when it is dirty, dropping it after a successful sync.
+    fn sync_one<F>(&mut self, path: &str, sync: F) -> Result<bool, FsError>
+    where
+        F: FnOnce() -> Result<(), FsError>,
+    {
+        if !self.paths.iter().any(|p| p == path) {
+            return Ok(false);
+        }
+        sync()?;
+        self.take(path);
+        Ok(true)
+    }
+}
+
+/// Sync `path`, treating a vanished file as "nothing left to make durable".
+#[cfg(feature = "cdr-bundle")]
+fn sync_file_or_missing(fs: &mut FsPlaneAdapter<StdFsBackend>, path: &str) -> Result<(), FsError> {
+    match fs.sync_file(path) {
+        Ok(()) | Err(FsError::NotFound) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Persistent CD-R directory store.
 ///
 /// The medium addresses files by resource id (`0` = aggregate sync, `1`/`2` =
@@ -100,6 +169,8 @@ pub struct BundleStore {
     slot: Option<u32>,
     /// Track ids the configured slot can persist (`16 + n`, `n >= 1`).
     max_tracks: u16,
+    /// Files written since their last successful fsync.
+    dirty: DirtyPaths,
 }
 
 /// One TOC slot as seen during the restore probe.
@@ -122,6 +193,7 @@ impl BundleStore {
             capacity_sectors,
             slot,
             max_tracks: max_tracks_for_slot(slot.unwrap_or(TOC_SLOT_DEFAULT)),
+            dirty: DirtyPaths::default(),
         }
     }
 
@@ -132,9 +204,35 @@ impl BundleStore {
 
     /// Aggregate flush (`Sync { resource: 0 }`).
     ///
-    /// The `FsStorage` seam has no fsync, so this settles the page cache only.
+    /// Fsyncs every dirty track and TOC file and then settles the backend-wide
+    /// flush. The per-file fsync makes the written bytes durable; crash safety
+    /// of the TOC comes from the header CRC plus the alternating slots, so a
+    /// torn slot is rejected on restore.
     fn sync(&mut self) -> Result<usize, StorageError> {
-        self.fs.sync().map_err(StorageError::from)?;
+        let Self { fs, dirty, .. } = self;
+        dirty
+            .sync_all(|path| sync_file_or_missing(fs, path))
+            .map_err(StorageError::from)?;
+        fs.sync().map_err(StorageError::from)?;
+        Ok(0)
+    }
+
+    /// Fsync one resource file if a write left it dirty.
+    ///
+    /// A file that vanished since its write has nothing left to make durable,
+    /// so `NotFound` is not a sync failure. A successful per-file sync also
+    /// settles the namespace through the backend-wide sync, because a slot
+    /// created by this save has no durable directory entry before that.
+    fn sync_path(&mut self, path: &str) -> Result<usize, StorageError> {
+        let Self { fs, dirty, .. } = self;
+        let synced = dirty
+            .sync_one(path, || sync_file_or_missing(fs, path))
+            .map_err(StorageError::from)?;
+        if synced {
+            // A newly created slot has no directory entry until the namespace
+            // is settled; the backend-wide sync covers that.
+            fs.sync().map_err(StorageError::from)?;
+        }
         Ok(0)
     }
 
@@ -175,10 +273,9 @@ impl BundleStore {
         track: bool,
     ) -> Result<usize, StorageError> {
         match (req.dir, buf) {
-            // `Sync` on a TOC slot or track flushes the whole plane: the
-            // medium has no per-file durability and the `FsPlane` seam only
-            // exposes a plane-level sync.
-            (snowscsi::core::Direction::None, IoBuf::None) => self.sync(),
+            // `Sync` on a TOC slot or track fsyncs exactly that resource when a
+            // write left it dirty; a clean file is not re-synced.
+            (snowscsi::core::Direction::None, IoBuf::None) => self.sync_path(path),
             (snowscsi::core::Direction::ToHost, IoBuf::Read(b)) => {
                 if track {
                     self.read_track(path, req.offset, b)
@@ -194,8 +291,10 @@ impl BundleStore {
                     // A reused track id must not inherit a stale tail. The
                     // resource contract says its first write truncates.
                     self.fs.truncate(path)?;
+                    self.dirty.mark(path);
                 }
                 self.fs.write(path, req.offset, b)?;
+                self.dirty.mark(path);
                 Ok(b.len())
             }
             _ => Err(StorageError::Unsupported),
@@ -1151,6 +1250,118 @@ mod tests {
     #[test]
     fn owned_plane_is_send() {
         assert_send::<OwnedPlane>();
+    }
+
+    // ── CD-R dirty-path bookkeeping ──────────────────────────────────────
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn dirty_paths_mark_tracks_and_slots_once() {
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("track_1.bin");
+        dirty.mark("toc.0");
+        dirty.mark("track_1.bin");
+        assert_eq!(dirty.paths, vec!["track_1.bin", "toc.0"]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn dirty_paths_aggregate_sync_drains_everything_once() {
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("track_1.bin");
+        dirty.mark("toc.0");
+
+        let mut synced = Vec::new();
+        dirty
+            .sync_all(|path| {
+                synced.push(path.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(synced, vec!["track_1.bin", "toc.0"]);
+        assert!(dirty.paths.is_empty());
+
+        // Nothing is dirty any more, so a second aggregate sync is a no-op.
+        dirty
+            .sync_all(|path| panic!("clean path re-synced: {path}"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn dirty_paths_per_resource_sync_drains_only_that_path() {
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("track_1.bin");
+        dirty.mark("track_2.bin");
+
+        let mut synced = Vec::new();
+        assert!(dirty
+            .sync_one("track_1.bin", || {
+                synced.push("track_1.bin");
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(synced, vec!["track_1.bin"]);
+        assert_eq!(dirty.paths, vec!["track_2.bin"]);
+
+        // A clean path is not re-synced.
+        assert!(!dirty
+            .sync_one("track_1.bin", || panic!("clean path re-synced"))
+            .unwrap());
+        assert_eq!(dirty.paths, vec!["track_2.bin"]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn dirty_paths_keep_a_failed_sync_for_retry() {
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("track_1.bin");
+
+        assert!(dirty.sync_all(|_| Err(FsError::OutOfBounds)).is_err());
+        assert_eq!(dirty.paths, vec!["track_1.bin"]);
+
+        assert!(dirty
+            .sync_one("track_1.bin", || Err(FsError::OutOfBounds))
+            .is_err());
+        assert_eq!(dirty.paths, vec!["track_1.bin"]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn reads_do_not_mark_a_path_dirty() {
+        let dir = temp_dir("cdr_dirty_read");
+        let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
+        let mut store = BundleStore::new(fs, 360_000, None);
+
+        let mut out = [0xAAu8; 8];
+        assert_eq!(
+            store.exec(
+                io_req(17, 0, 8, snowscsi::core::Direction::ToHost),
+                IoBuf::Read(&mut out)
+            ),
+            Ok(8)
+        );
+        assert!(store.dirty.paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn missing_file_sync_is_not_an_error_and_drops_the_path() {
+        let dir = temp_dir("cdr_dirty_missing");
+        let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
+        let mut store = BundleStore::new(fs, 360_000, None);
+
+        store.dirty.mark("track_9.bin");
+        assert_eq!(store.sync(), Ok(0));
+        assert!(store.dirty.paths.is_empty());
+
+        store.dirty.mark("toc.0");
+        assert_eq!(store.sync_path("toc.0"), Ok(0));
+        assert!(store.dirty.paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Storage that must never be used by the no-data eject command.

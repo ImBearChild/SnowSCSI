@@ -215,6 +215,7 @@ fn map_change<P, Q>(c: Change<P>, f: impl Fn(P) -> Q) -> Change<Q> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn cross<Q>(
     change: Change<TestPair>,
     f: impl Fn(TestPair) -> Result<Q, TestPair>,

@@ -16,7 +16,7 @@ use snowscsi::core::{Flow, ServeExit};
 
 use snowscsi::core::storage::Storage;
 use snowscsi::core::{RuntimeSet, Target};
-use snowscsi::usb::{serve, BotIo, BotIoErr, BotSession, ServeError};
+use snowscsi::usb::{serve, BotIo, BotIoErr, BotSession};
 
 use crate::golden::{RecBotIo, RecGadget};
 

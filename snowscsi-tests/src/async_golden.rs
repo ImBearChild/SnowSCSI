@@ -20,9 +20,7 @@ use std::rc::Rc;
 use snowscsi::common::store::StorePlane;
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::serve::serve_async;
-use snowscsi::usb::{
-    AsyncBotRecv, AsyncBotSend, BotIo, BotIoErr, BotSession, RecvMode, ServeError,
-};
+use snowscsi::usb::{AsyncBotRecv, AsyncBotSend, BotIo, BotIoErr, BotSession, RecvMode};
 
 use crate::golden::{self, InStep, RecBotIo, RecGadget, TraceEntry, CSW_MAGIC};
 use crate::iscsi_harness::{PlaneSet, TestLu, TestPair};

@@ -99,11 +99,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires an existing TOC, and an unreadable/malformed slot is an error rather
   than a silent overwrite. Track reads return the readable prefix followed by
   zeros (a missing track file is empty), and the first write at offset `0`
-  truncates a reused track id. `Sync` settles the page cache only (the
-  `FsStorage` seam has no fsync); orphan track files are left in place. Host
-  eject drops the LUN plane and any unsaved state — the host must
-  CLOSE/SYNCHRONIZE CACHE first. The same resource mapping covers
-  `--banks dual`, so a bundle LUN can run on the worker path.
+  truncates a reused track id. A resource `Sync` fsyncs that track or TOC slot,
+  and `CLOSE`/`SYNCHRONIZE CACHE` fsync every dirty track plus the TOC slot
+  before reporting GOOD; orphan track files are left in place. Host eject drops
+  the LUN plane and any unsaved state — the host must CLOSE/SYNCHRONIZE CACHE
+  first. The same resource mapping covers `--banks dual`, so a bundle LUN can
+  run on the worker path.
+- **common**: `FsStorage::sync_file` (defaults to the backend-wide sync) and
+  `FsPlane::sync_file` (defaults to the plane-wide sync) expose per-file fsync,
+  so a resource-addressed backend can make one file durable; `StdFsBackend`
+  implements it with `File::sync_all` and fsyncs its root directory on `sync`.
 - **common**: `FsPlane::len` (seek-to-end size) and `FsPlane::truncate`
   (create/truncate), both defaulting to `Unsupported`, so a path-addressed
   backend can expose resource reuse without a new store-op variant.

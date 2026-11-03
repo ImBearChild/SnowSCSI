@@ -116,6 +116,7 @@ fn make_target(slot: &mut CardSlot) -> CardTarget<'_> {
     Target::new([slot as &mut dyn Lu<Pair = CardPair>])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive(
     target: &mut CardTarget<'_>,
     storage: &mut BlockingStorage<Plane>,
@@ -404,7 +405,6 @@ fn a_new_card_at_the_same_lun_reports_its_geometry_after_one_medium_changed_ua()
     assert_eq!(target.tick(), RunOutcome::ResourcesReady { lun: 0 });
     let old = target.take_rt(0).expect("old pair");
     assert_eq!(old.pair.map(|p| p.backing), Some(1));
-    drop(target);
 
     // Application rebuilds the LUN device with the new card geometry (same
     // LUN), then installs the new pair and raises MediumChanged before

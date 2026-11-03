@@ -48,6 +48,15 @@ pub trait FsPlane {
 
     /// Persist the filesystem.
     fn sync(&mut self) -> Result<(), FsError>;
+
+    /// Persist the file at `path` to stable storage (per-file fsync).
+    ///
+    /// Defaults to a plane-wide [`sync`](Self::sync): a backend that cannot
+    /// flush one file can still offer the stronger filesystem-wide guarantee.
+    fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+        let _ = path;
+        self.sync()
+    }
 }
 
 /// One cached open file handle, keyed by `path`.
@@ -210,6 +219,20 @@ impl<F: FsStorage, const N: usize> FsPlane for FsPlaneAdapter<F, N> {
     fn sync(&mut self) -> Result<(), FsError> {
         self.fs.sync()
     }
+
+    fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+        if let Some(i) = self.touch(path) {
+            if self.slots[i].writable {
+                // A buffered backend must see the cached handle's bytes before
+                // the fsync; a read-only handle has nothing of ours to flush.
+                self.slots[i]
+                    .file
+                    .flush()
+                    .map_err(|e| FsError::Io(e.kind()))?;
+            }
+        }
+        self.fs.sync_file(path)
+    }
 }
 
 impl<F: FsStorage, const N: usize> Drop for FsPlaneAdapter<F, N> {
@@ -235,32 +258,83 @@ mod tests {
     // drop) and a close counter records handle lifecycle.
 
     type Store = Rc<RefCell<HashMap<String, Rc<RefCell<Vec<u8>>>>>>;
+    type SyncLog = Rc<RefCell<Vec<String>>>;
+    type SyncCount = Rc<Cell<usize>>;
 
     struct MockFs {
         store: Store,
         closes: Rc<Cell<usize>>,
+        /// Paths passed to `sync_file`, in call order.
+        sync_files: SyncLog,
+        /// Number of plane-wide `sync` calls.
+        plane_syncs: SyncCount,
     }
 
     impl MockFs {
         fn new() -> (Self, Store, Rc<Cell<usize>>) {
+            let (fs, store, closes, _, _) = Self::tracked();
+            (fs, store, closes)
+        }
+
+        fn tracked() -> (Self, Store, Rc<Cell<usize>>, SyncLog, SyncCount) {
             let store: Store = Rc::default();
             let closes = Rc::new(Cell::new(0));
+            let sync_files = Rc::new(RefCell::new(Vec::new()));
+            let plane_syncs = Rc::new(Cell::new(0));
             (
                 Self {
                     store: Rc::clone(&store),
                     closes: Rc::clone(&closes),
+                    sync_files: Rc::clone(&sync_files),
+                    plane_syncs: Rc::clone(&plane_syncs),
                 },
                 store,
                 closes,
+                sync_files,
+                plane_syncs,
             )
         }
 
-        /// A fresh backend over an existing store (fresh close counter).
+        /// A fresh backend over an existing store (fresh close/sync counters).
         fn with_store(store: &Store) -> Self {
             Self {
                 store: Rc::clone(store),
                 closes: Rc::new(Cell::new(0)),
+                sync_files: Rc::new(RefCell::new(Vec::new())),
+                plane_syncs: Rc::new(Cell::new(0)),
             }
+        }
+    }
+
+    /// Backend that keeps the default [`FsStorage::sync_file`] (delegates to
+    /// the backend-wide `sync`).
+    struct DefaultSyncFs(MockFs);
+
+    impl FsStorage for DefaultSyncFs {
+        type File = MockFile;
+
+        fn open(&mut self, path: &str, opts: OpenOptions) -> Result<MockFile, FsError> {
+            self.0.open(path, opts)
+        }
+
+        fn close(&mut self, file: MockFile) {
+            self.0.close(file);
+        }
+
+        fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError> {
+            self.0.read_dir(path, out)
+        }
+
+        fn root(&self) -> &str {
+            self.0.root()
+        }
+
+        fn sync(&mut self) -> Result<(), FsError> {
+            self.0.sync()
+        }
+
+        fn remove(&mut self, path: &str) -> Result<(), FsError> {
+            self.0.remove(path)
         }
     }
 
@@ -373,6 +447,12 @@ mod tests {
         }
 
         fn sync(&mut self) -> Result<(), FsError> {
+            self.plane_syncs.set(self.plane_syncs.get() + 1);
+            Ok(())
+        }
+
+        fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+            self.sync_files.borrow_mut().push(path.to_string());
             Ok(())
         }
 
@@ -511,5 +591,31 @@ mod tests {
             .any(|e| e.name.as_str() == "b" && e.size == 2));
 
         p.sync().unwrap();
+    }
+
+    #[test]
+    fn sync_file_is_per_path_and_does_not_flush_the_plane() {
+        let (fs, _store, _closes, sync_files, plane_syncs) = MockFs::tracked();
+        let mut p = FsPlaneAdapter::<_, 8>::new(fs);
+        p.sync_file("a").unwrap();
+        assert_eq!(&*sync_files.borrow(), &["a".to_string()]);
+        assert_eq!(
+            plane_syncs.get(),
+            0,
+            "a per-file sync must not fall back to the plane-wide sync"
+        );
+    }
+
+    #[test]
+    fn default_sync_file_falls_back_to_the_backend_sync() {
+        let (fs, _store, _closes, sync_files, plane_syncs) = MockFs::tracked();
+        let mut p = FsPlaneAdapter::<_, 8>::new(DefaultSyncFs(fs));
+        assert_eq!(p.sync_file("a"), Ok(()));
+        assert!(sync_files.borrow().is_empty());
+        assert_eq!(
+            plane_syncs.get(),
+            1,
+            "a backend without a per-file primitive must fall back to its own sync"
+        );
     }
 }

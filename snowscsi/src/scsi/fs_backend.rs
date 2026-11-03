@@ -115,9 +115,44 @@ impl FsStorage for StdFsBackend {
         self.root.to_str().unwrap_or("")
     }
 
+    /// Settle namespace entries (new file names) at best effort.
+    ///
+    /// There is no open file table to flush here; per-file data durability is
+    /// [`FsStorage::sync_file`]. On Unix the root directory is fsynced so a file
+    /// created by a recent write is at least named in stable metadata; other
+    /// platforms have no portable directory-fsync primitive, so this is a
+    /// no-op there.
     fn sync(&mut self) -> Result<(), FsError> {
-        // No open file table to flush in the new FsStorage model.
-        Ok(())
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(&self.root).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => FsError::NotFound,
+                other => FsError::Io(map_io_err(other)),
+            })?;
+            dir.sync_all().map_err(|e| {
+                crate::warn!("std fs sync root {:?} failed: {}", self.root, e);
+                FsError::Io(map_io_err(e.kind()))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+        let full = self.full_path(path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&full)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => FsError::NotFound,
+                other => FsError::Io(map_io_err(other)),
+            })?;
+        file.sync_all().map_err(|e| {
+            crate::warn!("std fs sync {:?} failed: {}", full, e);
+            FsError::Io(map_io_err(e.kind()))
+        })
     }
 
     fn remove(&mut self, path: &str) -> Result<(), FsError> {
@@ -271,6 +306,24 @@ mod tests {
         let mut fs = StdFsBackend::new(&dir.to_string_lossy());
         fs.remove("gone.txt").unwrap();
         assert!(!dir.join("gone.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_root_directory_succeeds() {
+        let dir = temp_dir("sync_root");
+        let mut fs = StdFsBackend::new(&dir.to_string_lossy());
+        fs.sync().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_file_existing_and_missing() {
+        let dir = temp_dir("sync_file");
+        std::fs::write(dir.join("data.bin"), b"payload").unwrap();
+        let mut fs = StdFsBackend::new(&dir.to_string_lossy());
+        fs.sync_file("data.bin").unwrap();
+        assert_eq!(fs.sync_file("missing.bin"), Err(FsError::NotFound));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

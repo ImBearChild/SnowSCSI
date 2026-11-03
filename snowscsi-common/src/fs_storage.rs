@@ -143,6 +143,18 @@ pub trait FsStorage {
     /// Persist the entire filesystem.
     fn sync(&mut self) -> Result<(), FsError>;
 
+    /// Persist one file's data and metadata to stable storage (per-file fsync).
+    ///
+    /// A caller that writes a resource addressed by `path` uses this to make
+    /// that file durable without flushing the whole filesystem. The default
+    /// falls back to the backend-wide [`sync`](Self::sync), so a backend that
+    /// only implements the coarse flush still settles the write. A backend that
+    /// can fsync a single path should override it.
+    fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+        let _ = path;
+        self.sync()
+    }
+
     /// Remove a file (BLANK / orphan track cleanup).
     fn remove(&mut self, path: &str) -> Result<(), FsError>;
 }

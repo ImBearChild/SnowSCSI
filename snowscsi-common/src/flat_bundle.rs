@@ -18,9 +18,10 @@
 //!   and zero-fills it; it never surfaces `UnexpectedEof` as an error (which
 //!   the SCSI layer would map to READ ERROR). Missing chunks are zero-filled
 //!   too, and are only probed read-only (a hole read never creates a file).
-//! - **Best-effort `sync`:** the `FsStorage`/`embedded_io` seams cap durability
-//!   at OS page cache (`flush`). True fsync requires extending the seam; this
-//!   implementation guarantees page-cache visibility only.
+//! - **Best-effort `sync`:** the chunk slot keeps only an index, and this type
+//!   knows the path through `chunk_path(idx)`, but it deliberately relies on the
+//!   backend-wide [`FsStorage::sync`]: it flushes every open handle and then
+//!   syncs the filesystem. Per-chunk [`FsStorage::sync_file`] is not used here.
 //!
 //! # Feature gating
 //!
