@@ -42,7 +42,7 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 │       ├── usb/                   # feature "usb": bot, gadget, io, target
 │       └── dvdram.rs            # feature "dvdram": blank, host-formatted DVD-RAM media
 ├── snowscsi-cli/                 # crate: `snowscsi` binary (src/main.rs)
-│   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/log/defmt
+│   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/bundle/cdr-bundle/log/tokio/defmt
 │   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
 ├── tests/                         # crate: snowscsi-tests (integration tests)
 │   ├── Cargo.toml
@@ -91,7 +91,8 @@ Feature maps:
   Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowscsi-cli`** — `full` (default) pulls `std` +
-  `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`log` plus
+  `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`bundle`/`cdr-bundle`/`log`/
+  `tokio` plus
   std-only deps (clap/ctrlc/env_logger). Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
@@ -124,6 +125,8 @@ truncate an existing resource. A FUA write syncs its data, and both CLOSE TRACK
 SESSION and SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`)
 before writing and syncing the TOC slot. The medium never deletes track files;
 the application reconciles orphans with `CdrBundleMedium::track_numbers`.
+Serve at most one writer per bundle directory: the alternating TOC slots and
+the orphan cleanup assume a single serving process.
 
 The CLI application maps that contract onto a host directory with
 `--cdrom bundle=<dir>` (`cdr-bundle` feature):
@@ -145,9 +148,10 @@ The CLI application maps that contract onto a host directory with
   existing TOC and never creates one. A resource `Sync` fsyncs the addressed
   track or TOC slot, and the aggregate `Sync { resource: 0 }` fsyncs every
   dirty track and TOC file before `SYNCHRONIZE CACHE`/`CLOSE` reports GOOD.
-  Orphan track files are not removed in v1; stale tails are ignored because the
-  TOC bounds every read. On host eject the serve paths that own the storage
-  handle snapshot the ejected medium before its plane is dropped: USB inline
+  Orphan `track_<n>.bin` files are removed when a bundle is reopened with
+  `recovery=delete` (never with `recovery=readonly`); stale tails are ignored
+  because the TOC bounds every read. On host eject the serve paths that own the
+  storage handle snapshot the ejected medium before its plane is dropped: USB inline
   (`CliStorage`) and USB `--banks dual` (`WorkerStore`) first flush the bundle's
   track data, then render the next alternating slot (`CdrBundleMedium::toc_image`
   -> `toc.<slot>`) as a fsynced temp file renamed into place, so the slot switch
@@ -331,9 +335,9 @@ mount -o ro /dev/sr0 /mnt     # or mount the raw device
 
 A blank CD-R reports its ATIP extent in READ CAPACITY, so the block device
 is sized for the full disc before the first session and keeps that size
-after the burn. READ TOC formats 0-2 stay `24h/00` while no complete session
-exists, which keeps the kernel's last-session probe at LBA 0; format 4 (ATIP)
-is independent of session state. The finalize also reports a medium-change
+until the disc is finalized. READ TOC formats 0-2 stay `24h/00` while no
+complete session exists, which keeps the kernel's last-session probe at LBA 0;
+format 4 (ATIP) is independent of session state. The finalize also reports a medium-change
 unit attention, although a burner's own `TEST UNIT READY` can consume it first.
 
 READ TOC format 4 answers the ATIP descriptor in every disc state (blank,
@@ -343,8 +347,8 @@ header declaring an ATIP Data Length of 26 plus the 24-byte descriptor, no
 optional S4 values) with binary, not BCD, M/S/F bytes. The descriptor's
 lead-out is the same address READ DISC INFORMATION reports as the last
 possible lead-out while the disc is blank or appendable (a finalized disc
-reports `FF`), and READ CAPACITY reports that extent minus one only while the
-disc is blank (after a burn it reports the last recorded LBA).
+reports `FF`), and READ CAPACITY reports that extent minus one while the
+disc is not finalized; a finalized disc reports the last recorded LBA.
 
 The bundle directory holds the durable state:
 
@@ -355,8 +359,13 @@ The bundle directory holds the durable state:
 
 Stop the server and start it again on the same directory to prove the TOC is
 re-read (`open_at` checks each slot against its physical index, so a copied
-slot is rejected). The server never deletes orphan `track_<n>.bin` files;
-`CdrBundleMedium::track_numbers` is the reconciliation source.
+slot is rejected). A `recovery=delete` reopen removes orphan `track_<n>.bin`
+files only when the TOC was restored from a readable slot with no skipped
+candidate; a file is kept only in its canonical `track_file(n)` spelling when
+the TOC references it and the slot can persist it. An unreadable slot disables
+cleanup, and a TOC-less directory is never wiped (leftover track files are
+counted and reported). `toc.0`/`toc.1` are never touched. A `recovery=readonly`
+reopen never deletes anything.
 
 Troubleshooting:
 

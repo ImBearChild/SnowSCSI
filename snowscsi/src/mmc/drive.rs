@@ -1867,23 +1867,28 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             // geometry; READ CAPACITY must not fabricate LBA 0.
             return None;
         }
-        // A blank write-once disc has no recorded session, but its ATIP
-        // geometry already fixes the future lead-out; report that extent so
-        // the host can size the device before the first session. A blank
-        // read-only disc keeps the standard zero-sector view.
+        // An unfinalized write-once disc keeps the medium extent: the geometry
+        // already fixes the future lead-out, so a reserved-only or partially
+        // burned track must not shrink the block device when the host
+        // re-probes mid-burn. A finalized disc reports the recorded extent,
+        // and a write-once disc without a lead-out falls back to the medium
+        // geometry. A blank rewritable/read-only disc keeps the standard
+        // one-block view.
         let last = self.medium.as_ref().map_or_else(
             || attrs.sectors.saturating_sub(1),
             |medium| {
                 let info = medium.disc_info();
-                if info.status == DiscStatus::Empty {
-                    if attrs.write_mode == MmcWriteMode::WriteOnce {
-                        info.last_possible_lead_out
-                            .unwrap_or(0)
-                            .max(0)
-                            .saturating_sub(1) as u64
+                if attrs.write_mode == MmcWriteMode::WriteOnce {
+                    if info.status == DiscStatus::Finalized {
+                        info.last_session_lba
                     } else {
-                        0
+                        let extent = info
+                            .last_possible_lead_out
+                            .map_or(attrs.sectors, |lead_out| lead_out.max(0) as u64);
+                        extent.saturating_sub(1)
                     }
+                } else if info.status == DiscStatus::Empty {
+                    0
                 } else {
                     info.last_session_lba
                 }

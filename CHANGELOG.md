@@ -31,14 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mmc**: `DiscInfo::last_possible_lead_out` of a blank/appendable `cdr-bundle`
   disc is the medium capacity (the ATIP lead-out), not `capacity - 2`.
   READ CAPACITY reports `last_possible_lead_out - 1` (the ATIP extent minus
-  one) while the disc is blank; after a burn it reports the last recorded LBA.
+  one) whenever the write-once disc is not finalized, so a reserved-only or
+  partially burned disc keeps the full device size; a finalized disc reports
+  the last recorded LBA.
 
 ### Added
 
 - **mmc**: a blank write-once CD reports its ATIP extent in READ CAPACITY,
   so the host sizes the block device before the first session; READ TOC
   formats 0-2 stay `24h/00` until a session completes (format 4 is independent
-  of session state).
+  of session state). An unfinalized disc keeps reporting that extent after a
+  track is reserved or partially burned, so a mid-burn re-probe cannot shrink
+  the block device; only a finalized disc reports the recorded last LBA.
 - **mmc**: READ TOC format 4 (ATIP) on a `cdr-bundle` CD-R — the 28-byte block
   (ATIP Data Length 26 plus the 24-byte descriptor, no optional S4 values) with
   binary M/S/F lead-in/lead-out times, so `wodim -atip`, `cdrecord -atip` and
@@ -62,9 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   UNIT/BLANK reject write-once media, CLOSE TRACK SESSION routes close
   functions 001b/010b to the medium, READ DISC/TRACK INFORMATION encode the
   recordable disc and track state (MMC-6 DIB/TIB), READ CAPACITY reports the
-  last recorded block, GET CONFIGURATION reports profile `0x09` with the
-  incremental-streaming and CD-track-at-once features, and READ TOC formats 0,
-  1 and 2 walk the recorded track/session layout and the raw lead-in. The ATIP
+  medium extent until the disc is finalized, then the last recorded block, GET
+  CONFIGURATION reports profile `0x09` with the incremental-streaming and
+  CD-track-at-once features, and READ TOC formats 0, 1 and 2 walk the recorded
+  track/session layout and the raw lead-in. The ATIP
   format 4 is covered separately under the format-4 entry above.
 - **mmc**: persistent TOC for the `cdr-bundle` CD-R medium — the track/session
   layout is written to two alternating INI slots (`toc.0`/`toc.1`, storage
@@ -139,8 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zeros (a missing track file is empty), and the first write at offset `0`
   truncates a reused track id. A resource `Sync` fsyncs that track or TOC slot,
   and `CLOSE`/`SYNCHRONIZE CACHE` fsync every dirty track plus the TOC slot
-  before reporting GOOD; orphan track files are left in place. On host eject
-  the paths that own the store (USB inline and USB `--banks dual`) flush the
+  before reporting GOOD. On host eject the paths that own the store (USB inline
+  and USB `--banks dual`) flush the
   bundle's track data, then render the next alternating TOC slot and install it
   atomically via a fsynced `toc.<slot>.tmp` rename; the async iSCSI accept loop
   snapshots too but cannot pre-flush track data through its generic storage
@@ -151,6 +156,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left Appendable (not finalized), and a host that never issued CLOSE may leave
   a partially recorded track. The same resource mapping covers `--banks dual`,
   so a bundle LUN can run on the worker path.
+- **cli**: a `recovery=delete` CD-R bundle open reconciles the directory
+  against the restored TOC: a `track_<n>.bin` is kept only when its canonical
+  `track_file(n)` spelling is referenced by the TOC and `n` fits the slot, so
+  unreferenced files, ids above `max_tracks_for_slot`, and non-canonical
+  spellings are removed (one summary log line; a failed removal only warns).
+  `toc.0`/`toc.1` are never touched, and a `recovery=readonly` open deletes
+  nothing. Cleanup runs only when the newest readable slot is restored with no
+  skipped/unreadable candidate; a TOC-less directory is never wiped (leftover
+  track files are counted and reported). The scan restarts at the first entry
+  (the seam has no cursor) and grows its `read_dir` batch up to 1024 entries,
+  warning when the directory is too large for a complete reconciliation.
 - **common**: `FsStorage::sync_file` (defaults to the backend-wide sync) and
   `FsPlane::sync_file` (defaults to the plane-wide sync) expose per-file fsync,
   so a resource-addressed backend can make one file durable; `StdFsBackend`
@@ -166,9 +182,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLOSE TRACK/SESSION), pins the payload resource/offset and restores both
   saved TOC slots through `open_at`. `HACKING.md` gains a manual CD-R bundle
   burn/read-back recipe with its troubleshooting notes.
+- **tests**: READ CAPACITY of a blank, reserved-only, partially burned and
+  finalized write-once disc, plus the `recovery=delete`/`recovery=readonly`
+  orphan-track reconciliation of the CLI bundle directory.
 - **cli**: `--print-config` reports the resolved backing per LUN after the
   existing fields (`… backing=ram,bundle`); a smoke test pins the `bundle=`
   help text and the backing token.
+- **docs**: the README lists the persistent CD-R bundle (`--cdrom bundle=<dir>`,
+  feature `cdr-bundle`) in its project status and full-feature example, and
+  points at `HACKING.md` for the directory/durability contract.
 
 ## [0.2.0] - 2026-10-18
 

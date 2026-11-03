@@ -2265,6 +2265,30 @@ fn cdr_finalize_reports_a_medium_change_unit_attention() {
     );
 }
 
+/// Issue READ CAPACITY and return the reported last LBA.
+fn capacity_lba(
+    target: &mut CdrTarget,
+    storage: &mut BlockingStorage<Plane>,
+    host: &mut BlockingHost<TestHost>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+) -> u32 {
+    assert_eq!(
+        run(
+            target,
+            storage,
+            host,
+            &read_capacity(),
+            Direction::ToHost,
+            8,
+            work,
+            scratch,
+        ),
+        Completion::Good
+    );
+    u32::from_be_bytes([work[0], work[1], work[2], work[3]])
+}
+
 #[test]
 fn cdr_blank_capacity_reports_the_recordable_extent() {
     let mut target = cdr_target();
@@ -2275,27 +2299,204 @@ fn cdr_blank_capacity_reports_the_recordable_extent() {
 
     // A blank CD-R has no recorded session, but the ATIP extent is already
     // known; the host sizes the block device from it before the first write.
+    let capacity = CdrCapacity::Cdr74.sectors();
     assert_eq!(
-        run(
+        capacity_lba(
             &mut target,
             &mut storage,
             &mut host,
-            &read_capacity(),
-            Direction::ToHost,
-            8,
             &mut work,
-            &mut scratch,
+            &mut scratch
         ),
-        Completion::Good
-    );
-    let capacity = CdrCapacity::Cdr74.sectors();
-    assert_eq!(
-        u32::from_be_bytes([work[0], work[1], work[2], work[3]]),
         (capacity - 1) as u32,
         "last writable LBA of the ATIP extent"
     );
     assert_eq!(
         u32::from_be_bytes([work[4], work[5], work[6], work[7]]),
         BLOCK as u32
+    );
+}
+
+#[test]
+fn cdr_unfinalized_capacity_keeps_the_atip_extent() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+    let extent = (CdrCapacity::Cdr74.sectors() - 1) as u32;
+
+    // A reserved-only track has no recorded block, but the disc is appendable
+    // and its ATIP geometry already fixes the future lead-out.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &reserve_track_cdb(false, 500),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent,
+        "a reserved-only appendable disc keeps the ATIP extent"
+    );
+
+    // A partially burned track must not shrink the block device mid-burn when
+    // the host re-probes READ CAPACITY.
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent,
+        "a partially burned appendable disc keeps the ATIP extent"
+    );
+}
+
+#[test]
+fn cdr_finalized_capacity_reports_the_recorded_extent() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+
+    // Record three blocks in an implicit track.
+    for lba in 0..3u32 {
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &write10(lba, 1),
+                Direction::FromHost,
+                BLOCK as u64,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good
+        );
+    }
+    // SYNCHRONIZE CACHE closes the open track; CLOSE TRACK/SESSION finalizes.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // A finalized disc reports the last recorded LBA, not the ATIP extent.
+    // Closing pads a track to the minimum length, so the three written blocks
+    // finalize as a 300-block track (last LBA 299).
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        299,
+        "last recorded LBA of a finalized disc"
+    );
+}
+
+#[test]
+fn cdr_appendable_reopened_capacity_keeps_the_atip_extent() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+
+    // One recorded block, closed by SYNCHRONIZE CACHE: the TOC is saved while
+    // the disc is still Appendable (not finalized).
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    let slot = storage.inner().slot(0);
+    let medium = CdrBundleMedium::open(&slot, SECTORS, Recovery::Delete).expect("appendable slot");
+    assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
+
+    // A medium restored from that slot still reports the ATIP extent, so the
+    // block device does not shrink when the host re-probes after a restart.
+    let mut reopened: CdrTarget =
+        Target::new(cons(LuImpl::new(Spc::new(MmcDrive::new(medium)), 1u8), Nil));
+    assert_eq!(
+        capacity_lba(
+            &mut reopened,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        (SECTORS - 1) as u32,
+        "an appendable restored from its TOC keeps the ATIP extent"
     );
 }

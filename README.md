@@ -67,6 +67,9 @@ sudo snowscsi serve --usb --cdrom img=out.iso
 
 # a live ISO9660 view of a directory, as a USB CD-ROM
 sudo snowscsi serve --usb --cdrom live=./src_dir
+
+# a persistent CD-R bundle (burn with wodim/cdrecord; survives restarts)
+sudo snowscsi serve --usb --cdrom bundle=./cdr,medium=cdr80
 ```
 
 `--iscsi` and `--usb` are mutually exclusive; exactly one transport is
@@ -113,7 +116,7 @@ snowscsi = { version = "0.2", default-features = false, features = ["std", "scsi
 snowscsi = { version = "0.2", default-features = false, features = ["std", "cdrom", "livefs"] }
 
 # Full feature set (`log` / `defmt` select the logging backend instead)
-snowscsi = { version = "0.2", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle"] }
+snowscsi = { version = "0.2", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle"] }
 ```
 
 A minimal embedded block device needs a backend and a work buffer:
@@ -144,6 +147,7 @@ Both transports drive any `impl ScsiDevice` through
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget on Linux): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
 - [x] Writable DVD-RAM (`--cdrom dvdram=`, feature `dvdram`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
+- [x] Persistent CD-R bundle (`--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once disc for Track-at-Once burning (`wodim`/`cdrecord`; the TAO path is exercised by an in-process cdrkit trace and the manual `wodim` recipe in `HACKING.md`), with the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, and TOC snapshotting on eject. See the [CD-R storage resource contract](HACKING.md#cd-r-storage-resource-contract) for the directory layout and durability rules.
 - [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`)
 
 ## Project structure
