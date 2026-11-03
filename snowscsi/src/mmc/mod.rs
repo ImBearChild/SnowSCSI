@@ -36,7 +36,7 @@ pub mod op;
 pub mod vendor;
 
 pub use self::attrs::{
-    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
+    AtipInfo, DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
     TrackInfoRequest, TrackKind, TrackStatus,
 };
 #[cfg(feature = "cdr-bundle")]

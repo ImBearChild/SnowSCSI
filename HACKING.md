@@ -326,10 +326,20 @@ mount -o ro /dev/sr0 /mnt     # or mount the raw device
 
 A blank CD-R reports its ATIP extent in READ CAPACITY, so the block device
 is sized for the full disc before the first session and keeps that size
-after the burn. READ TOC stays `24h/00` while no complete session exists,
-which keeps the kernel's last-session probe at LBA 0. The finalize also
-reports a medium-change unit attention, although a burner's own `TEST UNIT
-READY` can consume it first.
+after the burn. READ TOC formats 0-2 stay `24h/00` while no complete session
+exists, which keeps the kernel's last-session probe at LBA 0; format 4 (ATIP)
+is independent of session state. The finalize also reports a medium-change
+unit attention, although a burner's own `TEST UNIT READY` can consume it first.
+
+READ TOC format 4 answers the ATIP descriptor in every disc state (blank,
+appendable and finalized), so `wodim -atip`, `cdrecord -atip` and `cd-info`
+work before the first write. The response is the 28-byte block (a 4-byte
+header declaring an ATIP Data Length of 26 plus the 24-byte descriptor, no
+optional S4 values) with binary, not BCD, M/S/F bytes. The descriptor's
+lead-out is the same address READ DISC INFORMATION reports as the last
+possible lead-out while the disc is blank or appendable (a finalized disc
+reports `FF`), and READ CAPACITY reports that extent minus one only while the
+disc is blank (after a burn it reports the last recorded LBA).
 
 The bundle directory holds the durable state:
 
@@ -363,7 +373,12 @@ Troubleshooting:
   finalizes the disc and rejects later writes (`WRITE PROTECTED`).
 - **Geometry presets** — `medium=cdr74|cdr80|cdr90|cdr99` and `slot=<bytes>`
   (4 KiB..64 KiB) only apply to a new blank bundle; the number of track
-  files is bounded by `max_tracks_for_slot(slot)`.
+  files is bounded by `max_tracks_for_slot(slot)`. The presets are the real
+  media lead-out addresses (`minutes * 60 * 75 - 151`, so 74 → 332 849,
+  80 → 359 849, 90 → 404 849, 99 → 445 349 sectors). The 90- and 99-minute
+  presets report a lead-out above MMC's recommended maximum of `79:59:74`,
+  like real high-capacity media; their `A1` capacity-extension encoding is not
+  modeled.
 
 ## Browsing Documentation
 

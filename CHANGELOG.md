@@ -21,12 +21,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recordable-media fields. The default Hyper-Multi drive now lists the CD-R
   profile (`0x09`) in its profile list.
 - **mmc**: `TocError` gains `WriteProtected`; exhaustive matches must handle it.
+- **mmc**: the `cdr-bundle` capacity presets now report the real media lead-out
+  (`minutes * 60 * 75 - 151`: 74 → 332 849, 80 → 359 849, 90 → 404 849,
+  99 → 445 349 sectors instead of 333 000/360 000/405 000/445 500), so the
+  addressable extent of a preset disc shrinks by 151 blocks. The 90- and
+  99-minute presets report a lead-out above MMC's recommended maximum of
+  `79:59:74`, like real high-capacity media; their `A1` capacity-extension
+  encoding is not modeled.
+- **mmc**: `DiscInfo::last_possible_lead_out` of a blank/appendable `cdr-bundle`
+  disc is the medium capacity (the ATIP lead-out), not `capacity - 2`.
+  READ CAPACITY reports `last_possible_lead_out - 1` (the ATIP extent minus
+  one) while the disc is blank; after a burn it reports the last recorded LBA.
 
 ### Added
 
 - **mmc**: a blank write-once CD reports its ATIP extent in READ CAPACITY,
   so the host sizes the block device before the first session; READ TOC
-  stays `24h/00` until a session completes.
+  formats 0-2 stay `24h/00` until a session completes (format 4 is independent
+  of session state).
+- **mmc**: READ TOC format 4 (ATIP) on a `cdr-bundle` CD-R — the 28-byte block
+  (ATIP Data Length 26 plus the 24-byte descriptor, no optional S4 values) with
+  binary M/S/F lead-in/lead-out times, so `wodim -atip`, `cdrecord -atip` and
+  `cd-info` work on a blank, appendable or finalized disc. `AtipInfo` and the
+  defaulted `MmcMedium::atip` carry the descriptor; a medium with no ATIP
+  (stamped CD, DVD) answers `ILLEGAL REQUEST / INVALID FIELD IN CDB`. The
+  descriptor's lead-out equals DISC INFORMATION's last possible lead-out until
+  the disc is finalized (a finalized disc reports `FF`).
 - **mmc**: recordable-medium vocabulary — `TrackStatus`, `TrackInfo`,
   `TrackInfoRequest`, and the defaulted `MmcMedium::track_info`; the
   `cdr-bundle` feature gate for a sequential CD-R medium.
@@ -43,8 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   functions 001b/010b to the medium, READ DISC/TRACK INFORMATION encode the
   recordable disc and track state (MMC-6 DIB/TIB), READ CAPACITY reports the
   last recorded block, GET CONFIGURATION reports profile `0x09` with the
-  incremental-streaming and CD-track-at-once features, and READ TOC formats 0
-  and 1 walk the recorded track/session layout.
+  incremental-streaming and CD-track-at-once features, and READ TOC formats 0,
+  1 and 2 walk the recorded track/session layout and the raw lead-in. The ATIP
+  format 4 is covered separately under the format-4 entry above.
 - **mmc**: persistent TOC for the `cdr-bundle` CD-R medium — the track/session
   layout is written to two alternating INI slots (`toc.0`/`toc.1`, storage
   resources 1/2) with a strict header/body parser, `Delete`/`ReadOnly`

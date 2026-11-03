@@ -19,8 +19,8 @@
 //! 446, 501. This module has no runtime dependency on `cdrom`.
 
 use super::attrs::{
-    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, TrackInfo, TrackInfoRequest,
-    TrackKind, TrackStatus,
+    AtipInfo, DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, TrackInfo,
+    TrackInfoRequest, TrackKind, TrackStatus,
 };
 use super::medium::MmcMedium;
 use super::op::MmcOp;
@@ -71,14 +71,23 @@ const SET_CD_SPEED: u8 = 0xBB;
 const TOC_LEADOUT_LEN: usize = 12;
 /// READ TOC format 1 (session list): 4-byte header + 8-byte descriptor.
 const TOC_SESSION_LEN: usize = 12;
+/// READ TOC format 4 (ATIP): 4-byte header + the 24-byte ATIP descriptor.
+///
+/// The optional S4 block is not returned (real drives do not append it and
+/// hosts size their own buffer for 28 bytes), so the ATIP Data Length is
+/// `ATIP_LEN - 2` = 26.
+const ATIP_LEN: usize = 28;
+/// One ATIP descriptor (MMC-6 Table 488, without the optional S4 values).
+const ATIP_DESCRIPTOR_LEN: usize = ATIP_LEN - 4;
 /// One TOC track descriptor.
 const TOC_DESCRIPTOR_LEN: usize = 8;
 /// One compact raw-TOC (format 2) descriptor:
 /// session, ADR/control, TNO, POINT, MIN, SEC, FRAME, zero.
 const TOC_RAW_DESCRIPTOR_LEN: usize = 8;
-/// Staging bound for a multi-track READ TOC response: 4-byte header, the four
-/// format-2 lead-in descriptors, one descriptor per track (the CD track-number
-/// space is 1..=99) and the lead-out.
+/// Staging bound for a READ TOC response: 4-byte header, the four format-2
+/// lead-in descriptors, one descriptor per track (the CD track-number space is
+/// 1..=99) and the lead-out. Formats 0/1/2 fit this bound and the fixed
+/// 28-byte format-4 (ATIP) block does too.
 const TOC_MAX_LEN: usize = 4 + TOC_DESCRIPTOR_LEN * (99 + 5);
 /// READ DISC INFORMATION standard payload.
 const DISC_INFO_LEN: usize = 34;
@@ -280,11 +289,11 @@ enum Query {
     },
     /// READ TOC encoded by the drive.
     Toc {
-        /// MSF addressing requested.
+        /// MSF addressing requested (formats 0/1/2 only; format 4 ignores it).
         msf: bool,
-        /// Format field (0 or 1).
+        /// Format field (0, 1, 2 or 4).
         format: u8,
-        /// Starting track (0, 1 or 0xAA for format 0).
+        /// Starting track (0, 1 or 0xAA for format 0; reserved elsewhere).
         track: u8,
     },
     /// READ DISC INFORMATION encoded by the drive.
@@ -549,7 +558,11 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.begin_media(MmcOp::Commit, 0)
     }
 
-    /// READ TOC/PMA/ATIP: formats 0, 1 and 2, LBA or MSF (design offset 2).
+    /// READ TOC/PMA/ATIP: formats 0, 1, 2 and 4, LBA or MSF (design offset 2).
+    ///
+    /// The MSF bit only shapes the formats 0/1/2 addresses; format 4 returns
+    /// binary M/S/F regardless (MMC-6 6.25.3.6.1). Format 3 (PMA), 5 (CD-TEXT)
+    /// and higher are `24/00`.
     fn prepare_toc(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
         if cdb.len() < 10 {
             return Err(Completion::Check(INVALID_FIELD));
@@ -562,9 +575,9 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         let msf = cdb[1] & 0x02 != 0;
         let format = cdb[2] & 0x0F;
-        // Format 4 (ATIP) is not served yet: an unsupported format is
-        // ILLEGAL REQUEST / INVALID FIELD IN CDB (`24/00`).
-        if format > 2 {
+        // An unsupported format is ILLEGAL REQUEST / INVALID FIELD IN CDB
+        // (`24/00`): formats 3 (PMA), 5 (CD-TEXT) and above are not served.
+        if format == 3 || format > 4 {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let track = cdb[6];
@@ -612,6 +625,14 @@ impl<M: MmcMedium> MmcDrive<M> {
             let last = attrs.tracks.min(99);
             let descriptors = 4 + usize::from(last.saturating_sub(first).saturating_add(1)) + 1;
             4 + TOC_RAW_DESCRIPTOR_LEN * descriptors
+        } else if format == 4 {
+            // ATIP: the fixed 28-byte block. Byte 6 is reserved, so no
+            // track/session selector is accepted, and only a medium with ATIP
+            // data (a CD-R/RW) can answer (MMC-6 6.25.3.6.3).
+            if track != 0 || self.medium.as_ref().and_then(|m| m.atip()).is_none() {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            ATIP_LEN
         } else {
             // Format 1 returns the last complete session only.
             if track != 0 {
@@ -2230,14 +2251,15 @@ fn write_raw_descriptor(
 }
 
 /// Encode READ TOC format 0 (track list + lead-out), format 1 (last complete
-/// session) or format 2 (raw TOC) into `out`, returning the full response
-/// length.
+/// session), format 2 (raw TOC) or format 4 (ATIP) into `out`, returning the
+/// full response length.
 ///
 /// Format 0 emits one descriptor per requested track and always appends the
 /// lead-out (`0xAA`, `last_session_lba + 1`). Format 1 emits the first track of
 /// the last complete session; a disc without a complete session is rejected.
 /// Format 2 emits the Q-subchannel lead-in points A0/A1/A2/B0 followed by one
-/// descriptor per track and the lead-out, all in MSF form.
+/// descriptor per track and the lead-out, all in MSF form. Format 4 emits the
+/// 28-byte ATIP block (header + descriptor) and ignores the MSF bit.
 fn encode_toc<M: MmcMedium>(
     medium: &M,
     info: DiscInfo,
@@ -2386,6 +2408,16 @@ fn encode_toc<M: MmcMedium>(
             lead_msf,
         );
         total
+    } else if format == 4 {
+        // ATIP (MMC-6 Table 488): a 4-byte header plus the 24-byte descriptor.
+        // The MSF bit does not reshape these fields and no S4 block follows.
+        if ATIP_LEN > buf.len() {
+            return None;
+        }
+        let atip = medium.atip()?;
+        buf[0..2].copy_from_slice(&((ATIP_LEN - 2) as u16).to_be_bytes());
+        encode_atip(&atip, &mut buf[4..4 + ATIP_DESCRIPTOR_LEN]);
+        ATIP_LEN
     } else {
         // Format 1: the last complete session. An incomplete last session
         // leaves the previous (closed) one as the last complete session.
@@ -2412,17 +2444,42 @@ fn encode_toc<M: MmcMedium>(
     Some(total)
 }
 
+/// Encode the 24-byte ATIP descriptor of READ TOC format 4 (MMC-6 Table 488).
+///
+/// The descriptor opens with the three Special Information 1 bytes, then the
+/// lead-in and lead-out time codes, then the three optional additional-value
+/// triples. Reserved bytes stay zero. The A-valid bits are set exactly when the
+/// corresponding triple is present.
+fn encode_atip(atip: &AtipInfo, out: &mut [u8]) {
+    // Reserved bytes, invalid additional-value triples and the unset bits all
+    // stay zero.
+    out.fill(0);
+    out[0] = 0x80 | ((atip.writing_power & 0x07) << 4) | (atip.reference_speed & 0x07);
+    out[1] = u8::from(atip.unrestricted) << 6;
+    out[2] = 0x80
+        | ((atip.disc_type & 0x01) << 6)
+        | ((atip.disc_sub_type & 0x07) << 3)
+        | (u8::from(atip.a1.is_some()) << 2)
+        | (u8::from(atip.a2.is_some()) << 1)
+        | u8::from(atip.a3.is_some());
+    out[4..7].copy_from_slice(&atip.lead_in);
+    out[8..11].copy_from_slice(&atip.lead_out);
+    for (at, values) in [(12, atip.a1), (16, atip.a2), (20, atip.a3)] {
+        if let Some(values) = values {
+            out[at..at + 3].copy_from_slice(&values);
+        }
+    }
+}
+
 /// MSF field for READ DISC INFORMATION: binary M/S/F with the usual `+150`
-/// offset. A negative lead-in address wraps inside a 100-minute disc; `None`
-/// (but applicable) is `FF FF FF FF`.
+/// offset, wrapped inside a 100-minute disc (`100 * 60 * 75` frames) exactly
+/// like an ATIP time code, so a negative lead-in address stays representable.
+/// `None` (but applicable) is `FF FF FF FF`.
 fn disc_msf(lba: Option<i64>) -> [u8; 4] {
     let Some(lba) = lba else {
         return [0xFF; 4];
     };
-    let mut value = lba.saturating_add(150);
-    if value < 0 {
-        value = value.saturating_add(100 * 60 * 75);
-    }
+    let value = lba.saturating_add(150).rem_euclid(75 * 60 * 100);
     let m = value / (75 * 60);
     let s = (value / 75) % 60;
     let f = value % 75;
@@ -2830,7 +2887,14 @@ mod tests {
             dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
-        cdb[2] = 0x04; // format 4 (ATIP) is not served
+        cdb[2] = 0x05; // format 5 (CD-TEXT) is not served
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        // Format 4 (ATIP) is served, but a stamped CD has no pre-groove to
+        // describe, so this medium answers 24/00.
+        cdb[2] = 0x04;
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
             Err(Completion::Check(INVALID_FIELD))
@@ -2840,6 +2904,22 @@ mod tests {
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
             Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[test]
+    fn read_toc_format4_on_an_empty_drive_is_medium_not_present() {
+        // No medium is `3A/00`; the ATIP/format check only applies once a
+        // medium is installed.
+        let mut dev = MmcDrive::<FlatCdMedium>::empty(MmcCaps::hyper_multi());
+        let permit = permit();
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x04;
+        cdb[8] = 28;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 28), &cdb),
+            Err(Completion::Check(MEDIUM_NOT_PRESENT))
         );
     }
 
@@ -4815,7 +4895,7 @@ mod tests {
         MmcAttrs {
             write_mode: MmcWriteMode::WriteOnce,
             block_len: 2048,
-            sectors: 333_000,
+            sectors: 332_849,
             tracks: 0,
             sessions: 0,
             write_protected: false,
@@ -4837,9 +4917,63 @@ mod tests {
             last_track_last_session: 1,
             last_session_state: 0,
             last_session_lead_in: Some(-11_077),
-            last_possible_lead_out: Some(332_998),
+            last_possible_lead_out: Some(332_849),
             disc_type: 0xFF,
         }
+    }
+
+    #[test]
+    fn disc_msf_wraps_like_the_atip_time_code() {
+        // 450 000 + 150 wraps to 00:02:00 inside a 100-minute disc.
+        assert_eq!(disc_msf(Some(450_000)), [0x00, 0x00, 0x02, 0x00]);
+        // A negative lead-in address stays representable (97:34:23).
+        assert_eq!(disc_msf(Some(-11_077)), [0x00, 0x61, 0x22, 0x17]);
+        // Not applicable.
+        assert_eq!(disc_msf(None), [0xFF; 4]);
+    }
+
+    #[test]
+    fn atip_descriptor_encoder_offsets() {
+        let atip = AtipInfo {
+            lead_in: [97, 34, 23],
+            lead_out: [79, 59, 74],
+            writing_power: 5,
+            reference_speed: 2,
+            unrestricted: true,
+            disc_type: 0,
+            disc_sub_type: 0,
+            a1: Some([0x10, 0x20, 0x30]),
+            a2: Some([0x40, 0x50, 0x60]),
+            a3: None,
+        };
+        let mut buf = [0xFFu8; ATIP_DESCRIPTOR_LEN];
+        encode_atip(&atip, &mut buf);
+        assert_eq!(buf[0], 0x80 | (5 << 4) | 2, "writing power/speed");
+        assert_eq!(buf[1], 0x40, "URU, bit7 clear");
+        assert_eq!(buf[2], 0x80 | 0x04 | 0x02, "A1/A2 valid, A3 invalid");
+        assert_eq!(buf[3], 0x00);
+        assert_eq!(&buf[4..7], &[97, 34, 23], "lead-in");
+        assert_eq!(buf[7], 0x00);
+        assert_eq!(&buf[8..11], &[79, 59, 74], "lead-out");
+        assert_eq!(buf[11], 0x00);
+        assert_eq!(&buf[12..15], &[0x10, 0x20, 0x30]);
+        assert_eq!(&buf[16..19], &[0x40, 0x50, 0x60]);
+        assert_eq!(&buf[20..24], &[0u8; 4], "A3 invalid and reserved");
+
+        // A CD-RW sets Disc Type; the sub-type is a 3-bit code.
+        let mut cdrw = atip;
+        cdrw.disc_type = 1;
+        cdrw.disc_sub_type = 3;
+        cdrw.unrestricted = false;
+        let mut buf = [0u8; ATIP_DESCRIPTOR_LEN];
+        encode_atip(&cdrw, &mut buf);
+        assert_eq!(buf[1], 0x00, "restricted use");
+        assert_eq!(buf[2], 0x80 | 0x40 | (3 << 3) | 0x06);
+
+        // The descriptor fills the response exactly: a 4-byte header plus 24
+        // bytes with an ATIP Data Length of 26.
+        assert_eq!(ATIP_LEN, 28);
+        assert_eq!((ATIP_LEN - 2) as u16, 26);
     }
 
     #[test]
@@ -4860,8 +4994,8 @@ mod tests {
         // Blank/appendable CD-R report the next lead-in; -11_077 wraps to
         // 97:34:23 within a 100-minute disc.
         assert_eq!(&buf[16..20], &[0x00, 0x61, 0x22, 0x17]);
-        // 332_998 + 150 = 74:01:73 in binary M/S/F.
-        assert_eq!(&buf[20..24], &[0x00, 0x4A, 0x01, 0x49]);
+        // 332_849 + 150 = 73:59:74 in binary M/S/F: the ATIP lead-out start.
+        assert_eq!(&buf[20..24], &[0x00, 0x49, 0x3B, 0x4A]);
 
         // An appendable CD-R reports the incomplete disc/session state.
         let mut info = blank_disc_info();
@@ -4904,9 +5038,9 @@ mod tests {
             session: 1,
             start_lba: 0,
             length: 0,
-            allocated: 333_000,
+            allocated: 332_849,
             nwa: 0,
-            free_blocks: 332_996,
+            free_blocks: 332_847,
             status: TrackStatus::Invisible,
             kind: TrackKind::Data,
             packet: false,
@@ -4921,9 +5055,9 @@ mod tests {
         assert_eq!(buf[7], 0x01, "NWA_V (bit 0)");
         assert_eq!(&buf[8..12], &0u32.to_be_bytes(), "track start");
         assert_eq!(&buf[12..16], &0u32.to_be_bytes(), "NWA");
-        assert_eq!(&buf[16..20], &332_996u32.to_be_bytes(), "free blocks");
+        assert_eq!(&buf[16..20], &332_847u32.to_be_bytes(), "free blocks");
         assert_eq!(&buf[20..24], &0u32.to_be_bytes(), "no fixed packets");
-        assert_eq!(&buf[24..28], &333_000u32.to_be_bytes(), "track size");
+        assert_eq!(&buf[24..28], &332_849u32.to_be_bytes(), "track size");
         assert_eq!(&buf[28..32], &0u32.to_be_bytes(), "NWA-1");
         assert_eq!((buf[32], buf[33], buf[34]), (0, 0, 0), "track/session MSB");
 

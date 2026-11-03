@@ -882,7 +882,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
-        let plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 360_000, None));
+        let plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, None));
         (dir, plane)
     }
 

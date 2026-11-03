@@ -186,6 +186,55 @@ pub struct DiscInfo {
     pub disc_type: u8,
 }
 
+/// ATIP descriptor data served by READ TOC format 4 (MMC-6 Table 488).
+///
+/// The drive encodes one instance into the 24-byte ATIP descriptor of the
+/// 28-byte response; the 4-byte header declares an ATIP Data Length of `26`.
+/// Times are **binary** M/S/F bytes (`0..=99`, not BCD), as an ATIP time code
+/// is reported.
+///
+/// Descriptor byte layout (0-based, after the 4-byte header):
+///
+/// ```text
+///  0   bit7 = 1, bits6-4 = indicative target writing power,
+///      bit3 = reserved, bits2-0 = reference speed
+///  1   bit7 = 0, bit6 = unrestricted use (URU), bits5-0 = reserved
+///  2   bit7 = 1, bit6 = disc type (0 = CD-R, 1 = CD-RW),
+///      bits5-3 = disc sub-type, bit2 = A1 valid, bit1 = A2 valid,
+///      bit0 = A3 valid
+///  3   reserved
+///  4-6 ATIP start time of the lead-in (M, S, F)
+///  7   reserved
+///  8-10 ATIP last possible start time of the lead-out (M, S, F)
+///  11  reserved
+///  12-14 A1 values, 15 reserved
+///  16-18 A2 values, 19 reserved
+///  20-22 A3 values, 23 reserved
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtipInfo {
+    /// ATIP start time of the lead-in, binary M/S/F.
+    pub lead_in: [u8; 3],
+    /// ATIP last possible start time of the lead-out, binary M/S/F.
+    pub lead_out: [u8; 3],
+    /// Indicative target writing power (3 bits).
+    pub writing_power: u8,
+    /// Reference speed (3 bits).
+    pub reference_speed: u8,
+    /// The disc is for unrestricted use (the URU bit).
+    pub unrestricted: bool,
+    /// Disc type: `0` = CD-R, `1` = CD-RW.
+    pub disc_type: u8,
+    /// Disc sub-type (3 bits); CD-R has no sub-types and reports `0`.
+    pub disc_sub_type: u8,
+    /// Additional Information 1, valid when the A1 Valid bit is set.
+    pub a1: Option<[u8; 3]>,
+    /// Additional Information 2, valid when the A2 Valid bit is set.
+    pub a2: Option<[u8; 3]>,
+    /// Additional Information 3, valid when the A3 Valid bit is set.
+    pub a3: Option<[u8; 3]>,
+}
+
 /// Disc state (MMC-6 Table 367).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiscStatus {
@@ -294,6 +343,27 @@ mod tests {
         assert_eq!(info.status, TrackStatus::Incomplete);
         assert_ne!(TrackStatus::Incomplete, TrackStatus::Complete);
         assert_ne!(TrackStatus::Reserved, TrackStatus::Invisible);
+    }
+
+    #[test]
+    fn atip_info_values_are_copyable() {
+        let atip = AtipInfo {
+            lead_in: [97, 34, 23],
+            lead_out: [79, 59, 74],
+            writing_power: 5,
+            reference_speed: 0,
+            unrestricted: true,
+            disc_type: 0,
+            disc_sub_type: 0,
+            a1: None,
+            a2: Some([1, 2, 3]),
+            a3: None,
+        };
+        let copy = atip;
+        assert_eq!(copy, atip);
+        assert_eq!(atip.lead_out, [79, 59, 74]);
+        assert!(atip.unrestricted);
+        assert_ne!(atip.a1, atip.a2);
     }
 
     #[test]

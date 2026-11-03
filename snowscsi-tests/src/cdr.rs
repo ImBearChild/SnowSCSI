@@ -13,7 +13,9 @@ use snowscsi::core::{
     cons, CommandContext, Completion, Cons, DataPlan, Delivery, Direction, Fault, Here, LuImpl,
     Nil, Sense, Spc, StaticTarget, Target, INVALID_FIELD, LBA_OUT_OF_RANGE, WRITE_PROTECTED,
 };
-use snowscsi::mmc::{CdrBundleMedium, CdrCapacity, CdrDiscState, MmcDrive, MmcMedium, Recovery};
+use snowscsi::mmc::{
+    CdrBundleMedium, CdrCapacity, CdrDiscState, FlatCdMedium, MmcDrive, MmcMedium, Recovery,
+};
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2A;
@@ -37,7 +39,7 @@ const SET_CD_SPEED: u8 = 0xBB;
 const INVALID_ADDRESS_FOR_WRITE: Sense = Sense::new(0x05, 0x21, 0x02);
 
 const BLOCK: usize = 2048;
-const SECTORS: u64 = 333_000;
+const SECTORS: u64 = 332_849;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Byte-plane storage double
@@ -175,9 +177,13 @@ impl SyncHost for TestHost {
 type CdrTarget = Target<Cons<LuImpl<Spc<MmcDrive<CdrBundleMedium>>, u8>, Nil>>;
 
 fn cdr_target() -> CdrTarget {
+    cdr_target_with(CdrCapacity::Cdr74)
+}
+
+fn cdr_target_with(capacity: CdrCapacity) -> CdrTarget {
     Target::new(cons(
         LuImpl::new(
-            Spc::new(MmcDrive::new(CdrBundleMedium::blank(CdrCapacity::Cdr74))),
+            Spc::new(MmcDrive::new(CdrBundleMedium::blank(capacity))),
             1u8,
         ),
         Nil,
@@ -504,7 +510,7 @@ fn cdr_read_disc_information_blank_appendable_and_finalized() {
     assert_eq!(work[8], 0xFF, "unknown disc type");
     assert_eq!(&work[9..12], &[0, 0, 0]);
     assert_eq!(&work[16..20], &msf(97, 34, 23), "wrapped blank lead-in");
-    assert_eq!(&work[20..24], &msf(74, 1, 73), "last possible lead-out");
+    assert_eq!(&work[20..24], &msf(73, 59, 74), "last possible lead-out");
 
     // One block makes the disc appendable.
     write_one_block(
@@ -536,7 +542,7 @@ fn cdr_read_disc_information_blank_appendable_and_finalized() {
     );
     assert_eq!(work[2], 0x05, "incomplete disc / incomplete session");
     assert_eq!(&work[16..20], &msf(97, 34, 23), "wrapped negative lead-in");
-    assert_eq!(&work[20..24], &msf(74, 1, 73));
+    assert_eq!(&work[20..24], &msf(73, 59, 74));
 
     // SYNCHRONIZE CACHE closes the open track; CLOSE 010b finalizes.
     assert_eq!(
@@ -625,7 +631,7 @@ fn cdr_read_track_information_blank_lead_in_and_after_write() {
     assert_eq!(work[7], 0x01, "NWA_V");
     assert_eq!(&work[8..12], &0u32.to_be_bytes(), "track start");
     assert_eq!(&work[12..16], &0u32.to_be_bytes(), "NWA 0");
-    assert_eq!(&work[16..20], &((SECTORS - 4) as u32).to_be_bytes());
+    assert_eq!(&work[16..20], &((SECTORS - 2) as u32).to_be_bytes());
     assert_eq!(&work[20..24], &0u32.to_be_bytes(), "no fixed packets");
     assert_eq!(&work[24..28], &(SECTORS as u32).to_be_bytes());
 
@@ -715,7 +721,7 @@ fn cdr_read_track_information_blank_lead_in_and_after_write() {
         assert_eq!(work[7], 0x01, "NWA_V");
         assert_eq!(&work[8..12], &0u32.to_be_bytes());
         assert_eq!(&work[12..16], &1u32.to_be_bytes(), "NWA advanced");
-        assert_eq!(&work[16..20], &((SECTORS - 5) as u32).to_be_bytes());
+        assert_eq!(&work[16..20], &((SECTORS - 3) as u32).to_be_bytes());
         assert_eq!(&work[24..28], &1u32.to_be_bytes(), "track size");
         assert_eq!(&work[28..32], &0u32.to_be_bytes(), "last recorded LBA");
     }
@@ -786,9 +792,246 @@ fn cdr_blank_toc_and_incomplete_session_toc_are_rejected() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FORMAT / BLANK guard
+// READ TOC format 4 (ATIP)
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[test]
+fn cdr_read_toc_format4_reports_atip() {
+    let mut target = cdr_target_with(CdrCapacity::Cdr80);
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 28),
+            Direction::ToHost,
+            28,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    // 4-byte header + the 24-byte descriptor, no optional S4 block: the ATIP
+    // Data Length is 26.
+    assert_eq!(&work[0..2], &26u16.to_be_bytes());
+    assert_eq!(&work[2..4], &[0, 0]);
+    let atip = work[..28].to_vec();
+    let d = &atip[4..28];
+    assert_eq!(d[0], 0xD0, "bit7, writing power 5, reference speed 0");
+    assert_eq!(d[1], 0x40, "bit7 clear, URU set");
+    assert_eq!(d[2], 0x80, "CD-R, not erasable, no A-valid bit");
+    assert_eq!(d[3], 0x00);
+    // 450150 - 11077 = 439073 = 97:34:23 in binary M/S/F.
+    assert_eq!(&d[4..7], &[97, 34, 23], "ATIP start time of lead-in");
+    assert_eq!(d[7], 0x00);
+    // 359849 + 150 = 359999 = 79:59:74.
+    assert_eq!(&d[8..11], &[79, 59, 74], "last possible lead-out");
+    assert_eq!(d[11], 0x00);
+    assert_eq!(&d[12..24], &[0u8; 12], "no A1/A2/A3 values");
+
+    // MMC-6 6.25.3.6.1: the MSF bit affects no field of format 4.
+    let mut msf = vec![0u8; 64];
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(true, 4, 0, 28),
+            Direction::ToHost,
+            28,
+            &mut msf,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&msf[..28], &atip[..], "the MSF bit is ignored");
+
+    // A short allocation truncates the transfer but keeps the declared length.
+    let mut short = vec![0u8; 64];
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 10),
+            Direction::ToHost,
+            10,
+            &mut short,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&short[0..2], &26u16.to_be_bytes());
+    assert_eq!(&short[2..10], &atip[2..10]);
+
+    // cdrkit first reads only the 4-byte header to learn the declared data
+    // length (26) and then sizes its buffer from it; the allocation length does
+    // not change the declared length.
+    let mut probe = vec![0u8; 64];
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 4),
+            Direction::ToHost,
+            4,
+            &mut probe,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&probe[0..2], &26u16.to_be_bytes());
+    assert_eq!(&probe[2..4], &[0, 0]);
+    assert_eq!(&probe[4..8], &[0u8; 4], "nothing past the allocation");
+
+    // Byte 6 is reserved for format 4.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 1, 28),
+            Direction::ToHost,
+            28,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(INVALID_FIELD)
+    );
+
+    // The blank ATIP extent agrees with READ CAPACITY: the host may size the
+    // device from either before the first session.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_capacity(),
+            Direction::ToHost,
+            8,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        &work[0..4],
+        &((CdrCapacity::Cdr80.sectors() - 1) as u32).to_be_bytes()
+    );
+
+    // The pre-groove is written before any data, so a recorded and a finalized
+    // disc report the same descriptor.
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 28),
+            Direction::ToHost,
+            28,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[..28], &atip[..], "appendable disc");
+
+    // SYNCHRONIZE CACHE pads and closes the open track; CLOSE 010b then
+    // finalizes the disc.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 28),
+            Direction::ToHost,
+            28,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[..28], &atip[..], "finalized disc");
+}
+
+#[test]
+fn cdr_read_toc_format4_is_rejected_for_a_stamped_cd() {
+    // MMC-6 6.25.3.6.3: a non-CD-recordable medium has no ATIP, so format 4
+    // is ILLEGAL REQUEST / INVALID FIELD IN CDB.
+    type FlatTarget = Target<Cons<LuImpl<Spc<MmcDrive<FlatCdMedium>>, u8>, Nil>>;
+    let mut target = FlatTarget::new(cons(
+        LuImpl::new(Spc::new(MmcDrive::new(FlatCdMedium::read_only(16))), 1u8),
+        Nil,
+    ));
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+
+    assert_eq!(
+        target
+            .drive_static_host::<Here>(
+                &mut storage,
+                &mut host,
+                ctx(Direction::ToHost, 28),
+                &read_toc(false, 4, 0, 28),
+                &mut work,
+                &mut scratch,
+            )
+            .expect("command must not raise a boundary fault"),
+        Completion::Check(INVALID_FIELD)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORMAT / BLANK guard
+// ═══════════════════════════════════════════════════════════════════════════
 #[test]
 fn cdr_format_and_blank_are_rejected_without_touching_the_backing() {
     let mut target = cdr_target();
@@ -868,7 +1111,7 @@ fn cdr_format_and_blank_are_rejected_without_touching_the_backing() {
     );
     assert_eq!(
         &work[0..4],
-        &((CdrCapacity::Cdr74.sectors() - 3) as u32).to_be_bytes(),
+        &((CdrCapacity::Cdr74.sectors() - 1) as u32).to_be_bytes(),
         "blank disc ATIP last writable LBA"
     );
     assert_eq!(&work[4..8], &(BLOCK as u32).to_be_bytes());
@@ -1202,7 +1445,11 @@ fn cdr_cdrkit_tao_trace() {
     assert_eq!(work[2] & 0x10, 0, "not erasable");
     assert_eq!(work[4], 1, "one session");
     assert_eq!(&work[16..20], &msf(97, 34, 23), "lead-in MSF");
-    assert_eq!(&work[20..24], &msf(74, 1, 73), "last possible lead-out MSF");
+    assert_eq!(
+        &work[20..24],
+        &msf(73, 59, 74),
+        "last possible lead-out MSF"
+    );
 
     // 3. READ TRACK INFORMATION type 1, track 0xFF: the invisible next track
     //    has a valid NWA at LBA 0.
@@ -1796,7 +2043,7 @@ fn cdr_blank_capacity_reports_the_recordable_extent() {
     let capacity = CdrCapacity::Cdr74.sectors();
     assert_eq!(
         u32::from_be_bytes([work[0], work[1], work[2], work[3]]),
-        (capacity - 3) as u32,
+        (capacity - 1) as u32,
         "last writable LBA of the ATIP extent"
     );
     assert_eq!(

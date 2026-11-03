@@ -44,7 +44,7 @@ pub use self::toc::{
 };
 
 use super::attrs::{
-    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
+    AtipInfo, DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
     TrackInfoRequest, TrackKind, TrackStatus,
 };
 use super::medium::MmcMedium;
@@ -78,21 +78,32 @@ const SESSION_FIXATION_INCOMPLETE_TRACK: Sense = Sense::new(0x05, 0x72, 0x03);
 /// ILLEGAL REQUEST / EMPTY OR PARTIALLY WRITTEN RESERVED TRACK.
 const EMPTY_OR_PARTIALLY_WRITTEN_RESERVED_TRACK: Sense = Sense::new(0x05, 0x72, 0x04);
 
-/// Standard CD-R capacities in logical blocks.
+/// Standard CD-R capacities, expressed as the disc's lead-out start LBA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CdrCapacity {
     /// 74-minute disc.
     Cdr74,
     /// 80-minute disc.
     Cdr80,
-    /// 90-minute disc.
+    /// 90-minute high-capacity disc.
     Cdr90,
-    /// 99-minute disc.
+    /// 99-minute high-capacity disc.
     Cdr99,
 }
 
 impl CdrCapacity {
-    /// Addressable logical blocks (`minutes * 60 * 75`).
+    /// Number of writable logical blocks, i.e. the lead-out start LBA.
+    ///
+    /// Real media end at the `M:59:74` frame of the last full minute
+    /// (`minutes * 60 * 75 - 151`), so the lead-out of an 80-minute disc is
+    /// LBA 359 849 rather than a flat 360 000. The value is both the addressable
+    /// block count and the lead-out ATIP reports; READ CAPACITY reports the
+    /// last writable block, one below it, while the disc is blank.
+    ///
+    /// The 90- and 99-minute presets are high-capacity media: their lead-out is
+    /// above MMC's recommended maximum of `79:59:74`, and real media describe
+    /// the extra room through the `A1` capacity extension, which this model
+    /// does not encode.
     #[must_use]
     pub const fn sectors(self) -> u64 {
         let minutes: u64 = match self {
@@ -101,7 +112,7 @@ impl CdrCapacity {
             Self::Cdr90 => 90,
             Self::Cdr99 => 99,
         };
-        minutes * 60 * 75
+        minutes * 60 * 75 - 151
     }
 }
 
@@ -375,7 +386,7 @@ impl CdrBundleMedium {
         Ok(medium)
     }
 
-    /// Addressable logical blocks.
+    /// Addressable logical blocks; the lead-out starts at this LBA.
     #[must_use]
     pub const fn capacity_sectors(&self) -> u64 {
         self.capacity
@@ -1836,12 +1847,29 @@ impl MmcMedium for CdrBundleMedium {
             },
             last_possible_lead_out: match self.disc {
                 CdrDiscState::Finalized => None,
-                CdrDiscState::Blank | CdrDiscState::Appendable => {
-                    Some(signed_lba(self.capacity.saturating_sub(2)))
-                }
+                // The ATIP lead-out and the addressable extent agree: the
+                // media geometry is authoritative before the final lead-out is
+                // recorded, and DISC INFORMATION must not disagree with READ
+                // TOC format 4.
+                CdrDiscState::Blank | CdrDiscState::Appendable => Some(signed_lba(self.capacity)),
             },
             disc_type: 0xFF,
         }
+    }
+
+    fn atip(&self) -> Option<AtipInfo> {
+        Some(AtipInfo {
+            lead_in: atip_time_code(self.medium_leadin),
+            lead_out: atip_address(self.capacity),
+            writing_power: 5,
+            reference_speed: 0,
+            unrestricted: true,
+            disc_type: 0,
+            disc_sub_type: 0,
+            a1: None,
+            a2: None,
+            a3: None,
+        })
     }
 }
 
@@ -1861,12 +1889,40 @@ fn lead_in_info(medium_leadin: i64) -> TrackInfo {
     }
 }
 
-/// Free blocks for a CD track (MMC-6 6.26.3.16.1): the last possible lead-out
-/// is two blocks before the medium capacity, and TAO reserves the final two
-/// blocks, so the user-visible space is `capacity - nwa - 4`, clamped by the
-/// track's remaining allocation.
+/// Offset of the ATIP time base: a disc address becomes a lead-in time code by
+/// adding the usual `+150` frame offset and wrapping inside a 100-minute disc
+/// (`100 * 60 * 75`), i.e. `450150 + address`.
+const ATIP_PROGRAM_ORIGIN: i64 = 450_150;
+
+/// Split a raw ATIP frame count into binary M/S/F bytes.
+///
+/// The time base wraps inside a 100-minute disc (`100 * 60 * 75` frames), so
+/// the minute byte is always `0..=99` and a geometry past `99:59:74` continues
+/// from `00:00:00`, exactly like the ATIP frame numbering.
+fn atip_msf(frames: i64) -> [u8; 3] {
+    let value = frames.rem_euclid(75 * 60 * 100);
+    let m = value / (75 * 60);
+    let s = (value % (75 * 60)) / 75;
+    let f = value % 75;
+    [m as u8, s as u8, f as u8]
+}
+
+/// ATIP time code of a disc address (`450150 + address`), e.g. the lead-in.
+fn atip_time_code(address: i64) -> [u8; 3] {
+    atip_msf(ATIP_PROGRAM_ORIGIN.saturating_add(address))
+}
+
+/// Absolute MSF (`address + 150`) of a disc address, e.g. the lead-out.
+fn atip_address(address: u64) -> [u8; 3] {
+    atip_msf(signed_lba(address).saturating_add(150))
+}
+
+/// Free blocks for a CD track (MMC-6 6.26.3.16.1): `last possible lead-out -
+/// NWA - 2`. The last possible lead-out is the medium capacity, so the
+/// user-visible space is `capacity - nwa - 2`, clamped by the track's remaining
+/// allocation.
 fn cd_free_blocks(capacity: u64, nwa: u64, allocation: Option<u64>) -> u64 {
-    let available = capacity.saturating_sub(nwa).saturating_sub(4);
+    let available = capacity.saturating_sub(nwa).saturating_sub(2);
     match allocation {
         Some(remaining) => available.min(remaining),
         None => available,
@@ -2249,15 +2305,92 @@ mod tests {
     }
 
     #[test]
-    fn capacities_are_minutes_to_sectors() {
-        assert_eq!(CdrCapacity::Cdr74.sectors(), 333_000);
-        assert_eq!(CdrCapacity::Cdr80.sectors(), 360_000);
-        assert_eq!(CdrCapacity::Cdr90.sectors(), 405_000);
-        assert_eq!(CdrCapacity::Cdr99.sectors(), 445_500);
+    fn capacities_are_lead_out_addresses() {
+        assert_eq!(CdrCapacity::Cdr74.sectors(), 332_849);
+        assert_eq!(CdrCapacity::Cdr80.sectors(), 359_849);
+        assert_eq!(CdrCapacity::Cdr90.sectors(), 404_849);
+        assert_eq!(CdrCapacity::Cdr99.sectors(), 445_349);
         let medium = CdrBundleMedium::blank(CdrCapacity::Cdr80);
-        assert_eq!(medium.capacity_sectors(), 360_000);
+        assert_eq!(medium.capacity_sectors(), 359_849);
         assert_eq!(medium.medium_leadin(), -11_077);
         assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+    }
+
+    #[test]
+    fn atip_describes_the_media_in_every_disc_state() {
+        let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr80);
+        let mut mock = Mock::default();
+        // The ATIP time base starts 450 150 frames before the program area, so
+        // -11 077 is 439 073 = 97:34:23; an 80-minute lead-out is 359 849 +
+        // 150 = 359 999 = 79:59:74. Both are plain binary M/S/F bytes.
+        let check = |atip: AtipInfo| {
+            assert_eq!(atip.lead_in, [97, 34, 23]);
+            assert_eq!(atip.lead_out, [79, 59, 74]);
+            assert_eq!(atip.writing_power, 5);
+            assert_eq!(atip.reference_speed, 0);
+            assert!(atip.unrestricted, "general-purpose media");
+            assert_eq!(atip.disc_type, 0, "CD-R");
+            assert_eq!(atip.disc_sub_type, 0);
+            assert_eq!(atip.a1, None);
+            assert_eq!(atip.a2, None);
+            assert_eq!(atip.a3, None);
+        };
+
+        // The pre-groove is written before any data, so all disc states
+        // describe the same media.
+        check(medium.atip().expect("blank ATIP"));
+        write_one(&mut medium, &mut mock, 0);
+        assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
+        check(medium.atip().expect("appendable ATIP"));
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        check(medium.atip().expect("finalized ATIP"));
+    }
+
+    #[test]
+    fn atip_lead_out_follows_the_preset_geometry() {
+        // `sectors + 150` split into binary M/S/F: the 90- and 99-minute
+        // presets are above MMC's recommended lead-out, like real
+        // high-capacity media.
+        for (capacity, lead_out) in [
+            (CdrCapacity::Cdr74, [73, 59, 74]),
+            (CdrCapacity::Cdr80, [79, 59, 74]),
+            (CdrCapacity::Cdr90, [89, 59, 74]),
+            (CdrCapacity::Cdr99, [98, 59, 74]),
+        ] {
+            let medium = CdrBundleMedium::blank(capacity);
+            let atip = medium.atip().expect("ATIP");
+            assert_eq!(atip.lead_out, lead_out, "{capacity:?}");
+            assert_eq!(atip.lead_in, [97, 34, 23], "{capacity:?}");
+        }
+    }
+
+    #[test]
+    fn atip_wraps_past_a_100_minute_disc() {
+        // The ATIP time base wraps at 100 minutes (450 000 frames), so a
+        // capacity past 99:59:74 continues from 00:00:00 instead of saturating.
+        let medium = CdrBundleMedium::with_capacity(450_000);
+        assert_eq!(medium.atip().expect("ATIP").lead_out, [0, 2, 0]);
+        assert_eq!(medium.disc_info().last_possible_lead_out, Some(450_000));
+    }
+
+    #[test]
+    fn restored_medium_reports_the_same_atip_as_a_fresh_one() {
+        // A TOC slot only stores the geometry; ATIP is derived from it, so a
+        // reopened disc describes the same media as a blank one.
+        let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr90);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        let slot = store.slot(0);
+        let reopened = CdrBundleMedium::open_at(0, &slot, 0, Recovery::Delete)
+            .expect("reopen from the saved slot");
+        assert_eq!(reopened.capacity_sectors(), CdrCapacity::Cdr90.sectors());
+        assert_eq!(
+            reopened.atip(),
+            CdrBundleMedium::blank(CdrCapacity::Cdr90).atip()
+        );
     }
 
     #[test]
@@ -2266,7 +2399,7 @@ mod tests {
         let attrs = medium.attrs();
         assert_eq!(attrs.write_mode, MmcWriteMode::WriteOnce);
         assert_eq!(attrs.block_len, 2048);
-        assert_eq!(attrs.sectors, 333_000);
+        assert_eq!(attrs.sectors, 332_849);
         assert_eq!(attrs.tracks, 0);
         assert_eq!(attrs.sessions, 0);
         assert!(!attrs.write_protected);
@@ -2285,7 +2418,7 @@ mod tests {
         assert_eq!(info.last_track_last_session, 1);
         assert_eq!(info.last_session_state, 0);
         assert_eq!(info.last_session_lead_in, Some(-11_077));
-        assert_eq!(info.last_possible_lead_out, Some(332_998));
+        assert_eq!(info.last_possible_lead_out, Some(332_849));
         assert!(!info.erasable);
         assert_eq!(info.disc_type, 0xFF);
 
@@ -2306,9 +2439,9 @@ mod tests {
         assert_eq!(invisible.session, 1);
         assert_eq!(invisible.start_lba, 0);
         assert_eq!(invisible.length, 0);
-        assert_eq!(invisible.allocated, 333_000);
+        assert_eq!(invisible.allocated, 332_849);
         assert_eq!(invisible.nwa, 0);
-        assert_eq!(invisible.free_blocks, 332_996);
+        assert_eq!(invisible.free_blocks, 332_847);
         assert_eq!(invisible.status, TrackStatus::Invisible);
         assert_eq!(
             medium.track_info(TrackInfoRequest::Number(1)),
@@ -2343,7 +2476,7 @@ mod tests {
         assert_eq!(info.length, 2);
         assert_eq!(info.allocated, 0, "an implicit track has no reservation");
         assert_eq!(info.nwa, 2);
-        assert_eq!(info.free_blocks, 359_994);
+        assert_eq!(info.free_blocks, 359_845);
         assert_eq!(info.status, TrackStatus::Incomplete);
 
         assert_eq!(
@@ -3069,7 +3202,7 @@ end = 1
             .all(|byte| *byte == b';' || *byte == b'\n'));
 
         let reopened = CdrBundleMedium::open(&slot0, 0, Recovery::Delete).expect("reopen");
-        assert_eq!(reopened.capacity_sectors(), 333_000);
+        assert_eq!(reopened.capacity_sectors(), 332_849);
         assert_eq!(reopened.toc_seq(), 1);
         assert_eq!(reopened.current_slot(), 0);
         assert_eq!(reopened.disc_state(), CdrDiscState::Appendable);

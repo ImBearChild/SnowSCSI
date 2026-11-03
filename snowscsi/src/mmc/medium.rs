@@ -8,7 +8,9 @@
 //! `commit` is a local metadata hook only (no storage IO); durable host data is
 //! committed by `MmcOp::Commit` (SYNCHRONIZE CACHE).
 
-use super::attrs::{DiscInfo, MmcAttrs, Session, Track, TrackInfo, TrackInfoRequest, TrackStatus};
+use super::attrs::{
+    AtipInfo, DiscInfo, MmcAttrs, Session, Track, TrackInfo, TrackInfoRequest, TrackStatus,
+};
 use super::op::MmcOp;
 use crate::core::{Completion, Feedback, InterruptReason, KnownEffects, PollStep};
 
@@ -98,6 +100,16 @@ pub trait MmcMedium {
 
     /// Disc-information summary for READ DISC INFORMATION.
     fn disc_info(&self) -> DiscInfo;
+
+    /// ATIP descriptor data for READ TOC format 4 (MMC-6 Table 488).
+    ///
+    /// Only a CD-R/RW has a pre-groove to describe; a stamped CD or a
+    /// non-CD medium returns `None`, and the drive answers the format 4
+    /// request with `ILLEGAL REQUEST / INVALID FIELD IN CDB` (`24/00`).
+    /// Default: no ATIP.
+    fn atip(&self) -> Option<AtipInfo> {
+        None
+    }
 }
 
 /// Project a closed, fully recorded track into the track-information view.

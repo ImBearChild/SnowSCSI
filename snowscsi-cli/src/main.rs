@@ -3434,7 +3434,10 @@ mod tests {
         let planes = build_planes(&specs).expect("bundle plane");
         assert!(dir.is_dir(), "the CLI owns directory creation");
         assert_eq!(planes.len(), 1);
-        assert_eq!(planes[0].capacity(), 360_000 * 2048);
+        assert_eq!(
+            planes[0].capacity(),
+            snowscsi::mmc::CdrCapacity::Cdr80.sectors() * 2048
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
