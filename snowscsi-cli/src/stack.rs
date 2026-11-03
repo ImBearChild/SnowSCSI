@@ -155,6 +155,58 @@ fn sync_file_or_missing(fs: &mut FsPlaneAdapter<StdFsBackend>, path: &str) -> Re
     }
 }
 
+/// Write a rendered TOC slot image to `<dir>/toc.<slot>` atomically.
+///
+/// The complete image is written to `<dir>/toc.<slot>.tmp`, fsynced, and then
+/// renamed over the real slot. Within the temp file the header/body order is
+/// irrelevant because the file is not visible until the rename, which makes
+/// the slot switch atomic. The directory is fsynced best effort so the rename
+/// is durable. The plane is dropped right after an eject, so this uses
+/// `std::fs` uniformly on the serve paths that own the store.
+#[cfg(feature = "cdr-bundle")]
+fn write_toc_snapshot(dir: &str, slot: u8, image: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let name = toc_file(slot);
+    let path = std::path::Path::new(dir).join(name);
+    let tmp = std::path::Path::new(dir).join(format!("{name}.tmp"));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(image)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Snapshot a CD-R bundle pair before an eject drops its plane.
+///
+/// Only a writable, non-finalized medium with pending state (an open track or
+/// an unsaved transition) is rendered; a clean or finalized disc writes
+/// nothing. The medium's in-memory save bookkeeping advances as if the slot
+/// save had completed, so a later save alternates to the other slot.
+#[cfg(feature = "cdr-bundle")]
+pub(crate) fn snapshot_cdr_eject(pair: &mut CliPair, dir: &str) -> Result<bool, String> {
+    let medium = match &mut pair.medium {
+        CliPairMedium::Mmc(CliMedium::CdrBundle(medium)) => medium,
+        _ => return Ok(false),
+    };
+    if !medium.eject_needs_save() {
+        return Ok(false);
+    }
+    let mut image = vec![0u8; medium.slot_size() as usize];
+    let slot = medium.toc_image(&mut image).map_err(|e| e.to_string())?;
+    write_toc_snapshot(dir, slot, &image).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Persistent CD-R directory store.
 ///
 /// The medium addresses files by resource id (`0` = aggregate sync, `1`/`2` =
@@ -1171,18 +1223,15 @@ impl Storage for CliStorage {
 
     fn resources_released(&mut self, lun: usize) {
         // A CD-R bundle cannot be re-addressed after a host eject: drop its
-        // plane so the cached handles close. Anything the host did not flush
-        // with CLOSE/SYNCHRONIZE CACHE is lost.
+        // plane so the cached handles close. The eject path rendered the last
+        // TOC best effort before this point.
         let is_bundle = self
             .planes
             .get(lun)
             .and_then(Option::as_ref)
             .is_some_and(OwnedPlane::is_cdr_bundle);
         if is_bundle {
-            log::warn!(
-                "LUN {lun}: CD-R bundle ejected; unsaved writes are lost \
-                 (the host must CLOSE/SYNCHRONIZE CACHE before eject)"
-            );
+            log::info!("LUN {lun}: CD-R bundle plane released after the eject");
             self.pending = None;
             self.planes[lun] = None;
         }
@@ -1538,6 +1587,145 @@ mod tests {
         );
     }
 
+    /// Host that fills every received data phase with one byte value.
+    #[cfg(feature = "cdr-bundle")]
+    struct FillHost(u8);
+
+    #[cfg(feature = "cdr-bundle")]
+    impl snowscsi::core::storage::SyncHost for FillHost {
+        fn publish(&mut self, _plan: snowscsi::core::DataPlan) -> Result<(), Fault> {
+            Ok(())
+        }
+        fn receive(
+            &mut self,
+            req: snowscsi::core::storage::HostReq,
+            buf: snowscsi::core::storage::HostBuf<'_>,
+        ) -> snowscsi::core::storage::HostReceipt {
+            match buf {
+                snowscsi::core::storage::HostBuf::Recv { buf: bytes, .. } => {
+                    let accepted = (req.len as usize).min(bytes.len());
+                    bytes[..accepted].fill(self.0);
+                    snowscsi::core::storage::HostReceipt::from_adapter(accepted, None)
+                }
+                snowscsi::core::storage::HostBuf::Send { .. } => {
+                    snowscsi::core::storage::HostReceipt::from_adapter(0, Some(Fault::Contract))
+                }
+            }
+        }
+        fn send(
+            &mut self,
+            _req: snowscsi::core::storage::HostReq,
+            _buf: snowscsi::core::storage::HostBuf<'_>,
+        ) -> snowscsi::core::storage::HostReceipt {
+            snowscsi::core::storage::HostReceipt::from_adapter(0, Some(Fault::Contract))
+        }
+        fn delivery(&self) -> Delivery {
+            Delivery::Complete
+        }
+    }
+
+    /// Borrowed medium so a drive command can leave its state with the test.
+    #[cfg(feature = "cdr-bundle")]
+    struct BorrowedMedium<'a>(&'a mut CdrBundleMedium);
+
+    #[cfg(feature = "cdr-bundle")]
+    impl MmcMedium for BorrowedMedium<'_> {
+        type State = <CdrBundleMedium as MmcMedium>::State;
+
+        fn attrs(&self) -> MmcAttrs {
+            self.0.attrs()
+        }
+
+        fn state(&self) -> &Self::State {
+            self.0.state()
+        }
+
+        fn begin(&mut self, op: MmcOp) -> Result<(), Completion> {
+            self.0.begin(op)
+        }
+
+        fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
+            self.0.poll(fb, data)
+        }
+
+        fn poll_with_alt<'a>(
+            &mut self,
+            fb: Feedback,
+            data: &'a mut [u8],
+            alt: &'a mut [u8],
+        ) -> PollStep<'a> {
+            self.0.poll_with_alt(fb, data, alt)
+        }
+
+        fn active(&self) -> bool {
+            self.0.active()
+        }
+
+        fn interrupt(&mut self, reason: InterruptReason, known: KnownEffects) {
+            self.0.interrupt(reason, known);
+        }
+
+        fn commit(&mut self) -> Result<(), Completion> {
+            self.0.commit()
+        }
+
+        fn track(&self, number: u16) -> Option<Track> {
+            self.0.track(number)
+        }
+
+        fn session(&self, number: u16) -> Option<Session> {
+            self.0.session(number)
+        }
+
+        fn track_info(&self, request: TrackInfoRequest) -> Option<TrackInfo> {
+            self.0.track_info(request)
+        }
+
+        fn disc_info(&self) -> DiscInfo {
+            self.0.disc_info()
+        }
+    }
+
+    /// Drive one WRITE(10) block through a real `MmcDrive<CdrBundleMedium>`,
+    /// leaving the medium open (and therefore unsaved) for the test.
+    #[cfg(feature = "cdr-bundle")]
+    fn drive_write_track(plane: &mut OwnedPlane, medium: &mut CdrBundleMedium, lba: u64) {
+        use snowscsi::core::storage::{BlockingHost, BlockingStorage};
+        use snowscsi::core::{cons, Cons, Here, Nil, StaticTarget, Target};
+
+        type WriteTarget<'a> = Target<Cons<LuImpl<Spc<MmcDrive<BorrowedMedium<'a>>>, u32>, Nil>>;
+        let mut storage = BlockingStorage::new(PlaneStorage(plane));
+        let mut host = BlockingHost::new(FillHost(0x5A));
+        let mut target = WriteTarget::new(cons(
+            LuImpl::new(Spc::new(MmcDrive::new(BorrowedMedium(medium))), 1u32),
+            Nil,
+        ));
+        let mut work = [0u8; 4096];
+        let mut scratch = [0u8; 4096];
+        let ctx = CommandContext {
+            lun: 0,
+            lun_count: 1,
+            host_bytes: 2048,
+            host_direction: snowscsi::core::Direction::FromHost,
+        };
+        // WRITE(10): one block at `lba`.
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x2A;
+        cdb[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+        cdb[7..9].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            target.drive_static_host::<Here>(
+                &mut storage,
+                &mut host,
+                ctx,
+                &cdb,
+                &mut work,
+                &mut scratch,
+            ),
+            Ok(Completion::Good)
+        );
+    }
+
     #[cfg(feature = "cdr-bundle")]
     #[test]
     fn cdr_bundle_exec_routes_resources() {
@@ -1871,6 +2059,144 @@ mod tests {
         assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_eject_snapshot_survives_reopen() {
+        use snowscsi::core::Direction;
+        use snowscsi::mmc::{CdrDiscState, TrackStatus};
+
+        let dir = temp_dir("cdr_snapshot");
+        let mut plane = bundle_plane(&dir);
+        let mut medium = plane
+            .open_cdr_medium(360_000, Recovery::Delete)
+            .expect("fresh bundle");
+        drive_write_track(&mut plane, &mut medium, 0);
+        assert!(
+            medium.eject_needs_save(),
+            "an open track needs an eject snapshot"
+        );
+
+        let mut pair = CliPair {
+            medium: CliPairMedium::Mmc(CliMedium::CdrBundle(medium)),
+            backing: 0,
+        };
+        let dir_text = dir.to_string_lossy().into_owned();
+        assert_eq!(snapshot_cdr_eject(&mut pair, &dir_text), Ok(true));
+        assert!(
+            !dir.join("toc.0.tmp").exists(),
+            "the atomic snapshot must not leave a temp file"
+        );
+        let slot_image = std::fs::read(dir.join("toc.0")).expect("slot file");
+        assert_eq!(slot_image.len(), TOC_SLOT_DEFAULT as usize);
+        CdrBundleMedium::open_at(0, &slot_image, 0, Recovery::Delete)
+            .expect("the slot file is a complete image");
+
+        let CliPairMedium::Mmc(CliMedium::CdrBundle(medium)) = pair.medium else {
+            panic!("snapshot must keep the CD-R medium");
+        };
+        assert_eq!(medium.current_slot(), 0);
+        assert_eq!(medium.toc_seq(), 1);
+        assert!(!medium.needs_save());
+        assert!(!medium.eject_needs_save());
+        drop(plane);
+
+        let mut reopened_plane = bundle_plane(&dir);
+        let mut reopened = reopened_plane
+            .open_cdr_medium(0, Recovery::Delete)
+            .expect("reopen the snapshot");
+        assert_eq!(reopened.current_slot(), 0);
+        assert_eq!(reopened.toc_seq(), 1);
+        assert_eq!(reopened.disc_state(), CdrDiscState::Appendable);
+        assert_eq!(reopened.capacity_sectors(), 360_000);
+        let info = reopened
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.status, TrackStatus::Complete);
+        assert_eq!(
+            info.length, 300,
+            "the eject close pads like SYNCHRONIZE CACHE"
+        );
+
+        let mut data = [0u8; 2048];
+        assert_eq!(
+            reopened_plane.exec(
+                io_req(17, 0, 2048, Direction::ToHost),
+                IoBuf::Read(&mut data)
+            ),
+            Ok(2048)
+        );
+        assert_eq!(data, [0x5A; 2048], "the written prefix survives the eject");
+
+        // A second snapshot alternates to slot 1; reopening selects the newer
+        // slot by sequence number, not by file name.
+        let mut image = vec![0u8; reopened.slot_size() as usize];
+        let slot = reopened.toc_image(&mut image).expect("second snapshot");
+        assert_eq!(slot, 1);
+        write_toc_snapshot(&dir_text, slot, &image).expect("write slot 1");
+        assert!(
+            !dir.join("toc.1.tmp").exists(),
+            "the second snapshot must not leave a temp file"
+        );
+        drop(reopened);
+        drop(reopened_plane);
+
+        let mut latest_plane = bundle_plane(&dir);
+        let latest = latest_plane
+            .open_cdr_medium(0, Recovery::Delete)
+            .expect("reopen the newer slot");
+        assert_eq!(latest.current_slot(), 1);
+        assert_eq!(latest.toc_seq(), 2);
+        assert_eq!(latest.disc_state(), CdrDiscState::Appendable);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_snapshot_skips_clean_and_non_mmc_pairs() {
+        // A saved disc with no open track and no pending transition renders
+        // nothing.
+        let source = temp_dir("cdr_snapshot_clean_src");
+        let mut plane = bundle_plane(&source);
+        let medium = plane
+            .open_cdr_medium(360_000, Recovery::Delete)
+            .expect("fresh bundle");
+        drive_close_session(&mut plane, medium);
+        let clean = plane
+            .open_cdr_medium(360_000, Recovery::Delete)
+            .expect("saved bundle");
+        assert!(!clean.eject_needs_save());
+
+        let target = temp_dir("cdr_snapshot_clean_dst");
+        let target_text = target.to_string_lossy().into_owned();
+        let mut pair = CliPair {
+            medium: CliPairMedium::Mmc(CliMedium::CdrBundle(clean)),
+            backing: 0,
+        };
+        assert_eq!(snapshot_cdr_eject(&mut pair, &target_text), Ok(false));
+        assert!(
+            std::fs::read_dir(&target).unwrap().next().is_none(),
+            "a clean disc must not write a TOC slot"
+        );
+
+        // A non-MMC pair is not a CD-R bundle either.
+        let block_dir = temp_dir("cdr_snapshot_block");
+        let block_text = block_dir.to_string_lossy().into_owned();
+        let mut block_pair = CliPair {
+            medium: CliPairMedium::Block(snowscsi::core::NoMedium),
+            backing: 0,
+        };
+        assert_eq!(snapshot_cdr_eject(&mut block_pair, &block_text), Ok(false));
+        assert!(
+            std::fs::read_dir(&block_dir).unwrap().next().is_none(),
+            "a block pair must not write a TOC slot"
+        );
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&block_dir);
     }
 
     #[cfg(feature = "cdr-bundle")]

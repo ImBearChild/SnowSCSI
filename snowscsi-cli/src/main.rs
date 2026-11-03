@@ -60,9 +60,15 @@ use snowscsi::common::flat_bundle::FlatBundle;
 use snowscsi::common::fs_plane::FsPlaneAdapter;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
-use snowscsi::common::seekable_storage::{FlatData, StorageError};
+use snowscsi::common::seekable_storage::FlatData;
+#[cfg(feature = "tokio")]
+use snowscsi::common::seekable_storage::StorageError;
+#[cfg(feature = "tokio")]
 use snowscsi::core::slots::{SlotPool, SlotTask};
-use snowscsi::core::storage::{IoReq, Storage};
+#[cfg(feature = "tokio")]
+use snowscsi::core::storage::IoReq;
+use snowscsi::core::storage::Storage;
+#[cfg(feature = "tokio")]
 use snowscsi::core::Direction;
 use snowscsi::core::{Lu, Spc, Writability};
 use snowscsi::iscsi::pdu::BHS_SIZE;
@@ -670,8 +676,10 @@ fn build_core_slots(
                     backing,
                 )));
                 // A host eject detaches the pair and leaves the LUN empty (no
-                // automatic reinsert): the TOC is already saved on CLOSE/SYNC,
-                // and restarting the server re-reads the directory.
+                // automatic reinsert). Before dropping the plane the serve
+                // path snapshots the ejected medium's TOC best effort, so an
+                // open track or unsaved transition survives; restarting the
+                // server re-reads the directory.
                 log::debug!("LUN {lun}: CD-R bundle ({sectors} sectors)");
             }
             _ => {
@@ -791,6 +799,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
                 &mut table[..],
                 planes,
                 config,
+                specs,
             );
             if let Some(handle) = auto_handle {
                 stop.store(true, Ordering::SeqCst);
@@ -1084,6 +1093,7 @@ fn serve_iscsi_async(
     table: &mut [&mut dyn Lu<Pair = CliPair>],
     planes: Vec<Option<OwnedPlane>>,
     config: &ServeConfig,
+    specs: &[DeviceSpec],
 ) -> Result<(), TargetError> {
     if let Err(e) = listener.set_nonblocking(true) {
         log::error!("failed to make the listener non-blocking: {e}");
@@ -1132,6 +1142,7 @@ fn serve_iscsi_async(
                     table,
                     &mut storage,
                     true,
+                    specs,
                 ));
                 let mut backend = core::pin::pin!(drive_async_backend(&mut backends, &task));
                 tokio::select! {
@@ -1151,7 +1162,7 @@ fn serve_iscsi_async(
         std::thread::scope(|scope| {
             let mut store = WorkerStore::new(scope, planes, per_bank);
             let res = runtime.block_on(accept_loop(
-                &listener, stop, &shutdown, work, scratch, table, &mut store, true,
+                &listener, stop, &shutdown, work, scratch, table, &mut store, true, specs,
             ));
             if let Err((i, e)) = store.sync() {
                 eprintln!("snowscsi: sync failed for LUN {i}: {e}");
@@ -1169,6 +1180,7 @@ fn serve_iscsi_async(
             table,
             &mut storage,
             false,
+            specs,
         ));
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");
@@ -1193,6 +1205,7 @@ async fn accept_loop<W>(
     table: &mut [&mut dyn Lu<Pair = CliPair>],
     storage: &mut W,
     overlap: bool,
+    specs: &[DeviceSpec],
 ) -> Result<(), TargetError>
 where
     W: snowscsi::core::storage::Storage + snowscsi::core::async_wake::AsyncWake,
@@ -1254,8 +1267,11 @@ where
             ) = r?
             {
                 // The target is per-connection here; take the detached pair so
-                // the slot does not keep a resident result.
-                let _ = target.take_rt(lun);
+                // the slot does not keep a resident result, preserving a CD-R
+                // TOC snapshot before the plane is released.
+                let mut taken = target.take_rt(lun);
+                preserve_ejected_cdr(specs, lun, &mut taken);
+                drop(taken);
                 storage.resources_released(lun);
             },
             _ = shutdown.notified() => {
@@ -2057,6 +2073,48 @@ fn card_attrs(len: u64, sector: u32, read_only: bool) -> Result<BlockAttrs, &'st
     Ok(attrs)
 }
 
+/// Directory of a `--cdrom bundle=` LUN, if any.
+#[cfg(feature = "cdr-bundle")]
+fn cdr_bundle_dir(specs: &[DeviceSpec], lun: usize) -> Option<&str> {
+    match specs.get(lun).map(|spec| &spec.backing) {
+        Some(Backing::CdrBundle { dir, .. }) => Some(dir),
+        _ => None,
+    }
+}
+
+/// Snapshot an ejected CD-R bundle before its plane is dropped.
+///
+/// The taken pair still owns the medium's in-memory state; a clean or
+/// finalized disc writes nothing. Snapshot failures are reported and never
+/// abort the eject.
+#[cfg(feature = "cdr-bundle")]
+fn preserve_ejected_cdr(
+    specs: &[DeviceSpec],
+    lun: usize,
+    taken: &mut Result<snowscsi::core::ChangeResult<CliPair>, snowscsi::core::BoundaryReject>,
+) {
+    let Some(pair) = taken.as_mut().ok().and_then(|result| result.pair.as_mut()) else {
+        return;
+    };
+    let Some(dir) = cdr_bundle_dir(specs, lun) else {
+        return;
+    };
+    match stack::snapshot_cdr_eject(pair, dir) {
+        Ok(true) => log::info!("LUN {lun}: CD-R TOC snapshot written to {dir}"),
+        Ok(false) => {}
+        Err(e) => log::warn!("LUN {lun}: CD-R TOC snapshot failed: {e}"),
+    }
+}
+
+/// No-op without the `cdr-bundle` feature.
+#[cfg(not(feature = "cdr-bundle"))]
+fn preserve_ejected_cdr(
+    _specs: &[DeviceSpec],
+    _lun: usize,
+    _taken: &mut Result<snowscsi::core::ChangeResult<CliPair>, snowscsi::core::BoundaryReject>,
+) {
+}
+
 /// Build the fully installed slot for a newly inserted "card".
 ///
 /// The slot is replaced wholesale because `BlockDevice` owns the geometry, so a
@@ -2202,11 +2260,23 @@ fn run_serve_usb(
                         Ok(snowscsi::core::ServeExit::Outcome(
                             snowscsi::core::RunOutcome::ResourcesReady { lun },
                         )) => {
-                            // The host ejected: take the pair so the slot is
-                            // not left with a resident result, then keep
-                            // serving with the SAME target/runner: another LUN
-                            // may still have a resident long-operation receipt.
-                            let _ = target.take_rt(lun);
+                            // The host ejected: flush the bundle's track data,
+                            // take the pair so the slot is not left with a
+                            // resident result, preserve a CD-R TOC snapshot,
+                            // then keep serving with the SAME target/runner:
+                            // another LUN may still have a resident
+                            // long-operation receipt.
+                            #[cfg(feature = "cdr-bundle")]
+                            if cdr_bundle_dir(specs, lun).is_some() {
+                                if let Err((i, e)) = store.sync() {
+                                    log::warn!(
+                                        "LUN {lun}: CD-R pre-eject flush failed for LUN {i}: {e}"
+                                    );
+                                }
+                            }
+                            let mut taken = target.take_rt(lun);
+                            preserve_ejected_cdr(specs, lun, &mut taken);
+                            drop(taken);
                             store.resources_released(lun);
                             log::info!("LUN {lun}: medium ejected by the host");
                         }
@@ -2260,9 +2330,21 @@ fn run_serve_usb(
                         Ok(snowscsi::core::ServeExit::Outcome(
                             snowscsi::core::RunOutcome::ResourcesReady { lun },
                         )) => {
-                            // `ResourcesReady` is not a rebuild point: take the
-                            // pair and keep the same target/runner serving.
-                            let _ = target.take_rt(lun);
+                            // `ResourcesReady` is not a rebuild point: flush
+                            // the bundle's track data, take the pair, preserve a
+                            // CD-R TOC snapshot, and keep the same
+                            // target/runner serving.
+                            #[cfg(feature = "cdr-bundle")]
+                            if cdr_bundle_dir(specs, lun).is_some() {
+                                if let Err((i, e)) = storage.sync() {
+                                    log::warn!(
+                                        "LUN {lun}: CD-R pre-eject flush failed for LUN {i}: {e}"
+                                    );
+                                }
+                            }
+                            let mut taken = target.take_rt(lun);
+                            preserve_ejected_cdr(specs, lun, &mut taken);
+                            drop(taken);
                             storage.resources_released(lun);
                             log::info!("LUN {lun}: medium ejected by the host");
                             if Some(lun) == removable_lun {

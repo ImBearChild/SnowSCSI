@@ -422,6 +422,15 @@ impl CdrBundleMedium {
         self.needs_save
     }
 
+    /// Whether a host eject must persist a TOC snapshot first.
+    ///
+    /// A finalized disc and a read-only recovery medium already describe a
+    /// complete disc, so an eject has nothing left to save for them.
+    #[must_use]
+    pub const fn eject_needs_save(&self) -> bool {
+        !self.write_protected() && (self.needs_save || self.open_track.is_some())
+    }
+
     /// Whether writes are refused by a recovery latch or a finalized disc.
     const fn write_protected(&self) -> bool {
         self.read_only || matches!(self.disc, CdrDiscState::Finalized)
@@ -955,6 +964,95 @@ impl CdrBundleMedium {
         Ok(())
     }
 
+    /// Render the next alternating TOC slot into `out` and seal the medium.
+    ///
+    /// This is the pre-eject snapshot path: it performs the same in-memory
+    /// sealing as `SYNCHRONIZE CACHE` (padding and closing an open track),
+    /// renders the slot image that a save would write, and advances the save
+    /// bookkeeping without touching storage. `out` must be at least
+    /// [`Self::slot_size`] bytes; the header is written at offset 0 and the
+    /// body plus padding fills the rest. The returned slot index is the
+    /// physical slot an application must write (via [`toc_resource`] /
+    /// [`toc_file`]). A later save therefore alternates to the other slot and
+    /// the sequence numbers stay monotonic.
+    ///
+    /// A render failure after the seal still leaves the medium sealed with
+    /// `needs_save` set, so the next `CLOSE`/`SYNCHRONIZE CACHE` persists the
+    /// compacted state.
+    pub fn toc_image(&mut self, out: &mut [u8]) -> Result<u8, TocError> {
+        if self.read_only {
+            return Err(TocError::WriteProtected);
+        }
+        let slot_size = self.slot_size as usize;
+        if out.len() < slot_size {
+            return Err(TocError::Invalid);
+        }
+
+        self.close_open_track();
+        self.needs_save = true;
+
+        let max_tracks = toc::max_tracks_for_slot(self.slot_size);
+        if max_tracks == 0
+            || self.tracks.len() > usize::from(max_tracks)
+            || self.tracks.iter().any(|track| track.number > max_tracks)
+        {
+            return Err(TocError::TooLarge);
+        }
+        let body_len = toc::body_len(
+            &self.tracks,
+            &self.sessions,
+            self.capacity,
+            self.medium_leadin,
+            self.disc,
+        );
+        if TOC_HEADER_LEN
+            .checked_add(body_len)
+            .is_none_or(|end| end > slot_size)
+        {
+            return Err(TocError::TooLarge);
+        }
+        let checksum = toc::body_checksum(
+            &self.tracks,
+            &self.sessions,
+            self.capacity,
+            self.medium_leadin,
+            self.disc,
+        );
+        let seq = self.toc_seq.checked_add(1).ok_or(TocError::Invalid)?;
+        let slot = if self.saved {
+            1 - self.current_slot
+        } else {
+            self.current_slot
+        };
+        let save = SaveState {
+            slot,
+            seq,
+            stage: SaveStage::Body,
+            offset: TOC_HEADER_LEN as u32,
+            body_len: body_len as u32,
+            checksum,
+            max_tracks,
+            rollback: None,
+        };
+
+        out[..slot_size].fill(0);
+        if self.render_header(save, 0, &mut out[..TOC_HEADER_LEN]) != TOC_HEADER_LEN
+            || self.render_body_slot(
+                save,
+                TOC_HEADER_LEN as u32,
+                &mut out[TOC_HEADER_LEN..slot_size],
+            ) != slot_size - TOC_HEADER_LEN
+        {
+            return Err(TocError::Invalid);
+        }
+
+        self.toc_seq = seq;
+        self.current_slot = slot;
+        self.saved = true;
+        self.needs_save = false;
+        Ok(slot)
+    }
+
     /// Undo a `RESERVE TRACK` that could not be persisted.
     fn rollback_reserve(&mut self, rollback: ReserveRollback) {
         self.tracks.truncate(rollback.tracks);
@@ -1252,6 +1350,9 @@ impl CdrBundleMedium {
     /// Remove a track the current command created implicitly and that never
     /// received a confirmed block.
     fn drop_implicit_track(&mut self, number: u16) {
+        if self.open_track == Some(number) {
+            self.open_track = None;
+        }
         if self
             .tracks
             .last()
@@ -2788,6 +2889,45 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_drops_the_open_implicit_track_and_reuses_lba_zero() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut data = [0u8; 2048];
+        assert_eq!(medium.begin(MmcOp::Write { lba: 0, blocks: 1 }), Ok(()));
+        assert!(matches!(
+            medium.poll(Feedback::begin(), &mut data),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            medium.poll(Feedback::plan_accepted(), &mut data),
+            PollStep::Receive { .. }
+        ));
+        assert!(matches!(
+            medium.poll(
+                Feedback::host_received(HostReceipt::test(2048, None)),
+                &mut data
+            ),
+            PollStep::Io(StorageOp::Write { .. })
+        ));
+
+        // Link loss during the first block: the implicit track never received
+        // a confirmed block, so it is dropped together with its open handle.
+        medium.interrupt(InterruptReason::Disconnect, KnownEffects::NONE);
+        assert!(!medium.active());
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert_eq!(medium.attrs().sessions, 0);
+
+        let mut store = Mock::default();
+        let payload = [0x3Cu8; 2048];
+        assert_eq!(
+            run_write(&mut medium, &mut store, 0, 1, &payload, 2048),
+            Completion::Good,
+            "the next write must reuse LBA 0 instead of hitting a dangling open track"
+        );
+        assert_eq!(medium.attrs().tracks, 1);
+    }
+
+    #[test]
     fn a_failed_write_leaves_the_track_at_the_last_confirmed_block() {
         let mut medium = CdrBundleMedium::with_capacity(4096);
         let payload = [0xA5u8; 4096];
@@ -2957,6 +3097,94 @@ end = 1
             std::vec![1, 2]
         );
         assert_eq!(store.slot(0), slot0, "the older slot is untouched");
+    }
+
+    #[test]
+    fn toc_image_seals_an_open_track() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert!(medium.eject_needs_save());
+
+        let mut image = std::vec![0u8; medium.slot_size() as usize];
+        let slot = medium.toc_image(&mut image).expect("eject snapshot");
+        assert_eq!(slot, 0);
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+        assert!(medium.saved);
+        assert!(!medium.needs_save());
+        assert!(
+            !medium.eject_needs_save(),
+            "the snapshot cleared the save state"
+        );
+
+        let mut reopened = CdrBundleMedium::open_at(slot, &image, 0, Recovery::Delete)
+            .expect("the snapshot restores");
+        assert_eq!(reopened.capacity_sectors(), 4096);
+        assert_eq!(reopened.disc_state(), CdrDiscState::Appendable);
+        let info = reopened
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.status, TrackStatus::Complete);
+        assert_eq!(info.length, MIN_TRACK_BLOCKS);
+        assert_eq!(info.nwa, MIN_TRACK_BLOCKS);
+
+        // The written prefix, not the close padding, is the readable extent.
+        let (data, completion) = run_read(&mut reopened, &mut store, 0, 1, 2048);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(data, std::vec![0x5Au8; 2048]);
+    }
+
+    #[test]
+    fn toc_image_eject_needs_save_rules() {
+        // A clean save has no pending state.
+        let mut clean = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut clean, &mut store, 0);
+        assert_eq!(close_track(&mut clean, &mut store, 1), Completion::Good);
+        assert!(!clean.eject_needs_save());
+
+        // A finalized disc is complete even with the write-once latch.
+        assert_eq!(close_track(&mut clean, &mut store, 2), Completion::Good);
+        assert_eq!(clean.disc_state(), CdrDiscState::Finalized);
+        assert!(!clean.eject_needs_save());
+
+        // Read-only recovery refuses a snapshot without writing anything.
+        let mut frozen = CdrBundleMedium::open(&slot_from_body(VALID_BODY), 0, Recovery::ReadOnly)
+            .expect("read-only recovery");
+        assert!(!frozen.eject_needs_save());
+        let mut image = std::vec![0xAAu8; frozen.slot_size() as usize];
+        let before = image.clone();
+        assert_eq!(frozen.toc_image(&mut image), Err(TocError::WriteProtected));
+        assert_eq!(
+            image, before,
+            "a refused snapshot leaves the buffer untouched"
+        );
+    }
+
+    #[test]
+    fn toc_image_alternates_slots_and_sequence() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+
+        let mut first = std::vec![0u8; medium.slot_size() as usize];
+        assert_eq!(medium.toc_image(&mut first), Ok(0));
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+        assert!(!medium.eject_needs_save());
+
+        let mut second = std::vec![0u8; medium.slot_size() as usize];
+        assert_eq!(medium.toc_image(&mut second), Ok(1));
+        assert_eq!(medium.toc_seq(), 2);
+        assert_eq!(medium.current_slot(), 1);
+        assert!(!medium.eject_needs_save());
+
+        let older = CdrBundleMedium::open_at(0, &first, 0, Recovery::Delete).expect("slot 0");
+        let newer = CdrBundleMedium::open_at(1, &second, 0, Recovery::Delete).expect("slot 1");
+        assert_eq!(older.toc_seq(), 1);
+        assert_eq!(newer.toc_seq(), 2);
+        assert!(newer.toc_seq() > older.toc_seq());
     }
 
     #[test]

@@ -510,17 +510,15 @@ impl Storage for WorkerStore {
         // Dropping the WorkerPlane closes its channels; the worker finishes any
         // in-flight job, sees the closed result channel and drops the plane
         // (closing its cached handles). A bundle cannot be re-addressed after
-        // a host eject, and unflushed writes are lost.
+        // a host eject, so the eject path rendered the last TOC best effort
+        // before this point.
         let is_bundle = self
             .planes
             .get(lun)
             .and_then(Option::as_ref)
             .is_some_and(|plane| plane.bundle);
         if is_bundle {
-            log::warn!(
-                "LUN {lun}: CD-R bundle ejected; unsaved writes are lost \
-                 (the host must CLOSE/SYNCHRONIZE CACHE before eject)"
-            );
+            log::info!("LUN {lun}: CD-R bundle plane released after the eject");
             self.planes[lun] = None;
         }
     }

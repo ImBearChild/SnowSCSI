@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is added; `MmcAttrs` gains `profile`/`current_features`; `DiscInfo` gains the
   recordable-media fields. The default Hyper-Multi drive now lists the CD-R
   profile (`0x09`) in its profile list.
+- **mmc**: `TocError` gains `WriteProtected`; exhaustive matches must handle it.
 
 ### Added
 
@@ -58,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   creation is capped by `max_tracks_for_slot`; `TocHeader::parse`,
   `CdrBundleMedium::open`/`open_at`, `slot_size`, `toc_seq`, `current_slot` and
   `track_numbers` expose the persisted state.
+- **mmc**: `CdrBundleMedium::eject_needs_save` and `toc_image` render a
+  pre-eject TOC snapshot into a caller bank: the medium seals an open track
+  exactly like `SYNCHRONIZE CACHE`, writes the next alternating slot image
+  (header, body, padding) without touching storage, and advances
+  `toc_seq`/`current_slot`/`saved`/`needs_save` as a completed save would.
+  `toc_image` refuses a read-only recovery medium with
+  `TocError::WriteProtected`.
 - **mmc**: `RESERVE TRACK` (`0x53`) decoding in `MmcDrive`: ARSV is rejected
   with `ILLEGAL REQUEST / INVALID FIELD IN CDB`, reserved CDB fields are
   validated, and the reservation size reaches the medium's capacity and
@@ -101,10 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zeros (a missing track file is empty), and the first write at offset `0`
   truncates a reused track id. A resource `Sync` fsyncs that track or TOC slot,
   and `CLOSE`/`SYNCHRONIZE CACHE` fsync every dirty track plus the TOC slot
-  before reporting GOOD; orphan track files are left in place. Host eject drops
-  the LUN plane and any unsaved state — the host must CLOSE/SYNCHRONIZE CACHE
-  first. The same resource mapping covers `--banks dual`, so a bundle LUN can
-  run on the worker path.
+  before reporting GOOD; orphan track files are left in place. On host eject
+  the paths that own the store (USB inline and USB `--banks dual`) flush the
+  bundle's track data, then render the next alternating TOC slot and install it
+  atomically via a fsynced `toc.<slot>.tmp` rename; the async iSCSI accept loop
+  snapshots too but cannot pre-flush track data through its generic storage
+  seam, and the blocking iSCSI wire still has no snapshot hook (it takes the
+  pair inside `iscsi::serve`), so those paths rely on the host's
+  CLOSE/SYNCHRONIZE CACHE. A snapshot preserves an open track or an unsaved
+  transition best effort: nothing after the snapshot is lost, but the disc is
+  left Appendable (not finalized), and a host that never issued CLOSE may leave
+  a partially recorded track. The same resource mapping covers `--banks dual`,
+  so a bundle LUN can run on the worker path.
 - **common**: `FsStorage::sync_file` (defaults to the backend-wide sync) and
   `FsPlane::sync_file` (defaults to the plane-wide sync) expose per-file fsync,
   so a resource-addressed backend can make one file durable; `StdFsBackend`

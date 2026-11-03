@@ -120,6 +120,8 @@ pub enum TocError {
     TooLarge,
     /// The requested slot size is below [`TOC_SLOT_MIN`].
     BadSlotSize,
+    /// The medium is read-only (a recovery latch) and refuses a snapshot.
+    WriteProtected,
 }
 
 impl core::fmt::Display for TocError {
@@ -131,6 +133,7 @@ impl core::fmt::Display for TocError {
             Self::Invalid => write!(f, "invalid TOC body"),
             Self::TooLarge => write!(f, "TOC slot is too large"),
             Self::BadSlotSize => write!(f, "TOC slot is too small"),
+            Self::WriteProtected => write!(f, "medium is write-protected"),
         }
     }
 }

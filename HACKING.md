@@ -146,10 +146,22 @@ The CLI application maps that contract onto a host directory with
   track or TOC slot, and the aggregate `Sync { resource: 0 }` fsyncs every
   dirty track and TOC file before `SYNCHRONIZE CACHE`/`CLOSE` reports GOOD.
   Orphan track files are not removed in v1; stale tails are ignored because the
-  TOC bounds every read. On host eject the LUN plane is dropped and unsaved
-  state is lost, so the host must CLOSE/SYNCHRONIZE CACHE before ejecting; the
-  LUN stays empty (no automatic reinsert). The same `exec` drives the inline and
-  `--banks dual` worker paths, so a bundle LUN is resource-correct on both.
+  TOC bounds every read. On host eject the serve paths that own the storage
+  handle snapshot the ejected medium before its plane is dropped: USB inline
+  (`CliStorage`) and USB `--banks dual` (`WorkerStore`) first flush the bundle's
+  track data, then render the next alternating slot (`CdrBundleMedium::toc_image`
+  -> `toc.<slot>`) as a fsynced temp file renamed into place, so the slot switch
+  is atomic. The async iSCSI accept loop also snapshots, but its generic
+  `Storage + AsyncWake` seam has no sync entry point, so it cannot pre-flush
+  track data: a power loss right after that eject may still lose the last
+  unsynced track bytes. The blocking iSCSI wire (the default `--wire blocking`)
+  takes the pair inside `iscsi::serve` and has no snapshot hook, so it still
+  relies on the host's `CLOSE`/`SYNCHRONIZE CACHE`. A snapshot preserves an open
+  track or an unsaved transition best effort: nothing after the snapshot is
+  lost, but the disc is left **Appendable**, not finalized, and a host that
+  never issued `CLOSE` may leave a partially recorded track. The LUN stays empty
+  (no automatic reinsert). The same `exec` drives the inline and `--banks dual`
+  worker paths, so a bundle LUN is resource-correct on both.
 
 ## Commit Messages
 
@@ -299,8 +311,9 @@ wodim -v -tao dev=/dev/sr0 /path/image.iso
 `-tao` is mandatory: `-dao` (SAO), packet/raw write modes and `-dummy` (Test
 Write) are rejected by MODE SELECT page 0x05 with ILLEGAL REQUEST. Make sure
 the host has completed `SYNCHRONIZE CACHE` / `CLOSE TRACK SESSION` before
-ejecting — on eject the server drops the LUN plane and any state not already
-saved to a TOC slot.
+ejecting: on eject the server snapshots the current TOC into an alternating
+slot, so the disc restarts Appendable (a host that never issued CLOSE may leave
+a partially recorded track).
 
 Read the disc back:
 
