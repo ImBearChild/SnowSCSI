@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mmc**: recordable-medium vocabulary — `TrackStatus`, `TrackInfo`,
   `TrackInfoRequest`, and the defaulted `MmcMedium::track_info`; the
   `cdr-bundle` feature gate for a sequential CD-R medium.
+- **mmc**: `CdrBundleMedium` (`cdr-bundle`) — an in-memory sequential
+  write-once CD-R medium model over per-track storage resources: implicit and
+  reserved tracks, NWA-ordered writes, track/session close and finalize,
+  zero-filled pre-gap/padding/unwritten reads, and `SYNCHRONIZE CACHE` closing
+  the open track. This is medium behaviour only; the MMC drive still does not
+  expose RESERVE TRACK or the close functions. `TrackInfo::start_lba` and the
+  `DiscInfo` lead-in/lead-out are now signed so the CD lead-in address is
+  representable.
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
 - **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`

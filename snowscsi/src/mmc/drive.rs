@@ -1694,7 +1694,7 @@ const POWER_CONDITION_PAGE: [u8; 12] = [
 const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// A read-only CD-ROM profile list, used by tests that build a deliberately
 /// narrow capability set.
-#[cfg(test)]
+#[cfg(all(test, feature = "dvdram"))]
 const CDROM_PROFILES: [u16; 1] = [0x08];
 /// Profiles the default Hyper-Multi drive supports, in descending order; the
 /// non-current ones are still listed.

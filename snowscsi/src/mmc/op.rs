@@ -2,7 +2,8 @@
 //!
 //! `MmcDrive` decodes a CDB into one `MmcOp`; the medium owns the semantics.
 //! `Commit` (SYNCHRONIZE CACHE) and `Close` (CLOSE TRACK SESSION) are
-//! deliberately separate: commit persists, close changes the write state.
+//! deliberately separate: commit persists (a recordable medium pads and closes
+//! its open track first), close changes the write state.
 //! `ReserveTrack` (RESERVE TRACK) reserves space for a future track and, like
 //! `Close`, is the drive's write-state vocabulary rather than a data transfer.
 
@@ -66,7 +67,8 @@ pub enum MmcOp {
         /// Number of logical blocks to reserve.
         size: u32,
     },
-    /// SYNCHRONIZE CACHE class: persist only; never changes the write state.
+    /// SYNCHRONIZE CACHE class: persist. A recordable medium pads and closes
+    /// its open track first, but never finalizes the disc.
     Commit,
 }
 

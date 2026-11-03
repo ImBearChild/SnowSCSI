@@ -110,7 +110,9 @@ pub struct TrackInfo {
     /// Session the track belongs to.
     pub session: u16,
     /// First user block of the track (after the pre-gap).
-    pub start_lba: u64,
+    ///
+    /// Signed because the lead-in address and pre-gap addresses are negative.
+    pub start_lba: i64,
     /// Recorded length in blocks (padded after a close).
     pub length: u64,
     /// Reserved length in blocks (`0` when not reserved).
@@ -175,9 +177,11 @@ pub struct DiscInfo {
     pub last_session_state: u8,
     /// Start address of the last session lead-in, or `None` for "not
     /// applicable" (`FF FF FF FF`).
-    pub last_session_lead_in: Option<u64>,
+    ///
+    /// Signed because a CD lead-in address is negative.
+    pub last_session_lead_in: Option<i64>,
     /// Last possible lead-out address, or `None` for "not applicable".
-    pub last_possible_lead_out: Option<u64>,
+    pub last_possible_lead_out: Option<i64>,
     /// Disc type: `0` for CD-DA/CD-ROM, `0xFF` for unknown.
     pub disc_type: u8,
 }

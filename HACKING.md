@@ -76,9 +76,10 @@ Feature maps:
 - **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
-  `async-io` (→`usb` + `snowscsi-common/async-io`), `embassy` (→`async-io`
-  plus the embassy-usb/embassy-time adapters),
-  `log`, `defmt`. `defmt` forwards to `embedded-io/defmt` and
+  `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (in-memory sequential
+  CD-R medium), `async-io` (→`usb` + `snowscsi-common/async-io`), `embassy`
+  (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
+  `defmt` forwards to `embedded-io/defmt` and
   `snowscsi-common/defmt` (no `snowscsi-iso9660` propagation: that crate has
   no `defmt` feature). `std` + `defmt` is unsupported — `std::io::Error`
   cannot implement `defmt::Format` — and is guarded by a `compile_error!` in
@@ -96,9 +97,9 @@ Feature maps:
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
   targets.
 - **`tests`** (`snowscsi-tests`) — depends on `snowscsi` with
-  `std, scsi, iscsi, cdrom, livefs, usb, dvdram, bundle, async-io, embassy`;
-  enables `has_libiscsi` only when the `libiscsi` system library is present
-  (probed in `build.rs`).
+  `std, scsi, iscsi, cdrom, livefs, usb, dvdram, bundle, cdr-bundle, async-io,
+  embassy`; enables `has_libiscsi` only when the `libiscsi` system library is
+  present (probed in `build.rs`).
 
 `snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.

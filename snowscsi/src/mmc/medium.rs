@@ -105,7 +105,7 @@ fn recorded_track_info(track: Track) -> TrackInfo {
     TrackInfo {
         number: track.number,
         session: track.session,
-        start_lba: track.start_lba,
+        start_lba: signed_lba(track.start_lba),
         length: track.blocks,
         allocated: track.blocks,
         nwa: track.start_lba.saturating_add(track.blocks),
@@ -113,6 +113,15 @@ fn recorded_track_info(track: Track) -> TrackInfo {
         status: TrackStatus::Complete,
         kind: track.kind,
         packet: false,
+    }
+}
+
+/// Clamp a non-negative LBA into the signed track-information field.
+const fn signed_lba(lba: u64) -> i64 {
+    if lba > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        lba as i64
     }
 }
 

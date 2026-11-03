@@ -20,9 +20,13 @@
 //! [`vendor::VendorMedium`](crate::mmc::vendor::VendorMedium) is a second
 //! independent read-only medium (a new
 //! medium is a new `MmcMedium` impl, never a `MmcDrive` match); and
-//! `DvdRamMedium` is the feature-gated rewritable DVD-RAM medium.
+//! `DvdRamMedium` is the feature-gated rewritable DVD-RAM medium;
+//! `cdr_bundle::CdrBundleMedium` is the feature-gated sequential write-once
+//! CD-R medium.
 
 pub mod attrs;
+#[cfg(feature = "cdr-bundle")]
+pub mod cdr_bundle;
 pub mod drive;
 #[cfg(feature = "dvdram")]
 pub mod dvdram;
@@ -35,6 +39,8 @@ pub use self::attrs::{
     DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
     TrackInfoRequest, TrackKind, TrackStatus,
 };
+#[cfg(feature = "cdr-bundle")]
+pub use self::cdr_bundle::{CdrBundleMedium, CdrBundleState, CdrCapacity, CdrDiscState};
 pub use self::drive::{MmcCaps, MmcDrive};
 #[cfg(feature = "dvdram")]
 pub use self::dvdram::{DvdRamMedium, DvdRamState};
