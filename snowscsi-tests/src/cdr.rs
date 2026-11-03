@@ -25,6 +25,9 @@ const READ_TRACK_INFORMATION: u8 = 0x52;
 const CLOSE_TRACK_SESSION: u8 = 0x5B;
 const FORMAT_UNIT: u8 = 0x04;
 const BLANK: u8 = 0xA1;
+const MODE_SENSE_10: u8 = 0x5A;
+const MODE_SELECT_10: u8 = 0x55;
+const SET_CD_SPEED: u8 = 0xBB;
 
 const BLOCK: usize = 2048;
 const SECTORS: u64 = 333_000;
@@ -236,6 +239,32 @@ fn close_track_session(function: u8, track: u16) -> [u8; 10] {
     cdb[0] = CLOSE_TRACK_SESSION;
     cdb[2] = function;
     cdb[4..6].copy_from_slice(&track.to_be_bytes());
+    cdb
+}
+
+fn mode_sense10(page: u8, alloc: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = MODE_SENSE_10;
+    cdb[2] = page;
+    cdb[7] = (alloc >> 8) as u8;
+    cdb[8] = alloc as u8;
+    cdb
+}
+
+fn mode_select10(length: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = MODE_SELECT_10;
+    cdb[1] = 0x10; // PF=1, SP=0: a page list, not saved
+    cdb[7] = (length >> 8) as u8;
+    cdb[8] = length as u8;
+    cdb
+}
+
+fn set_cd_speed(read: u16, write: u16) -> [u8; 12] {
+    let mut cdb = [0u8; 12];
+    cdb[0] = SET_CD_SPEED;
+    cdb[2..4].copy_from_slice(&read.to_be_bytes());
+    cdb[4..6].copy_from_slice(&write.to_be_bytes());
     cdb
 }
 
@@ -873,5 +902,81 @@ fn cdr_write_sync_close_then_toc_and_capacity() {
             &mut scratch,
         ),
         Completion::Check(WRITE_PROTECTED)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// cdrkit recorder-control sequence: MODE SENSE/SELECT 0x05 + SET CD SPEED
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cdr_recorder_control_sequence_returns_good_before_a_write() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 256];
+    let mut scratch = vec![0u8; 256];
+
+    // MODE SENSE(10) page 0x05: the CD-R recorder parameters.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mode_sense10(0x05, 64),
+            Direction::ToHost,
+            64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[0..2], &58u16.to_be_bytes(), "8 + 52 bytes");
+    assert_eq!(work[8], 0x05, "Write Parameters page");
+    assert_eq!(work[9], 0x32, "page length");
+    assert_eq!(work[10], 0x01, "Write Type = Track-at-Once");
+    assert_eq!(work[11], 0x04, "Track Mode = data");
+    assert_eq!(work[12], 0x08, "Data Block Type = Mode 1");
+
+    // Send the same page back as a MODE SELECT(10) page list.
+    let params = work[..60].to_vec();
+    let mut select_host = BlockingHost::new(TestHost::new(params));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // SET CD SPEED is accepted and remembered.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &set_cd_speed(7060, 4236),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // The recorder still accepts the first TAO write.
+    let mut write_host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut write_host,
+        &mut work,
+        &mut scratch,
     );
 }

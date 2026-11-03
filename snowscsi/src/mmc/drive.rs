@@ -56,6 +56,14 @@ const CLOSE_TRACK_SESSION: u8 = 0x5B;
 const BLANK: u8 = 0xA1;
 /// READ CD.
 const READ_CD: u8 = 0xBE;
+/// MODE SELECT(6).
+const MODE_SELECT_6: u8 = 0x15;
+/// SEND OPC INFORMATION.
+const SEND_OPC: u8 = 0x54;
+/// MODE SELECT(10).
+const MODE_SELECT_10: u8 = 0x55;
+/// SET CD SPEED.
+const SET_CD_SPEED: u8 = 0xBB;
 
 /// READ TOC format 0 for the lead-out track (0xAA).
 const TOC_LEADOUT_LEN: usize = 12;
@@ -63,9 +71,13 @@ const TOC_LEADOUT_LEN: usize = 12;
 const TOC_SESSION_LEN: usize = 12;
 /// One TOC track descriptor.
 const TOC_DESCRIPTOR_LEN: usize = 8;
-/// Staging bound for a multi-track READ TOC response: 4-byte header, one
-/// descriptor per track (the CD track-number space is 1..=99) and the lead-out.
-const TOC_MAX_LEN: usize = 4 + TOC_DESCRIPTOR_LEN * (99 + 1);
+/// One compact raw-TOC (format 2) descriptor:
+/// session, ADR/control, TNO, POINT, MIN, SEC, FRAME, zero.
+const TOC_RAW_DESCRIPTOR_LEN: usize = 8;
+/// Staging bound for a multi-track READ TOC response: 4-byte header, the four
+/// format-2 lead-in descriptors, one descriptor per track (the CD track-number
+/// space is 1..=99) and the lead-out.
+const TOC_MAX_LEN: usize = 4 + TOC_DESCRIPTOR_LEN * (99 + 5);
 /// READ DISC INFORMATION standard payload.
 const DISC_INFO_LEN: usize = 34;
 /// READ TRACK INFORMATION payload.
@@ -280,6 +292,18 @@ enum Query {
     },
     /// FORMAT UNIT / BLANK zero-fill state machine.
     Format(FormatCmd),
+    /// MODE SELECT receiving its parameter list.
+    ModeSelect {
+        /// The command was MODE SELECT(10) (8-byte mode header).
+        ten: bool,
+        /// Planned parameter-list length.
+        len: usize,
+    },
+    /// SEND OPC INFORMATION receiving and discarding its parameter list.
+    SendOpc {
+        /// Planned parameter-list length.
+        len: usize,
+    },
 }
 
 /// MMC drive over a replaceable medium.
@@ -299,6 +323,10 @@ pub struct MmcDrive<M: MmcMedium> {
     io_issues: u32,
     /// Speculative prefetch operations issued by the medium (probe counter).
     prefetch_issues: u32,
+    /// Last SET CD SPEED read speed in kilobytes per second (`0xFFFF` = max).
+    read_speed: u16,
+    /// Last SET CD SPEED write speed in kilobytes per second (`0xFFFF` = max).
+    write_speed: u16,
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
@@ -312,6 +340,8 @@ impl<M: MmcMedium> MmcDrive<M> {
             long: LongOp::Idle,
             io_issues: 0,
             prefetch_issues: 0,
+            read_speed: 0,
+            write_speed: 0,
         }
     }
 
@@ -366,6 +396,14 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.prefetch_issues
     }
 
+    /// Last requested SET CD SPEED `(read, write)` values in kilobytes per
+    /// second (`0xFFFF` selects the drive maximum).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cd_speed(&self) -> (u16, u16) {
+        (self.read_speed, self.write_speed)
+    }
+
     /// Borrow the installed medium.
     #[must_use]
     pub fn medium(&self) -> Option<&M> {
@@ -401,6 +439,10 @@ impl<M: MmcMedium> MmcDrive<M> {
             READ_TRACK_INFORMATION => self.prepare_track_info(ctx, cdb),
             READ_CD => self.prepare_read_cd(ctx, cdb),
             CLOSE_TRACK_SESSION => self.prepare_close(ctx, cdb),
+            MODE_SELECT_6 => self.prepare_mode_select(ctx, cdb, false),
+            MODE_SELECT_10 => self.prepare_mode_select(ctx, cdb, true),
+            SEND_OPC => self.prepare_send_opc(ctx, cdb),
+            SET_CD_SPEED => self.prepare_set_cd_speed(ctx, cdb),
             _ => Err(Completion::Check(INVALID_FIELD)),
         }
     }
@@ -498,7 +540,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.begin_media(MmcOp::Commit, 0)
     }
 
-    /// READ TOC/PMA/ATIP: formats 0 and 1, LBA or MSF (design offset 2).
+    /// READ TOC/PMA/ATIP: formats 0, 1 and 2, LBA or MSF (design offset 2).
     fn prepare_toc(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
         if cdb.len() < 10 {
             return Err(Completion::Check(INVALID_FIELD));
@@ -511,7 +553,9 @@ impl<M: MmcMedium> MmcDrive<M> {
         }
         let msf = cdb[1] & 0x02 != 0;
         let format = cdb[2] & 0x0F;
-        if format > 1 {
+        // Format 4 (ATIP) is not served yet: an unsupported format is
+        // ILLEGAL REQUEST / INVALID FIELD IN CDB (`24/00`).
+        if format > 2 {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let track = cdb[6];
@@ -542,6 +586,23 @@ impl<M: MmcMedium> MmcDrive<M> {
                 let descriptors = last.saturating_sub(first).saturating_add(1);
                 4 + TOC_DESCRIPTOR_LEN * (descriptors as usize + 1)
             }
+        } else if format == 2 {
+            // Raw TOC: byte 6 is a session number in MMC-6. The design only
+            // serves the complete disc, so no session selector is accepted.
+            if track != 0 {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            // A blank disc or an open last session has no recorded TOC.
+            let Some(info) = self.medium.as_ref().map(|m| m.disc_info()) else {
+                return Err(Completion::Check(MEDIUM_NOT_PRESENT));
+            };
+            if info.last_session_state != 3 {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            let first = info.first_track.max(1);
+            let last = attrs.tracks.min(99);
+            let descriptors = 4 + usize::from(last.saturating_sub(first).saturating_add(1)) + 1;
+            4 + TOC_RAW_DESCRIPTOR_LEN * descriptors
         } else {
             // Format 1 returns the last complete session only.
             if track != 0 {
@@ -695,6 +756,96 @@ impl<M: MmcMedium> MmcDrive<M> {
             _ => return Err(Completion::Check(INVALID_FIELD)),
         }
         self.begin_media(MmcOp::Close { function }, 0)
+    }
+
+    /// MODE SELECT(6)/MODE SELECT(10): page-list validation only.
+    ///
+    /// A recorder host learns the write parameters through MODE SENSE page
+    /// 0x05, changes Write Type/Track Mode/Data Block Type and sends the whole
+    /// list back. Only a page list (PF=1) without save (SP=0) is accepted; the
+    /// parameter list is staged in the caller's bank and validated when the
+    /// data phase completes.
+    fn prepare_mode_select(
+        &mut self,
+        ctx: CommandContext,
+        cdb: &[u8],
+        ten: bool,
+    ) -> Result<(), Completion> {
+        let need = if ten { 10 } else { 6 };
+        if cdb.len() < need {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        // SPC-3 Tables 94/96: PF is byte 1 bit 4, SP is bit 0, the rest of
+        // byte 1 is reserved. Page lists only: PF=1 and SP=0.
+        if cdb[1] != 0x10 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        let len = if ten {
+            usize::from(be16(&cdb[7..9]))
+        } else {
+            usize::from(cdb[4])
+        };
+        if ctx.host_direction != Direction::FromHost {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if matches!(ctx.declared_host_bytes(), Some(declared) if declared != len as u64) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if len == 0 {
+            // SPC-3 6.7: an empty parameter list is a no-op, not an error.
+            return Err(Completion::Good);
+        }
+        self.len = len;
+        self.query = Query::ModeSelect { ten, len };
+        Ok(())
+    }
+
+    /// SEND OPC INFORMATION: a DoOpc request or an 8-byte-granular OPC table.
+    ///
+    /// The table is consumed and discarded (the recorder does not calibrate
+    /// here); its length must be a multiple of eight and a zero length is a
+    /// valid no-op.
+    fn prepare_send_opc(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
+        if cdb.len() < 10 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        // Table 612: only DoOpc (byte 1 bit 0) and Exclude0/1 (byte 2 bits
+        // 1-0) are defined; bytes 3-6 are reserved.
+        if cdb[1] & 0xFE != 0 || cdb[2] & 0xFC != 0 || cdb[3..7] != [0; 4] {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        check_direction(ctx, Direction::FromHost)?;
+        let len = usize::from(be16(&cdb[7..9]));
+        // Table 614: every table entry is eight bytes.
+        if len % 8 != 0 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if matches!(ctx.declared_host_bytes(), Some(declared) if declared != len as u64) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if len == 0 {
+            return Err(Completion::Good);
+        }
+        self.len = len;
+        self.query = Query::SendOpc { len };
+        Ok(())
+    }
+
+    /// SET CD SPEED: record the requested read/write speeds.
+    ///
+    /// The drive has no physical spindle to retune, so it accepts the request
+    /// and remembers the values (0xFFFF means "drive maximum").
+    fn prepare_set_cd_speed(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
+        if cdb.len() < 12 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        check_direction(ctx, Direction::None)?;
+        if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        self.read_speed = be16(&cdb[2..4]);
+        self.write_speed = be16(&cdb[4..6]);
+        Err(Completion::Good)
     }
 
     /// TEST UNIT READY: presence first, then the medium health latch.
@@ -1263,6 +1414,95 @@ impl<M: MmcMedium> MmcDrive<M> {
                     }
                 }
             }
+            Query::ModeSelect { ten, len } => {
+                if !self.published {
+                    // The documented bank floor makes this guard unreachable
+                    // through a transport: it is the target's own inability to
+                    // stage the parameter list.
+                    if data.len() < len {
+                        self.query = Query::None;
+                        return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+                    }
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::FromHost,
+                        bytes: len as u64,
+                    });
+                }
+                match fb.kind() {
+                    FeedbackKind::PlanAccepted => {
+                        if data.len() < len {
+                            self.query = Query::None;
+                            return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+                        }
+                        PollStep::Receive {
+                            buf: &mut data[..len],
+                            write: None,
+                        }
+                    }
+                    FeedbackKind::HostReceived => {
+                        if data.len() < len {
+                            self.query = Query::None;
+                            return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+                        }
+                        let (accepted, failed) = match fb.host() {
+                            Some(receipt) => (receipt.accepted(), receipt.error().is_some()),
+                            None => (0, true),
+                        };
+                        if failed || accepted < len {
+                            // A short Data-Out is not a partial mode select.
+                            self.query = Query::None;
+                            return PollStep::Complete(Completion::Check(COMMAND_ABORTED));
+                        }
+                        let validated = validate_mode_select(ten, &data[..len], self.attrs());
+                        self.query = Query::None;
+                        match validated {
+                            Ok(()) => PollStep::Complete(Completion::Good),
+                            Err(sense) => PollStep::Complete(Completion::Check(sense)),
+                        }
+                    }
+                    _ => PollStep::Idle,
+                }
+            }
+            Query::SendOpc { len } => {
+                if !self.published {
+                    if data.len() < len {
+                        self.query = Query::None;
+                        return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+                    }
+                    self.published = true;
+                    return PollStep::Publish(DataPlan {
+                        direction: Direction::FromHost,
+                        bytes: len as u64,
+                    });
+                }
+                match fb.kind() {
+                    FeedbackKind::PlanAccepted => {
+                        if data.len() < len {
+                            self.query = Query::None;
+                            return PollStep::Complete(Completion::Check(INTERNAL_FAILURE));
+                        }
+                        PollStep::Receive {
+                            buf: &mut data[..len],
+                            write: None,
+                        }
+                    }
+                    FeedbackKind::HostReceived => {
+                        let (accepted, failed) = match fb.host() {
+                            Some(receipt) => (receipt.accepted(), receipt.error().is_some()),
+                            None => (0, true),
+                        };
+                        self.query = Query::None;
+                        if failed || accepted < len {
+                            return PollStep::Complete(Completion::Check(COMMAND_ABORTED));
+                        }
+                        // The OPC table is accepted and discarded: the medium
+                        // owns no calibration state here.
+                        PollStep::Complete(Completion::Good)
+                    }
+                    _ => PollStep::Idle,
+                }
+            }
         }
     }
 }
@@ -1464,19 +1704,17 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         // page) and 0x05 (defaults when no medium is loaded). Only commands
         // that describe *the mounted disc* are NOT READY.
         let caps = self.caps;
+        let attrs = self.attrs();
         let mut pages = [0u8; ALL_PAGES_LEN];
         let plen = if page == 0x3F {
             let mut at = 0usize;
             for code in ALL_PAGE_ORDER {
-                let bytes = page_bytes(code, caps)?;
-                pages[at..at + bytes.len()].copy_from_slice(bytes);
-                at += bytes.len();
+                let bytes = write_page(code, caps, attrs, &mut pages[at..])?;
+                at += bytes;
             }
             at
         } else {
-            let bytes = page_bytes(page, caps)?;
-            pages[..bytes.len()].copy_from_slice(bytes);
-            bytes.len()
+            write_page(page, caps, attrs, &mut pages)?
         };
         if pc == 1 {
             // Changeable mask: keep page code/length, zero the payload.
@@ -1777,13 +2015,8 @@ const CDROM_PARAMS: [u8; 4] = [0x0D, 0x02, 0x08, 0x00];
 const CDROM_AUDIO: [u8; 16] = [
     0x0E, 0x0E, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
 ];
-/// Write Parameters page 0x05 (cdrom/common.rs:129).
-const WRITE_PARAMS_PAGE: [u8; 52] = [
-    0x05, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-];
+/// Write Parameters page 0x05 payload length (page length byte `0x32`).
+const WRITE_PARAMS_LEN: usize = 52;
 /// Read/Write Error Recovery page 0x01 (cdrom/common.rs:137).
 const READ_WRITE_ERROR_RECOVERY_PAGE: [u8; 12] = [
     0x01, 0x0A, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1835,25 +2068,55 @@ const MODE_SENSE_MAX: usize = 8 + ALL_PAGES_LEN;
 /// (cdrom/common.rs:501).
 const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A, 0x00];
 
-/// Bytes of one supported mode page (`0x3F` excluded).
+/// Write Parameters page 0x05 for the mounted medium.
 ///
+/// A CD-R recorder advertises the mode it actually records with: Track-at-Once
+/// (Write Type 1), data track mode 4 and 2048-byte Mode 1 data blocks (Data
+/// Block Type 8). Read-only and rewritable media keep the default zero page
+/// and therefore never claim TAO.
+fn write_params_page(attrs: Option<MmcAttrs>) -> [u8; WRITE_PARAMS_LEN] {
+    let mut page = [0u8; WRITE_PARAMS_LEN];
+    page[0] = 0x05;
+    page[1] = 0x32;
+    if let Some(attrs) = attrs {
+        if attrs.write_mode == MmcWriteMode::WriteOnce {
+            page[2] = 0x01; // Write Type: Track-at-Once
+            page[3] = 0x04; // Track Mode: data
+            page[4] = 0x08; // Data Block Type: Mode 1, 2048 bytes
+        }
+    }
+    page
+}
+
+/// Copy one supported mode page into `out` and return its byte count.
+///
+/// Page 0x05 is medium-dependent; every other page is a fixed drive page.
 /// Page 0x2A comes from [`MmcCaps::capabilities_page`]: the 64-byte read-only
 /// CD-ROM view or the 36-byte DVD-RAM recorder view. The page length byte
 /// describes each one completely, so `0x3F` concatenation never carries padding
 /// that a host could parse as another page.
-fn page_bytes(page: u8, caps: MmcCaps) -> Option<&'static [u8]> {
-    match page {
-        0x00 => Some(&VENDOR_PAGE),
-        0x01 => Some(&READ_WRITE_ERROR_RECOVERY_PAGE),
-        0x05 => Some(&WRITE_PARAMS_PAGE),
-        0x08 => Some(&CACHING_PAGE),
-        0x0D => Some(&CDROM_PARAMS),
-        0x0E => Some(&CDROM_AUDIO),
-        0x1A => Some(&POWER_CONDITION_PAGE),
-        0x1D => Some(&TIMEOUT_PROTECT_PAGE),
-        0x2A => Some(caps.capabilities_page()),
-        _ => None,
+fn write_page(page: u8, caps: MmcCaps, attrs: Option<MmcAttrs>, out: &mut [u8]) -> Option<usize> {
+    if page == 0x05 {
+        if out.len() < WRITE_PARAMS_LEN {
+            return None;
+        }
+        out[..WRITE_PARAMS_LEN].copy_from_slice(&write_params_page(attrs));
+        return Some(WRITE_PARAMS_LEN);
     }
+    let bytes: &[u8] = match page {
+        0x00 => &VENDOR_PAGE,
+        0x01 => &READ_WRITE_ERROR_RECOVERY_PAGE,
+        0x08 => &CACHING_PAGE,
+        0x0D => &CDROM_PARAMS,
+        0x0E => &CDROM_AUDIO,
+        0x1A => &POWER_CONDITION_PAGE,
+        0x1D => &TIMEOUT_PROTECT_PAGE,
+        0x2A => caps.capabilities_page(),
+        _ => return None,
+    };
+    let n = bytes.len().min(out.len());
+    out[..n].copy_from_slice(&bytes[..n]);
+    Some(bytes.len())
 }
 
 /// READ TOC address helper: LBA or absolute MSF (`lba + 150`).
@@ -1876,12 +2139,39 @@ fn toc_control(kind: TrackKind) -> u8 {
     }
 }
 
-/// Encode READ TOC format 0 (track list + lead-out) or format 1 (last complete
-/// session) into `out`, returning the full response length.
+/// Three-byte absolute MSF (`lba + 150`) for the compact raw TOC.
+fn toc_msf3(lba: u32) -> [u8; 3] {
+    let [_, m, s, f] = toc_address(lba, true);
+    [m, s, f]
+}
+
+/// Write one compact format-2 descriptor:
+/// `[session, ADR/control, TNO, POINT, MIN, SEC, FRAME, 0]`.
+fn write_raw_descriptor(
+    out: &mut [u8],
+    session: u16,
+    adr_ctl: u8,
+    tno: u8,
+    point: u8,
+    value: [u8; 3],
+) {
+    out[0] = session.min(255) as u8;
+    out[1] = adr_ctl;
+    out[2] = tno;
+    out[3] = point;
+    out[4..7].copy_from_slice(&value);
+    out[7] = 0;
+}
+
+/// Encode READ TOC format 0 (track list + lead-out), format 1 (last complete
+/// session) or format 2 (raw TOC) into `out`, returning the full response
+/// length.
 ///
 /// Format 0 emits one descriptor per requested track and always appends the
 /// lead-out (`0xAA`, `last_session_lba + 1`). Format 1 emits the first track of
 /// the last complete session; a disc without a complete session is rejected.
+/// Format 2 emits the Q-subchannel lead-in points A0/A1/A2/B0 followed by one
+/// descriptor per track and the lead-out, all in MSF form.
 fn encode_toc<M: MmcMedium>(
     medium: &M,
     info: DiscInfo,
@@ -1939,6 +2229,96 @@ fn encode_toc<M: MmcMedium>(
         buf[at + 1] = ctl;
         buf[at + 2] = 0xAA;
         buf[at + 4..at + 8].copy_from_slice(&toc_address(lead_out, msf));
+        total
+    } else if format == 2 {
+        // Raw TOC. A disc without a complete session has no lead-in TOC to
+        // report; a complete last session is required.
+        let last_complete = match info.status {
+            DiscStatus::Finalized => info.sessions,
+            DiscStatus::Incomplete if info.sessions > 1 => info.sessions - 1,
+            _ => return None,
+        };
+        let first = info.first_track.max(1);
+        let descriptors = 4 + last_track.saturating_sub(first).saturating_add(1) as usize + 1;
+        let total = 4 + TOC_RAW_DESCRIPTOR_LEN * descriptors;
+        if total > buf.len() {
+            return None;
+        }
+        buf[0..2].copy_from_slice(&((total - 2) as u16).to_be_bytes());
+        buf[2] = 0x01;
+        buf[3] = last_complete.min(255) as u8;
+        let lead_out = info
+            .last_session_lba
+            .saturating_add(1)
+            .min(u64::from(u32::MAX)) as u32;
+        let lead_msf = toc_msf3(lead_out);
+        let first_track = medium.track(first)?;
+        let last_ctl = match medium.track(last_track) {
+            Some(track) => toc_control(track.kind),
+            None => toc_control(first_track.kind),
+        };
+        let mut at = 4usize;
+        // A0: first track number, disc type (CD-DA/CD-ROM = 00h), PFRAME 0.
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            1,
+            toc_control(first_track.kind),
+            0,
+            0xA0,
+            [first.min(255) as u8, 0x00, 0x00],
+        );
+        at += TOC_RAW_DESCRIPTOR_LEN;
+        // A1: last track number.
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            1,
+            last_ctl,
+            0,
+            0xA1,
+            [last_track.min(255) as u8, 0x00, 0x00],
+        );
+        at += TOC_RAW_DESCRIPTOR_LEN;
+        // A2: start of the lead-out.
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            1,
+            last_ctl,
+            0,
+            0xA2,
+            lead_msf,
+        );
+        at += TOC_RAW_DESCRIPTOR_LEN;
+        // B0: full-TOC marker (ADR=5); a closed disc points at the lead-out.
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            1,
+            0x50,
+            0,
+            0xB0,
+            lead_msf,
+        );
+        at += TOC_RAW_DESCRIPTOR_LEN;
+        for number in first..=last_track {
+            let track = medium.track(number)?;
+            let start = track.start_lba.min(u64::from(u32::MAX)) as u32;
+            write_raw_descriptor(
+                &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+                track.session,
+                toc_control(track.kind),
+                0,
+                track.number.min(255) as u8,
+                toc_msf3(start),
+            );
+            at += TOC_RAW_DESCRIPTOR_LEN;
+        }
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            last_complete,
+            last_ctl,
+            0,
+            0xAA,
+            lead_msf,
+        );
         total
     } else {
         // Format 1: the last complete session. An incomplete last session
@@ -2124,6 +2504,66 @@ fn validate_format_list(data: &[u8]) -> Result<FormatList, Sense> {
     })
 }
 
+/// Validate a MODE SELECT parameter list.
+///
+/// The list must carry a mode header whose block-descriptor length is zero
+/// (MM drives have no block descriptors), followed by complete mode pages. On
+/// a CD-R the Write Parameters page must describe the supported recording
+/// mode: Track-at-Once with 2048-byte Mode 1 blocks. Every other medium
+/// accepts and ignores page 0x05. A list without page 0x05 is a no-op.
+fn validate_mode_select(ten: bool, data: &[u8], attrs: Option<MmcAttrs>) -> Result<(), Sense> {
+    let header = if ten { 8 } else { 4 };
+    if data.len() < header {
+        return Err(INVALID_FIELD);
+    }
+    let block_descriptors = if ten {
+        usize::from(be16(&data[6..8]))
+    } else {
+        usize::from(data[3])
+    };
+    if block_descriptors != 0 {
+        return Err(INVALID_FIELD);
+    }
+    let cdr_recorder = attrs.is_some_and(|attrs| attrs.write_mode == MmcWriteMode::WriteOnce);
+    let mut at = header;
+    while at < data.len() {
+        if at + 2 > data.len() {
+            return Err(INVALID_FIELD);
+        }
+        let code = data[at] & 0x3F;
+        let payload = usize::from(data[at + 1]);
+        let end = at.checked_add(2 + payload).ok_or(INVALID_FIELD)?;
+        if end > data.len() {
+            return Err(INVALID_FIELD);
+        }
+        if code == 0x05 && cdr_recorder {
+            // MMC-6 7.4.4: the page is 32h (or 36h with vendor specific
+            // bytes). Byte 2 bit 4 is Test Write, bits 3-0 Write Type; byte 4
+            // bits 3-0 Data Block Type.
+            if payload != 0x32 && payload != 0x36 {
+                return Err(INVALID_FIELD);
+            }
+            let byte2 = data[at + 2];
+            if byte2 & 0x10 != 0 {
+                // Test Write would pretend to burn; refuse it instead of
+                // silently discarding the host's data.
+                return Err(INVALID_FIELD);
+            }
+            if byte2 & 0x0F != 0x01 {
+                // Only Track-at-Once is supported: SAO, raw and packet are
+                // rejected rather than silently treated as TAO.
+                return Err(INVALID_FIELD);
+            }
+            if data[at + 4] & 0x0F != 0x08 {
+                // Only Mode 1 (2048-byte) blocks are accepted.
+                return Err(INVALID_FIELD);
+            }
+        }
+        at = end;
+    }
+    Ok(())
+}
+
 /// Zero-fill progress in whole percent, clamped to 0..=100.
 fn format_progress(done: u64, total: u64) -> u32 {
     if total == 0 {
@@ -2177,6 +2617,8 @@ mod tests {
     use crate::core::storage::{HostReceipt, IoReceipt, StorageOp};
     use crate::core::{Effect, InterruptReason as Irq, TargetId};
     use crate::mmc::attrs::{Session, Track};
+    #[cfg(feature = "cdr-bundle")]
+    use crate::mmc::cdr_bundle::{CdrBundleMedium, CdrCapacity};
     use crate::mmc::flat::FlatCdMedium;
     use std::cell::Cell;
 
@@ -2210,8 +2652,8 @@ mod tests {
     }
 
     /// Run a ToHost descriptor command to completion and return its length.
-    fn run_query(
-        dev: &mut MmcDrive<FlatCdMedium>,
+    fn run_query<M: MmcMedium>(
+        dev: &mut MmcDrive<M>,
         cdb: &[u8],
         alloc: u64,
         data: &mut [u8],
@@ -2317,7 +2759,12 @@ mod tests {
         let permit = permit();
         let mut cdb = [0u8; 10];
         cdb[0] = READ_TOC;
-        cdb[2] = 0x02;
+        cdb[2] = 0x03; // format 3 (PMA) is not served
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        cdb[2] = 0x04; // format 4 (ATIP) is not served
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::ToHost, 20), &cdb),
             Err(Completion::Check(INVALID_FIELD))
@@ -4495,5 +4942,452 @@ mod tests {
         assert_eq!(buf[6], 0x00, "RT=Blank=0");
         assert_eq!(buf[7], 0x00, "no NWA");
         assert_eq!(&buf[8..12], &(-11_077i32 as u32).to_be_bytes());
+    }
+
+    // =======================================================================
+    // Recorder control: MODE SENSE/SELECT 0x05, SET CD SPEED, SEND OPC
+    // =======================================================================
+
+    /// Run a FromHost parameter-list command to completion.
+    fn run_receive<M: MmcMedium>(
+        dev: &mut MmcDrive<M>,
+        cdb: &[u8],
+        payload: &[u8],
+        data: &mut [u8],
+    ) -> Completion {
+        let permit = permit();
+        match dev.prepare(&permit, ctx(Direction::FromHost, payload.len() as u64), cdb) {
+            Ok(()) => {}
+            Err(completion) => return completion,
+        }
+        let len = match dev.poll(&permit, Feedback::begin(), data) {
+            PollStep::Publish(plan) => {
+                assert_eq!(plan.direction, Direction::FromHost);
+                plan.bytes as usize
+            }
+            PollStep::Complete(completion) => return completion,
+            other => panic!("expected publish, got {other:?}"),
+        };
+        assert_eq!(len, payload.len());
+        match dev.poll(&permit, Feedback::plan_accepted(), data) {
+            PollStep::Receive { buf, write } => {
+                assert!(write.is_none());
+                assert_eq!(buf.len(), len);
+                buf.copy_from_slice(payload);
+            }
+            PollStep::Complete(completion) => return completion,
+            other => panic!("expected receive, got {other:?}"),
+        }
+        match dev.poll(
+            &permit,
+            Feedback::host_received(HostReceipt::test(len, None)),
+            data,
+        ) {
+            PollStep::Complete(completion) => completion,
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+
+    fn mode_select_cdb(ten: bool, len: usize) -> std::vec::Vec<u8> {
+        let mut cdb = if ten {
+            std::vec![0u8; 10]
+        } else {
+            std::vec![0u8; 6]
+        };
+        cdb[0] = if ten { MODE_SELECT_10 } else { MODE_SELECT_6 };
+        cdb[1] = 0x10; // PF=1, SP=0
+        if ten {
+            cdb[7..9].copy_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            cdb[4] = len as u8;
+        }
+        cdb
+    }
+
+    fn test_write_params_page(
+        write_type: u8,
+        track_mode: u8,
+        dbt: u8,
+        test_write: bool,
+    ) -> Vec<u8> {
+        let mut page = vec![0u8; 2 + WRITE_PARAMS_LEN];
+        page[0] = 0x05;
+        page[1] = 0x32;
+        page[2] = (u8::from(test_write) << 4) | (write_type & 0x0F);
+        page[3] = track_mode & 0x0F;
+        page[4] = dbt & 0x0F;
+        page
+    }
+
+    fn mode_select_params(ten: bool, pages: &[u8]) -> Vec<u8> {
+        let mut params = vec![0u8; if ten { 8 } else { 4 }];
+        params.extend_from_slice(pages);
+        params
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn cdr_drive() -> MmcDrive<CdrBundleMedium> {
+        MmcDrive::new(CdrBundleMedium::blank(CdrCapacity::Cdr74))
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn write_medium_block(medium: &mut CdrBundleMedium, lba: u64) {
+        let mut data = [0u8; 2048];
+        assert_eq!(medium.begin(MmcOp::Write { lba, blocks: 1 }), Ok(()));
+        match medium.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2048),
+            other => panic!("expected write publish, got {other:?}"),
+        }
+        match medium.poll(Feedback::plan_accepted(), &mut data) {
+            PollStep::Receive { buf, .. } => buf.fill(0x5A),
+            other => panic!("expected write receive, got {other:?}"),
+        }
+        match medium.poll(
+            Feedback::host_received(HostReceipt::test(2048, None)),
+            &mut data,
+        ) {
+            PollStep::Io(StorageOp::Write { buf, .. }) => assert_eq!(buf.len(), 2048),
+            other => panic!("expected write IO, got {other:?}"),
+        }
+        assert!(matches!(
+            medium.poll(
+                Feedback::io_done(IoReceipt::test(2048, None, Effect::Known)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn commit_medium(medium: &mut CdrBundleMedium) {
+        let mut data = [0u8; 0];
+        assert_eq!(medium.begin(MmcOp::Commit), Ok(()));
+        match medium.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.direction, Direction::None),
+            other => panic!("expected sync publish, got {other:?}"),
+        }
+        match medium.poll(Feedback::plan_accepted(), &mut data) {
+            PollStep::Io(StorageOp::Sync { .. }) => {}
+            other => panic!("expected sync IO, got {other:?}"),
+        }
+        assert!(matches!(
+            medium.poll(
+                Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
+                &mut data
+            ),
+            PollStep::Complete(Completion::Good)
+        ));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn finalized_cdr_drive() -> MmcDrive<CdrBundleMedium> {
+        let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr74);
+        write_medium_block(&mut medium, 0);
+        commit_medium(&mut medium);
+        assert_eq!(
+            medium.begin(MmcOp::Close { function: 2 }),
+            Err(Completion::Good)
+        );
+        MmcDrive::new(medium)
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_sense_page_05_cdr_claims_tao() {
+        let dev = cdr_drive();
+        let profile = dev.spc_profile().expect("profile");
+        let mut long = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(true, 0x05, false, 0, Some(&mut long)),
+            Some(60)
+        );
+        assert_eq!(&long[0..2], &58u16.to_be_bytes());
+        assert_eq!(long[8], 0x05);
+        assert_eq!(long[9], 0x32);
+        assert_eq!(long[10], 0x01, "Write Type = Track-at-Once");
+        assert_eq!(long[11], 0x04, "Track Mode = data");
+        assert_eq!(long[12], 0x08, "Data Block Type = Mode 1");
+
+        let mut short = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(false, 0x05, false, 0, Some(&mut short)),
+            Some(56)
+        );
+        assert_eq!(&short[4..9], &[0x05, 0x32, 0x01, 0x04, 0x08]);
+    }
+
+    #[test]
+    fn mode_sense_page_05_read_only_does_not_claim_tao() {
+        let dev = drive(100);
+        let profile = dev.spc_profile().expect("profile");
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(true, 0x05, false, 0, Some(&mut buf)),
+            Some(60)
+        );
+        assert_eq!(&buf[8..13], &[0x05, 0x32, 0x00, 0x00, 0x00]);
+    }
+
+    #[cfg(feature = "dvdram")]
+    #[test]
+    fn mode_sense_page_05_dvdram_does_not_claim_tao() {
+        let dev = MmcDrive::new(crate::mmc::dvdram::DvdRamMedium::new(16));
+        let profile = dev.spc_profile().expect("profile");
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(true, 0x05, false, 0, Some(&mut buf)),
+            Some(60)
+        );
+        assert_eq!(&buf[8..13], &[0x05, 0x32, 0x00, 0x00, 0x00]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_accepts_tao_on_a_cdr() {
+        let mut dev = cdr_drive();
+        let page = test_write_params_page(1, 4, 8, false);
+        let mut data = [0u8; 128];
+        for ten in [false, true] {
+            let params = mode_select_params(ten, &page);
+            let cdb = mode_select_cdb(ten, params.len());
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &params, &mut data),
+                Completion::Good,
+                "MODE SELECT ten={ten}"
+            );
+            assert!(!dev.active());
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_rejects_unsupported_write_parameters() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        for (write_type, track_mode, dbt, test_write) in [
+            (2, 4, 8, false),  // Session-at-Once
+            (3, 4, 8, false),  // RAW
+            (0, 4, 8, false),  // Packet/Incremental
+            (1, 4, 8, true),   // Test Write (-dummy)
+            (1, 4, 0, false),  // raw 2352-byte blocks
+            (1, 4, 10, false), // Mode 2 Form 1
+        ] {
+            let page = test_write_params_page(write_type, track_mode, dbt, test_write);
+            let params = mode_select_params(true, &page);
+            let cdb = mode_select_cdb(true, params.len());
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &params, &mut data),
+                Completion::Check(INVALID_FIELD),
+                "write type {write_type}, dbt {dbt}, test {test_write}"
+            );
+            assert!(!dev.active());
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_rejects_bad_cdb_and_parameter_structure() {
+        let mut dev = cdr_drive();
+        let permit = permit();
+        let page = test_write_params_page(1, 4, 8, false);
+        let params = mode_select_params(true, &page);
+        let mut cdb = mode_select_cdb(true, params.len());
+
+        // PF=0 or SP=1 are not page lists.
+        cdb[1] = 0x00;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, params.len() as u64), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        cdb[1] = 0x11;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, params.len() as u64), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        // The transport's declared byte count must match the CDB length.
+        cdb[1] = 0x10;
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::FromHost, params.len() as u64 + 1),
+                &cdb
+            ),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        // A zero-length list is a no-op.
+        let empty = mode_select_cdb(false, 0);
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 0), &empty),
+            Err(Completion::Good)
+        );
+
+        let mut data = [0u8; 128];
+        // Non-zero block descriptor length.
+        let mut bad = params.clone();
+        bad[6..8].copy_from_slice(&8u16.to_be_bytes());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &bad, &mut data),
+            Completion::Check(INVALID_FIELD)
+        );
+        // Page length that does not fit the list.
+        let mut truncated = params.clone();
+        truncated[9] = 0x40;
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &truncated, &mut data),
+            Completion::Check(INVALID_FIELD)
+        );
+        // Write Parameters page length must be 32h or 36h.
+        let mut wrong_page_len = params.clone();
+        wrong_page_len[9] = 0x10;
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &wrong_page_len, &mut data),
+            Completion::Check(INVALID_FIELD)
+        );
+        assert!(!dev.active());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_without_page_05_is_a_noop() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        let page = [0x08u8, 0x02, 0x00, 0x00]; // caching page
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+    }
+
+    #[test]
+    fn mode_select_on_a_read_only_medium_ignores_the_page() {
+        let mut dev = drive(100);
+        let mut data = [0u8; 128];
+        // Even a SAO + Test Write page is accepted and ignored on a ROM.
+        let page = test_write_params_page(2, 4, 8, true);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+    }
+
+    #[test]
+    fn set_cd_speed_records_the_requested_speeds() {
+        let mut dev = drive(100);
+        let permit = permit();
+        let mut cdb = [0u8; 12];
+        cdb[0] = SET_CD_SPEED;
+        cdb[2..4].copy_from_slice(&7060u16.to_be_bytes());
+        cdb[4..6].copy_from_slice(&4236u16.to_be_bytes());
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Good)
+        );
+        assert_eq!(dev.cd_speed(), (7060, 4236));
+        assert!(!dev.active());
+
+        // A host data phase is invalid for a no-data command.
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 4), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[test]
+    fn send_opc_accepts_eight_byte_entries_and_rejects_a_partial_one() {
+        let mut dev = drive(100);
+        let permit = permit();
+        let mut data = [0u8; 32];
+        for len in [0usize, 8, 16] {
+            let mut cdb = [0u8; 10];
+            cdb[0] = SEND_OPC;
+            cdb[7..9].copy_from_slice(&(len as u16).to_be_bytes());
+            let payload = vec![0u8; len];
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &payload, &mut data),
+                Completion::Good,
+                "SEND OPC length {len}"
+            );
+            assert!(!dev.active());
+        }
+        let mut cdb = [0u8; 10];
+        cdb[0] = SEND_OPC;
+        cdb[7..9].copy_from_slice(&7u16.to_be_bytes());
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 7), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn read_toc_format2_raw_descriptors_on_a_finalized_cdr() {
+        let mut dev = finalized_cdr_drive();
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x02;
+        cdb[8] = 64;
+        let mut data = [0u8; 64];
+        assert_eq!(run_query(&mut dev, &cdb, 64, &mut data), Completion::Good);
+        assert_eq!(&data[0..2], &50u16.to_be_bytes(), "52-byte response");
+        assert_eq!(data[2], 1, "first complete session");
+        assert_eq!(data[3], 1, "last complete session");
+
+        let desc = |at: usize| &data[at..at + TOC_RAW_DESCRIPTOR_LEN];
+        // A0: first track 1, CD-DA/CD-ROM disc type 00h, PFRAME 0.
+        assert_eq!(desc(4), &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0]);
+        // A1: last track 1.
+        assert_eq!(desc(12), &[1, 0x14, 0, 0xA1, 1, 0, 0, 0]);
+        // A2: lead-out at LBA 300 => 00:06:00.
+        assert_eq!(desc(20), &[1, 0x14, 0, 0xA2, 0, 6, 0, 0]);
+        // B0: closed full-TOC marker (ADR=5) at the lead-out.
+        assert_eq!(desc(28), &[1, 0x50, 0, 0xB0, 0, 6, 0, 0]);
+        // Track 1 starts at LBA 0 => 00:02:00.
+        assert_eq!(desc(36), &[1, 0x14, 0, 1, 0, 2, 0, 0]);
+        // Lead-out descriptor.
+        assert_eq!(desc(44), &[1, 0x14, 0, 0xAA, 0, 6, 0, 0]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn read_toc_format2_rejects_a_blank_disc_and_bad_selector() {
+        let mut dev = cdr_drive();
+        let permit = permit();
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x02;
+        cdb[8] = 64;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 64), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        // Format 2 takes no session selector in the design.
+        cdb[6] = 1;
+        let mut dev = finalized_cdr_drive();
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 64), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn read_toc_format2_truncates_but_keeps_the_declared_length() {
+        let mut dev = finalized_cdr_drive();
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x02;
+        cdb[8] = 20;
+        let mut data = [0u8; 64];
+        assert_eq!(run_query(&mut dev, &cdb, 20, &mut data), Completion::Good);
+        // Only the first 20 bytes are sent; the header still declares 50.
+        assert_eq!(&data[0..2], &50u16.to_be_bytes());
+        assert_eq!(data[2], 1);
+        assert_eq!(data[3], 1);
+        assert_eq!(&data[4..12], &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0]);
+        assert_eq!(&data[12..20], &[1, 0x14, 0, 0xA1, 1, 0, 0, 0]);
     }
 }

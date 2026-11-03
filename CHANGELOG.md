@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last recorded block, GET CONFIGURATION reports profile `0x09` with the
   incremental-streaming and CD-track-at-once features, and READ TOC formats 0
   and 1 walk the recorded track/session layout.
+- **mmc**: recorder-control commands — MODE SENSE page 0x05 reports
+  Track-at-Once/2048-byte Mode 1 parameters on a CD-R (and no TAO claim on
+  read-only/rewritable media), MODE SELECT(6/10) validates and accepts that
+  page (rejecting SAO/raw/packet and Test Write), SET CD SPEED records the
+  requested read/write speeds, SEND OPC INFORMATION accepts eight-byte tables,
+  and READ TOC format 2 serves the raw A0/A1/A2/B0 lead-in descriptors plus the
+  track and lead-out entries.
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
 - **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`
