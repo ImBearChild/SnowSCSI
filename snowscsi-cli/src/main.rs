@@ -24,6 +24,9 @@
 //!   `toc.0`/`toc.1` plus `track_<n>.bin` in the directory, reopened from its
 //!   newest valid TOC slot; requires the `cdr-bundle` feature), or `empty` (an
 //!   enumerated drive with no medium; the application installs the first one).
+//!   Bundles are written only in Track-at-Once: `wodim -tao` (also `-audio`
+//!   for CD-DA and `-multi` for another session) and, on a CD-RW,
+//!   `wodim blank=fast|all`. SAO/DAO is not implemented.
 //!
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
@@ -203,7 +206,10 @@ struct ServeArgs {
     /// readonly]` (a persistent CD-R or erasable CD-RW bundle whose
     /// `toc.0`/`toc.1` and `track_<n>.bin` live in the directory; requires the
     /// `cdr-bundle` feature), or `empty` (an enumerated drive with no
-    /// medium). Repeatable; these LUNs follow the `--block` LUNs.
+    /// medium). A bundle is written only in Track-at-Once: `wodim -tao`
+    /// (also `-audio` for CD-DA and `-multi` for another session) and, on a
+    /// CD-RW, `wodim blank=fast|all`; SAO/DAO is not implemented. Repeatable;
+    /// these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -3402,6 +3408,10 @@ mod tests {
         assert!(help.contains("bundle=<dir>"), "help text:\n{help}");
         assert!(help.contains("toc.0"), "help text:\n{help}");
         assert!(help.contains("track_<n>.bin"), "help text:\n{help}");
+        assert!(help.contains("CD-RW"), "help text:\n{help}");
+        assert!(help.contains("Track-at-Once"), "help text:\n{help}");
+        assert!(help.contains("blank="), "help text:\n{help}");
+        assert!(help.contains("-audio"), "help text:\n{help}");
 
         // `--print-config` resolves the same backing without touching the
         // filesystem: the token lists every LUN's backing in LUN order.

@@ -77,7 +77,8 @@ Feature maps:
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
   `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (sequential CD-R/CD-RW
-  medium with an alternating persistent TOC), `async-io` (→`usb` +
+  medium with TAO data/CD-DA audio, multi-session append, BLANK and an
+  alternating persistent TOC), `async-io` (→`usb` +
   `snowscsi-common/async-io`), `embassy`
   (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
   `defmt` forwards to `embedded-io/defmt` and
@@ -285,6 +286,24 @@ Track kind is already part of the persistent TOC body (`kind = data` /
 audio/data tracks and their payload unchanged. The TOC slot format itself did
 not change.
 
+### Not implemented: SAO/DAO and legacy MMC commands
+
+The bundle only records user data in Track-at-Once, and TAO covers both data
+and CD-DA audio (including mixed-mode discs). Session-at-Once (`wodim -dao`)
+is deliberately not implemented: it would need a raw 2352-byte mastering path
+where the drive synthesizes the sync/header/EDC fields and follows a cue sheet
+for the lead-in/lead-out layout, plus a capability page advertising SAO.
+Consequently SEND CUE SHEET (`0x5D`) answers ILLEGAL REQUEST / COMMAND
+SEQUENCE ERROR (`2C/00`) and MODE SELECT page 0x05 rejects Write Type 2 (SAO)
+with ILLEGAL REQUEST / INVALID FIELD IN PARAMETER LIST (`24/00`), like every
+other non-TAO write type.
+
+READ SUB-CHANNEL (`0x42`) and READ HEADER (`0x44`) are MMC-2/CD and
+packet-writing legacy commands that MMC-6 no longer defines, so they answer
+ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE (`20/00`) like any unknown
+opcode. READ DISC STRUCTURE (`0xAD`) is DVD/BD vocabulary and stays ILLEGAL
+REQUEST / INVALID FIELD IN CDB (`24/00`) on a CD.
+
 ## Commit Messages
 
 This project follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
@@ -368,6 +387,17 @@ standard-library Python (no pytest dependency):
   `dummy_hcd` + `libcomposite` and auto-mounts configfs. The runtime must
   allow Linux native aio (a seccomp/container ban surfaces as a failed
   first bulk transfer).
+- `tools/ext-test/test_cdr_bundle.py` — burns an already-served
+  CD-R/CD-RW (`SNOWSCSI_CDR_DEV`, `SNOWSCSI_CDR_AUDIO_DEV`,
+  `SNOWSCSI_CDRW_DEV`) with `wodim -tao`, `-audio`, `-dummy` and
+  `blank=fast|all`, then verifies the volume through `isoinfo` and a
+  read-only mount. The root-only persistence case starts its own
+  `serve --usb dummy`, burns, restarts on the same bundle directory and
+  checks the mounted volume plus the alternating TOC sequence; the opt-in
+  `SNOWSCSI_CDR_EJECT_TEST=1` case writes one raw block with `sg_raw`,
+  ejects, verifies the snapshot, restarts and checks the appendable disc
+  with READ DISC INFORMATION/READ TRACK INFORMATION before finalizing it.
+  Skips without the matching device/tools or a free `dummy_hcd` UDC.
 
 ```bash
 # Fast, no privileges needed (ISO cross-validation)
@@ -400,10 +430,13 @@ Design notes:
 ### Manual CD-R/CD-RW bundle check
 
 `--cdrom bundle=<dir>` serves a persistent CD-R (or, with `medium=cdrwNN`, an
-erasable CD-RW). The medium model, the recorder-control commands and the
-alternating TOC slots are covered in-process (`cdr_cdrkit_tao_trace` follows
-the exact `wodim -tao` sequence), but a manual burn catches host/driver
-interaction the harness cannot.
+erasable CD-RW). The medium model covers CD-RW BLANK, multi-session append,
+CD-DA audio (data/audio/mixed-mode) and the blocking-iSCSI eject snapshot; the
+recorder-control commands and alternating TOC slots are covered in-process
+(`cdr_cdrkit_tao_trace` follows the exact `wodim -tao` sequence) and by
+`tools/ext-test/test_cdr_bundle.py` (burn/read-back, read-only mount,
+CD-RW blank/reburn, restart and opt-in eject snapshot), but a manual burn
+catches host/driver interaction the harness cannot.
 
 Serve the disc over USB (FunctionFS; `<udc>` is a controller name, `auto`
 picks one, `dummy` auto-loads `dummy_hcd`):

@@ -261,6 +261,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature `cdr-bundle`) in its project status and full-feature example, and
   points at `HACKING.md` for the directory/durability contract.
 
+### Documentation
+
+- **docs/tests**: `tools/ext-test/test_cdr_bundle.py` now covers a read-only
+  mount payload check, a server restart over the same bundle directory
+  (mounted volume plus alternating TOC sequence), CD-RW `blank=fast`/`blank=all`
+  reburns, and an opt-in eject-snapshot case driven through `sg_raw`.
+  `HACKING.md` documents that the bundle is TAO-only: SAO/DAO would need a raw
+  2352-byte mastering path and an SAO capability page, so SEND CUE SHEET is
+  `2C/00` and Write Type 2 is `24/00`; it also records the MMC-2 legacy
+  READ SUB-CHANNEL/READ HEADER (`20/00`) and DVD/BD-only READ DISC STRUCTURE
+  (`24/00`) answers. README, HACKING and the CLI help describe the CD-RW
+  BLANK, multi-session and CD-DA audio workflows.
+
 ## [0.2.0] - 2026-10-18
 
 ### ⚠️ Breaking changes

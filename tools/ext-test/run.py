@@ -17,12 +17,15 @@ sys.path.insert(0, _HERE)
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__.strip())
+        return 0
     loader = unittest.TestLoader()
     suite = loader.discover(_HERE, pattern="test_*.py")
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    sys.exit(0 if result.wasSuccessful() else 1)
+    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
