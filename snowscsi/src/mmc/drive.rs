@@ -2840,10 +2840,12 @@ struct WriteParams {
 /// The list must carry a mode header whose block-descriptor length is zero
 /// (MM drives have no block descriptors), followed by complete mode pages. On
 /// a sequential recordable CD (CD-R or CD-RW) the Write Parameters page must
-/// describe the supported recording mode: Track-at-Once with 2048-byte Mode 1
-/// blocks. Test Write is accepted and returned so the caller can apply it.
-/// Every other medium accepts and ignores page 0x05. A list without page 0x05
-/// is a no-op.
+/// describe the supported recording mode: Track-at-Once with 2048-byte user
+/// blocks. Both Data Block Type 8 (Mode 1) and 10 (Mode 2 Form 1) are
+/// accepted because both carry 2048-byte user sectors in this model (`wodim
+/// -multi -tao` sends Mode 2 Form 1). Test Write is accepted and returned so
+/// the caller can apply it. Every other medium accepts and ignores page 0x05.
+/// A list without page 0x05 is a no-op.
 fn validate_mode_select(
     ten: bool,
     data: &[u8],
@@ -2887,8 +2889,11 @@ fn validate_mode_select(
                 // rejected rather than silently treated as TAO.
                 return Err(INVALID_FIELD);
             }
-            if data[at + 4] & 0x0F != 0x08 {
-                // Only Mode 1 (2048-byte) blocks are accepted.
+            // Only 2048-byte user blocks are accepted: Data Block Type 8
+            // (Mode 1) and 10 (Mode 2 Form 1) both carry 2048-byte user
+            // sectors, and `wodim -multi -tao` uses the latter.
+            let dbt = data[at + 4] & 0x0F;
+            if dbt != 0x08 && dbt != 0x0A {
                 return Err(INVALID_FIELD);
             }
             // MMC-6 7.4.4 / Table 670: bits 7-6 of byte 3. `00b` forbids a
@@ -5806,17 +5811,21 @@ mod tests {
     #[test]
     fn mode_select_accepts_tao_on_a_cdr() {
         let mut dev = cdr_drive();
-        let page = test_write_params_page(1, 4, 8, false);
         let mut data = [0u8; 128];
-        for ten in [false, true] {
-            let params = mode_select_params(ten, &page);
-            let cdb = mode_select_cdb(ten, params.len());
-            assert_eq!(
-                run_receive(&mut dev, &cdb, &params, &mut data),
-                Completion::Good,
-                "MODE SELECT ten={ten}"
-            );
-            assert!(!dev.active());
+        // Both 2048-byte user block types are accepted: Mode 1 (8) and Mode 2
+        // Form 1 (10, what `wodim -multi -tao` sends).
+        for dbt in [8u8, 10] {
+            let page = test_write_params_page(1, 4, dbt, false);
+            for ten in [false, true] {
+                let params = mode_select_params(ten, &page);
+                let cdb = mode_select_cdb(ten, params.len());
+                assert_eq!(
+                    run_receive(&mut dev, &cdb, &params, &mut data),
+                    Completion::Good,
+                    "MODE SELECT ten={ten}, dbt={dbt}"
+                );
+                assert!(!dev.active());
+            }
         }
     }
 
@@ -5976,7 +5985,7 @@ mod tests {
             (0, 4, 8, false),  // Packet/Incremental
             (2, 4, 8, true),   // SAO with Test Write
             (1, 4, 0, false),  // raw 2352-byte blocks
-            (1, 4, 10, false), // Mode 2 Form 1
+            (1, 4, 11, false), // unsupported Data Block Type
             (1, 4, 0, true),   // simulated raw 2352-byte blocks
         ] {
             let page = test_write_params_page(write_type, track_mode, dbt, test_write);

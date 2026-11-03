@@ -437,6 +437,14 @@ fn multi_mode_page() -> Vec<u8> {
     page
 }
 
+/// `wodim -multi -tao`'s page: Multi-session `11b` with Data Block Type `0x0A`
+/// (Mode 2 Form 1, still 2048 user bytes per logical block).
+fn multi_mode2_page() -> Vec<u8> {
+    let mut page = multi_mode_page();
+    page[12] = 0x0A;
+    page
+}
+
 /// The TAO page with Multi-session explicitly `00b` (finalize on close).
 fn finalize_mode_page() -> Vec<u8> {
     let mut page = tao_mode_page();
@@ -1774,6 +1782,131 @@ fn cdr_multi_session_close_appends_and_reports_the_last_complete_session() {
         ),
         Completion::Check(WRITE_PROTECTED)
     );
+}
+
+/// A `wodim -multi -tao`-style burn uses Data Block Type `0x0A` (Mode 2
+/// Form 1, 2048 user bytes). It must be accepted and record exactly like the
+/// Mode 1 path.
+#[test]
+fn cdr_multi_session_burn_with_mode2_form1_page_records_and_stays_appendable() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(64 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; BLOCK];
+    let mut scratch = vec![0u8; 128];
+
+    // MODE SELECT(10) page 0x05: Multi-session 11b + Data Block Type 0x0A.
+    let params = multi_mode2_page();
+    let mut select_host = BlockingHost::new(TestHost::new(params));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    // The page round-trips with Mode 2 Form 1.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mode_sense10(0x05, 64),
+            Direction::ToHost,
+            64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[11] & 0xC0, 0xC0, "Multi-session 11b");
+    assert_eq!(work[12], 0x08, "MODE SENSE still advertises Mode 1");
+
+    // WRITE at LBA 0 then CLOSE SESSION with 11b: records and stays open.
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_no_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // Track 1 is closed and padded to the 300-block minimum.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_track_information(1, 1, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[6], 0x81, "RT=1, Data Mode 1");
+    assert_eq!(&work[24..28], &300u32.to_be_bytes());
+
+    // The disc is appendable with one complete session.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x01, "disc status incomplete");
+    assert_eq!((work[2] >> 2) & 0x03, 0x03, "last session complete");
+    assert_eq!(work[4], 1, "one complete session");
+
+    // The recorded user data reads back.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read10(0, 1),
+            Direction::ToHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[..BLOCK], &[0x5A; BLOCK][..]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

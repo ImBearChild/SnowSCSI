@@ -218,8 +218,11 @@ A host sequence is therefore: MODE SELECT page 0x05 with Multi-session
 `11b`, write the track at the NWA, `SYNCHRONIZE CACHE`, `CLOSE
 TRACK/SESSION 010b`, query the new NWA/TOC, write session 2, then either
 close again with `11b` or set the field back to `00b`/`01b` before the final
-close. Closing a session with `11b` does not raise the finalize media-change
-unit attention (the addressable extent is unchanged).
+close. `wodim -multi -tao` requests Data Block Type 10 (Mode 2 Form 1) rather
+than 8 (Mode 1); both carry 2048-byte user sectors and are accepted, mapped
+to the same logical-block write path. Closing a session with `11b` does not
+raise the finalize media-change unit attention (the addressable extent is
+unchanged).
 
 ## Commit Messages
 
@@ -448,8 +451,9 @@ Troubleshooting:
   are not.
 - **`Cannot init drive`** at burn startup — MODE SELECT page 0x05 was
   rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
-  (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet and
-  raw are refused. The Test Write bit (`-dummy`) is accepted and simulated.
+  (data) and a 2048-byte user block type: Data Block Type 8 (Mode 1) or 10
+  (Mode 2 Form 1, which `wodim -multi -tao` uses); SAO, packet and raw are
+  refused. The Test Write bit (`-dummy`) is accepted and simulated.
   The Multi-session field (byte 3 bits 7-6) accepts `00b` (finalize on close),
   `01b` (also finalize-compatible; its B0 = FF form is not emitted) and `11b`
   (keep the disc open for another session); `10b` is `24/00`.

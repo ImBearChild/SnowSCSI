@@ -46,9 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **mmc**: multi-session CD-R/CD-RW for the persistent `cdr-bundle` medium.
   Write Parameters page 0x05 byte 3 bits 7-6 is parsed (`00b`/`01b` accepted
-  as finalize-compatible, `11b` allows another session, `10b` → `24/00`),
-  forwarded through a new defaulted `MmcMedium::set_multi_session`, reflected
-  by MODE SENSE and cleared on medium install. `CLOSE TRACK/SESSION 010b`
+  as finalize-compatible, `11b` allows another session, `10b` → `24/00`), and
+  Data Block Type 8 (Mode 1) and 10 (Mode 2 Form 1, used by
+  `wodim -multi -tao`) are both accepted as 2048-byte user blocks. The
+  field is forwarded through a new defaulted `MmcMedium::set_multi_session`,
+  reflected by MODE SENSE and cleared on medium install. `CLOSE TRACK/SESSION 010b`
   with `11b` closes the open track and the session but leaves the disc
   Appendable; `00b`/`01b` finalizes as before. The next session's lead-in
   starts at the previous lead-out, its first track preamble at
