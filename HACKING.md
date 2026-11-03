@@ -310,6 +310,14 @@ blkid /dev/sr0                # ISO9660 signature / label
 mount -o ro /dev/sr0 /mnt     # or mount the raw device
 ```
 
+After a burn, Linux may still report the capacity it probed while the disc
+was blank (one block). The drive reports a medium-change unit attention when
+the finalize completes, but a burner's own `TEST UNIT READY` can consume it
+first; if `isoinfo`/`mount` still see a one-block device, restart the server
+on the same directory (the TOC is persistent) or re-plug the gadget.
+`sg_readcap /dev/sr0` queries the device directly and shows the recorded
+capacity meanwhile.
+
 The bundle directory holds the durable state:
 
 | Path | Content |

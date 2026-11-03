@@ -750,6 +750,11 @@ impl<D: Device> Device for Spc<D> {
                 if let PollStep::Complete(Completion::Check(sense)) = &step {
                     self.saved_sense = Some(*sense);
                 }
+                if matches!(&step, PollStep::Complete(Completion::Good))
+                    && self.inner.take_media_changed()
+                {
+                    self.raise_unit_attention(UaClass::MediumChanged);
+                }
                 step
             }
             Query::Tur => {
@@ -1043,6 +1048,10 @@ impl<D: Device> Device for Spc<D> {
         let step = self.inner.poll_with_alt(permit, fb, data, alt);
         if let PollStep::Complete(Completion::Check(sense)) = &step {
             self.saved_sense = Some(*sense);
+        }
+        if matches!(&step, PollStep::Complete(Completion::Good)) && self.inner.take_media_changed()
+        {
+            self.raise_unit_attention(UaClass::MediumChanged);
         }
         step
     }

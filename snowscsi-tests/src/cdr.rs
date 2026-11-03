@@ -209,6 +209,38 @@ fn run(
         .expect("command must not raise a boundary fault")
 }
 
+/// Consume an optional medium-change unit attention before reading the disc.
+///
+/// A finalize reports `06/28/00`; a blank or merely appendable disc does not.
+/// `cdr_finalize_reports_a_medium_change_unit_attention` asserts the strict
+/// case.
+fn consume_medium_change(
+    target: &mut CdrTarget,
+    storage: &mut BlockingStorage<Plane>,
+    host: &mut BlockingHost<TestHost>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+) {
+    match run(
+        target,
+        storage,
+        host,
+        &[0u8; 6],
+        Direction::None,
+        0,
+        work,
+        scratch,
+    ) {
+        Completion::Good => {}
+        Completion::Check(sense) => assert_eq!(
+            sense,
+            Sense::new(0x06, 0x28, 0x00),
+            "only a medium change may precede the read"
+        ),
+        other => panic!("unexpected TUR completion {other:?}"),
+    }
+}
+
 fn get_configuration(alloc: u16) -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = GET_CONFIGURATION;
@@ -442,6 +474,13 @@ fn cdr_read_disc_information_blank_appendable_and_finalized() {
     let mut scratch = vec![0u8; 64];
 
     // Blank disc.
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
     assert_eq!(
         run(
             &mut target,
@@ -469,6 +508,13 @@ fn cdr_read_disc_information_blank_appendable_and_finalized() {
 
     // One block makes the disc appendable.
     write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    consume_medium_change(
         &mut target,
         &mut storage,
         &mut host,
@@ -518,6 +564,13 @@ fn cdr_read_disc_information_blank_appendable_and_finalized() {
             &mut scratch,
         ),
         Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
     );
     assert_eq!(
         run(
@@ -882,6 +935,13 @@ fn cdr_write_sync_close_then_toc_and_capacity() {
         Completion::Good
     );
 
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
     // READ TOC format 0: track 1 at LBA 0 and the lead-out at LBA 300.
     assert_eq!(
         run(
@@ -1114,6 +1174,13 @@ fn cdr_cdrkit_tao_trace() {
 
     // 2. READ DISC INFORMATION: empty, one session, not erasable, with the
     //    lead-in and last-possible-lead-out addresses in MSF.
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
     assert_eq!(
         run(
             &mut target,
@@ -1332,6 +1399,13 @@ fn cdr_cdrkit_tao_trace() {
             &mut scratch,
         ),
         Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
     );
     assert_eq!(
         run(
@@ -1611,5 +1685,83 @@ fn cdr_reserve_write_sync_close_and_reopen_from_a_slot() {
             &mut scratch,
         ),
         Completion::Check(WRITE_PROTECTED)
+    );
+}
+
+#[test]
+fn cdr_finalize_reports_a_medium_change_unit_attention() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &write10(0, 1),
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    let tur = [0u8; 6];
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &tur,
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(Sense::new(0x06, 0x28, 0x00)),
+        "finalize must report a medium change so the host revalidates"
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &tur,
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
     );
 }

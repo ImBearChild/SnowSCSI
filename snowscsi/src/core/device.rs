@@ -576,6 +576,15 @@ pub trait Device {
         None
     }
 
+    /// Whether the last completed command changed the readable medium
+    /// (capacity or layout) and the host should revalidate it.
+    ///
+    /// [`Spc`](super::spc::Spc) raises `UaClass::MediumChanged` when this
+    /// returns true after a GOOD completion. Default: never.
+    fn take_media_changed(&mut self) -> bool {
+        false
+    }
+
     /// Local medium-metadata commit before detaching the old pair. It has no
     /// `Storage` parameter, must not issue storage IO, and is not a durability
     /// promise. Default: no-op.

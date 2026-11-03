@@ -273,6 +273,8 @@ enum Query {
         bytes: u32,
         /// WRITE FUA: issue a post-write SYNC before completing GOOD.
         fua: bool,
+        /// A successful completion changed the readable medium (finalize).
+        media_change: bool,
         /// The post-write SYNC is in flight.
         syncing: bool,
     },
@@ -314,6 +316,9 @@ pub struct MmcDrive<M: MmcMedium> {
     /// Drive (LU) capabilities. Independent of the installed medium: they
     /// survive an eject and are what an empty drive still reports.
     caps: MmcCaps,
+    /// A completed finalize changed the readable extent; report a media
+    /// change so the host revalidates the capacity.
+    media_changed: bool,
     query: Query,
     /// Bytes selected for a drive-encoded response.
     len: usize,
@@ -336,6 +341,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         Self {
             medium,
             caps,
+            media_changed: false,
             query: Query::None,
             len: 0,
             published: false,
@@ -786,7 +792,15 @@ impl<M: MmcMedium> MmcDrive<M> {
             }
             _ => return Err(Completion::Check(INVALID_FIELD)),
         }
-        self.begin_media(MmcOp::Close { function }, 0)
+        self.begin_media(MmcOp::Close { function }, 0)?;
+        // A finalized disc has a new readable extent; ask the host to
+        // revalidate the capacity on the next command.
+        if function == 2 {
+            if let Query::Media { media_change, .. } = &mut self.query {
+                *media_change = true;
+            }
+        }
+        Ok(())
     }
 
     /// MODE SELECT(6)/MODE SELECT(10): page-list validation only.
@@ -1159,6 +1173,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.query = Query::Media {
             bytes,
             fua,
+            media_change: false,
             syncing: false,
         };
         Ok(())
@@ -1217,6 +1232,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             Query::Media {
                 bytes: _,
                 fua,
+                media_change,
                 syncing,
             } => {
                 if syncing {
@@ -1260,12 +1276,16 @@ impl<M: MmcMedium> MmcDrive<M> {
                         self.query = Query::Media {
                             bytes: 0,
                             fua,
+                            media_change,
                             syncing: true,
                         };
                         PollStep::Io(StorageOp::Sync { resource: 0 })
                     }
                     PollStep::Complete(completion) => {
                         self.query = Query::None;
+                        if completion == Completion::Good && media_change {
+                            self.media_changed = true;
+                        }
                         PollStep::Complete(completion)
                     }
                     other => other,
@@ -1554,6 +1574,12 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         // media-description commands stay NOT READY. 0x1B is admitted globally
         // by the slot gate.
         matches!(cdb.first().copied(), Some(0x1A) | Some(0x5A))
+    }
+
+    fn take_media_changed(&mut self) -> bool {
+        let changed = self.media_changed;
+        self.media_changed = false;
+        changed
     }
 
     fn spc_profile(&self) -> Option<&dyn SpcProfile> {
@@ -4595,6 +4621,7 @@ mod tests {
         dev.query = Query::Media {
             bytes: 0,
             fua: true,
+            media_change: false,
             syncing: false,
         };
         let mut data = [0u8; 16];
