@@ -201,6 +201,8 @@ enum Op {
     Read { lba: u64, bytes: u32 },
     /// Write `bytes` at `offset` into the track's resource.
     Write { track: u16, offset: u64, bytes: u32 },
+    /// Consume `bytes` of host data without recording it (Test Write).
+    TestWrite { bytes: u32 },
     /// Flush the backing (uncommitted data only).
     Sync,
     /// Persist the TOC: optional data sync, slot write, slot sync.
@@ -279,6 +281,8 @@ pub struct CdrBundleMedium {
     read_only: bool,
     /// A state transition still has to reach a TOC slot.
     needs_save: bool,
+    /// The host selected the Write Parameters Test Write (-dummy) mode.
+    test_write: bool,
     /// Start address of the disc lead-in.
     medium_leadin: i64,
     /// In-flight TOC save.
@@ -332,6 +336,7 @@ impl CdrBundleMedium {
             saved: false,
             read_only: false,
             needs_save: false,
+            test_write: false,
             medium_leadin: MEDIUM_LEADIN,
             save: None,
         })
@@ -536,7 +541,9 @@ impl CdrBundleMedium {
     /// Total bytes selected by the admitted operation.
     fn total_bytes(&self) -> usize {
         match self.op {
-            Some(Op::Read { bytes, .. } | Op::Write { bytes, .. }) => bytes as usize,
+            Some(Op::Read { bytes, .. } | Op::Write { bytes, .. } | Op::TestWrite { bytes }) => {
+                bytes as usize
+            }
             _ => 0,
         }
     }
@@ -746,14 +753,60 @@ impl CdrBundleMedium {
         Ok(())
     }
 
+    /// Admit a simulated write: only the address range is checked.
+    ///
+    /// Test Write consumes the host's data without touching the track/session
+    /// tables, so the next writable address, the TOC and the backing all stay
+    /// exactly as they were.
+    fn admit_test_write(&mut self, lba: u64, blocks: u16) -> Result<(), Completion> {
+        let end = lba
+            .checked_add(u64::from(blocks))
+            .ok_or(Completion::Check(LBA_OUT_OF_RANGE))?;
+        if end > self.capacity {
+            return Err(Completion::Check(LBA_OUT_OF_RANGE));
+        }
+        let bytes = u64::from(blocks) * u64::from(BLOCK_LEN);
+        if bytes > u64::from(u32::MAX) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        self.op = Some(Op::TestWrite {
+            bytes: bytes as u32,
+        });
+        Ok(())
+    }
+
+    /// Validate a `RESERVE TRACK` size against the disc geometry.
+    ///
+    /// This is the part of a reservation that does not depend on an open
+    /// track, so the Test Write no-op path can still reject an impossible
+    /// request.
+    fn validate_reserve_track(&self, size: u32) -> Result<(), Completion> {
+        let size = u64::from(size);
+        if size < MIN_TRACK_BLOCKS {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        let number = self.tracks.len() as u16 + 1;
+        if usize::from(number) > self.track_capacity() {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        let (start_lba, _) = self.next_positions();
+        // Track 1 starts at the first user block and has no pre-gap; every
+        // later track occupies its pre-gap plus the allocated blocks.
+        let required = if self.tracks.is_empty() {
+            size
+        } else {
+            size.saturating_add(PREGAP_BLOCKS)
+        };
+        if required > self.capacity.saturating_sub(start_lba) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        Ok(())
+    }
+
     /// Admit `RESERVE TRACK`; it changes the write state.
     fn reserve_track(&mut self, size: u32) -> Result<(), Completion> {
         if self.write_protected() {
             return Err(Completion::Check(WRITE_PROTECTED));
-        }
-        let size = u64::from(size);
-        if size < MIN_TRACK_BLOCKS {
-            return Err(Completion::Check(INVALID_FIELD));
         }
         if self.open_track.is_some()
             || self.tracks.iter().any(|track| {
@@ -765,26 +818,14 @@ impl CdrBundleMedium {
         {
             return Err(Completion::Check(INVALID_FIELD));
         }
+        self.validate_reserve_track(size)?;
         let number = self.tracks.len() as u16 + 1;
-        if usize::from(number) > self.track_capacity() {
-            return Err(Completion::Check(INVALID_FIELD));
-        }
         let (start_lba, data_start_lba) = self.next_positions();
-        // Track 1 starts at the first user block and has no pre-gap; every
-        // later track occupies its pre-gap plus the allocated blocks.
-        let required = if self.tracks.is_empty() {
-            size
-        } else {
-            size.saturating_add(PREGAP_BLOCKS)
-        };
-        if required > self.capacity.saturating_sub(start_lba) {
-            return Err(Completion::Check(INVALID_FIELD));
-        }
         self.push_track(
             number,
             start_lba,
             data_start_lba,
-            size,
+            u64::from(size),
             TrackStatus::Reserved,
             true,
         )
@@ -1438,6 +1479,23 @@ impl MmcMedium for CdrBundleMedium {
         self.progress = 0;
         self.chunk_len = 0;
         self.implicit_created = false;
+        // In Test Write mode the recording commands are simulations: they
+        // report GOOD without changing the disc or touching the TOC. A real
+        // open track or an unsaved transition still takes the normal path, so
+        // the simulation never hides pending state.
+        if self.test_write && self.open_track.is_none() && !self.needs_save {
+            match op {
+                MmcOp::Commit | MmcOp::Close { .. } => return Err(Completion::Good),
+                MmcOp::ReserveTrack { size } => {
+                    if self.write_protected() {
+                        return Err(Completion::Check(WRITE_PROTECTED));
+                    }
+                    self.validate_reserve_track(size)?;
+                    return Err(Completion::Good);
+                }
+                _ => {}
+            }
+        }
         match op {
             MmcOp::Read { lba, blocks } => {
                 let bytes = self.read_range(lba, blocks)?;
@@ -1464,7 +1522,11 @@ impl MmcMedium for CdrBundleMedium {
                 if blocks == 0 {
                     return Err(Completion::Good);
                 }
-                self.admit_write(lba, blocks)?;
+                if self.test_write {
+                    self.admit_test_write(lba, blocks)?;
+                } else {
+                    self.admit_write(lba, blocks)?;
+                }
             }
             MmcOp::WriteSectors { lba, blocks, kind } => match kind {
                 SectorKind::Auto | SectorKind::Data2048 => {
@@ -1474,8 +1536,13 @@ impl MmcMedium for CdrBundleMedium {
                     if blocks == 0 {
                         return Err(Completion::Good);
                     }
-                    self.admit_write(lba, blocks)?;
+                    if self.test_write {
+                        self.admit_test_write(lba, blocks)?;
+                    } else {
+                        self.admit_write(lba, blocks)?;
+                    }
                 }
+                // Physical audio writes are not simulated and stay rejected.
                 SectorKind::Audio2352 => return Err(Completion::Check(INVALID_FIELD)),
             },
             MmcOp::Commit => {
@@ -1564,6 +1631,13 @@ impl MmcMedium for CdrBundleMedium {
                         bytes: u64::from(bytes),
                     })
                 }
+                Some(Op::TestWrite { bytes }) => {
+                    self.phase = CdrBundleState::WriteRecv;
+                    PollStep::Publish(DataPlan {
+                        direction: Direction::FromHost,
+                        bytes: u64::from(bytes),
+                    })
+                }
                 Some(Op::Sync) => {
                     self.phase = CdrBundleState::SyncIo;
                     PollStep::Publish(DataPlan {
@@ -1636,6 +1710,23 @@ impl MmcMedium for CdrBundleMedium {
                 if failed || accepted < chunk {
                     // A short Data-Out is not a partial write.
                     return self.finish(Completion::Check(COMMAND_ABORTED));
+                }
+                if matches!(self.op, Some(Op::TestWrite { .. })) {
+                    // A simulated write consumes the host's data but never
+                    // reaches the backing or the track tables.
+                    self.progress = self.progress.saturating_add(chunk as u32);
+                    if (self.progress as usize) < total {
+                        let next = self.write_chunk(data.len());
+                        if next == 0 {
+                            return self.finish(Completion::Check(INTERNAL_FAILURE));
+                        }
+                        self.chunk_len = next;
+                        return PollStep::Receive {
+                            buf: &mut data[..next],
+                            write: None,
+                        };
+                    }
+                    return self.finish(Completion::Good);
                 }
                 let Some(Op::Write { track, offset, .. }) = self.op else {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
@@ -1734,6 +1825,10 @@ impl MmcMedium for CdrBundleMedium {
 
     fn commit(&mut self) -> Result<(), Completion> {
         Ok(())
+    }
+
+    fn set_test_write(&mut self, on: bool) {
+        self.test_write = on;
     }
 
     fn track(&self, number: u16) -> Option<Track> {
@@ -2000,7 +2095,7 @@ impl CdrBundleMedium {
 mod tests {
     use super::*;
     use crate::core::storage::{HostReceipt, IoReceipt};
-    use crate::core::WRITE_ERROR;
+    use crate::core::{KnownEffects, WRITE_ERROR};
 
     /// Minimal recording storage: remembers every operation and fills reads
     /// with a deterministic pattern.
@@ -4277,5 +4372,234 @@ end = 1
             reopened.begin(MmcOp::ReserveTrack { size: 300 }),
             Err(Completion::Check(INVALID_FIELD))
         );
+    }
+
+    #[test]
+    fn test_write_consumes_a_multi_bank_data_phase_without_recording() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut mock = Mock::default();
+        medium.set_test_write(true);
+        let payload: std::vec::Vec<u8> = (0..3 * 2048).map(|index| index as u8).collect();
+        assert_eq!(
+            run_write(&mut medium, &mut mock, 0, 3, &payload, 2048),
+            Completion::Good
+        );
+
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        let attrs = medium.attrs();
+        assert_eq!(attrs.tracks, 0);
+        assert_eq!(attrs.sessions, 0);
+        assert!(!medium.needs_save());
+        assert_eq!(medium.track(1), None);
+        assert_eq!(medium.session(1), None);
+        assert_eq!(medium.current_nwa(), 0, "the NWA never advances");
+        assert!(mock.writes.is_empty(), "a simulated write touches no track");
+        assert!(mock.syncs.is_empty());
+
+        // A zero-block write stays a GOOD no-op and the range is still
+        // checked.
+        assert_eq!(
+            medium.begin(MmcOp::Write { lba: 0, blocks: 0 }),
+            Err(Completion::Good)
+        );
+        assert_eq!(
+            medium.begin(MmcOp::Write {
+                lba: 4096,
+                blocks: 1
+            }),
+            Err(Completion::Check(LBA_OUT_OF_RANGE))
+        );
+
+        // WRITE SECTORS (Data2048) is simulated the same way.
+        assert_eq!(
+            medium.begin(MmcOp::WriteSectors {
+                lba: 0,
+                blocks: 2,
+                kind: SectorKind::Data2048,
+            }),
+            Ok(())
+        );
+        let mut data = std::vec![0u8; 2048];
+        match medium.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2 * 2048),
+            other => panic!("expected test-write publish, got {other:?}"),
+        }
+        match medium.poll(Feedback::plan_accepted(), &mut data) {
+            PollStep::Receive { buf, .. } => assert_eq!(buf.len(), 2048),
+            other => panic!("expected test-write receive, got {other:?}"),
+        }
+        match medium.poll(
+            Feedback::host_received(HostReceipt::test(2048, None)),
+            &mut data,
+        ) {
+            PollStep::Receive { buf, .. } => assert_eq!(buf.len(), 2048),
+            other => panic!("expected the second chunk, got {other:?}"),
+        }
+        match medium.poll(
+            Feedback::host_received(HostReceipt::test(2048, None)),
+            &mut data,
+        ) {
+            PollStep::Complete(Completion::Good) => {}
+            other => panic!("expected test-write completion, got {other:?}"),
+        }
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert!(mock.writes.is_empty());
+
+        // Physical audio writes are not simulated.
+        assert_eq!(
+            medium.begin(MmcOp::WriteSectors {
+                lba: 0,
+                blocks: 1,
+                kind: SectorKind::Audio2352,
+            }),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[test]
+    fn test_write_recording_control_commands_are_good_noops() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        medium.set_test_write(true);
+        for op in [
+            MmcOp::Commit,
+            MmcOp::Close { function: 1 },
+            MmcOp::Close { function: 2 },
+            MmcOp::ReserveTrack { size: 500 },
+        ] {
+            assert_eq!(
+                run_control(&mut medium, &mut store, op, 4096),
+                Completion::Good,
+                "{op:?}"
+            );
+        }
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert!(!medium.needs_save());
+        assert!(store.writes.is_empty());
+        assert!(store.syncs.is_empty());
+
+        // RESERVE TRACK keeps its geometry validation even while simulating.
+        for size in [299, 4097] {
+            assert_eq!(
+                medium.begin(MmcOp::ReserveTrack { size }),
+                Err(Completion::Check(INVALID_FIELD)),
+                "size {size}"
+            );
+        }
+        assert_eq!(medium.attrs().tracks, 0);
+    }
+
+    #[test]
+    fn test_write_does_not_swallow_an_open_track() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert!(medium.open_track.is_some());
+
+        // CLOSE must fall through to the real path: the open track is closed
+        // and the resulting TOC save reaches storage, even in Test Write mode.
+        medium.set_test_write(true);
+        assert_eq!(
+            run_control(&mut medium, &mut store, MmcOp::Close { function: 1 }, 4096),
+            Completion::Good
+        );
+        assert!(medium.open_track.is_none());
+        assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
+        assert!(
+            store
+                .writes
+                .iter()
+                .any(|(resource, _, _)| *resource == TOC_RESOURCE_0 || *resource == TOC_RESOURCE_1),
+            "the close saved a TOC slot: {:?}",
+            store.writes
+        );
+        assert_eq!(medium.attrs().tracks, 1);
+    }
+
+    /// Burn one block and finalize, optionally after a simulated write.
+    fn burn_after_simulation(simulate: bool) -> (CdrBundleMedium, StoreMock) {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        if simulate {
+            medium.set_test_write(true);
+            let payload = std::vec![0x77u8; 3 * 2048];
+            assert_eq!(
+                run_write(&mut medium, &mut store, 0, 3, &payload, 2048),
+                Completion::Good
+            );
+            medium.set_test_write(false);
+        }
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        (medium, store)
+    }
+
+    #[test]
+    fn a_real_burn_after_a_simulated_one_is_unchanged() {
+        let (simulated, simulated_store) = burn_after_simulation(true);
+        let (plain, plain_store) = burn_after_simulation(false);
+
+        assert_eq!(simulated.disc_state(), CdrDiscState::Finalized);
+        assert_eq!(simulated.disc_info(), plain.disc_info());
+        assert_eq!(simulated.attrs(), plain.attrs());
+        assert_eq!(simulated.track(1), plain.track(1));
+        assert_eq!(
+            simulated.track_numbers().collect::<std::vec::Vec<_>>(),
+            std::vec![1]
+        );
+
+        // The simulated data phase left no trace: both burns produce the same
+        // TOC slots and the same backing operations.
+        assert_eq!(simulated_store.slot(0), plain_store.slot(0));
+        assert_eq!(simulated_store.slot(1), plain_store.slot(1));
+        assert_eq!(simulated_store.writes, plain_store.writes);
+        assert_eq!(simulated_store.syncs, plain_store.syncs);
+    }
+
+    #[test]
+    fn aborted_simulated_write_leaves_the_medium_blank_and_usable() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut mock = Mock::default();
+        medium.set_test_write(true);
+        let mut data = std::vec![0u8; 2048];
+        assert_eq!(medium.begin(MmcOp::Write { lba: 0, blocks: 4 }), Ok(()));
+        match medium.poll(Feedback::begin(), &mut data) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 4 * 2048),
+            other => panic!("expected test-write publish, got {other:?}"),
+        }
+        match medium.poll(Feedback::plan_accepted(), &mut data) {
+            PollStep::Receive { buf, .. } => buf.fill(0xAA),
+            other => panic!("expected test-write receive, got {other:?}"),
+        }
+        match medium.poll(
+            Feedback::host_received(HostReceipt::test(2048, None)),
+            &mut data,
+        ) {
+            PollStep::Receive { buf, .. } => assert_eq!(buf.len(), 2048),
+            other => panic!("expected the second chunk, got {other:?}"),
+        }
+
+        medium.interrupt(
+            InterruptReason::Disconnect,
+            KnownEffects {
+                confirmed_write: 2048,
+                ..KnownEffects::NONE
+            },
+        );
+        assert!(!medium.active());
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert!(!medium.needs_save());
+        assert!(mock.writes.is_empty());
+
+        // The medium is still usable for a real burn.
+        medium.set_test_write(false);
+        write_one(&mut medium, &mut mock, 0);
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
     }
 }

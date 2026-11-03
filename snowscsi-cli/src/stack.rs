@@ -850,6 +850,18 @@ impl MmcMedium for CliMedium {
             Self::CdrBundle(m) => m.atip(),
         }
     }
+
+    fn set_test_write(&mut self, on: bool) {
+        match self {
+            Self::Flat(m) => m.set_test_write(on),
+            #[cfg(feature = "dvdram")]
+            Self::DvdRam(m) => m.set_test_write(on),
+            // Without this forward the CLI accepts MODE SELECT Test Write but
+            // the CD-R medium keeps recording.
+            #[cfg(feature = "cdr-bundle")]
+            Self::CdrBundle(m) => m.set_test_write(on),
+        }
+    }
 }
 
 /// Block slot type: the public six-command SPC wrapper over a block profile.
@@ -1654,6 +1666,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "cdr-bundle")]
+    fn command_ctx(direction: snowscsi::core::Direction, bytes: u64) -> CommandContext {
+        CommandContext {
+            lun: 0,
+            lun_count: 1,
+            host_bytes: bytes,
+            host_direction: direction,
+        }
+    }
+
+    /// MODE SELECT(10) parameter list with Test Write + TAO / Data Block Type 8.
+    #[cfg(feature = "cdr-bundle")]
+    fn dummy_mode_page() -> Vec<u8> {
+        let mut page = vec![0u8; 60];
+        page[0..2].copy_from_slice(&58u16.to_be_bytes());
+        page[8] = 0x05;
+        page[9] = 0x32;
+        page[10] = 0x01 | 0x10; // Test Write | Track-at-Once
+        page[11] = 0x04; // Track Mode: data
+        page[12] = 0x08; // Data Block Type: Mode 1
+        page
+    }
+
+    /// The CLI enum must forward `set_test_write` to the CD-R medium: without
+    /// it the accepted `-dummy` mode still records, creating `track_*.bin` and
+    /// a TOC slot in the bundle directory.
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cli_medium_forwards_test_write_and_keeps_the_bundle_blank() {
+        use snowscsi::core::storage::{BlockingHost, BlockingStorage};
+        use snowscsi::core::{cons, Cons, Here, Nil, StaticTarget, Target};
+        use snowscsi::mmc::{CdrCapacity, CdrDiscState};
+
+        type DummyTarget = Target<Cons<LuImpl<Spc<MmcDrive<CliMedium>>, u32>, Nil>>;
+
+        let dir = temp_dir("cli_cdr_dummy");
+        let mut plane = bundle_plane(&dir);
+        let medium = plane
+            .open_cdr_medium(CdrCapacity::Cdr80.sectors(), Recovery::Delete)
+            .expect("fresh bundle");
+        let mut target = DummyTarget::new(cons(
+            LuImpl::new(Spc::new(MmcDrive::new(CliMedium::CdrBundle(medium))), 1u32),
+            Nil,
+        ));
+        let mut work = [0u8; 4096];
+        let mut scratch = [0u8; 4096];
+
+        {
+            let mut storage = BlockingStorage::new(PlaneStorage(&mut plane));
+
+            // MODE SELECT(10) page 0x05: Test Write + TAO / DBT 8.
+            let params = dummy_mode_page();
+            let mut cdb = [0u8; 10];
+            cdb[0] = 0x55;
+            cdb[1] = 0x10;
+            cdb[7..9].copy_from_slice(&(params.len() as u16).to_be_bytes());
+            let mut host = BlockingHost::new(BytesHost(params));
+            assert_eq!(
+                target.drive_static_host::<Here>(
+                    &mut storage,
+                    &mut host,
+                    command_ctx(snowscsi::core::Direction::FromHost, 60),
+                    &cdb,
+                    &mut work,
+                    &mut scratch,
+                ),
+                Ok(Completion::Good)
+            );
+
+            // WRITE(10) with FUA at the NWA: the simulated data phase spans
+            // more than one bank and must not issue the post-write sync.
+            let mut cdb = [0u8; 10];
+            cdb[0] = 0x2A;
+            cdb[1] = 0x08; // FUA
+            cdb[7..9].copy_from_slice(&3u16.to_be_bytes());
+            let mut host = BlockingHost::new(FillHost(0x5A));
+            assert_eq!(
+                target.drive_static_host::<Here>(
+                    &mut storage,
+                    &mut host,
+                    command_ctx(snowscsi::core::Direction::FromHost, 3 * 2048),
+                    &cdb,
+                    &mut work,
+                    &mut scratch,
+                ),
+                Ok(Completion::Good)
+            );
+
+            // SYNCHRONIZE CACHE and CLOSE TRACK/SESSION 010b are no-ops.
+            let mut host = BlockingHost::new(NoHost);
+            let mut sync = [0u8; 10];
+            sync[0] = 0x35;
+            assert_eq!(
+                target.drive_static_host::<Here>(
+                    &mut storage,
+                    &mut host,
+                    command_ctx(snowscsi::core::Direction::None, 0),
+                    &sync,
+                    &mut work,
+                    &mut scratch,
+                ),
+                Ok(Completion::Good)
+            );
+            let close = [0x5B, 0, 2, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(
+                target.drive_static_host::<Here>(
+                    &mut storage,
+                    &mut host,
+                    command_ctx(snowscsi::core::Direction::None, 0),
+                    &close,
+                    &mut work,
+                    &mut scratch,
+                ),
+                Ok(Completion::Good)
+            );
+        }
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("bundle directory")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.starts_with("toc.") && !name.starts_with("track_")),
+            "a simulated burn wrote bundle files: {names:?}"
+        );
+
+        let reopened = plane
+            .open_cdr_medium(CdrCapacity::Cdr80.sectors(), Recovery::Delete)
+            .expect("reopen the simulated disc");
+        assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
+        assert_eq!(reopened.toc_seq(), 0);
+        assert_eq!(reopened.attrs().tracks, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Host that fills every received data phase with one byte value.
     #[cfg(feature = "cdr-bundle")]
     struct FillHost(u8);
@@ -1691,7 +1841,42 @@ mod tests {
         }
     }
 
-    /// Borrowed medium so a drive command can leave its state with the test.
+    /// Host that supplies a fixed byte payload to a FromHost data phase.
+    #[cfg(feature = "cdr-bundle")]
+    struct BytesHost(Vec<u8>);
+
+    #[cfg(feature = "cdr-bundle")]
+    impl snowscsi::core::storage::SyncHost for BytesHost {
+        fn publish(&mut self, _plan: snowscsi::core::DataPlan) -> Result<(), Fault> {
+            Ok(())
+        }
+        fn receive(
+            &mut self,
+            req: snowscsi::core::storage::HostReq,
+            buf: snowscsi::core::storage::HostBuf<'_>,
+        ) -> snowscsi::core::storage::HostReceipt {
+            match buf {
+                snowscsi::core::storage::HostBuf::Recv { buf: bytes, .. } => {
+                    let accepted = (req.len as usize).min(bytes.len()).min(self.0.len());
+                    bytes[..accepted].copy_from_slice(&self.0[..accepted]);
+                    snowscsi::core::storage::HostReceipt::from_adapter(accepted, None)
+                }
+                snowscsi::core::storage::HostBuf::Send { .. } => {
+                    snowscsi::core::storage::HostReceipt::from_adapter(0, Some(Fault::Contract))
+                }
+            }
+        }
+        fn send(
+            &mut self,
+            req: snowscsi::core::storage::HostReq,
+            _buf: snowscsi::core::storage::HostBuf<'_>,
+        ) -> snowscsi::core::storage::HostReceipt {
+            snowscsi::core::storage::HostReceipt::from_adapter(req.len as usize, None)
+        }
+        fn delivery(&self) -> Delivery {
+            Delivery::Complete
+        }
+    }
     #[cfg(feature = "cdr-bundle")]
     struct BorrowedMedium<'a>(&'a mut CdrBundleMedium);
 
@@ -1754,6 +1939,10 @@ mod tests {
 
         fn atip(&self) -> Option<AtipInfo> {
             self.0.atip()
+        }
+
+        fn set_test_write(&mut self, on: bool) {
+            self.0.set_test_write(on);
         }
     }
 

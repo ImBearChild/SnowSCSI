@@ -78,9 +78,19 @@ class CdrBundleBurnTest(unittest.TestCase):
         self.assertEqual(made.returncode, 0, made.stderr)
         self.assertTrue(os.path.isfile(self.iso))
 
-        # `-tao` is the only supported recording mode; `-dao` and `-dummy`
-        # are rejected by MODE SELECT page 0x05. wodim closes the session at
-        # the end, which is what stores the final TOC.
+        # `-tao` is the only supported recording mode; `-dao` is rejected by
+        # MODE SELECT page 0x05. `-dummy` (Test Write) is simulated in TAO:
+        # the data phase and the CLOSE commands are consumed but the disc stays
+        # blank, so a real burn must still succeed afterwards. wodim closes the
+        # session at the end, which is what stores the final TOC.
+        sh("wodim", "-v", "-dummy", "-tao", f"dev={DEV}", self.iso, timeout=300)
+        blank = sh("isoinfo", "-d", "-i", DEV, check=False)
+        self.assertNotIn(
+            LABEL,
+            blank.stdout,
+            "a -dummy burn must leave the disc blank:\n" + blank.stdout,
+        )
+
         sh("wodim", "-v", "-tao", f"dev={DEV}", self.iso, timeout=300)
 
         # An independent reader must see the finalized volume.

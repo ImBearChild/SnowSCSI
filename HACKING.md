@@ -308,8 +308,13 @@ Burn with cdrkit in Track-at-Once:
 wodim -v -tao dev=/dev/sr0 /path/image.iso
 ```
 
-`-tao` is mandatory: `-dao` (SAO), packet/raw write modes and `-dummy` (Test
-Write) are rejected by MODE SELECT page 0x05 with ILLEGAL REQUEST. Make sure
+`-tao` is mandatory: `-dao` (SAO), packet/raw write modes are rejected by
+MODE SELECT page 0x05 with ILLEGAL REQUEST. `-dummy` (Test Write) is accepted
+in TAO: the disc simulates the burn — the host's data phase is consumed, every
+recording command (WRITE, SYNCHRONIZE CACHE, CLOSE TRACK SESSION, RESERVE TRACK)
+reports GOOD, and the disc stays blank (no track, no NWA advance, no TOC slot
+write). Only the Test Write bit changes, so clearing it with a later MODE
+SELECT leaves the disc ready for a real burn exactly as before. Make sure
 the host has completed `SYNCHRONIZE CACHE` / `CLOSE TRACK SESSION` before
 ejecting: on eject the server snapshots the current TOC into an alternating
 slot, so the disc restarts Appendable (a host that never issued CLOSE may leave
@@ -360,8 +365,8 @@ Troubleshooting:
   `0x20` (Random Writable) and `0x24` (Defect Management) are not.
 - **`Cannot init drive`** at burn startup — MODE SELECT page 0x05 was
   rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
-  (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet,
-  raw and Test Write are refused.
+  (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet and
+  raw are refused. The Test Write bit (`-dummy`) is accepted and simulated.
 - **`SET CD SPEED`** — accepted and remembered, but the emulated drive has
   no spindle to retune; SEND OPC tables are consumed and discarded.
 - **TOC corrupt or missing** — the two slots alternate, so a torn save leaves

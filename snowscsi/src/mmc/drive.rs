@@ -343,6 +343,8 @@ pub struct MmcDrive<M: MmcMedium> {
     read_speed: u16,
     /// Last SET CD SPEED write speed in kilobytes per second (`0xFFFF` = max).
     write_speed: u16,
+    /// The host selected the Write Parameters Test Write (-dummy) mode.
+    test_write: bool,
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
@@ -359,6 +361,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             prefetch_issues: 0,
             read_speed: 0,
             write_speed: 0,
+            test_write: false,
         }
     }
 
@@ -419,6 +422,13 @@ impl<M: MmcMedium> MmcDrive<M> {
     #[must_use]
     pub const fn cd_speed(&self) -> (u16, u16) {
         (self.read_speed, self.write_speed)
+    }
+
+    /// Whether the host selected Write Parameters Test Write (`-dummy`).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn test_write(&self) -> bool {
+        self.test_write
     }
 
     /// Borrow the installed medium.
@@ -526,7 +536,8 @@ impl<M: MmcMedium> MmcDrive<M> {
         } else {
             MmcOp::Read { lba, blocks }
         };
-        self.begin_media_fua(op, bytes as u32, write && fua)
+        // Test Write never records, so a FUA write needs no aggregate sync.
+        self.begin_media_fua(op, bytes as u32, write && fua && !self.test_write)
     }
 
     /// SYNCHRONIZE CACHE(10): IMMED is rejected; SYNC_NV is accepted.
@@ -1529,7 +1540,17 @@ impl<M: MmcMedium> MmcDrive<M> {
                         let validated = validate_mode_select(ten, &data[..len], self.attrs());
                         self.query = Query::None;
                         match validated {
-                            Ok(()) => PollStep::Complete(Completion::Good),
+                            Ok(params) => {
+                                if let Some(params) = params {
+                                    // A CD-R recorder applies the requested
+                                    // test mode to itself and to the medium.
+                                    self.test_write = params.test_write;
+                                    if let Some(medium) = self.medium.as_mut() {
+                                        medium.set_test_write(params.test_write);
+                                    }
+                                }
+                                PollStep::Complete(Completion::Good)
+                            }
                             Err(sense) => PollStep::Complete(Completion::Check(sense)),
                         }
                     }
@@ -1742,13 +1763,20 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         medium
     }
 
-    fn install_medium(&mut self, _permit: &BoundaryPermit, medium: M) -> Result<(), (M, Fault)> {
+    fn install_medium(
+        &mut self,
+        _permit: &BoundaryPermit,
+        mut medium: M,
+    ) -> Result<(), (M, Fault)> {
         if self.medium.is_some() {
             return Err((medium, Fault::Contract));
         }
-        // A new medium never inherits the previous medium's long result.
+        // A new medium never inherits the previous medium's long result or its
+        // simulated-write mode.
         self.long = LongOp::Idle;
         self.query = Query::None;
+        self.test_write = false;
+        medium.set_test_write(false);
         self.medium = Some(medium);
         Ok(())
     }
@@ -1766,6 +1794,11 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             .is_some_and(|m| m.attrs().write_protected)
     }
 
+    /// Encode one mode page (or every page for `0x3F`) behind the mode header.
+    ///
+    /// `pc == 1` (changeable values) keeps each page's code and length but
+    /// reports an all-zero payload: this drive declares no field of any page
+    /// changeable, including the Write Parameters Test Write bit.
     fn mode_sense(
         &self,
         ten: bool,
@@ -1787,12 +1820,12 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         let plen = if page == 0x3F {
             let mut at = 0usize;
             for code in ALL_PAGE_ORDER {
-                let bytes = write_page(code, caps, attrs, &mut pages[at..])?;
+                let bytes = write_page(code, caps, attrs, self.test_write, &mut pages[at..])?;
                 at += bytes;
             }
             at
         } else {
-            write_page(page, caps, attrs, &mut pages)?
+            write_page(page, caps, attrs, self.test_write, &mut pages)?
         };
         if pc == 1 {
             // Changeable mask: keep page code/length, zero the payload.
@@ -2159,15 +2192,17 @@ const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A,
 ///
 /// A CD-R recorder advertises the mode it actually records with: Track-at-Once
 /// (Write Type 1), data track mode 4 and 2048-byte Mode 1 data blocks (Data
-/// Block Type 8). Read-only and rewritable media keep the default zero page
-/// and therefore never claim TAO.
-fn write_params_page(attrs: Option<MmcAttrs>) -> [u8; WRITE_PARAMS_LEN] {
+/// Block Type 8). `test_write` is the current Test Write bit (byte 2 bit 4),
+/// which the host sets for `wodim -dummy`; it is only meaningful on a
+/// write-once CD. Read-only and rewritable media keep the default zero page
+/// and therefore never claim TAO or Test Write.
+fn write_params_page(attrs: Option<MmcAttrs>, test_write: bool) -> [u8; WRITE_PARAMS_LEN] {
     let mut page = [0u8; WRITE_PARAMS_LEN];
     page[0] = 0x05;
     page[1] = 0x32;
     if let Some(attrs) = attrs {
         if attrs.write_mode == MmcWriteMode::WriteOnce {
-            page[2] = 0x01; // Write Type: Track-at-Once
+            page[2] = 0x01 | if test_write { 0x10 } else { 0 }; // Test Write | TAO
             page[3] = 0x04; // Track Mode: data
             page[4] = 0x08; // Data Block Type: Mode 1, 2048 bytes
         }
@@ -2182,12 +2217,18 @@ fn write_params_page(attrs: Option<MmcAttrs>) -> [u8; WRITE_PARAMS_LEN] {
 /// CD-ROM view or the 36-byte DVD-RAM recorder view. The page length byte
 /// describes each one completely, so `0x3F` concatenation never carries padding
 /// that a host could parse as another page.
-fn write_page(page: u8, caps: MmcCaps, attrs: Option<MmcAttrs>, out: &mut [u8]) -> Option<usize> {
+fn write_page(
+    page: u8,
+    caps: MmcCaps,
+    attrs: Option<MmcAttrs>,
+    test_write: bool,
+    out: &mut [u8],
+) -> Option<usize> {
     if page == 0x05 {
         if out.len() < WRITE_PARAMS_LEN {
             return None;
         }
-        out[..WRITE_PARAMS_LEN].copy_from_slice(&write_params_page(attrs));
+        out[..WRITE_PARAMS_LEN].copy_from_slice(&write_params_page(attrs, test_write));
         return Some(WRITE_PARAMS_LEN);
     }
     let bytes: &[u8] = match page {
@@ -2627,14 +2668,26 @@ fn validate_format_list(data: &[u8]) -> Result<FormatList, Sense> {
     })
 }
 
+/// The Write Parameters fields the drive keeps from MODE SELECT page 0x05.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteParams {
+    /// Test Write (byte 2 bit 4): record as a simulation.
+    test_write: bool,
+}
+
 /// Validate a MODE SELECT parameter list.
 ///
 /// The list must carry a mode header whose block-descriptor length is zero
 /// (MM drives have no block descriptors), followed by complete mode pages. On
 /// a CD-R the Write Parameters page must describe the supported recording
-/// mode: Track-at-Once with 2048-byte Mode 1 blocks. Every other medium
-/// accepts and ignores page 0x05. A list without page 0x05 is a no-op.
-fn validate_mode_select(ten: bool, data: &[u8], attrs: Option<MmcAttrs>) -> Result<(), Sense> {
+/// mode: Track-at-Once with 2048-byte Mode 1 blocks. Test Write is accepted and
+/// returned so the caller can apply it. Every other medium accepts and ignores
+/// page 0x05. A list without page 0x05 is a no-op.
+fn validate_mode_select(
+    ten: bool,
+    data: &[u8],
+    attrs: Option<MmcAttrs>,
+) -> Result<Option<WriteParams>, Sense> {
     let header = if ten { 8 } else { 4 };
     if data.len() < header {
         return Err(INVALID_FIELD);
@@ -2648,6 +2701,7 @@ fn validate_mode_select(ten: bool, data: &[u8], attrs: Option<MmcAttrs>) -> Resu
         return Err(INVALID_FIELD);
     }
     let cdr_recorder = attrs.is_some_and(|attrs| attrs.write_mode == MmcWriteMode::WriteOnce);
+    let mut params = None;
     let mut at = header;
     while at < data.len() {
         if at + 2 > data.len() {
@@ -2667,11 +2721,6 @@ fn validate_mode_select(ten: bool, data: &[u8], attrs: Option<MmcAttrs>) -> Resu
                 return Err(INVALID_FIELD);
             }
             let byte2 = data[at + 2];
-            if byte2 & 0x10 != 0 {
-                // Test Write would pretend to burn; refuse it instead of
-                // silently discarding the host's data.
-                return Err(INVALID_FIELD);
-            }
             if byte2 & 0x0F != 0x01 {
                 // Only Track-at-Once is supported: SAO, raw and packet are
                 // rejected rather than silently treated as TAO.
@@ -2681,10 +2730,13 @@ fn validate_mode_select(ten: bool, data: &[u8], attrs: Option<MmcAttrs>) -> Resu
                 // Only Mode 1 (2048-byte) blocks are accepted.
                 return Err(INVALID_FIELD);
             }
+            params = Some(WriteParams {
+                test_write: byte2 & 0x10 != 0,
+            });
         }
         at = end;
     }
-    Ok(())
+    Ok(params)
 }
 
 /// Zero-fill progress in whole percent, clamped to 0..=100.
@@ -3284,6 +3336,8 @@ mod tests {
         begin_calls: Cell<u32>,
         poll_calls: Cell<u32>,
         commit_calls: Cell<u32>,
+        test_write_calls: Cell<u32>,
+        last_test_write: Cell<Option<bool>>,
     }
 
     impl SpyMedium {
@@ -3312,6 +3366,8 @@ mod tests {
                 begin_calls: Cell::new(0),
                 poll_calls: Cell::new(0),
                 commit_calls: Cell::new(0),
+                test_write_calls: Cell::new(0),
+                last_test_write: Cell::new(None),
             }
         }
 
@@ -3321,6 +3377,10 @@ mod tests {
 
         fn read_only(sectors: u64) -> Self {
             Self::new(MmcWriteMode::ReadOnly, sectors)
+        }
+
+        fn write_once(sectors: u64) -> Self {
+            Self::new(MmcWriteMode::WriteOnce, sectors)
         }
 
         fn snap(&self) -> (u32, u32, u32) {
@@ -3363,6 +3423,11 @@ mod tests {
         fn commit(&mut self) -> Result<(), Completion> {
             self.commit_calls.set(self.commit_calls.get() + 1);
             Ok(())
+        }
+
+        fn set_test_write(&mut self, on: bool) {
+            self.test_write_calls.set(self.test_write_calls.get() + 1);
+            self.last_test_write.set(Some(on));
         }
 
         fn track(&self, number: u16) -> Option<Track> {
@@ -4413,6 +4478,25 @@ mod tests {
     }
 
     #[test]
+    fn installing_a_medium_clears_the_simulated_write_mode() {
+        let boundary = boundary();
+        let mut dev: MmcDrive<SpyMedium> = MmcDrive::empty(MmcCaps::hyper_multi());
+        dev.test_write = true;
+
+        assert!(dev
+            .install_medium(&boundary, SpyMedium::write_once(16))
+            .is_ok());
+        assert!(!dev.test_write(), "the drive reports the bit cleared");
+        let spy = dev.take_medium(&boundary).expect("medium");
+        assert_eq!(spy.test_write_calls.get(), 1);
+        assert_eq!(
+            spy.last_test_write.get(),
+            Some(false),
+            "the installed medium is told to stop simulating"
+        );
+    }
+
+    #[test]
     fn empty_default_drive_reports_hyper_multi_caps() {
         // The default drive is a Hyper-Multi recorder; an empty tray keeps
         // every drive capability (only Current bits are cleared).
@@ -5366,6 +5450,95 @@ mod tests {
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
+    fn mode_select_test_write_round_trips() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        for ten in [false, true] {
+            for on in [true, false] {
+                let page = test_write_params_page(1, 4, 8, on);
+                let params = mode_select_params(ten, &page);
+                let cdb = mode_select_cdb(ten, params.len());
+                assert_eq!(
+                    run_receive(&mut dev, &cdb, &params, &mut data),
+                    Completion::Good,
+                    "MODE SELECT ten={ten}, test_write={on}"
+                );
+                assert_eq!(dev.test_write(), on);
+                assert!(!dev.active());
+
+                let profile = dev.spc_profile().expect("profile");
+                let mut long = [0u8; 64];
+                assert_eq!(
+                    profile.mode_sense(true, 0x05, false, 0, Some(&mut long)),
+                    Some(60)
+                );
+                assert_eq!(
+                    long[10] & 0x10,
+                    if on { 0x10 } else { 0 },
+                    "MODE SENSE reports Test Write (ten={ten})"
+                );
+                assert_eq!(long[10] & 0x0F, 0x01, "Write Type stays TAO");
+                assert_eq!(long[11], 0x04, "Track Mode stays data");
+                assert_eq!(long[12], 0x08, "Data Block Type stays Mode 1");
+
+                let mut short = [0u8; 64];
+                assert_eq!(
+                    profile.mode_sense(false, 0x05, false, 0, Some(&mut short)),
+                    Some(56)
+                );
+                assert_eq!(short[6] & 0x10, if on { 0x10 } else { 0 });
+            }
+        }
+
+        // The drive forwards every transition to the medium.
+        let mut spy = MmcDrive::new(SpyMedium::write_once(16));
+        for on in [true, false] {
+            let page = test_write_params_page(1, 4, 8, on);
+            let params = mode_select_params(true, &page);
+            let cdb = mode_select_cdb(true, params.len());
+            assert_eq!(
+                run_receive(&mut spy, &cdb, &params, &mut data),
+                Completion::Good
+            );
+            assert_eq!(spy.test_write(), on);
+            assert_eq!(
+                spy.medium().expect("medium").last_test_write.get(),
+                Some(on),
+                "the medium received set_test_write({on})"
+            );
+        }
+        assert_eq!(spy.medium().expect("medium").test_write_calls.get(), 2);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn simulated_close_does_not_arm_a_medium_change() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 4, 8, true);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert!(dev.test_write());
+
+        // A simulated CLOSE session completes before the finalize branch, so
+        // it must not latch the capacity-change unit attention.
+        let mut close = [0u8; 10];
+        close[0] = CLOSE_TRACK_SESSION;
+        close[2] = 2;
+        assert_eq!(
+            dev.prepare(&permit(), ctx(Direction::None, 0), &close),
+            Err(Completion::Good)
+        );
+        assert!(!dev.take_media_changed());
+        assert!(!dev.active());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
     fn mode_select_rejects_unsupported_write_parameters() {
         let mut dev = cdr_drive();
         let mut data = [0u8; 128];
@@ -5373,9 +5546,10 @@ mod tests {
             (2, 4, 8, false),  // Session-at-Once
             (3, 4, 8, false),  // RAW
             (0, 4, 8, false),  // Packet/Incremental
-            (1, 4, 8, true),   // Test Write (-dummy)
+            (2, 4, 8, true),   // SAO with Test Write
             (1, 4, 0, false),  // raw 2352-byte blocks
             (1, 4, 10, false), // Mode 2 Form 1
+            (1, 4, 0, true),   // simulated raw 2352-byte blocks
         ] {
             let page = test_write_params_page(write_type, track_mode, dbt, test_write);
             let params = mode_select_params(true, &page);
@@ -5385,6 +5559,7 @@ mod tests {
                 Completion::Check(INVALID_FIELD),
                 "write type {write_type}, dbt {dbt}, test {test_write}"
             );
+            assert!(!dev.test_write());
             assert!(!dev.active());
         }
     }
@@ -5453,9 +5628,19 @@ mod tests {
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
-    fn mode_select_without_page_05_is_a_noop() {
+    fn mode_select_without_page_05_keeps_the_test_write_bit() {
         let mut dev = cdr_drive();
         let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 4, 8, true);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert!(dev.test_write());
+
+        // A list without page 0x05 describes no change to the write mode.
         let page = [0x08u8, 0x02, 0x00, 0x00]; // caching page
         let params = mode_select_params(true, &page);
         let cdb = mode_select_cdb(true, params.len());
@@ -5463,20 +5648,75 @@ mod tests {
             run_receive(&mut dev, &cdb, &params, &mut data),
             Completion::Good
         );
+        assert!(dev.test_write(), "an absent page 0x05 leaves the bit set");
     }
 
     #[test]
     fn mode_select_on_a_read_only_medium_ignores_the_page() {
         let mut dev = drive(100);
         let mut data = [0u8; 128];
-        // Even a SAO + Test Write page is accepted and ignored on a ROM.
-        let page = test_write_params_page(2, 4, 8, true);
+        // The real TAO + Test Write page is accepted and ignored on a ROM.
+        let page = test_write_params_page(1, 4, 8, true);
         let params = mode_select_params(true, &page);
         let cdb = mode_select_cdb(true, params.len());
         assert_eq!(
             run_receive(&mut dev, &cdb, &params, &mut data),
             Completion::Good
         );
+        assert!(!dev.test_write(), "a ROM never enters Test Write");
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_sense_changeable_page_05_hides_the_test_write_bit() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 4, 8, true);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert!(dev.test_write());
+
+        let profile = dev.spc_profile().expect("profile");
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(true, 0x05, false, 1, Some(&mut buf)),
+            Some(60)
+        );
+        assert_eq!(buf[8], 0x05, "page code is kept");
+        assert_eq!(buf[9], 0x32, "page length is kept");
+        assert_eq!(
+            &buf[10..13],
+            &[0u8, 0, 0],
+            "changeable page 0x05 is all zero (nothing is changeable)"
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn simulated_write_on_a_finalized_disc_is_write_protected() {
+        let mut dev = finalized_cdr_drive();
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 4, 8, true);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert!(dev.test_write());
+
+        let mut write = [0u8; 10];
+        write[0] = WRITE_10;
+        write[7..9].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            dev.prepare(&permit(), ctx(Direction::FromHost, 2048), &write),
+            Err(Completion::Check(WRITE_PROTECTED))
+        );
+        assert!(!dev.active());
     }
 
     #[test]

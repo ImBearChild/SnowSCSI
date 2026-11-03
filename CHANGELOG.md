@@ -94,10 +94,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mmc**: recorder-control commands — MODE SENSE page 0x05 reports
   Track-at-Once/2048-byte Mode 1 parameters on a CD-R (and no TAO claim on
   read-only/rewritable media), MODE SELECT(6/10) validates and accepts that
-  page (rejecting SAO/raw/packet and Test Write), SET CD SPEED records the
-  requested read/write speeds, SEND OPC INFORMATION accepts eight-byte tables,
-  and READ TOC format 2 serves the raw A0/A1/A2/B0 lead-in descriptors plus the
-  track and lead-out entries.
+  page (rejecting SAO/raw/packet), SET CD SPEED records the requested
+  read/write speeds, SEND OPC INFORMATION accepts eight-byte tables, and READ
+  TOC format 2 serves the raw A0/A1/A2/B0 lead-in descriptors plus the track
+  and lead-out entries.
+- **mmc**: Write Parameters Test Write (`wodim -dummy -tao`) on a
+  `cdr-bundle` CD-R. MODE SELECT page 0x05 keeps the Test Write bit (byte 2
+  bit 4) and MODE SENSE round-trips it; while it is set the medium consumes a
+  range-checked WRITE data phase without recording it, and SYNCHRONIZE CACHE,
+  CLOSE TRACK SESSION and RESERVE TRACK are GOOD no-ops, so the disc stays
+  blank (no implicit track, no NWA advance, no TOC slot write). Clearing the
+  bit leaves a real burn byte-identical to one that was never simulated. The
+  new defaulted `MmcMedium::set_test_write` carries the drive's mode to the
+  medium, and the CLI's `CliMedium` forwards it to the bundle.
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
 - **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`

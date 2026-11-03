@@ -370,6 +370,13 @@ fn tao_mode_page() -> Vec<u8> {
     page
 }
 
+/// The same page with Test Write (byte 2 bit 4) set, as `wodim -dummy` sends.
+fn dummy_mode_page() -> Vec<u8> {
+    let mut page = tao_mode_page();
+    page[10] |= 0x10;
+    page
+}
+
 fn set_cd_speed(read: u16, write: u16) -> [u8; 12] {
     let mut cdb = [0u8; 12];
     cdb[0] = SET_CD_SPEED;
@@ -1767,6 +1774,247 @@ fn cdr_cdrkit_tao_trace() {
         )],
         "the read is served from track 1 at offset 0"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// cdrkit `wodim -dummy` trace: Test Write consumes the data phase
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `wodim -dummy -tao` selects Test Write in MODE SELECT page 0x05, sends the
+/// payload, flushes and closes the session. Every command must report GOOD
+/// while the disc stays blank: the data phase is consumed, no track is
+/// created, and no TOC slot is written.
+#[test]
+fn cdr_dummy_tao_trace_leaves_the_disc_blank() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // Drain the install medium-change unit attention.
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // 1. MODE SELECT(10) page 0x05 with Test Write + TAO/DBT 8.
+    let mut select_host = BlockingHost::new(TestHost::new(dummy_mode_page()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 2. MODE SENSE reports the simulated mode back.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mode_sense10(0x05, 64),
+            Direction::ToHost,
+            64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[10] & 0x10, 0x10, "Test Write is Current");
+    assert_eq!(work[10] & 0x0F, 0x01, "Write Type stays TAO");
+    assert_eq!(work[12], 0x08, "Data Block Type stays Mode 1");
+
+    // 3. WRITE(10) with FUA at the NWA for a few blocks: the data phase is
+    //    larger than the work bank and is consumed without recording. FUA must
+    //    not issue the aggregate sync in the simulated mode.
+    let payload = vec![0x5A; 3 * BLOCK];
+    let mut write_host = BlockingHost::new(TestHost::new(payload));
+    let mut write = write10(0, 3);
+    write[1] = 0x08; // FUA
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &write,
+            Direction::FromHost,
+            3 * BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 4. SYNCHRONIZE CACHE and CLOSE TRACK/SESSION 010b are GOOD no-ops.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 5. No finalize happened, so there is no medium-change unit attention.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &[0u8; 6],
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // 6. The disc is still blank with the NWA at LBA 0.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x00, "Empty disc");
+    assert_eq!(work[2] & 0x10, 0, "not erasable");
+    assert_eq!(work[4], 1, "still one session");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_track_information(1, 0xFF, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 1, "invisible track 1");
+    assert_eq!(work[6] & 0x40, 0x40, "invisible (blank) track");
+    assert_eq!(&work[12..16], &0u32.to_be_bytes(), "NWA still 0");
+
+    // 7. The backing saw no track write and no TOC save.
+    let log = &storage.inner().log;
+    assert!(
+        !log.iter().any(|event| matches!(event, Ev::Write(..))),
+        "a simulated write never reaches storage: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|event| matches!(event, Ev::Sync(_))),
+        "neither SYNCHRONIZE CACHE nor CLOSE syncs: {log:?}"
+    );
+
+    // 8. Clearing Test Write leaves the disc burnable: the real TAO sequence
+    //    starts at LBA 0 as if nothing had happened.
+    let mut select_host = BlockingHost::new(TestHost::new(tao_mode_page()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    let mut write_host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut write_host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 0x0E, "the real burn finalized the disc");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

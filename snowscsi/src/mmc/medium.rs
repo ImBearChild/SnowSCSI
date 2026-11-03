@@ -110,6 +110,14 @@ pub trait MmcMedium {
     fn atip(&self) -> Option<AtipInfo> {
         None
     }
+
+    /// The host entered or left the Write Parameters Test Write mode.
+    ///
+    /// A medium that can simulate writes must consume the host's data without
+    /// recording it. Default: ignore the mode; a write is a real write.
+    fn set_test_write(&mut self, on: bool) {
+        let _ = on;
+    }
 }
 
 /// Project a closed, fully recorded track into the track-information view.
