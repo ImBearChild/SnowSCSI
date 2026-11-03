@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mmc**: multi-session CD-R/CD-RW for the persistent `cdr-bundle` medium.
+  Write Parameters page 0x05 byte 3 bits 7-6 is parsed (`00b`/`01b` accepted
+  as finalize-compatible, `11b` allows another session, `10b` → `24/00`),
+  forwarded through a new defaulted `MmcMedium::set_multi_session`, reflected
+  by MODE SENSE and cleared on medium install. `CLOSE TRACK/SESSION 010b`
+  with `11b` closes the open track and the session but leaves the disc
+  Appendable; `00b`/`01b` finalizes as before. The next session's lead-in
+  starts at the previous lead-out, its first track preamble at
+  `lead-in + 4500` and its user data 150 blocks later (`READ TRACK
+  INFORMATION 0xFF` reports that NWA). READ TOC formats 0/1/2 describe the
+  last complete session even while a later session is open; format 2 uses
+  the 11-byte MMC-6 Table 483 descriptors with B0 at the next program area
+  while appendable and at the lead-out once finalized, and READ DISC
+  INFORMATION counts complete sessions plus an open one and reports the last
+  closed session's lead-out as the next lead-in. A restored TOC keeps the
+  disc appendable for the next session. Tests cover close/append/third
+  session/finalize, the layout, TOC/DISC INFO reporting, mode-page
+  round-trip and a CLI `set_multi_session` forward.
 - **mmc**: CD-RW media for the persistent `cdr-bundle` — `DiscKind` is stored
   in the TOC (`disc_type = cdr`/`cdrw`, the old body still loads), the medium
   reports `MmcWriteMode::Rewritable` + profile `0x0A`, DISC INFORMATION sets

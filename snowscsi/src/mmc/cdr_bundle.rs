@@ -63,6 +63,12 @@ use crate::core::{
 const BLOCK_LEN: u32 = 2048;
 /// Pre-gap before every track after the first.
 const PREGAP_BLOCKS: u64 = 150;
+/// Length of the 1-minute lead-in area at the start of every appended session.
+///
+/// The next session's lead-in starts at the previous session's lead-out; its
+/// first track preamble starts this many blocks later, and user data starts
+/// one [`PREGAP_BLOCKS`] pre-gap after that.
+pub(crate) const SESSION_LEADIN_BLOCKS: u64 = 4500;
 /// Minimum recorded length of a closed track.
 const MIN_TRACK_BLOCKS: u64 = 300;
 /// Start address of the disc lead-in.
@@ -302,6 +308,9 @@ pub struct CdrBundleMedium {
     needs_save: bool,
     /// The host selected the Write Parameters Test Write (-dummy) mode.
     test_write: bool,
+    /// The host selected the Multi-session mode (the next session closure may
+    /// keep the disc appendable instead of finalizing it).
+    multi_session: bool,
     /// Start address of the disc lead-in.
     medium_leadin: i64,
     /// In-flight TOC save.
@@ -377,6 +386,7 @@ impl CdrBundleMedium {
             read_only: false,
             needs_save: false,
             test_write: false,
+            multi_session: false,
             medium_leadin: MEDIUM_LEADIN,
             save: None,
         })
@@ -453,6 +463,13 @@ impl CdrBundleMedium {
     #[must_use]
     pub const fn disc_state(&self) -> CdrDiscState {
         self.disc
+    }
+
+    /// Whether the host selected the Write Parameters Multi-session mode.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn multi_session(&self) -> bool {
+        self.multi_session
     }
 
     /// Fixed TOC slot size in bytes.
@@ -634,14 +651,37 @@ impl CdrBundleMedium {
         Ok(bytes as u32)
     }
 
-    /// Start positions of the next track: `(start_lba, data_start_lba)`.
-    fn next_positions(&self) -> (u64, u64) {
+    /// Start positions of the next track:
+    /// `(session_start_lba, track_start_lba, data_start_lba)`.
+    ///
+    /// A track appended to an open session follows the previous track after
+    /// the usual 150-block pre-gap. A track that starts a new session uses the
+    /// documented multi-session geometry: the session lead-in begins at the
+    /// previous session's lead-out, the first track preamble starts 4500 blocks
+    /// (one minute) later, and its user data starts one pre-gap after that.
+    fn next_positions(&self) -> (u64, u64, u64) {
         match self.tracks.last() {
-            None => (0, 0),
-            Some(last) => {
-                let start = last.data_start_lba.saturating_add(last.length);
-                (start, start.saturating_add(PREGAP_BLOCKS))
-            }
+            None => (0, 0, 0),
+            Some(last) => match self.sessions.last() {
+                Some(session) if session.closed => {
+                    let lead_in = session.lead_out_lba;
+                    let track_start = lead_in.saturating_add(SESSION_LEADIN_BLOCKS);
+                    (
+                        lead_in,
+                        track_start,
+                        track_start.saturating_add(PREGAP_BLOCKS),
+                    )
+                }
+                Some(session) => {
+                    let track_start = last.data_start_lba.saturating_add(last.length);
+                    (
+                        session.start_lba,
+                        track_start,
+                        track_start.saturating_add(PREGAP_BLOCKS),
+                    )
+                }
+                None => (0, 0, 0),
+            },
         }
     }
 
@@ -656,7 +696,7 @@ impl CdrBundleMedium {
         }
         match self.tracks.last() {
             None => 0,
-            Some(_) => self.next_positions().1,
+            Some(_) => self.next_positions().2,
         }
     }
 
@@ -666,7 +706,7 @@ impl CdrBundleMedium {
     }
 
     /// Open a session for `track` if the last session is already closed.
-    fn ensure_session(&mut self, track: u16, start_lba: u64) -> Result<(), Completion> {
+    fn ensure_session(&mut self, track: u16, session_start_lba: u64) -> Result<(), Completion> {
         match self.sessions.last_mut() {
             Some(session) if !session.closed => {
                 session.last_track = track;
@@ -683,24 +723,26 @@ impl CdrBundleMedium {
                 number,
                 first_track: track,
                 last_track: track,
-                start_lba,
-                lead_out_lba: start_lba,
+                start_lba: session_start_lba,
+                lead_out_lba: session_start_lba,
                 closed: false,
             })
             .map_err(|_| Completion::Check(INVALID_FIELD))
     }
 
     /// Add a track and make it the open one.
+    #[allow(clippy::too_many_arguments)]
     fn push_track(
         &mut self,
         number: u16,
+        session_start_lba: u64,
         start_lba: u64,
         data_start_lba: u64,
         allocated: u64,
         status: TrackStatus,
         reserved: bool,
     ) -> Result<(), Completion> {
-        self.ensure_session(number, start_lba)?;
+        self.ensure_session(number, session_start_lba)?;
         let session_number = self.sessions.last().map_or(1, |session| session.number);
         self.tracks
             .push(TrackEntry {
@@ -739,40 +781,48 @@ impl CdrBundleMedium {
             return Err(Completion::Check(LBA_OUT_OF_RANGE));
         }
 
-        let (number, start_lba, data_start_lba, nwa, limit) = match self.open_track {
-            Some(number) => {
-                let track = self
-                    .track_entry(number)
-                    .ok_or(Completion::Check(INTERNAL_FAILURE))?;
-                let limit = if track.reserved {
-                    track.data_start_lba.saturating_add(track.allocated)
-                } else {
-                    self.capacity
+        let (number, session_start_lba, start_lba, data_start_lba, nwa, limit) =
+            match self.open_track {
+                Some(number) => {
+                    let track = self
+                        .track_entry(number)
+                        .ok_or(Completion::Check(INTERNAL_FAILURE))?;
+                    let limit = if track.reserved {
+                        track.data_start_lba.saturating_add(track.allocated)
+                    } else {
+                        self.capacity
+                    }
+                    .min(self.capacity);
+                    let session_start_lba = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.number == track.session)
+                        .map_or(0, |session| session.start_lba);
+                    (
+                        number,
+                        session_start_lba,
+                        track.start_lba,
+                        track.data_start_lba,
+                        track.nwa,
+                        limit,
+                    )
                 }
-                .min(self.capacity);
-                (
-                    number,
-                    track.start_lba,
-                    track.data_start_lba,
-                    track.nwa,
-                    limit,
-                )
-            }
-            None => {
-                let number = self.tracks.len() as u16 + 1;
-                if usize::from(number) > self.track_capacity() {
-                    return Err(Completion::Check(INVALID_FIELD));
+                None => {
+                    let number = self.tracks.len() as u16 + 1;
+                    if usize::from(number) > self.track_capacity() {
+                        return Err(Completion::Check(INVALID_FIELD));
+                    }
+                    let (session_start_lba, start_lba, data_start_lba) = self.next_positions();
+                    (
+                        number,
+                        session_start_lba,
+                        start_lba,
+                        data_start_lba,
+                        data_start_lba,
+                        self.capacity,
+                    )
                 }
-                let (start_lba, data_start_lba) = self.next_positions();
-                (
-                    number,
-                    start_lba,
-                    data_start_lba,
-                    data_start_lba,
-                    self.capacity,
-                )
-            }
-        };
+            };
 
         if end > limit {
             return Err(Completion::Check(LBA_OUT_OF_RANGE));
@@ -784,6 +834,7 @@ impl CdrBundleMedium {
         if self.open_track.is_none() {
             self.push_track(
                 number,
+                session_start_lba,
                 start_lba,
                 data_start_lba,
                 0,
@@ -850,7 +901,7 @@ impl CdrBundleMedium {
         if usize::from(number) > self.track_capacity() {
             return Err(Completion::Check(INVALID_FIELD));
         }
-        let (start_lba, _) = self.next_positions();
+        let (_, start_lba, _) = self.next_positions();
         // Track 1 starts at the first user block and has no pre-gap; every
         // later track occupies its pre-gap plus the allocated blocks.
         let required = if self.tracks.is_empty() {
@@ -881,9 +932,10 @@ impl CdrBundleMedium {
         }
         self.validate_reserve_track(size)?;
         let number = self.tracks.len() as u16 + 1;
-        let (start_lba, data_start_lba) = self.next_positions();
+        let (session_start_lba, start_lba, data_start_lba) = self.next_positions();
         self.push_track(
             number,
+            session_start_lba,
             start_lba,
             data_start_lba,
             u64::from(size),
@@ -956,13 +1008,11 @@ impl CdrBundleMedium {
                 },
             ));
         }
-        // Closing an empty session (blank disc, or only empty/reserved tracks)
-        // is a success no-op; it must not latch the disc write-protected.
-        let has_data = self.sessions.last().is_some_and(|session| {
-            self.tracks
-                .iter()
-                .any(|track| track.session == session.number && track.written > 0)
-        });
+        // Finalizing an empty disc (no recorded user data anywhere) is a
+        // success no-op; it must not latch the disc write-protected. This is
+        // a disc-wide check: an empty trailing session must not hide data
+        // recorded in an earlier session.
+        let has_data = self.tracks.iter().any(|track| track.written > 0);
         if !has_data {
             return Ok(());
         }
@@ -974,6 +1024,71 @@ impl CdrBundleMedium {
             }
         }
         self.disc = CdrDiscState::Finalized;
+        Ok(())
+    }
+
+    /// Close the current session.
+    ///
+    /// With the Write Parameters Multi-session field set to `11b` the session
+    /// is only closed: the disc stays [`CdrDiscState::Appendable`] and a later
+    /// write may start the next session at the lead-in following this
+    /// session's lead-out. Without it the disc is finalized as before.
+    fn close_session(&mut self) -> Result<(), Completion> {
+        if self.disc == CdrDiscState::Finalized {
+            return Ok(());
+        }
+        if !self.multi_session {
+            return self.finalize();
+        }
+        // A CLOSE SESSION without a preceding SYNCHRONIZE CACHE still seals
+        // the open track before the session is closed.
+        if self.open_track.is_some() {
+            self.close_open_track();
+        } else if let Some(track) = self.tracks.iter().find(|track| {
+            matches!(
+                track.status,
+                TrackStatus::Reserved | TrackStatus::Incomplete
+            )
+        }) {
+            return Err(Completion::Check(
+                if track.status == TrackStatus::Reserved && track.written == 0 {
+                    EMPTY_OR_PARTIALLY_WRITTEN_RESERVED_TRACK
+                } else {
+                    SESSION_FIXATION_INCOMPLETE_TRACK
+                },
+            ));
+        }
+        let Some(number) = self.sessions.last().map(|session| session.number) else {
+            return Ok(());
+        };
+        let has_data = self
+            .tracks
+            .iter()
+            .any(|track| track.session == number && track.written > 0);
+        let end = self
+            .tracks
+            .iter()
+            .filter(|track| track.session == number)
+            .map(|track| track.nwa)
+            .max()
+            .unwrap_or(0);
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.number == number)
+        {
+            if session.closed {
+                return Ok(());
+            }
+            session.lead_out_lba = end;
+            session.closed = true;
+        }
+        // Closing a session with no recorded user data is still a successful
+        // close; it does not by itself make a blank disc appendable for a
+        // next-session write.
+        if has_data {
+            self.disc = CdrDiscState::Appendable;
+        }
         Ok(())
     }
 
@@ -1651,7 +1766,7 @@ impl MmcMedium for CdrBundleMedium {
                     if self.disc == CdrDiscState::Finalized && !self.needs_save {
                         return Err(Completion::Good);
                     }
-                    self.finalize()?;
+                    self.close_session()?;
                     self.needs_save = true;
                     self.start_save(true, None)?;
                 }
@@ -1922,6 +2037,10 @@ impl MmcMedium for CdrBundleMedium {
         self.test_write = on;
     }
 
+    fn set_multi_session(&mut self, open: bool) {
+        self.multi_session = open;
+    }
+
     fn track(&self, number: u16) -> Option<Track> {
         let track = self.track_entry(number)?;
         Some(Track {
@@ -1988,24 +2107,37 @@ impl MmcMedium for CdrBundleMedium {
     }
 
     fn disc_info(&self) -> DiscInfo {
+        let last_session = self.sessions.last();
         let sessions = match self.disc {
             CdrDiscState::Blank => 1,
             CdrDiscState::Appendable => {
-                self.sessions
+                // MMC-6 6.21.3.1.7: complete sessions plus the
+                // incomplete/empty session, if one is open.
+                let closed = self
+                    .sessions
                     .iter()
                     .filter(|session| session.closed)
-                    .count() as u16
-                    + 1
+                    .count() as u16;
+                match last_session {
+                    Some(session) if !session.closed => closed.saturating_add(1),
+                    _ => closed,
+                }
             }
             CdrDiscState::Finalized => self.sessions.len().max(1) as u16,
         };
-        let last_session = self.sessions.last();
         let last_session_lba = if self.disc == CdrDiscState::Blank {
             0
         } else {
             last_session
                 .map(|session| session.lead_out_lba.saturating_sub(1))
                 .unwrap_or(0)
+        };
+        // The last session is complete only when it has been closed. A
+        // multi-session disc keeps `Appendable` with a closed last session.
+        let last_session_complete = match self.disc {
+            CdrDiscState::Blank => false,
+            CdrDiscState::Appendable => last_session.is_some_and(|session| session.closed),
+            CdrDiscState::Finalized => true,
         };
         DiscInfo {
             status: match self.disc {
@@ -2022,13 +2154,22 @@ impl MmcMedium for CdrBundleMedium {
             last_track_last_session: last_session.map_or(1, |session| session.last_track),
             last_session_state: match self.disc {
                 CdrDiscState::Blank => 0,
+                CdrDiscState::Appendable if last_session_complete => 3,
                 CdrDiscState::Appendable => 1,
                 CdrDiscState::Finalized => 3,
             },
             last_session_lead_in: match self.disc {
-                // A blank or appendable disc reports where the next lead-in
-                // will be recorded; only a complete disc reports FF.
-                CdrDiscState::Blank | CdrDiscState::Appendable => Some(self.medium_leadin),
+                // A blank disc reports its own lead-in. While appendable the
+                // field is where the next lead-in begins: the lead-out of the
+                // last *closed* session (never the moving NWA of an open one),
+                // or the disc lead-in when no session is complete yet.
+                CdrDiscState::Blank => Some(self.medium_leadin),
+                CdrDiscState::Appendable => {
+                    match self.sessions.iter().rev().find(|session| session.closed) {
+                        Some(session) => Some(signed_lba(session.lead_out_lba)),
+                        None => Some(self.medium_leadin),
+                    }
+                }
                 CdrDiscState::Finalized => None,
             },
             last_possible_lead_out: match self.disc {
@@ -2172,7 +2313,7 @@ impl CdrBundleMedium {
     /// Project the not-yet-recorded track after the last recorded one.
     fn invisible_info(&self) -> TrackInfo {
         let number = self.tracks.len() as u16 + 1;
-        let (_, data_start_lba) = self.next_positions();
+        let (_, _, data_start_lba) = self.next_positions();
         let allocated = self.capacity.saturating_sub(data_start_lba);
         let nwa = self.current_nwa();
         TrackInfo {
@@ -2979,6 +3120,171 @@ mod tests {
             reserve_medium(&mut medium, &mut mock, 550),
             Completion::Good
         );
+    }
+
+    #[test]
+    fn close_session_with_multi_session_appends_and_then_finalizes() {
+        let mut medium = CdrBundleMedium::with_capacity(100_000);
+        let mut store = StoreMock::default();
+        medium.set_multi_session(true);
+
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+
+        // The session is closed but the disc is still appendable.
+        assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
+        assert!(!medium.attrs().write_protected);
+        let info = medium.disc_info();
+        assert_eq!(info.status, DiscStatus::Incomplete);
+        assert_eq!(info.sessions, 1);
+        assert_eq!(info.first_track_last_session, 1);
+        assert_eq!(info.last_track_last_session, 1);
+        assert_eq!(info.last_session_state, 3);
+        // Session 1 was padded to 300 blocks; the next session's lead-in is
+        // recorded there, its first track preamble starts at 300 + 4500 and
+        // its user data at 300 + 4500 + 150.
+        assert_eq!(info.last_session_lba, 299);
+        assert_eq!(info.last_session_lead_in, Some(300));
+
+        // The `11b` close must not drop the recorded session-1 data.
+        let (payload, completion) = run_read(&mut medium, &mut store, 0, 1, 2048);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(payload, std::vec![0x5A; 2048]);
+
+        let invisible = medium
+            .track_info(TrackInfoRequest::Number(0xFF))
+            .expect("invisible track of session 2");
+        assert_eq!(invisible.session, 2);
+        assert_eq!(invisible.start_lba, 4_950);
+        assert_eq!(invisible.nwa, 4_950);
+
+        // A write at the reported NWA starts session 2 with that geometry.
+        write_one(&mut medium, &mut store, 4_950);
+        let session2 = medium.session(2).expect("session 2");
+        assert_eq!(session2.start_lba, 300);
+        assert_eq!(session2.first_track, 2);
+        let track2 = medium.track(2).expect("track 2");
+        assert_eq!(track2.session, 2);
+        assert_eq!(track2.start_lba, 4_950);
+        assert_eq!(medium.disc_info().sessions, 2);
+        assert_eq!(medium.disc_info().last_session_state, 1);
+
+        // Closing session 2 with multi-session still set keeps the disc open.
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
+        assert_eq!(medium.disc_info().sessions, 2);
+        assert_eq!(medium.disc_info().last_session_state, 3);
+
+        // A host that no longer allows a next session finalizes the disc.
+        medium.set_multi_session(false);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        assert!(medium.attrs().write_protected);
+        let info = medium.disc_info();
+        assert_eq!(info.sessions, 2);
+        assert_eq!(info.first_track_last_session, 2);
+        assert_eq!(info.last_track_last_session, 2);
+        assert_eq!(info.last_session_state, 3);
+        assert_eq!(info.last_session_lead_in, None);
+        assert_eq!(info.last_possible_lead_out, None);
+    }
+
+    #[test]
+    fn restored_multi_session_toc_appends_another_session() {
+        let mut medium = CdrBundleMedium::with_capacity(100_000);
+        let mut store = StoreMock::default();
+        medium.set_multi_session(true);
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+
+        let slot = medium.current_slot();
+        let restored_slot = store.slot(slot);
+        let mut reopened =
+            CdrBundleMedium::open_at(slot, &restored_slot, 0, Recovery::Delete).expect("reopen");
+        assert_eq!(reopened.disc_state(), CdrDiscState::Appendable);
+        assert_eq!(reopened.disc_info().sessions, 1);
+        assert_eq!(reopened.disc_info().last_session_state, 3);
+        let nwa = reopened
+            .track_info(TrackInfoRequest::Number(0xFF))
+            .expect("invisible track")
+            .nwa;
+        assert_eq!(nwa, 4_950);
+
+        // A real host re-applies the Write Parameters page after a restart.
+        reopened.set_multi_session(true);
+        write_one(&mut reopened, &mut store, nwa);
+        assert_eq!(reopened.session(2).expect("session 2").start_lba, 300);
+        assert_eq!(close_track(&mut reopened, &mut store, 1), Completion::Good);
+        reopened.set_multi_session(false);
+        assert_eq!(close_track(&mut reopened, &mut store, 2), Completion::Good);
+
+        assert_eq!(reopened.disc_state(), CdrDiscState::Finalized);
+        let info = reopened.disc_info();
+        assert_eq!(info.sessions, 2);
+        assert_eq!(info.first_track_last_session, 2);
+        assert_eq!(info.last_track_last_session, 2);
+        assert_eq!(info.last_session_state, 3);
+    }
+
+    #[test]
+    fn third_session_appends_after_two_multi_session_closes() {
+        let mut medium = CdrBundleMedium::with_capacity(200_000);
+        let mut store = StoreMock::default();
+        medium.set_multi_session(true);
+
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        write_one(&mut medium, &mut store, 4_950);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+
+        // Session 2 was padded to 5250; session 3 starts at that lead-in.
+        let invisible = medium
+            .track_info(TrackInfoRequest::Number(0xFF))
+            .expect("invisible track of session 3");
+        assert_eq!(invisible.session, 3);
+        assert_eq!(invisible.nwa, 9_900);
+
+        write_one(&mut medium, &mut store, 9_900);
+        let session3 = medium.session(3).expect("session 3");
+        assert_eq!(session3.start_lba, 5_250);
+        assert_eq!(session3.first_track, 3);
+        assert_eq!(medium.disc_info().sessions, 3);
+
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        medium.set_multi_session(false);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        let info = medium.disc_info();
+        assert_eq!(info.sessions, 3);
+        assert_eq!(info.first_track_last_session, 3);
+        assert_eq!(info.last_track_last_session, 3);
+        assert_eq!(info.last_session_state, 3);
+    }
+
+    #[test]
+    fn finalize_latches_with_data_before_an_empty_trailing_session() {
+        let mut medium = CdrBundleMedium::with_capacity(200_000);
+        let mut store = StoreMock::default();
+        medium.set_multi_session(true);
+
+        // Session 1 carries data and is closed for another session.
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+
+        // Session 2 only reserves a track and closes it without user data.
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 300),
+            Completion::Good
+        );
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+
+        // Finalizing must still latch on session 1's data.
+        medium.set_multi_session(false);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        assert!(medium.attrs().write_protected);
+        assert_eq!(medium.disc_info().sessions, 2);
+        assert_eq!(medium.disc_info().last_session_state, 3);
     }
 
     #[test]
@@ -3903,10 +4209,20 @@ end = 1
     fn toc_round_trips_32_tracks_and_16_sessions() {
         let mut tracks: heapless::Vec<TrackEntry, MAX_TRACKS> = heapless::Vec::new();
         let mut sessions: heapless::Vec<SessionEntry, MAX_SESSIONS> = heapless::Vec::new();
+        let mut next_start = 0u64;
+        let mut next_data = 0u64;
         for number in 1..=32u16 {
             let session = (number - 1) / 2 + 1;
-            let start_lba = u64::from(number - 1) * 450;
-            let data_start_lba = start_lba + if number == 1 { 0 } else { 150 };
+            let first = (session - 1) * 2 + 1;
+            if number == first && session > 1 {
+                // A new session's lead-in follows the previous lead-out; its
+                // first track preamble starts one minute later.
+                let session_start = next_start;
+                next_start = session_start + SESSION_LEADIN_BLOCKS;
+                next_data = next_start + 150;
+            }
+            let start_lba = next_start;
+            let data_start_lba = next_data;
             let nwa = data_start_lba + 300;
             let _ = tracks.push(TrackEntry {
                 number,
@@ -3921,6 +4237,8 @@ end = 1
                 kind: TrackKind::Data,
                 reserved: false,
             });
+            next_start = data_start_lba + 300;
+            next_data = next_start + 150;
         }
         for number in 1..=16u16 {
             let first_track = number * 2 - 1;
@@ -3929,6 +4247,11 @@ end = 1
                 .iter()
                 .find(|track| track.number == first_track)
                 .map_or(0, |track| track.start_lba);
+            let start_lba = if number == 1 {
+                start_lba
+            } else {
+                start_lba - SESSION_LEADIN_BLOCKS
+            };
             let lead_out_lba = tracks
                 .iter()
                 .find(|track| track.number == last_track)
@@ -4388,49 +4711,51 @@ end = 1
     fn toc_round_trips_99_tracks_and_16_sessions() {
         let mut tracks: heapless::Vec<TrackEntry, MAX_TRACKS> = heapless::Vec::new();
         let mut sessions: heapless::Vec<SessionEntry, MAX_SESSIONS> = heapless::Vec::new();
-        for number in 1..=99u16 {
-            let session = ((number - 1) / 6 + 1).min(16);
-            let start_lba = u64::from(number - 1) * 450;
-            let data_start_lba = start_lba + if number == 1 { 0 } else { 150 };
-            let nwa = data_start_lba + 300;
-            let _ = tracks.push(TrackEntry {
-                number,
-                session,
-                start_lba,
-                data_start_lba,
-                allocated: 0,
-                length: 300,
-                written: 300,
-                nwa,
-                status: TrackStatus::Complete,
-                kind: TrackKind::Data,
-                reserved: false,
-            });
-        }
+        let mut next_lead_out = 0u64;
         for number in 1..=16u16 {
             let first_track = (number - 1) * 6 + 1;
             let last_track = if number == 16 { 99 } else { number * 6 };
-            let start_lba = tracks
-                .iter()
-                .find(|track| track.number == first_track)
-                .map_or(0, |track| track.start_lba);
-            let lead_out_lba = tracks
-                .iter()
-                .find(|track| track.number == last_track)
-                .map_or(0, |track| track.nwa);
+            let session_start = next_lead_out;
+            let mut start_lba = if number == 1 {
+                0
+            } else {
+                session_start + SESSION_LEADIN_BLOCKS
+            };
+            let mut data_start_lba = if number == 1 { 0 } else { start_lba + 150 };
+            let mut lead_out_lba = 0;
+            for track_number in first_track..=last_track {
+                let nwa = data_start_lba + 300;
+                let _ = tracks.push(TrackEntry {
+                    number: track_number,
+                    session: number,
+                    start_lba,
+                    data_start_lba,
+                    allocated: 0,
+                    length: 300,
+                    written: 300,
+                    nwa,
+                    status: TrackStatus::Complete,
+                    kind: TrackKind::Data,
+                    reserved: false,
+                });
+                lead_out_lba = nwa;
+                start_lba = nwa;
+                data_start_lba = start_lba + 150;
+            }
             let _ = sessions.push(SessionEntry {
                 number,
                 first_track,
                 last_track,
-                start_lba,
+                start_lba: session_start,
                 lead_out_lba,
                 closed: true,
             });
+            next_lead_out = lead_out_lba;
         }
         let len = toc::body_len(
             &tracks,
             &sessions,
-            100_000,
+            500_000,
             MEDIUM_LEADIN,
             CdrDiscState::Appendable,
             DiscKind::Cdr,
@@ -4440,7 +4765,7 @@ end = 1
             toc::render_body(
                 &tracks,
                 &sessions,
-                100_000,
+                500_000,
                 MEDIUM_LEADIN,
                 CdrDiscState::Appendable,
                 DiscKind::Cdr,

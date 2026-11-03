@@ -129,6 +129,17 @@ pub trait MmcMedium {
     fn set_test_write(&mut self, on: bool) {
         let _ = on;
     }
+
+    /// The host selected whether the next session closure keeps the disc open
+    /// for another session (Write Parameters page 0x05 Multi-session = `11b`).
+    ///
+    /// A sequential recordable medium uses this to choose between closing the
+    /// session and finalizing the disc. `00b` and the finalize-compatible CD
+    /// `01b` both arrive as `false`. Default: ignore the mode; a session
+    /// closure finalizes.
+    fn set_multi_session(&mut self, open: bool) {
+        let _ = open;
+    }
 }
 
 /// Project a closed, fully recorded track into the track-information view.

@@ -174,6 +174,53 @@ The CLI application maps that contract onto a host directory with
   (no automatic reinsert). The same `exec` drives the inline and `--banks dual`
   worker paths, so a bundle LUN is resource-correct on both.
 
+### Multi-session CD-R/CD-RW
+
+A recorder appends a session only when the Write Parameters page 0x05 asks
+for it. Byte 3 bits 7-6 (Multi-session, MMC-6 7.4.4 / Table 670) select the
+action taken by `CLOSE TRACK/SESSION 010b`: `00b` finalizes the disc (no B0
+pointer, no next session); `01b` is the CD `B0 = FF:FF:FF` form of "no next
+session" and is accepted as finalize-compatible (this model does not emit the
+B0 = FF variant); `11b` closes the session but leaves the disc appendable and
+reports a live B0 pointer; `10b` is reserved and rejected with `24/00`.
+Only a sequential recorder reads the field — non-recordable media keep
+ignoring page 0x05. The selection is target/LUN host state (like Test Write):
+it survives a link loss and `install_medium` clears it, so a host re-applies
+the page after a restart. The disc state itself is persisted in the TOC.
+
+The session-append layout is fixed and shared by READ TRACK INFORMATION,
+DISC INFORMATION and the TOC encoders:
+
+```text
+session 1 program area .. LBA 0 (the disc lead-in is at -11077)
+session N lead-in ....... previous session's lead-out   (N > 1)
+first track preamble ..... lead-in + 4500  (the 1-minute lead-in area)
+first user data .......... preamble + 150   (the usual pre-gap)
+```
+
+so after a 300-block first session (`lead-out = 300`) the invisible track
+reports NWA `300 + 4500 + 150 = 4950`; a write there starts session 2. A
+session's later tracks follow the usual 150-block pre-gap. `READ DISC
+INFORMATION` counts complete sessions plus an open trailing session, marks
+the last session complete only when it is closed, and reports the last
+**closed** session's lead-out as the next lead-in start (never the moving NWA
+of an open session); with no closed session it reports the disc lead-in.
+`READ TOC` formats 0, 1 and 2 all describe the **last complete session**, even
+when a later session is already open. Format 2 emits A0/A1/A2/B0 plus that
+session's 11-byte Table 483 descriptors, with B0 at the next possible program
+area (matching the invisible track's NWA) while appendable and at the
+lead-out once finalized; its P fields carry the lead-out. Reporting only the
+last complete session (rather than every session) is a deliberate
+simplification. This is what Linux `sr_cd_check` (`CDROMMULTISESSION`) and
+`wodim -msinfo` (TOC format 1 + TRACK INFORMATION 0xFF) consume.
+
+A host sequence is therefore: MODE SELECT page 0x05 with Multi-session
+`11b`, write the track at the NWA, `SYNCHRONIZE CACHE`, `CLOSE
+TRACK/SESSION 010b`, query the new NWA/TOC, write session 2, then either
+close again with `11b` or set the field back to `00b`/`01b` before the final
+close. Closing a session with `11b` does not raise the finalize media-change
+unit attention (the addressable extent is unchanged).
+
 ## Commit Messages
 
 This project follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
@@ -403,6 +450,9 @@ Troubleshooting:
   rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
   (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet and
   raw are refused. The Test Write bit (`-dummy`) is accepted and simulated.
+  The Multi-session field (byte 3 bits 7-6) accepts `00b` (finalize on close),
+  `01b` (also finalize-compatible; its B0 = FF form is not emitted) and `11b`
+  (keep the disc open for another session); `10b` is `24/00`.
 - **`SET CD SPEED`** — accepted and remembered, but the emulated drive has
   no spindle to retune; SEND OPC tables are consumed and discarded.
 - **TOC corrupt or missing** — the two slots alternate, so a torn save leaves

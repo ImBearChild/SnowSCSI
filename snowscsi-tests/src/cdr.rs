@@ -266,6 +266,31 @@ fn consume_medium_change(
     }
 }
 
+/// Assert that no unit attention is pending (a multi-session close must not
+/// raise the finalize media-change sense).
+fn assert_no_medium_change(
+    target: &mut CdrTarget,
+    storage: &mut BlockingStorage<Plane>,
+    host: &mut BlockingHost<TestHost>,
+    work: &mut [u8],
+    scratch: &mut [u8],
+) {
+    assert_eq!(
+        run(
+            target,
+            storage,
+            host,
+            &[0u8; 6],
+            Direction::None,
+            0,
+            work,
+            scratch,
+        ),
+        Completion::Good,
+        "no medium-change unit attention is pending"
+    );
+}
+
 fn get_configuration(alloc: u16) -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = GET_CONFIGURATION;
@@ -401,6 +426,21 @@ fn tao_mode_page() -> Vec<u8> {
 fn dummy_mode_page() -> Vec<u8> {
     let mut page = tao_mode_page();
     page[10] |= 0x10;
+    page
+}
+
+/// The TAO page with Multi-session `11b` (byte 3 bits 7-6): a session closure
+/// keeps the disc open so a later write can start the next session.
+fn multi_mode_page() -> Vec<u8> {
+    let mut page = tao_mode_page();
+    page[11] |= 0xC0;
+    page
+}
+
+/// The TAO page with Multi-session explicitly `00b` (finalize on close).
+fn finalize_mode_page() -> Vec<u8> {
+    let mut page = tao_mode_page();
+    page[11] &= 0x3F;
     page
 }
 
@@ -1311,6 +1351,422 @@ fn cdr_write_sync_close_then_toc_and_capacity() {
             &mut storage,
             &mut host,
             &cdb,
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(WRITE_PROTECTED)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Multi-session: CLOSE session keeps the disc appendable, TOC/DISC INFO
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cdr_multi_session_close_appends_and_reports_the_last_complete_session() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(64 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 128];
+    let mut scratch = vec![0u8; 128];
+
+    // Ask for Track-at-Once with Multi-session `11b`.
+    let params = multi_mode_page();
+    let mut select_host = BlockingHost::new(TestHost::new(params));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // WRITE at LBA 0, then CLOSE SESSION with the track still open: the
+    // multi-session close seals the track and leaves the disc appendable.
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    // No finalize, so no medium-change unit attention is pending.
+    assert_no_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // DISC INFO: one complete session, no open one.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x01, "disc status incomplete");
+    assert_eq!((work[2] >> 2) & 0x03, 0x03, "last session complete");
+    assert_eq!(work[4], 1, "one session");
+    assert_eq!(work[5], 1, "first track of the last session");
+    assert_eq!(work[6], 1, "last track of the last session");
+    // The next lead-in is recorded at the previous session's lead-out (300).
+    assert_eq!(&work[16..20], &msf(0, 6, 0));
+
+    // The invisible track reports session 2's first user block as its NWA.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_track_information(1, 0xFF, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 2, "invisible track belongs to session 2");
+    assert_eq!(&work[8..12], &4_950u32.to_be_bytes(), "track start");
+    assert_eq!(&work[12..16], &4_950u32.to_be_bytes(), "NWA");
+
+    // Format 0/1 still describe the last *complete* session (session 1).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 0, 0, 20),
+            Direction::ToHost,
+            20,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 1, "first track of session 1");
+    assert_eq!(work[3], 1, "last track of session 1");
+    assert_eq!(&work[16..20], &300u32.to_be_bytes(), "session 1 lead-out");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 1, 0, 12),
+            Direction::ToHost,
+            12,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 1, "last complete session");
+    assert_eq!(work[6], 1, "its first track");
+
+    // Format 2 B0 points at the next possible program area (4950).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 2, 0, 80),
+            Direction::ToHost,
+            80,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 1, "last complete session");
+    assert_eq!(&work[41..44], &[1, 8, 0], "B0 next program area 4950");
+    assert_eq!(&work[45..48], &[0, 6, 0], "B0 lead-out 300");
+    assert_eq!(&work[52..55], &[0, 2, 0], "track 1 starts at LBA 0");
+
+    // Start session 2 at the reported NWA.
+    let cdb = write10(4_950, 1);
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &cdb,
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    // Disc INFO now counts the open session 2.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[4], 2, "two sessions (one open)");
+    assert_eq!(work[5], 2, "first track of session 2");
+    assert_eq!(work[6], 2, "last track of session 2");
+    assert_eq!((work[2] >> 2) & 0x03, 0x01, "last session incomplete");
+    // The lead-in field is the last *closed* session's lead-out (300), not
+    // the open session's moving NWA.
+    assert_eq!(&work[16..20], &msf(0, 6, 0));
+
+    // Format 0/1 still describe the last complete session (session 1) while
+    // session 2 is open.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 0, 0, 20),
+            Direction::ToHost,
+            20,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 1, "first track of session 1");
+    assert_eq!(work[3], 1, "last track of session 1");
+    assert_eq!(work[6], 1, "track 1");
+    assert_eq!(&work[8..12], &0u32.to_be_bytes(), "track 1 start");
+    assert_eq!(&work[16..20], &300u32.to_be_bytes(), "session 1 lead-out");
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 1, 0, 12),
+            Direction::ToHost,
+            12,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 1, "last complete session");
+    assert_eq!(work[6], 1, "its first track");
+
+    // Format 2 also describes session 1; B0 is the invisible track NWA of
+    // the open session (4951).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 2, 0, 80),
+            Direction::ToHost,
+            80,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 1, "last complete session");
+    assert_eq!(&work[41..44], &[1, 8, 1], "B0 open-session NWA 4951");
+    assert_eq!(&work[45..48], &[0, 6, 0], "B0 lead-out 300");
+    assert_eq!(&work[52..55], &[0, 2, 0], "track 1 starts at LBA 0");
+
+    // Close session 2 with multi-session still set: still appendable.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_no_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // Format 0 now reports session 2: track 2 at 4950, lead-out 5250.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 0, 0, 20),
+            Direction::ToHost,
+            20,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2], 2, "first track of session 2");
+    assert_eq!(work[3], 2, "last track of session 2");
+    assert_eq!(work[6], 2, "track 2");
+    assert_eq!(&work[8..12], &4_950u32.to_be_bytes(), "track 2 start");
+    assert_eq!(&work[16..20], &5_250u32.to_be_bytes(), "session 2 lead-out");
+
+    // Format 1: session 2, first track 2.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 1, 0, 12),
+            Direction::ToHost,
+            12,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 2, "last complete session");
+    assert_eq!(work[6], 2, "its first track");
+    assert_eq!(&work[8..12], &4_950u32.to_be_bytes());
+
+    // Format 2 B0 points at the next possible program area (9900).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 2, 0, 80),
+            Direction::ToHost,
+            80,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[3], 2, "last complete session");
+    assert_eq!(&work[41..44], &[2, 14, 0], "B0 next program area 9900");
+    assert_eq!(&work[45..48], &[1, 12, 0], "B0 lead-out 5250");
+    assert_eq!(&work[52..55], &[1, 8, 0], "track 2 starts at 4950");
+
+    // The host now forbids another session: CLOSE finalizes.
+    let params = finalize_mode_page();
+    let mut select_host = BlockingHost::new(TestHost::new(params));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // Both sessions are closed and the disc is write-protected.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x02, "disc finalized");
+    assert_eq!((work[2] >> 2) & 0x03, 0x03, "last session complete");
+    assert_eq!(work[4], 2, "two sessions");
+    assert_eq!(&work[16..20], &[0xFF; 4], "complete disc lead-in");
+    assert_eq!(&work[20..24], &[0xFF; 4], "complete disc lead-out");
+
+    // B0 now points at the lead-out (5250).
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 2, 0, 80),
+            Direction::ToHost,
+            80,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[41..44], &[1, 12, 0], "B0 lead-out 5250");
+    assert_eq!(&work[45..48], &[1, 12, 0], "B0 P-fields lead-out 5250");
+    assert_eq!(&work[59..63], &[2, 0x14, 0, 0xAA], "lead-out descriptor");
+    assert_eq!(&work[63..66], &[1, 12, 0], "lead-out 5250");
+    assert_eq!(&work[67..70], &[1, 12, 0], "lead-out P-fields 5250");
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &write10(5_250, 1),
             Direction::FromHost,
             BLOCK as u64,
             &mut work,

@@ -35,6 +35,7 @@ use heapless::{String, Vec};
 
 use super::{
     CdrDiscState, DiscKind, SessionEntry, TrackEntry, MAX_SESSIONS, MAX_TRACKS, MEDIUM_LEADIN,
+    SESSION_LEADIN_BLOCKS,
 };
 use crate::mmc::attrs::{TrackKind, TrackStatus};
 
@@ -930,6 +931,7 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
     }
 
     let mut previous_last = 0u16;
+    let mut previous_lead_out = 0u64;
     for (index, session) in sessions.iter().enumerate() {
         let expected_first = previous_last + 1;
         if session.first_track != expected_first
@@ -939,6 +941,16 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
         {
             return Err(TocError::Invalid);
         }
+        // A session after the first begins at the previous session's lead-out
+        // (its lead-in), and its first track preamble starts one minute later.
+        if index > 0 && session.start_lba != previous_lead_out {
+            return Err(TocError::Invalid);
+        }
+        let expected_track_start = if index == 0 {
+            session.start_lba
+        } else {
+            session.start_lba.saturating_add(SESSION_LEADIN_BLOCKS)
+        };
         let mut first_track = None;
         let mut last_track = None;
         for number in session.first_track..=session.last_track {
@@ -956,10 +968,11 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
         }
         let first_track = first_track.ok_or(TocError::Invalid)?;
         let last_track = last_track.ok_or(TocError::Invalid)?;
-        if first_track.start_lba != session.start_lba || last_track.nwa != session.lead_out_lba {
+        if first_track.start_lba != expected_track_start || last_track.nwa != session.lead_out_lba {
             return Err(TocError::Invalid);
         }
         previous_last = session.last_track;
+        previous_lead_out = session.lead_out_lba;
         if index == sessions.len() - 1 && previous_last as usize != tracks.len() {
             return Err(TocError::Invalid);
         }

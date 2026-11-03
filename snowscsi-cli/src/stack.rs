@@ -1027,6 +1027,18 @@ impl MmcMedium for CliMedium {
             Self::CdrBundle(m) => m.set_test_write(on),
         }
     }
+
+    fn set_multi_session(&mut self, open: bool) {
+        match self {
+            Self::Flat(m) => m.set_multi_session(open),
+            #[cfg(feature = "dvdram")]
+            Self::DvdRam(m) => m.set_multi_session(open),
+            // Without this forward the CLI accepts MODE SELECT Multi-session
+            // but the recordable-CD medium finalizes on the next CLOSE.
+            #[cfg(feature = "cdr-bundle")]
+            Self::CdrBundle(m) => m.set_multi_session(open),
+        }
+    }
 }
 
 /// Block slot type: the public six-command SPC wrapper over a block profile.
@@ -1949,6 +1961,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The CLI enum must forward `set_multi_session` to the CD-R medium:
+    /// without it the medium would finalize on the next CLOSE SESSION even
+    /// though the host asked for another session.
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cli_medium_forwards_multi_session() {
+        use snowscsi::mmc::CdrCapacity;
+
+        let dir = temp_dir("cli_cdr_multi");
+        let mut plane = bundle_plane(&dir);
+        let medium = plane
+            .open_cdr_medium(
+                CdrCapacity::Cdr80.sectors(),
+                Some(DiscKind::Cdr),
+                Recovery::Delete,
+            )
+            .expect("fresh bundle");
+        let mut cli = CliMedium::CdrBundle(medium);
+        assert!(!cli_multi(&cli));
+        cli.set_multi_session(true);
+        assert!(cli_multi(&cli));
+        cli.set_multi_session(false);
+        assert!(!cli_multi(&cli));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn cli_multi(medium: &CliMedium) -> bool {
+        match medium {
+            CliMedium::CdrBundle(medium) => medium.multi_session(),
+            _ => panic!("expected a CD-R bundle medium"),
+        }
+    }
+
     #[cfg(feature = "cdr-bundle")]
     fn command_ctx(direction: snowscsi::core::Direction, bytes: u64) -> CommandContext {
         CommandContext {
@@ -2238,6 +2285,10 @@ mod tests {
 
         fn set_test_write(&mut self, on: bool) {
             self.0.set_test_write(on);
+        }
+
+        fn set_multi_session(&mut self, open: bool) {
+            self.0.set_multi_session(open);
         }
     }
 

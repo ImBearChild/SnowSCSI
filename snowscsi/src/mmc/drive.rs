@@ -90,14 +90,14 @@ fn sequential_cd(attrs: MmcAttrs) -> bool {
 const ATIP_DESCRIPTOR_LEN: usize = ATIP_LEN - 4;
 /// One TOC track descriptor.
 const TOC_DESCRIPTOR_LEN: usize = 8;
-/// One compact raw-TOC (format 2) descriptor:
-/// session, ADR/control, TNO, POINT, MIN, SEC, FRAME, zero.
-const TOC_RAW_DESCRIPTOR_LEN: usize = 8;
-/// Staging bound for a READ TOC response: 4-byte header, the four format-2
-/// lead-in descriptors, one descriptor per track (the CD track-number space is
-/// 1..=99) and the lead-out. Formats 0/1/2 fit this bound and the fixed
-/// 28-byte format-4 (ATIP) block does too.
-const TOC_MAX_LEN: usize = 4 + TOC_DESCRIPTOR_LEN * (99 + 5);
+/// One raw-TOC (format 2) descriptor (MMC-6 Table 483):
+/// session, ADR/control, TNO, POINT, MIN, SEC, FRAME, zero, PMIN, PSEC, PFRAME.
+const TOC_RAW_DESCRIPTOR_LEN: usize = 11;
+/// Staging bound for a READ TOC response: 4-byte header, the four fixed
+/// format-2 lead-in descriptors, one descriptor per track (the CD track-number
+/// space is 1..=99) and the lead-out. Formats 0/1/2 fit this bound and the
+/// fixed 28-byte format-4 (ATIP) block does too.
+const TOC_MAX_LEN: usize = 4 + TOC_RAW_DESCRIPTOR_LEN * (99 + 5);
 /// READ DISC INFORMATION standard payload.
 const DISC_INFO_LEN: usize = 34;
 /// READ TRACK INFORMATION payload.
@@ -354,6 +354,11 @@ pub struct MmcDrive<M: MmcMedium> {
     write_speed: u16,
     /// The host selected the Write Parameters Test Write (-dummy) mode.
     test_write: bool,
+    /// The host selected the Write Parameters Multi-session mode.
+    ///
+    /// This is target/LUN host state (like Test Write): it survives a link
+    /// loss and is cleared when a medium is installed.
+    multi_session: bool,
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
@@ -371,6 +376,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             read_speed: 0,
             write_speed: 0,
             test_write: false,
+            multi_session: false,
         }
     }
 
@@ -438,6 +444,13 @@ impl<M: MmcMedium> MmcDrive<M> {
     #[must_use]
     pub const fn test_write(&self) -> bool {
         self.test_write
+    }
+
+    /// Whether the host selected the Write Parameters Multi-session mode.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn multi_session(&self) -> bool {
+        self.multi_session
     }
 
     /// Borrow the installed medium.
@@ -611,38 +624,47 @@ impl<M: MmcMedium> MmcDrive<M> {
             if track != 0 && track != 0xAA && u16::from(track) > attrs.tracks.min(99) {
                 return Err(Completion::Check(INVALID_FIELD));
             }
-            // Track AAh describes the lead-out of the last complete session;
-            // a blank disc or an open last session has none (Table 474).
-            if self
+            let medium = self
                 .medium
                 .as_ref()
-                .is_some_and(|m| m.disc_info().last_session_state != 3)
-            {
+                .ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
+            // Track AAh describes the lead-out of the last complete session;
+            // a blank disc or one with only an open session has none.
+            let Some((_, first, last, _)) = last_complete_toc(medium, &medium.disc_info()) else {
                 return Err(Completion::Check(INVALID_FIELD));
-            }
+            };
             if track == 0xAA {
                 TOC_LEADOUT_LEN
             } else {
-                let first = if track == 0 { 1 } else { u16::from(track) };
-                let last = attrs.tracks.min(99);
-                let descriptors = last.saturating_sub(first).saturating_add(1);
+                // Format 0 lists the tracks of the last complete session.
+                let first = first.max(1);
+                let last = last.min(99);
+                let start = if track == 0 {
+                    first
+                } else {
+                    u16::from(track).max(first)
+                };
+                let descriptors = last.saturating_sub(start).saturating_add(1);
                 4 + TOC_DESCRIPTOR_LEN * (descriptors as usize + 1)
             }
         } else if format == 2 {
-            // Raw TOC: byte 6 is a session number in MMC-6. The design only
-            // serves the complete disc, so no session selector is accepted.
+            // Raw TOC: byte 6 is a session number in MMC-6. The design serves
+            // the last complete session, so no session selector is accepted.
             if track != 0 {
                 return Err(Completion::Check(INVALID_FIELD));
             }
-            // A blank disc or an open last session has no recorded TOC.
-            let Some(info) = self.medium.as_ref().map(|m| m.disc_info()) else {
+            let Some(medium) = self.medium.as_ref() else {
                 return Err(Completion::Check(MEDIUM_NOT_PRESENT));
             };
-            if info.last_session_state != 3 {
+            // A blank disc or one with only an open session has no complete
+            // session to describe.
+            let Some((_, first, last, _)) = last_complete_toc(medium, &medium.disc_info()) else {
                 return Err(Completion::Check(INVALID_FIELD));
-            }
-            let first = info.first_track.max(1);
-            let last = attrs.tracks.min(99);
+            };
+            // A0/A1/A2/B0 followed by the tracks and lead-out of the last
+            // complete session.
+            let first = first.max(1);
+            let last = last.min(99);
             let descriptors = 4 + usize::from(last.saturating_sub(first).saturating_add(1)) + 1;
             4 + TOC_RAW_DESCRIPTOR_LEN * descriptors
         } else if format == 4 {
@@ -834,9 +856,15 @@ impl<M: MmcMedium> MmcDrive<M> {
             _ => return Err(Completion::Check(INVALID_FIELD)),
         }
         self.begin_media(MmcOp::Close { function }, 0)?;
-        // A finalized disc has a new readable extent; ask the host to
-        // revalidate the capacity on the next command.
-        if function == 2 {
+        // Only a finalized disc has a new readable extent; a multi-session
+        // session closure leaves the same addressable medium, so it must not
+        // arm a capacity-change unit attention.
+        if function == 2
+            && self
+                .medium
+                .as_ref()
+                .is_some_and(|m| m.disc_info().status == DiscStatus::Finalized)
+        {
             if let Query::Media { media_change, .. } = &mut self.query {
                 *media_change = true;
             }
@@ -1596,10 +1624,13 @@ impl<M: MmcMedium> MmcDrive<M> {
                             Ok(params) => {
                                 if let Some(params) = params {
                                     // A sequential CD recorder applies the requested
-                                    // test mode to itself and to the medium.
+                                    // test and multi-session modes to itself and to the
+                                    // medium.
                                     self.test_write = params.test_write;
+                                    self.multi_session = params.multi_session;
                                     if let Some(medium) = self.medium.as_mut() {
                                         medium.set_test_write(params.test_write);
+                                        medium.set_multi_session(params.multi_session);
                                     }
                                 }
                                 PollStep::Complete(Completion::Good)
@@ -1829,7 +1860,9 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         self.long = LongOp::Idle;
         self.query = Query::None;
         self.test_write = false;
+        self.multi_session = false;
         medium.set_test_write(false);
+        medium.set_multi_session(false);
         self.medium = Some(medium);
         Ok(())
     }
@@ -1873,12 +1906,26 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         let plen = if page == 0x3F {
             let mut at = 0usize;
             for code in ALL_PAGE_ORDER {
-                let bytes = write_page(code, caps, attrs, self.test_write, &mut pages[at..])?;
+                let bytes = write_page(
+                    code,
+                    caps,
+                    attrs,
+                    self.test_write,
+                    self.multi_session,
+                    &mut pages[at..],
+                )?;
                 at += bytes;
             }
             at
         } else {
-            write_page(page, caps, attrs, self.test_write, &mut pages)?
+            write_page(
+                page,
+                caps,
+                attrs,
+                self.test_write,
+                self.multi_session,
+                &mut pages,
+            )?
         };
         if pc == 1 {
             // Changeable mask: keep page code/length, zero the payload.
@@ -2255,14 +2302,18 @@ const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A,
 /// current Test Write bit (byte 2 bit 4), which the host sets for
 /// `wodim -dummy`. Read-only and other rewritable media keep the default zero
 /// page and therefore never claim TAO or Test Write.
-fn write_params_page(attrs: Option<MmcAttrs>, test_write: bool) -> [u8; WRITE_PARAMS_LEN] {
+fn write_params_page(
+    attrs: Option<MmcAttrs>,
+    test_write: bool,
+    multi_session: bool,
+) -> [u8; WRITE_PARAMS_LEN] {
     let mut page = [0u8; WRITE_PARAMS_LEN];
     page[0] = 0x05;
     page[1] = 0x32;
     if let Some(attrs) = attrs {
         if sequential_cd(attrs) {
             page[2] = 0x01 | if test_write { 0x10 } else { 0 }; // Test Write | TAO
-            page[3] = 0x04; // Track Mode: data
+            page[3] = 0x04 | if multi_session { 0xC0 } else { 0 }; // Multi-session | Track Mode data
             page[4] = 0x08; // Data Block Type: Mode 1, 2048 bytes
         }
     }
@@ -2281,13 +2332,18 @@ fn write_page(
     caps: MmcCaps,
     attrs: Option<MmcAttrs>,
     test_write: bool,
+    multi_session: bool,
     out: &mut [u8],
 ) -> Option<usize> {
     if page == 0x05 {
         if out.len() < WRITE_PARAMS_LEN {
             return None;
         }
-        out[..WRITE_PARAMS_LEN].copy_from_slice(&write_params_page(attrs, test_write));
+        out[..WRITE_PARAMS_LEN].copy_from_slice(&write_params_page(
+            attrs,
+            test_write,
+            multi_session,
+        ));
         return Some(WRITE_PARAMS_LEN);
     }
     let bytes: &[u8] = match page {
@@ -2332,22 +2388,55 @@ fn toc_msf3(lba: u32) -> [u8; 3] {
     [m, s, f]
 }
 
-/// Write one compact format-2 descriptor:
-/// `[session, ADR/control, TNO, POINT, MIN, SEC, FRAME, 0]`.
+/// Write one MMC-6 Table 483 format-2 descriptor (11 bytes):
+/// `[session, ADR/control, TNO=0, POINT, MIN, SEC, FRAME, zero, PMIN, PSEC,
+/// PFRAME]`.
 fn write_raw_descriptor(
     out: &mut [u8],
     session: u16,
     adr_ctl: u8,
-    tno: u8,
     point: u8,
     value: [u8; 3],
+    p: [u8; 3],
 ) {
     out[0] = session.min(255) as u8;
     out[1] = adr_ctl;
-    out[2] = tno;
+    out[2] = 0;
     out[3] = point;
     out[4..7].copy_from_slice(&value);
     out[7] = 0;
+    out[8..11].copy_from_slice(&p);
+}
+
+/// Number of the last complete session, or `None` on a blank disc / one with
+/// only an open session.
+///
+/// MMC-6 6.21.3.1.7 counts complete sessions plus the incomplete/empty one, so
+/// an appendable disc with an open trailing session reports one more session
+/// than the complete count.
+fn last_complete_session(info: &DiscInfo) -> Option<u16> {
+    match info.status {
+        DiscStatus::Finalized => Some(info.sessions.max(1)),
+        DiscStatus::Incomplete if info.last_session_state == 3 => Some(info.sessions.max(1)),
+        DiscStatus::Incomplete if info.sessions > 1 => Some(info.sessions - 1),
+        _ => None,
+    }
+}
+
+/// Resolve the last complete session and its lead-out for the TOC encoders.
+///
+/// Returns `(session number, first track, last track, lead-out LBA)`. The
+/// lead-out is the address one past the session's last track
+/// (`start_lba + blocks`). `None` means the disc has no complete session.
+fn last_complete_toc<M: MmcMedium>(medium: &M, info: &DiscInfo) -> Option<(u16, u16, u16, u32)> {
+    let number = last_complete_session(info)?;
+    let session = medium.session(number)?;
+    let last = medium.track(session.last_track)?;
+    let lead_out = last
+        .start_lba
+        .saturating_add(last.blocks)
+        .min(u64::from(u32::MAX)) as u32;
+    Some((number, session.first_track, session.last_track, lead_out))
 }
 
 /// Encode READ TOC format 0 (track list + lead-out), format 1 (last complete
@@ -2355,11 +2444,13 @@ fn write_raw_descriptor(
 /// full response length.
 ///
 /// Format 0 emits one descriptor per requested track and always appends the
-/// lead-out (`0xAA`, `last_session_lba + 1`). Format 1 emits the first track of
-/// the last complete session; a disc without a complete session is rejected.
-/// Format 2 emits the Q-subchannel lead-in points A0/A1/A2/B0 followed by one
-/// descriptor per track and the lead-out, all in MSF form. Format 4 emits the
-/// 28-byte ATIP block (header + descriptor) and ignores the MSF bit.
+/// lead-out (`0xAA`) of the last complete session; a disc without a complete
+/// session is rejected. Format 1 emits that session's first track. Format 2
+/// emits the Q-subchannel lead-in points A0/A1/A2/B0 followed by the tracks
+/// and lead-out of the last complete session, using the 11-byte MMC-6 Table 483
+/// descriptors. Reporting only the last complete session (instead of every
+/// session) is a deliberate simplification. Format 4 emits the 28-byte ATIP
+/// block (header + descriptor) and ignores the MSF bit.
 fn encode_toc<M: MmcMedium>(
     medium: &M,
     info: DiscInfo,
@@ -2372,7 +2463,11 @@ fn encode_toc<M: MmcMedium>(
     let last_track = tracks.min(99);
     let mut buf = [0u8; TOC_MAX_LEN];
     let total = if format == 0 {
-        let first = info.first_track.max(1);
+        // Format 0 reports the tracks of the last complete session, even when
+        // a later session is already open.
+        let (_, first, last, lead_out) = last_complete_toc(medium, &info)?;
+        let first = first.max(1);
+        let last = last.min(99);
         let start = if track_req == 0 {
             first
         } else {
@@ -2381,7 +2476,7 @@ fn encode_toc<M: MmcMedium>(
         let descriptors = if track_req == 0xAA {
             0
         } else {
-            last_track.saturating_sub(start).saturating_add(1)
+            last.saturating_sub(start).saturating_add(1)
         };
         let total = 4 + TOC_DESCRIPTOR_LEN * (descriptors as usize + 1);
         if total > buf.len() {
@@ -2389,10 +2484,10 @@ fn encode_toc<M: MmcMedium>(
         }
         buf[0..2].copy_from_slice(&((total - 2) as u16).to_be_bytes());
         buf[2] = first.min(255) as u8;
-        buf[3] = last_track.min(255) as u8;
+        buf[3] = last.min(255) as u8;
         let mut at = 4usize;
         if track_req != 0xAA {
-            for number in start..=last_track {
+            for number in start..=last {
                 let track = medium.track(number)?;
                 let ctl = toc_control(track.kind);
                 buf[at + 1] = ctl;
@@ -2405,11 +2500,7 @@ fn encode_toc<M: MmcMedium>(
             }
         }
         // The lead-out follows the last program-area track.
-        let lead_out = info
-            .last_session_lba
-            .saturating_add(1)
-            .min(u64::from(u32::MAX)) as u32;
-        let ctl = match medium.track(last_track) {
+        let ctl = match medium.track(last) {
             Some(track) => toc_control(track.kind),
             None if track_req == 0xAA => 0x14,
             None => return None,
@@ -2419,15 +2510,16 @@ fn encode_toc<M: MmcMedium>(
         buf[at + 4..at + 8].copy_from_slice(&toc_address(lead_out, msf));
         total
     } else if format == 2 {
-        // Raw TOC. A disc without a complete session has no lead-in TOC to
-        // report; a complete last session is required.
-        let last_complete = match info.status {
-            DiscStatus::Finalized => info.sessions,
-            DiscStatus::Incomplete if info.sessions > 1 => info.sessions - 1,
-            _ => return None,
-        };
+        // Raw TOC. The design deliberately reports one session (the last
+        // complete one) instead of the full multi-session history; a disc with
+        // no complete session has no lead-in TOC to report.
+        let (last_complete, session_first, session_last, lead_out) =
+            last_complete_toc(medium, &info)?;
         let first = info.first_track.max(1);
-        let descriptors = 4 + last_track.saturating_sub(first).saturating_add(1) as usize + 1;
+        let session_first = session_first.max(1);
+        let session_last = session_last.min(99);
+        let descriptors =
+            4 + usize::from(session_last.saturating_sub(session_first).saturating_add(1)) + 1;
         let total = 4 + TOC_RAW_DESCRIPTOR_LEN * descriptors;
         if total > buf.len() {
             return None;
@@ -2435,13 +2527,21 @@ fn encode_toc<M: MmcMedium>(
         buf[0..2].copy_from_slice(&((total - 2) as u16).to_be_bytes());
         buf[2] = 0x01;
         buf[3] = last_complete.min(255) as u8;
-        let lead_out = info
-            .last_session_lba
-            .saturating_add(1)
-            .min(u64::from(u32::MAX)) as u32;
         let lead_msf = toc_msf3(lead_out);
+        // B0 is the start of the next possible program area while another
+        // session is allowed (MMC-6 Table 670 `11b`) and the lead-out once the
+        // disc is complete (`00b`). It matches the invisible track's NWA.
+        let b0 = if info.status == DiscStatus::Incomplete {
+            medium
+                .track_info(TrackInfoRequest::Number(0xFF))
+                .map(|track| track.nwa.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(lead_out)
+        } else {
+            lead_out
+        };
+        let b0_msf = toc_msf3(b0);
         let first_track = medium.track(first)?;
-        let last_ctl = match medium.track(last_track) {
+        let last_ctl = match medium.track(session_last) {
             Some(track) => toc_control(track.kind),
             None => toc_control(first_track.kind),
         };
@@ -2449,53 +2549,55 @@ fn encode_toc<M: MmcMedium>(
         // A0: first track number, disc type (CD-DA/CD-ROM = 00h), PFRAME 0.
         write_raw_descriptor(
             &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
-            1,
+            last_complete,
             toc_control(first_track.kind),
-            0,
             0xA0,
+            [first.min(255) as u8, 0x00, 0x00],
             [first.min(255) as u8, 0x00, 0x00],
         );
         at += TOC_RAW_DESCRIPTOR_LEN;
         // A1: last track number.
         write_raw_descriptor(
             &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
-            1,
+            last_complete,
             last_ctl,
-            0,
             0xA1,
+            [last_track.min(255) as u8, 0x00, 0x00],
             [last_track.min(255) as u8, 0x00, 0x00],
         );
         at += TOC_RAW_DESCRIPTOR_LEN;
         // A2: start of the lead-out.
         write_raw_descriptor(
             &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
-            1,
+            last_complete,
             last_ctl,
-            0,
             0xA2,
             lead_msf,
-        );
-        at += TOC_RAW_DESCRIPTOR_LEN;
-        // B0: full-TOC marker (ADR=5); a closed disc points at the lead-out.
-        write_raw_descriptor(
-            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
-            1,
-            0x50,
-            0,
-            0xB0,
             lead_msf,
         );
         at += TOC_RAW_DESCRIPTOR_LEN;
-        for number in first..=last_track {
+        // B0: next program area in MIN.. and the lead-out in PMIN..
+        write_raw_descriptor(
+            &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
+            last_complete,
+            0x50,
+            0xB0,
+            b0_msf,
+            lead_msf,
+        );
+        at += TOC_RAW_DESCRIPTOR_LEN;
+        // The descriptors of the last complete session.
+        for number in session_first..=session_last {
             let track = medium.track(number)?;
             let start = track.start_lba.min(u64::from(u32::MAX)) as u32;
+            let start_msf = toc_msf3(start);
             write_raw_descriptor(
                 &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
                 track.session,
                 toc_control(track.kind),
-                0,
                 track.number.min(255) as u8,
-                toc_msf3(start),
+                start_msf,
+                start_msf,
             );
             at += TOC_RAW_DESCRIPTOR_LEN;
         }
@@ -2503,8 +2605,8 @@ fn encode_toc<M: MmcMedium>(
             &mut buf[at..at + TOC_RAW_DESCRIPTOR_LEN],
             last_complete,
             last_ctl,
-            0,
             0xAA,
+            lead_msf,
             lead_msf,
         );
         total
@@ -2521,11 +2623,7 @@ fn encode_toc<M: MmcMedium>(
     } else {
         // Format 1: the last complete session. An incomplete last session
         // leaves the previous (closed) one as the last complete session.
-        let last_complete = match info.status {
-            DiscStatus::Finalized => info.sessions,
-            DiscStatus::Incomplete if info.sessions > 1 => info.sessions - 1,
-            _ => return None,
-        };
+        let last_complete = last_complete_session(&info)?;
         let session = medium.session(last_complete)?;
         let track = medium.track(session.first_track)?;
         buf[0..2].copy_from_slice(&((TOC_SESSION_LEN - 2) as u16).to_be_bytes());
@@ -2732,6 +2830,9 @@ fn validate_format_list(data: &[u8]) -> Result<FormatList, Sense> {
 struct WriteParams {
     /// Test Write (byte 2 bit 4): record as a simulation.
     test_write: bool,
+    /// Multi-session (`11b` of byte 3 bits 7-6): a session closure keeps the
+    /// disc open for another session.
+    multi_session: bool,
 }
 
 /// Validate a MODE SELECT parameter list.
@@ -2790,8 +2891,18 @@ fn validate_mode_select(
                 // Only Mode 1 (2048-byte) blocks are accepted.
                 return Err(INVALID_FIELD);
             }
+            // MMC-6 7.4.4 / Table 670: bits 7-6 of byte 3. `00b` forbids a
+            // next session (no B0 pointer); `01b` is the CD `B0 = FF:FF:FF`
+            // variant of "next session not allowed"; `11b` allows one. We do
+            // not emit the B0 = FF form, so `01b` is accepted as a
+            // finalize-compatible selection (`10b` remains invalid).
+            let multi = (data[at + 3] >> 6) & 0x03;
+            if multi == 2 {
+                return Err(INVALID_FIELD);
+            }
             params = Some(WriteParams {
                 test_write: byte2 & 0x10 != 0,
+                multi_session: multi == 3,
             });
         }
         at = end;
@@ -3400,6 +3511,8 @@ mod tests {
         commit_calls: Cell<u32>,
         test_write_calls: Cell<u32>,
         last_test_write: Cell<Option<bool>>,
+        multi_session_calls: Cell<u32>,
+        last_multi_session: Cell<Option<bool>>,
     }
 
     impl SpyMedium {
@@ -3430,6 +3543,8 @@ mod tests {
                 commit_calls: Cell::new(0),
                 test_write_calls: Cell::new(0),
                 last_test_write: Cell::new(None),
+                multi_session_calls: Cell::new(0),
+                last_multi_session: Cell::new(None),
             }
         }
 
@@ -3494,6 +3609,12 @@ mod tests {
         fn set_test_write(&mut self, on: bool) {
             self.test_write_calls.set(self.test_write_calls.get() + 1);
             self.last_test_write.set(Some(on));
+        }
+
+        fn set_multi_session(&mut self, open: bool) {
+            self.multi_session_calls
+                .set(self.multi_session_calls.get() + 1);
+            self.last_multi_session.set(Some(open));
         }
 
         fn track(&self, number: u16) -> Option<Track> {
@@ -4588,6 +4709,28 @@ mod tests {
     }
 
     #[test]
+    fn installing_a_medium_clears_the_multi_session_mode() {
+        let boundary = boundary();
+        let mut dev: MmcDrive<SpyMedium> = MmcDrive::empty(MmcCaps::hyper_multi());
+        dev.multi_session = true;
+
+        assert!(dev
+            .install_medium(&boundary, SpyMedium::write_once(16))
+            .is_ok());
+        assert!(
+            !dev.multi_session(),
+            "the drive reports the multi-session selection cleared"
+        );
+        let spy = dev.take_medium(&boundary).expect("medium");
+        assert_eq!(spy.multi_session_calls.get(), 1);
+        assert_eq!(
+            spy.last_multi_session.get(),
+            Some(false),
+            "the installed medium is told to finalize on close"
+        );
+    }
+
+    #[test]
     fn empty_default_drive_reports_hyper_multi_caps() {
         // The default drive is a Hyper-Multi recorder; an empty tray keeps
         // every drive capability (only Current bits are cleared).
@@ -5400,6 +5543,13 @@ mod tests {
         page
     }
 
+    /// Write Parameters page with the Multi-session field in bits 7-6 of byte 3.
+    fn test_multi_session_page(multi: u8) -> Vec<u8> {
+        let mut page = test_write_params_page(1, 4, 8, false);
+        page[3] = ((multi & 0x03) << 6) | 0x04;
+        page
+    }
+
     fn mode_select_params(ten: bool, pages: &[u8]) -> Vec<u8> {
         let mut params = vec![0u8; if ten { 8 } else { 4 }];
         params.extend_from_slice(pages);
@@ -5465,6 +5615,17 @@ mod tests {
     #[cfg(feature = "cdr-bundle")]
     fn commit_medium(medium: &mut CdrBundleMedium) {
         run_control_medium(medium, MmcOp::Commit);
+    }
+
+    /// A CD-R with session 1 complete and session 2 open (one recorded block).
+    #[cfg(feature = "cdr-bundle")]
+    fn cdr_drive_with_open_second_session() -> MmcDrive<CdrBundleMedium> {
+        let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr74);
+        medium.set_multi_session(true);
+        write_medium_block(&mut medium, 0);
+        run_control_medium(&mut medium, MmcOp::Close { function: 2 });
+        write_medium_block(&mut medium, 4_950);
+        MmcDrive::new(medium)
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -5719,6 +5880,62 @@ mod tests {
             );
         }
         assert_eq!(spy.medium().expect("medium").test_write_calls.get(), 2);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_multi_session_round_trips() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        // `01b` is accepted but normalized to "no next session": the B0 = FF
+        // form it asks for is not emitted.
+        for (multi, open) in [(0u8, false), (1, false), (3, true)] {
+            let page = test_multi_session_page(multi);
+            let params = mode_select_params(true, &page);
+            let cdb = mode_select_cdb(true, params.len());
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &params, &mut data),
+                Completion::Good,
+                "MODE SELECT multi={multi}"
+            );
+            assert_eq!(dev.multi_session(), open);
+            assert_eq!(
+                dev.medium().expect("medium").multi_session(),
+                open,
+                "the medium received set_multi_session"
+            );
+            assert!(!dev.active());
+
+            let profile = dev.spc_profile().expect("profile");
+            let mut long = [0u8; 64];
+            assert_eq!(
+                profile.mode_sense(true, 0x05, false, 0, Some(&mut long)),
+                Some(60)
+            );
+            assert_eq!(
+                long[11] & 0xC0,
+                if open { 0xC0 } else { 0 },
+                "MODE SENSE Multi-session"
+            );
+            assert_eq!(long[11] & 0x0F, 0x04, "Track Mode stays data");
+            assert_eq!(long[10] & 0x0F, 0x01, "Write Type stays TAO");
+            assert_eq!(long[12], 0x08, "Data Block Type stays Mode 1");
+        }
+
+        // `10b` is reserved and remains rejected.
+        let multi = 2u8;
+        let page = test_multi_session_page(multi);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Check(INVALID_FIELD),
+            "MODE SELECT multi={multi} is rejected"
+        );
+        assert!(
+            dev.multi_session(),
+            "a rejected page leaves the accepted `11b` selection"
+        );
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -5985,26 +6202,76 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = READ_TOC;
         cdb[2] = 0x02;
-        cdb[8] = 64;
-        let mut data = [0u8; 64];
-        assert_eq!(run_query(&mut dev, &cdb, 64, &mut data), Completion::Good);
-        assert_eq!(&data[0..2], &50u16.to_be_bytes(), "52-byte response");
+        cdb[8] = 80;
+        let mut data = [0u8; 80];
+        assert_eq!(run_query(&mut dev, &cdb, 80, &mut data), Completion::Good);
+        assert_eq!(&data[0..2], &68u16.to_be_bytes(), "70-byte response");
         assert_eq!(data[2], 1, "first complete session");
         assert_eq!(data[3], 1, "last complete session");
 
         let desc = |at: usize| &data[at..at + TOC_RAW_DESCRIPTOR_LEN];
         // A0: first track 1, CD-DA/CD-ROM disc type 00h, PFRAME 0.
-        assert_eq!(desc(4), &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0]);
+        assert_eq!(
+            desc(4),
+            &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0, 1, 0x00, 0x00]
+        );
         // A1: last track 1.
-        assert_eq!(desc(12), &[1, 0x14, 0, 0xA1, 1, 0, 0, 0]);
+        assert_eq!(desc(15), &[1, 0x14, 0, 0xA1, 1, 0, 0, 0, 1, 0, 0]);
         // A2: lead-out at LBA 300 => 00:06:00.
-        assert_eq!(desc(20), &[1, 0x14, 0, 0xA2, 0, 6, 0, 0]);
+        assert_eq!(desc(26), &[1, 0x14, 0, 0xA2, 0, 6, 0, 0, 0, 6, 0]);
         // B0: closed full-TOC marker (ADR=5) at the lead-out.
-        assert_eq!(desc(28), &[1, 0x50, 0, 0xB0, 0, 6, 0, 0]);
+        assert_eq!(desc(37), &[1, 0x50, 0, 0xB0, 0, 6, 0, 0, 0, 6, 0]);
         // Track 1 starts at LBA 0 => 00:02:00.
-        assert_eq!(desc(36), &[1, 0x14, 0, 1, 0, 2, 0, 0]);
+        assert_eq!(desc(48), &[1, 0x14, 0, 1, 0, 2, 0, 0, 0, 2, 0]);
         // Lead-out descriptor.
-        assert_eq!(desc(44), &[1, 0x14, 0, 0xAA, 0, 6, 0, 0]);
+        assert_eq!(desc(59), &[1, 0x14, 0, 0xAA, 0, 6, 0, 0, 0, 6, 0]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn read_toc_formats_report_the_last_complete_session_while_session_two_is_open() {
+        let mut dev = cdr_drive_with_open_second_session();
+        let mut data = [0u8; 80];
+
+        // Format 0: session 1's track 1 and lead-out, not the open session 2.
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[8] = 20;
+        assert_eq!(run_query(&mut dev, &cdb, 20, &mut data), Completion::Good);
+        assert_eq!(&data[0..2], &[0x00, 0x12]);
+        assert_eq!(data[2], 1, "first track of the last complete session");
+        assert_eq!(data[3], 1, "last track of the last complete session");
+        assert_eq!(data[6], 1, "track 1");
+        assert_eq!(&data[8..12], &0u32.to_be_bytes());
+        assert_eq!(data[14], 0xAA);
+        assert_eq!(&data[16..20], &300u32.to_be_bytes(), "session 1 lead-out");
+
+        // Format 1: session 1, first track 1.
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x01;
+        cdb[8] = 12;
+        assert_eq!(run_query(&mut dev, &cdb, 12, &mut data), Completion::Good);
+        assert_eq!(data[3], 1, "last complete session");
+        assert_eq!(data[6], 1, "its first track");
+        assert_eq!(&data[8..12], &0u32.to_be_bytes());
+
+        // Format 2: session 1 descriptors, B0 at the open session's NWA.
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TOC;
+        cdb[2] = 0x02;
+        cdb[8] = 80;
+        assert_eq!(run_query(&mut dev, &cdb, 80, &mut data), Completion::Good);
+        assert_eq!(&data[0..2], &68u16.to_be_bytes(), "70-byte response");
+        assert_eq!(data[2], 1, "first complete session");
+        assert_eq!(data[3], 1, "last complete session");
+        let desc = |at: usize| &data[at..at + TOC_RAW_DESCRIPTOR_LEN];
+        // B0: next program area at the open track's NWA (4951) and the
+        // session lead-out (300) in the P fields.
+        assert_eq!(desc(37), &[1, 0x50, 0, 0xB0, 1, 8, 1, 0, 0, 6, 0]);
+        // Track 1 still comes from session 1.
+        assert_eq!(desc(48), &[1, 0x14, 0, 1, 0, 2, 0, 0, 0, 2, 0]);
+        assert_eq!(desc(59), &[1, 0x14, 0, 0xAA, 0, 6, 0, 0, 0, 6, 0]);
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -6154,11 +6421,14 @@ mod tests {
         cdb[8] = 20;
         let mut data = [0u8; 64];
         assert_eq!(run_query(&mut dev, &cdb, 20, &mut data), Completion::Good);
-        // Only the first 20 bytes are sent; the header still declares 50.
-        assert_eq!(&data[0..2], &50u16.to_be_bytes());
+        // Only the first 20 bytes are sent; the header still declares 68.
+        assert_eq!(&data[0..2], &68u16.to_be_bytes());
         assert_eq!(data[2], 1);
         assert_eq!(data[3], 1);
-        assert_eq!(&data[4..12], &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0]);
-        assert_eq!(&data[12..20], &[1, 0x14, 0, 0xA1, 1, 0, 0, 0]);
+        assert_eq!(
+            &data[4..15],
+            &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0, 1, 0x00, 0x00]
+        );
+        assert_eq!(&data[15..20], &[1, 0x14, 0, 0xA1, 1]);
     }
 }
