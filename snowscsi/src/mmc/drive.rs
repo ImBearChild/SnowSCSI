@@ -50,6 +50,8 @@ const READ_TOC: u8 = 0x43;
 const READ_DISC_INFORMATION: u8 = 0x51;
 /// READ TRACK INFORMATION.
 const READ_TRACK_INFORMATION: u8 = 0x52;
+/// RESERVE TRACK.
+const RESERVE_TRACK: u8 = 0x53;
 /// CLOSE TRACK SESSION.
 const CLOSE_TRACK_SESSION: u8 = 0x5B;
 /// BLANK.
@@ -437,6 +439,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             READ_TOC => self.prepare_toc(ctx, cdb),
             READ_DISC_INFORMATION => self.prepare_disc_info(ctx, cdb),
             READ_TRACK_INFORMATION => self.prepare_track_info(ctx, cdb),
+            RESERVE_TRACK => self.prepare_reserve_track(ctx, cdb),
             READ_CD => self.prepare_read_cd(ctx, cdb),
             CLOSE_TRACK_SESSION => self.prepare_close(ctx, cdb),
             MODE_SELECT_6 => self.prepare_mode_select(ctx, cdb, false),
@@ -666,6 +669,34 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.len = TRACK_INFO_LEN.min(alloc);
         self.query = Query::TrackInfo { request };
         Ok(())
+    }
+
+    /// RESERVE TRACK: byte 1 bit 0 = ARSV, bytes 2-4 and 9 reserved, bytes
+    /// 5-8 = reservation size when ARSV is zero.
+    ///
+    /// The medium owns the capacity and open-track checks. ARSV=1 is not
+    /// served; only an unconditional reservation is accepted.
+    fn prepare_reserve_track(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
+        if cdb.len() < 10 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if cdb[1] & 0xFE != 0 || cdb[2..5] != [0, 0, 0] || cdb[9] != 0 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        check_direction(ctx, Direction::None)?;
+        if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        if cdb[1] & 0x01 != 0 {
+            // Only an unconditional reservation is served.
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
+        if attrs.sectors == 0 {
+            return Err(Completion::Check(MEDIUM_NOT_PRESENT));
+        }
+        let size = be32(&cdb[5..9]);
+        self.begin_media(MmcOp::ReserveTrack { size }, 0)
     }
 
     /// READ CD: MMC-6 Table 351/354. Expected Sector Type is CDB byte 1
@@ -5059,24 +5090,31 @@ mod tests {
     }
 
     #[cfg(feature = "cdr-bundle")]
+    fn run_control_medium(medium: &mut CdrBundleMedium, op: MmcOp) {
+        let mut data = [0u8; 4096];
+        assert_eq!(medium.begin(op), Ok(()));
+        let mut feedback = Feedback::begin();
+        loop {
+            match medium.poll(feedback, &mut data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::None);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Sync { .. }) => {
+                    feedback = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                }
+                PollStep::Io(StorageOp::Write { buf, .. }) => {
+                    feedback = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                }
+                PollStep::Complete(Completion::Good) => return,
+                other => panic!("expected control completion, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
     fn commit_medium(medium: &mut CdrBundleMedium) {
-        let mut data = [0u8; 0];
-        assert_eq!(medium.begin(MmcOp::Commit), Ok(()));
-        match medium.poll(Feedback::begin(), &mut data) {
-            PollStep::Publish(plan) => assert_eq!(plan.direction, Direction::None),
-            other => panic!("expected sync publish, got {other:?}"),
-        }
-        match medium.poll(Feedback::plan_accepted(), &mut data) {
-            PollStep::Io(StorageOp::Sync { .. }) => {}
-            other => panic!("expected sync IO, got {other:?}"),
-        }
-        assert!(matches!(
-            medium.poll(
-                Feedback::io_done(IoReceipt::test(0, None, Effect::Known)),
-                &mut data
-            ),
-            PollStep::Complete(Completion::Good)
-        ));
+        run_control_medium(medium, MmcOp::Commit);
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -5084,10 +5122,7 @@ mod tests {
         let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr74);
         write_medium_block(&mut medium, 0);
         commit_medium(&mut medium);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 2 }),
-            Err(Completion::Good)
-        );
+        run_control_medium(&mut medium, MmcOp::Close { function: 2 });
         MmcDrive::new(medium)
     }
 
@@ -5371,6 +5406,121 @@ mod tests {
             dev.prepare(&permit, ctx(Direction::ToHost, 64), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn reserve_track_cdb(arsv: bool, size: u32) -> [u8; 10] {
+        let mut cdb = [0u8; 10];
+        cdb[0] = RESERVE_TRACK;
+        cdb[1] = u8::from(arsv);
+        cdb[5..9].copy_from_slice(&size.to_be_bytes());
+        cdb
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn run_control_drive(
+        dev: &mut MmcDrive<CdrBundleMedium>,
+        cdb: &[u8],
+        data: &mut [u8],
+    ) -> Completion {
+        let permit = permit();
+        match dev.prepare(&permit, ctx(Direction::None, 0), cdb) {
+            Ok(()) => {}
+            Err(completion) => return completion,
+        }
+        let mut feedback = Feedback::begin();
+        loop {
+            match dev.poll(&permit, feedback, data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::None);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Sync { .. }) => {
+                    feedback = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                }
+                PollStep::Io(StorageOp::Write { buf, .. }) => {
+                    feedback = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                }
+                PollStep::Complete(completion) => return completion,
+                other => panic!("expected control completion, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn reserve_track_decodes_and_persists_the_toc() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 4096];
+        assert_eq!(
+            run_control_drive(&mut dev, &reserve_track_cdb(false, 500), &mut data),
+            Completion::Good
+        );
+        let medium = dev.medium().expect("medium");
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+
+        let mut cdb = [0u8; 10];
+        cdb[0] = READ_TRACK_INFORMATION;
+        cdb[1] = 1;
+        cdb[2..6].copy_from_slice(&1u32.to_be_bytes());
+        cdb[8] = 48;
+        assert_eq!(run_query(&mut dev, &cdb, 48, &mut data), Completion::Good);
+        assert_eq!(data[2], 1, "track number");
+        assert_eq!(data[6], 0xC1, "reserved empty track");
+        assert_eq!(&data[24..28], &500u32.to_be_bytes(), "allocation");
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn reserve_track_rejects_arsv_reserved_bits_and_bad_context() {
+        let mut dev = cdr_drive();
+        let permit = permit();
+
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &reserve_track_cdb(true, 500)
+            ),
+            Err(Completion::Check(INVALID_FIELD)),
+            "ARSV=1 is not served"
+        );
+        let mut cdb = reserve_track_cdb(false, 500);
+        cdb[2] = 1;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        let mut cdb = reserve_track_cdb(false, 500);
+        cdb[9] = 1;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        let cdb = reserve_track_cdb(false, 500);
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 0), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 0), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 4), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &reserve_track_cdb(false, 299)
+            ),
+            Err(Completion::Check(INVALID_FIELD)),
+            "the medium owns the minimum size"
+        );
+        assert!(!dev.active());
     }
 
     #[cfg(feature = "cdr-bundle")]

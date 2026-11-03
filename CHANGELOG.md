@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **mmc**: recordable-medium vocabulary — `TrackStatus`, `TrackInfo`,
   `TrackInfoRequest`, and the defaulted `MmcMedium::track_info`; the
   `cdr-bundle` feature gate for a sequential CD-R medium.
-- **mmc**: `CdrBundleMedium` (`cdr-bundle`) — an in-memory sequential
-  write-once CD-R medium model over per-track storage resources: implicit and
+- **mmc**: `CdrBundleMedium` (`cdr-bundle`) — a sequential write-once CD-R
+  medium model over per-track storage resources: implicit and
   reserved tracks, NWA-ordered writes, track/session close and finalize,
   zero-filled pre-gap/padding/unwritten reads, and `SYNCHRONIZE CACHE` closing
   the open track. This is medium behaviour only; the MMC drive routes the
@@ -41,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last recorded block, GET CONFIGURATION reports profile `0x09` with the
   incremental-streaming and CD-track-at-once features, and READ TOC formats 0
   and 1 walk the recorded track/session layout.
+- **mmc**: persistent TOC for the `cdr-bundle` CD-R medium — the track/session
+  layout is written to two alternating INI slots (`toc.0`/`toc.1`, storage
+  resources 1/2) with a strict header/body parser, `Delete`/`ReadOnly`
+  interrupted-save recovery, and a save state machine that formats the body
+  directly into the caller's bank. The body is written before the header; the
+  header carries the body length, CRC-32 and physical slot index, so a torn
+  save is rejected and the last valid slot survives. `CLOSE` and
+  `SYNCHRONIZE CACHE` order the aggregate data sync before the TOC body/header
+  and slot sync (`RESERVE TRACK` skips the data sync). A failed save keeps
+  `needs_save` latched for the next close/commit/reserve; a failed reserve
+  rolls the new track back. The default slot is `TOC_SLOT_MAX` (64 KiB) and
+  creation is capped by `max_tracks_for_slot`; `TocHeader::parse`,
+  `CdrBundleMedium::open`/`open_at`, `slot_size`, `toc_seq`, `current_slot` and
+  `track_numbers` expose the persisted state.
+- **mmc**: `RESERVE TRACK` (`0x53`) decoding in `MmcDrive`: ARSV is rejected
+  with `ILLEGAL REQUEST / INVALID FIELD IN CDB`, reserved CDB fields are
+  validated, and the reservation size reaches the medium's capacity and
+  open-track checks through `MmcOp::ReserveTrack`.
 - **mmc**: recorder-control commands — MODE SENSE page 0x05 reports
   Track-at-Once/2048-byte Mode 1 parameters on a CD-R (and no TAO claim on
   read-only/rewritable media), MODE SELECT(6/10) validates and accepts that

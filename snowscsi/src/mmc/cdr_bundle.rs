@@ -1,10 +1,23 @@
 //! Sequential write-once CD-R medium.
 //!
-//! The medium models a CD-R whose payload lives in the application's storage:
-//! each track is a separate storage resource (`16 + track_number`) and reads
-//! and writes become [`StorageOp`] at the track-relative byte offset. The
-//! track/session layout is held in memory only; this module owns no backing
-//! driver and performs no persistence.
+//! The medium models a CD-R whose payload lives in the application's storage.
+//! The storage resource contract is:
+//!
+//! - `0` is the aggregate flush (`Sync { resource: 0 }` must flush every
+//!   track resource);
+//! - `1`/`2` are the two TOC slots (`toc.0`/`toc.1`);
+//! - `16 + n` is track `n` (`track_<n>.bin`);
+//! - any other resource id is a contract fault, never a valid request.
+//!
+//! A track resource is created/truncated by its first write at offset `0`;
+//! short reads zero-fill. For a TOC save the application opens/truncates the
+//! target slot once, then the medium writes the body at offset 256 first and
+//! the 256-byte header at offset 0 last: a plain write at offset 0 must not
+//! truncate an existing resource. The track/session layout (the TOC) is
+//! persisted in two alternating slots so an interrupted save leaves the
+//! previous document intact. The header binds the body by length and CRC-32,
+//! so the last valid slot is only replaced after the whole new slot has been
+//! written. The slot format and its strict parser live in [`toc`].
 //!
 //! Writing follows the TAO shape a recorder uses: the first `WRITE(10)` may
 //! land on the next writable address without a preceding `RESERVE TRACK`, and
@@ -12,10 +25,23 @@
 //! the next one after a 150-block pre-gap; pre-gaps and unwritten regions read
 //! as zeros without touching storage.
 //!
+//! Durability: a FUA write syncs its data before GOOD. `CLOSE TRACK SESSION`
+//! and `SYNCHRONIZE CACHE` both sync the aggregate data (`Sync { resource: 0 }`)
+//! before writing and syncing the TOC slot.
+//!
 //! [`CdrBundleMedium`] never allocates: the track and session tables are
-//! fixed-capacity `heapless::Vec`s.
+//! fixed-capacity `heapless::Vec`s, and the save state machine regenerates the
+//! TOC in the caller's bank instead of holding a slot-sized buffer.
 
 use heapless::Vec;
+
+pub mod toc;
+
+pub use self::toc::{
+    toc_file, toc_resource, track_file, track_resource, Recovery, TocError, TocHeader,
+    TOC_HEADER_LEN, TOC_RESOURCE_0, TOC_RESOURCE_1, TOC_SLOT_DEFAULT, TOC_SLOT_MAX, TOC_SLOT_MIN,
+    TRACK_RESOURCE_BASE,
+};
 
 use super::attrs::{
     DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackInfo,
@@ -109,13 +135,17 @@ pub enum CdrBundleState {
     SyncIo,
     /// COMMIT: waiting for the sync receipt.
     SyncWait,
+    /// TOC: the next slot write or sync is being issued.
+    SaveIo,
+    /// TOC: waiting for a slot write or sync receipt.
+    SaveWait,
     /// Completion fixed; the operation is over.
     Done,
 }
 
 /// One recorded, reserved or open track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrackEntry {
+pub(crate) struct TrackEntry {
     number: u16,
     session: u16,
     /// First block of the track, including the pre-gap.
@@ -124,9 +154,11 @@ struct TrackEntry {
     data_start_lba: u64,
     /// Blocks reserved for the track (`0` means unallocated).
     allocated: u64,
-    /// Recorded (or padded) length in blocks.
+    /// Recorded (or padded) length in blocks; serialized as the TOC `written`
+    /// field (the recorded extent).
     length: u64,
-    /// Blocks actually recorded; a close may pad `length` beyond this.
+    /// Blocks actually recorded; a close may pad `length` beyond this;
+    /// serialized as the TOC `length` field (the user-written prefix).
     written: u64,
     /// Next writable address.
     nwa: u64,
@@ -140,7 +172,7 @@ struct TrackEntry {
 
 /// One session slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SessionEntry {
+pub(crate) struct SessionEntry {
     number: u16,
     first_track: u16,
     last_track: u16,
@@ -158,11 +190,58 @@ enum Op {
     Read { lba: u64, bytes: u32 },
     /// Write `bytes` at `offset` into the track's resource.
     Write { track: u16, offset: u64, bytes: u32 },
-    /// Flush the backing.
+    /// Flush the backing (uncommitted data only).
     Sync,
+    /// Persist the TOC: optional data sync, slot write, slot sync.
+    SaveToc,
 }
 
-/// In-memory sequential CD-R medium.
+/// Stage of the TOC save state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveStage {
+    /// `Commit`/`Close`: the aggregate data resource is synced first.
+    DataSync,
+    /// The body and padding are written (they replace the old body first).
+    Body,
+    /// The header is written last, binding the new body by length/checksum.
+    Header,
+    /// The written slot is being synced.
+    SlotSync,
+}
+
+/// Snapshot restored when a `RESERVE TRACK` save fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReserveRollback {
+    tracks: usize,
+    sessions: usize,
+    last_session: Option<SessionEntry>,
+    open_track: Option<u16>,
+    disc: CdrDiscState,
+    needs_save: bool,
+}
+
+/// In-flight TOC save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SaveState {
+    /// Slot being written (`0` or `1`).
+    slot: u8,
+    /// Sequence number claimed by the slot.
+    seq: u32,
+    /// Current stage.
+    stage: SaveStage,
+    /// Slot bytes already written in the current stage.
+    offset: u32,
+    /// Body byte count (`body_end = TOC_HEADER_LEN + body_len`).
+    body_len: u32,
+    /// Body checksum bound into the header.
+    checksum: u32,
+    /// `max_tracks` advertised by the header.
+    max_tracks: u16,
+    /// A `RESERVE TRACK` save rolls its new track back on failure.
+    rollback: Option<ReserveRollback>,
+}
+
+/// Sequential CD-R medium with a persistent TOC.
 pub struct CdrBundleMedium {
     capacity: u64,
     disc: CdrDiscState,
@@ -177,19 +256,55 @@ pub struct CdrBundleMedium {
     chunk_len: usize,
     /// The current write command created its track implicitly.
     implicit_created: bool,
+    /// Fixed slot size in bytes.
+    slot_size: u32,
+    /// Sequence number of the newest saved TOC.
+    toc_seq: u32,
+    /// Slot holding the newest saved TOC.
+    current_slot: u8,
+    /// At least one slot was loaded or saved.
+    saved: bool,
+    /// A read-only recovery made the disc reject writes.
+    read_only: bool,
+    /// A state transition still has to reach a TOC slot.
+    needs_save: bool,
+    /// Start address of the disc lead-in.
+    medium_leadin: i64,
+    /// In-flight TOC save.
+    save: Option<SaveState>,
 }
 
 impl CdrBundleMedium {
-    /// Build a blank medium with a standard capacity.
+    /// Build a blank medium with a standard capacity and the default TOC slot.
     #[must_use]
     pub fn blank(capacity: CdrCapacity) -> Self {
         Self::with_capacity(capacity.sectors())
     }
 
-    /// Build a blank medium with an explicit sector count.
+    /// Build a blank medium with an explicit sector count and the default TOC
+    /// slot size ([`TOC_SLOT_DEFAULT`]).
     #[must_use]
     pub fn with_capacity(sectors: u64) -> Self {
-        Self {
+        Self::build(sectors, TOC_SLOT_DEFAULT).expect("default TOC slot size is valid")
+    }
+
+    /// Build a blank medium with an explicit sector count and slot size.
+    ///
+    /// `slot_size` must be within [`TOC_SLOT_MIN`]..=[`TOC_SLOT_MAX`]; it is
+    /// never silently disabled. A medium constructed this way starts with slot
+    /// 0 as current and saves its first TOC there with sequence 1.
+    pub fn with_capacity_and_slot(sectors: u64, slot_size: u32) -> Result<Self, TocError> {
+        Self::build(sectors, slot_size)
+    }
+
+    fn build(sectors: u64, slot_size: u32) -> Result<Self, TocError> {
+        if slot_size < TOC_SLOT_MIN {
+            return Err(TocError::BadSlotSize);
+        }
+        if slot_size > TOC_SLOT_MAX {
+            return Err(TocError::TooLarge);
+        }
+        Ok(Self {
             capacity: sectors,
             disc: CdrDiscState::Blank,
             tracks: Vec::new(),
@@ -200,7 +315,64 @@ impl CdrBundleMedium {
             progress: 0,
             chunk_len: 0,
             implicit_created: false,
+            slot_size,
+            toc_seq: 0,
+            current_slot: 0,
+            saved: false,
+            read_only: false,
+            needs_save: false,
+            medium_leadin: MEDIUM_LEADIN,
+            save: None,
+        })
+    }
+
+    /// Restore a medium from a full slot (header + body + padding).
+    ///
+    /// `capacity` is the caller's sector count; `0` accepts the stored value
+    /// and a different non-zero value is rejected. `recovery` decides what
+    /// happens to tracks that were not closed when the TOC was written. The
+    /// physical slot index comes from the header (`slot`), never from `seq`.
+    pub fn open(slot: &[u8], capacity: u64, recovery: Recovery) -> Result<Self, TocError> {
+        let parsed = toc::parse(slot, capacity)?;
+        Self::from_parsed(parsed, recovery)
+    }
+
+    /// Restore a medium from a slot read from known physical position `slot`.
+    ///
+    /// Unlike [`Self::open`], this rejects a copied/restored document whose
+    /// stored `slot` does not match the position it was read from. Applications
+    /// that address the two slots explicitly should use this entry point.
+    pub fn open_at(
+        slot: u8,
+        bytes: &[u8],
+        capacity: u64,
+        recovery: Recovery,
+    ) -> Result<Self, TocError> {
+        let parsed = toc::parse(bytes, capacity)?;
+        if parsed.header.slot != slot {
+            return Err(TocError::Invalid);
         }
+        Self::from_parsed(parsed, recovery)
+    }
+
+    fn from_parsed(parsed: toc::ParsedToc, recovery: Recovery) -> Result<Self, TocError> {
+        let mut medium = Self::build(parsed.capacity, parsed.header.slot_size)?;
+        medium.disc = parsed.disc;
+        medium.tracks = parsed.tracks;
+        medium.sessions = parsed.sessions;
+        medium.toc_seq = parsed.header.seq;
+        medium.current_slot = parsed.header.slot;
+        medium.saved = true;
+        medium.medium_leadin = parsed.medium_leadin;
+        match recovery {
+            Recovery::Delete => {
+                if medium.drop_unclosed_tracks() {
+                    medium.needs_save = true;
+                }
+            }
+            Recovery::ReadOnly => medium.freeze_written_prefix(),
+        }
+        Ok(medium)
     }
 
     /// Addressable logical blocks.
@@ -212,13 +384,123 @@ impl CdrBundleMedium {
     /// Start address of the disc lead-in.
     #[must_use]
     pub const fn medium_leadin(&self) -> i64 {
-        MEDIUM_LEADIN
+        self.medium_leadin
     }
 
     /// Current disc-level state.
     #[must_use]
     pub const fn disc_state(&self) -> CdrDiscState {
         self.disc
+    }
+
+    /// Fixed TOC slot size in bytes.
+    #[must_use]
+    pub const fn slot_size(&self) -> u32 {
+        self.slot_size
+    }
+
+    /// Sequence number of the newest saved TOC (`0` before the first save).
+    #[must_use]
+    pub const fn toc_seq(&self) -> u32 {
+        self.toc_seq
+    }
+
+    /// Slot holding the newest saved TOC (slot 0 before the first save).
+    #[must_use]
+    pub const fn current_slot(&self) -> u8 {
+        self.current_slot
+    }
+
+    /// Track numbers present in the TOC, for orphan-file reconciliation.
+    pub fn track_numbers(&self) -> impl Iterator<Item = u16> + '_ {
+        self.tracks.iter().map(|track| track.number)
+    }
+
+    /// Whether an in-memory transition still has to reach a TOC slot.
+    #[must_use]
+    pub const fn needs_save(&self) -> bool {
+        self.needs_save
+    }
+
+    /// Whether writes are refused by a recovery latch or a finalized disc.
+    const fn write_protected(&self) -> bool {
+        self.read_only || matches!(self.disc, CdrDiscState::Finalized)
+    }
+
+    /// Number of tracks the configured slot can persist.
+    fn track_capacity(&self) -> usize {
+        usize::from(toc::max_tracks_for_slot(self.slot_size))
+    }
+
+    /// Drop the unclosed tail and the sessions it leaves empty.
+    ///
+    /// Tracks are sequential, so keeping the complete prefix preserves both
+    /// contiguous track/session numbering and the `16 + track` payload
+    /// resource of every surviving track. Returns whether anything changed.
+    fn drop_unclosed_tracks(&mut self) -> bool {
+        let keep = self
+            .tracks
+            .iter()
+            .position(|track| track.status != TrackStatus::Complete)
+            .unwrap_or(self.tracks.len());
+        let changed = keep != self.tracks.len();
+        self.tracks.truncate(keep);
+        let surviving = self.tracks.len() as u16;
+
+        let mut sessions: Vec<SessionEntry, MAX_SESSIONS> = Vec::new();
+        for old in &self.sessions {
+            if old.first_track > surviving {
+                break;
+            }
+            let mut session = *old;
+            session.last_track = session.last_track.min(surviving);
+            if let Some(track) = self
+                .tracks
+                .iter()
+                .find(|track| track.number == session.last_track)
+            {
+                session.lead_out_lba = track.nwa;
+            }
+            let _ = sessions.push(session);
+        }
+        self.sessions = sessions;
+        if self.tracks.is_empty() {
+            self.disc = CdrDiscState::Blank;
+            self.sessions.clear();
+        } else if changed || self.disc == CdrDiscState::Blank {
+            self.disc = CdrDiscState::Appendable;
+        }
+        changed
+    }
+
+    /// Keep the written prefix of every track and protect the disc.
+    fn freeze_written_prefix(&mut self) {
+        for track in &mut self.tracks {
+            let end = track
+                .data_start_lba
+                .saturating_add(track.written)
+                .min(self.capacity);
+            track.nwa = end;
+            track.length = end.saturating_sub(track.data_start_lba);
+            track.written = track.length;
+            track.status = TrackStatus::Complete;
+        }
+        for session in &mut self.sessions {
+            let mut lead_out = session.lead_out_lba;
+            for track in self
+                .tracks
+                .iter()
+                .filter(|track| track.session == session.number)
+            {
+                lead_out = lead_out.max(track.nwa);
+            }
+            session.lead_out_lba = lead_out;
+            session.closed = true;
+        }
+        if !self.tracks.is_empty() || !self.sessions.is_empty() {
+            self.disc = CdrDiscState::Finalized;
+        }
+        self.read_only = true;
     }
 
     /// Clear the operation state.
@@ -228,6 +510,7 @@ impl CdrBundleMedium {
         self.progress = 0;
         self.chunk_len = 0;
         self.implicit_created = false;
+        self.save = None;
     }
 
     /// Total bytes selected by the admitted operation.
@@ -330,10 +613,11 @@ impl CdrBundleMedium {
         reserved: bool,
     ) -> Result<(), Completion> {
         self.ensure_session(number, start_lba)?;
+        let session_number = self.sessions.last().map_or(1, |session| session.number);
         self.tracks
             .push(TrackEntry {
                 number,
-                session: self.sessions.last().map_or(1, |session| session.number),
+                session: session_number,
                 start_lba,
                 data_start_lba,
                 allocated,
@@ -345,6 +629,14 @@ impl CdrBundleMedium {
                 reserved,
             })
             .map_err(|_| Completion::Check(INVALID_FIELD))?;
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.number == session_number)
+        {
+            session.last_track = number;
+            session.lead_out_lba = data_start_lba;
+        }
         self.open_track = Some(number);
         self.disc = CdrDiscState::Appendable;
         Ok(())
@@ -380,7 +672,7 @@ impl CdrBundleMedium {
             }
             None => {
                 let number = self.tracks.len() as u16 + 1;
-                if usize::from(number) > MAX_TRACKS {
+                if usize::from(number) > self.track_capacity() {
                     return Err(Completion::Check(INVALID_FIELD));
                 }
                 let (start_lba, data_start_lba) = self.next_positions();
@@ -434,9 +726,9 @@ impl CdrBundleMedium {
         Ok(())
     }
 
-    /// Admit `RESERVE TRACK`; it changes the write state without storage IO.
+    /// Admit `RESERVE TRACK`; it changes the write state.
     fn reserve_track(&mut self, size: u32) -> Result<(), Completion> {
-        if self.disc == CdrDiscState::Finalized {
+        if self.write_protected() {
             return Err(Completion::Check(WRITE_PROTECTED));
         }
         let size = u64::from(size);
@@ -454,7 +746,7 @@ impl CdrBundleMedium {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let number = self.tracks.len() as u16 + 1;
-        if usize::from(number) > MAX_TRACKS {
+        if usize::from(number) > self.track_capacity() {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let (start_lba, data_start_lba) = self.next_positions();
@@ -596,6 +888,293 @@ impl CdrBundleMedium {
         }
     }
 
+    /// Arm a TOC save after an in-memory state transition.
+    ///
+    /// The body is written before the header, so a torn save cannot pair a new
+    /// header with an old body. A body that cannot fit leaves the previous
+    /// slot untouched and fails the command.
+    fn start_save(
+        &mut self,
+        sync_data: bool,
+        rollback: Option<ReserveRollback>,
+    ) -> Result<(), Completion> {
+        if self.read_only {
+            return Err(Completion::Check(WRITE_PROTECTED));
+        }
+        let max_tracks = toc::max_tracks_for_slot(self.slot_size);
+        if max_tracks == 0
+            || self.tracks.len() > usize::from(max_tracks)
+            || self.tracks.iter().any(|track| track.number > max_tracks)
+        {
+            return Err(Completion::Check(INTERNAL_FAILURE));
+        }
+        let body_len = toc::body_len(
+            &self.tracks,
+            &self.sessions,
+            self.capacity,
+            self.medium_leadin,
+            self.disc,
+        );
+        if TOC_HEADER_LEN
+            .checked_add(body_len)
+            .is_none_or(|end| end > self.slot_size as usize)
+        {
+            return Err(Completion::Check(INTERNAL_FAILURE));
+        }
+        let checksum = toc::body_checksum(
+            &self.tracks,
+            &self.sessions,
+            self.capacity,
+            self.medium_leadin,
+            self.disc,
+        );
+        let seq = match self.toc_seq.checked_add(1) {
+            Some(seq) => seq,
+            None => return Err(Completion::Check(INTERNAL_FAILURE)),
+        };
+        let slot = if self.saved {
+            1 - self.current_slot
+        } else {
+            self.current_slot
+        };
+        self.save = Some(SaveState {
+            slot,
+            seq,
+            stage: if sync_data {
+                SaveStage::DataSync
+            } else {
+                SaveStage::Body
+            },
+            offset: if sync_data { 0 } else { TOC_HEADER_LEN as u32 },
+            body_len: body_len as u32,
+            checksum,
+            max_tracks,
+            rollback,
+        });
+        self.op = Some(Op::SaveToc);
+        Ok(())
+    }
+
+    /// Undo a `RESERVE TRACK` that could not be persisted.
+    fn rollback_reserve(&mut self, rollback: ReserveRollback) {
+        self.tracks.truncate(rollback.tracks);
+        self.sessions.truncate(rollback.sessions);
+        if let (Some(session), Some(slot)) = (rollback.last_session, self.sessions.last_mut()) {
+            *slot = session;
+        }
+        self.open_track = rollback.open_track;
+        self.disc = rollback.disc;
+        self.needs_save = rollback.needs_save;
+    }
+
+    /// Abort a save, applying a pending reservation rollback.
+    fn abort_save(&mut self, save: SaveState, completion: Completion) -> PollStep<'static> {
+        if let Some(rollback) = save.rollback {
+            self.rollback_reserve(rollback);
+        }
+        self.save = None;
+        self.finish(completion)
+    }
+
+    fn abort_save_sense(
+        &mut self,
+        save: SaveState,
+        fault: Fault,
+        ctx: IoContext,
+    ) -> PollStep<'static> {
+        if let Some(rollback) = save.rollback {
+            self.rollback_reserve(rollback);
+        }
+        self.save = None;
+        self.storage_sense(fault, ctx)
+    }
+
+    /// Render body bytes or padding at slot offset `offset` (`>= 256`).
+    fn render_body_slot(&self, save: SaveState, offset: u32, out: &mut [u8]) -> usize {
+        let slot_size = self.slot_size as usize;
+        let start = offset as usize;
+        let body_end = TOC_HEADER_LEN + save.body_len as usize;
+        let want = out.len().min(slot_size.saturating_sub(start));
+        let mut written = 0usize;
+        if start < body_end {
+            let body_at = start - TOC_HEADER_LEN;
+            let take = want.min(body_end - start);
+            written += toc::render_body(
+                &self.tracks,
+                &self.sessions,
+                self.capacity,
+                self.medium_leadin,
+                self.disc,
+                body_at,
+                &mut out[..take],
+            );
+        }
+        let cursor = start + written;
+        if cursor < slot_size && written < want {
+            let padding_at = cursor - body_end;
+            written +=
+                toc::render_padding(slot_size - body_end, padding_at, &mut out[written..want]);
+        }
+        written
+    }
+
+    /// Copy the header bytes at header offset `offset`.
+    fn render_header(&self, save: SaveState, offset: u32, out: &mut [u8]) -> usize {
+        let header = toc::header_bytes(
+            save.slot,
+            self.slot_size,
+            save.max_tracks,
+            save.body_len,
+            save.checksum,
+            save.seq,
+        );
+        let start = offset as usize;
+        let take = out.len().min(TOC_HEADER_LEN.saturating_sub(start));
+        out[..take].copy_from_slice(&header[start..start + take]);
+        take
+    }
+
+    /// Issue the next save operation (data sync, body, header or slot sync).
+    fn save_next<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        let Some(save) = self.save else {
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
+        };
+        match save.stage {
+            SaveStage::DataSync => {
+                self.phase = CdrBundleState::SaveWait;
+                PollStep::Io(StorageOp::Sync { resource: 0 })
+            }
+            SaveStage::Body => {
+                let remaining = (self.slot_size - save.offset) as usize;
+                if remaining == 0 {
+                    self.save = Some(SaveState {
+                        stage: SaveStage::Header,
+                        offset: 0,
+                        ..save
+                    });
+                    return self.save_next(data);
+                }
+                let chunk = remaining.min(data.len());
+                if chunk == 0 {
+                    return self.abort_save(save, Completion::Check(INTERNAL_FAILURE));
+                }
+                if self.render_body_slot(save, save.offset, &mut data[..chunk]) != chunk {
+                    return self.abort_save(save, Completion::Check(INTERNAL_FAILURE));
+                }
+                self.chunk_len = chunk;
+                self.phase = CdrBundleState::SaveWait;
+                PollStep::Io(StorageOp::Write {
+                    resource: toc_resource(save.slot),
+                    offset: u64::from(save.offset),
+                    buf: &data[..chunk],
+                })
+            }
+            SaveStage::Header => {
+                let remaining = (TOC_HEADER_LEN as u32 - save.offset) as usize;
+                if remaining == 0 {
+                    self.save = Some(SaveState {
+                        stage: SaveStage::SlotSync,
+                        offset: 0,
+                        ..save
+                    });
+                    return self.save_next(data);
+                }
+                let chunk = remaining.min(data.len());
+                if chunk == 0 {
+                    return self.abort_save(save, Completion::Check(INTERNAL_FAILURE));
+                }
+                if self.render_header(save, save.offset, &mut data[..chunk]) != chunk {
+                    return self.abort_save(save, Completion::Check(INTERNAL_FAILURE));
+                }
+                self.chunk_len = chunk;
+                self.phase = CdrBundleState::SaveWait;
+                PollStep::Io(StorageOp::Write {
+                    resource: toc_resource(save.slot),
+                    offset: u64::from(save.offset),
+                    buf: &data[..chunk],
+                })
+            }
+            SaveStage::SlotSync => {
+                self.phase = CdrBundleState::SaveWait;
+                PollStep::Io(StorageOp::Sync {
+                    resource: toc_resource(save.slot),
+                })
+            }
+        }
+    }
+
+    /// Fold the receipt of the in-flight save operation.
+    fn save_done<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
+        let Some(mut save) = self.save else {
+            return self.finish(Completion::Check(INTERNAL_FAILURE));
+        };
+        let Some(receipt) = fb.io() else {
+            return self.abort_save(save, Completion::Check(INTERNAL_FAILURE));
+        };
+        match save.stage {
+            SaveStage::DataSync => {
+                if let Some(fault) = receipt.error() {
+                    return self.abort_save_sense(save, fault, IoContext::Sync);
+                }
+                if receipt.effect() != Effect::Known {
+                    return self.abort_save(save, Completion::Check(MEDIUM_ERROR));
+                }
+                save.stage = SaveStage::Body;
+                save.offset = TOC_HEADER_LEN as u32;
+                self.save = Some(save);
+                self.save_next(data)
+            }
+            SaveStage::Body => {
+                let chunk = self.chunk_len;
+                if let Some(fault) = receipt.error() {
+                    return self.abort_save_sense(save, fault, IoContext::Write);
+                }
+                let confirmed = receipt.confirmed().min(chunk);
+                if confirmed < chunk || receipt.effect() != Effect::Known {
+                    return self.abort_save(save, Completion::Check(MEDIUM_ERROR));
+                }
+                save.offset = save.offset.saturating_add(confirmed as u32);
+                if save.offset >= self.slot_size {
+                    save.stage = SaveStage::Header;
+                    save.offset = 0;
+                }
+                self.save = Some(save);
+                self.save_next(data)
+            }
+            SaveStage::Header => {
+                let chunk = self.chunk_len;
+                if let Some(fault) = receipt.error() {
+                    return self.abort_save_sense(save, fault, IoContext::Write);
+                }
+                let confirmed = receipt.confirmed().min(chunk);
+                if confirmed < chunk || receipt.effect() != Effect::Known {
+                    return self.abort_save(save, Completion::Check(MEDIUM_ERROR));
+                }
+                save.offset = save.offset.saturating_add(confirmed as u32);
+                if save.offset >= TOC_HEADER_LEN as u32 {
+                    save.stage = SaveStage::SlotSync;
+                    save.offset = 0;
+                }
+                self.save = Some(save);
+                self.save_next(data)
+            }
+            SaveStage::SlotSync => {
+                if let Some(fault) = receipt.error() {
+                    return self.abort_save_sense(save, fault, IoContext::Sync);
+                }
+                if receipt.effect() != Effect::Known {
+                    return self.abort_save(save, Completion::Check(MEDIUM_ERROR));
+                }
+                self.toc_seq = save.seq;
+                self.current_slot = save.slot;
+                self.saved = true;
+                self.needs_save = false;
+                self.save = None;
+                self.finish(Completion::Good)
+            }
+        }
+    }
+
     /// Issue the next read segment, or zero-fill an unrecorded one.
     fn next_read_step<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
         let total = self.total_bytes();
@@ -640,7 +1219,7 @@ impl CdrBundleMedium {
             self.chunk_len = chunk;
             self.phase = CdrBundleState::ReadIo;
             return PollStep::Io(StorageOp::Read {
-                resource: 16 + track.number,
+                resource: track_resource(track.number),
                 offset,
                 buf: &mut data[..chunk],
             });
@@ -703,6 +1282,7 @@ impl CdrBundleMedium {
         self.phase = CdrBundleState::Done;
         self.op = None;
         self.implicit_created = false;
+        self.save = None;
         PollStep::Complete(completion)
     }
 
@@ -725,7 +1305,7 @@ impl MmcMedium for CdrBundleMedium {
             sectors: self.capacity,
             tracks: self.tracks.len() as u16,
             sessions: self.sessions.len() as u16,
-            write_protected: self.disc == CdrDiscState::Finalized,
+            write_protected: self.write_protected(),
             needs_recovery: false,
             profile: 0x0009,
             current_features: CDR_FEATURES,
@@ -766,7 +1346,7 @@ impl MmcMedium for CdrBundleMedium {
                 SectorKind::Audio2352 => return Err(Completion::Check(INVALID_FIELD)),
             },
             MmcOp::Write { lba, blocks } => {
-                if self.disc == CdrDiscState::Finalized {
+                if self.write_protected() {
                     return Err(Completion::Check(WRITE_PROTECTED));
                 }
                 if blocks == 0 {
@@ -776,7 +1356,7 @@ impl MmcMedium for CdrBundleMedium {
             }
             MmcOp::WriteSectors { lba, blocks, kind } => match kind {
                 SectorKind::Auto | SectorKind::Data2048 => {
-                    if self.disc == CdrDiscState::Finalized {
+                    if self.write_protected() {
                         return Err(Completion::Check(WRITE_PROTECTED));
                     }
                     if blocks == 0 {
@@ -788,24 +1368,61 @@ impl MmcMedium for CdrBundleMedium {
             },
             MmcOp::Commit => {
                 // A TAO recorder relies on SYNCHRONIZE CACHE to pad and close
-                // the track before it finalizes the disc.
-                self.close_open_track();
-                self.op = Some(Op::Sync);
+                // the track before it finalizes the disc. The aggregate data is
+                // synced before the TOC body/header.
+                if self.read_only {
+                    self.op = Some(Op::Sync);
+                } else {
+                    self.close_open_track();
+                    self.needs_save = true;
+                    self.start_save(true, None)?;
+                }
             }
             MmcOp::Close { function } => match function {
                 1 => {
-                    self.close_open_track();
-                    return Err(Completion::Good);
+                    if self.read_only {
+                        return Err(Completion::Check(WRITE_PROTECTED));
+                    }
+                    if self.open_track.is_some() {
+                        self.close_open_track();
+                        self.needs_save = true;
+                    } else if !self.needs_save {
+                        return Err(Completion::Good);
+                    }
+                    self.start_save(true, None)?;
                 }
                 2 => {
+                    if self.read_only {
+                        return if self.disc == CdrDiscState::Finalized {
+                            Err(Completion::Good)
+                        } else {
+                            Err(Completion::Check(WRITE_PROTECTED))
+                        };
+                    }
+                    if self.disc == CdrDiscState::Finalized && !self.needs_save {
+                        return Err(Completion::Good);
+                    }
                     self.finalize()?;
-                    return Err(Completion::Good);
+                    self.needs_save = true;
+                    self.start_save(true, None)?;
                 }
                 _ => return Err(Completion::Check(INVALID_FIELD)),
             },
             MmcOp::ReserveTrack { size } => {
+                let rollback = ReserveRollback {
+                    tracks: self.tracks.len(),
+                    sessions: self.sessions.len(),
+                    last_session: self.sessions.last().copied(),
+                    open_track: self.open_track,
+                    disc: self.disc,
+                    needs_save: self.needs_save,
+                };
                 self.reserve_track(size)?;
-                return Err(Completion::Good);
+                self.needs_save = true;
+                if let Err(completion) = self.start_save(false, Some(rollback)) {
+                    self.rollback_reserve(rollback);
+                    return Err(completion);
+                }
             }
             // FORMAT UNIT/BLANK is not erasable on a write-once medium; the
             // descriptor commands are encoded by the drive.
@@ -837,6 +1454,13 @@ impl MmcMedium for CdrBundleMedium {
                 }
                 Some(Op::Sync) => {
                     self.phase = CdrBundleState::SyncIo;
+                    PollStep::Publish(DataPlan {
+                        direction: Direction::None,
+                        bytes: 0,
+                    })
+                }
+                Some(Op::SaveToc) => {
+                    self.phase = CdrBundleState::SaveIo;
                     PollStep::Publish(DataPlan {
                         direction: Direction::None,
                         bytes: 0,
@@ -907,7 +1531,7 @@ impl MmcMedium for CdrBundleMedium {
                 let at = offset.saturating_add(u64::from(self.progress));
                 self.phase = CdrBundleState::WriteIo;
                 PollStep::Io(StorageOp::Write {
-                    resource: 16 + track,
+                    resource: track_resource(track),
                     offset: at,
                     buf: &data[..accepted],
                 })
@@ -959,6 +1583,8 @@ impl MmcMedium for CdrBundleMedium {
                 }
                 self.finish(Completion::Good)
             }
+            (CdrBundleState::SaveIo, FeedbackKind::PlanAccepted) => self.save_next(data),
+            (CdrBundleState::SaveWait, FeedbackKind::IoDone) => self.save_done(fb, data),
             _ => PollStep::Idle,
         }
     }
@@ -984,6 +1610,11 @@ impl MmcMedium for CdrBundleMedium {
                     .is_some_and(|entry| entry.written == 0)
             {
                 self.drop_implicit_track(track);
+            }
+        }
+        if let Some(save) = self.save {
+            if let Some(rollback) = save.rollback {
+                self.rollback_reserve(rollback);
             }
         }
         self.reset();
@@ -1021,7 +1652,7 @@ impl MmcMedium for CdrBundleMedium {
 
     fn track_info(&self, request: TrackInfoRequest) -> Option<TrackInfo> {
         match request {
-            TrackInfoRequest::Number(0) => Some(lead_in_info()),
+            TrackInfoRequest::Number(0) => Some(lead_in_info(self.medium_leadin)),
             TrackInfoRequest::Number(0xFF) => {
                 (self.disc != CdrDiscState::Finalized).then(|| self.invisible_info())
             }
@@ -1099,7 +1730,7 @@ impl MmcMedium for CdrBundleMedium {
             last_session_lead_in: match self.disc {
                 // A blank or appendable disc reports where the next lead-in
                 // will be recorded; only a complete disc reports FF.
-                CdrDiscState::Blank | CdrDiscState::Appendable => Some(MEDIUM_LEADIN),
+                CdrDiscState::Blank | CdrDiscState::Appendable => Some(self.medium_leadin),
                 CdrDiscState::Finalized => None,
             },
             last_possible_lead_out: match self.disc {
@@ -1114,11 +1745,11 @@ impl MmcMedium for CdrBundleMedium {
 }
 
 /// The lead-in pseudo-track (`READ TRACK INFORMATION` number 0).
-fn lead_in_info() -> TrackInfo {
+fn lead_in_info(medium_leadin: i64) -> TrackInfo {
     TrackInfo {
         number: 0,
         session: 0,
-        start_lba: MEDIUM_LEADIN,
+        start_lba: medium_leadin,
         length: 0,
         allocated: 0,
         nwa: 0,
@@ -1240,9 +1871,109 @@ mod tests {
         }
     }
 
-    fn run_read(
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StoreEv {
+        Write(u16, u64, usize),
+        Sync(u16),
+    }
+
+    /// Byte-plane backing used by the TOC tests: resources are independent
+    /// byte vectors, so a TOC write can never clobber track payload.
+    #[derive(Default)]
+    struct StoreMock {
+        mem: std::collections::HashMap<u16, std::vec::Vec<u8>>,
+        writes: std::vec::Vec<(u16, u64, usize)>,
+        syncs: std::vec::Vec<u16>,
+        events: std::vec::Vec<StoreEv>,
+        fail_write: bool,
+        fail_toc_header: bool,
+        fail_sync: bool,
+        fail_sync_resource: Option<u16>,
+    }
+
+    impl StoreMock {
+        fn slot(&self, slot: u8) -> std::vec::Vec<u8> {
+            self.mem
+                .get(&toc_resource(slot))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl Backing for StoreMock {
+        fn read_into(&mut self, resource: u16, offset: u64, buf: &mut [u8]) {
+            let src = self
+                .mem
+                .get(&resource)
+                .map_or(&[][..], |bytes| bytes.as_slice());
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = src.get(offset as usize + index).copied().unwrap_or(0);
+            }
+        }
+
+        fn write_from(&mut self, resource: u16, offset: u64, buf: &[u8]) {
+            self.writes.push((resource, offset, buf.len()));
+            self.events
+                .push(StoreEv::Write(resource, offset, buf.len()));
+            let bytes = self.mem.entry(resource).or_default();
+            let end = offset as usize + buf.len();
+            if bytes.len() < end {
+                bytes.resize(end, 0);
+            }
+            bytes[offset as usize..end].copy_from_slice(buf);
+        }
+
+        fn sync(&mut self, resource: u16) {
+            self.syncs.push(resource);
+            self.events.push(StoreEv::Sync(resource));
+        }
+
+        fn write_fails(&self, resource: u16, offset: u64) -> bool {
+            self.fail_write
+                || (self.fail_toc_header
+                    && (resource == TOC_RESOURCE_0 || resource == TOC_RESOURCE_1)
+                    && offset == 0)
+        }
+
+        fn sync_fails(&self, resource: u16) -> bool {
+            self.fail_sync || self.fail_sync_resource == Some(resource)
+        }
+    }
+
+    /// Storage operations used by the medium test helpers.
+    trait Backing {
+        fn read_into(&mut self, resource: u16, offset: u64, buf: &mut [u8]);
+        fn write_from(&mut self, resource: u16, offset: u64, buf: &[u8]);
+        fn sync(&mut self, resource: u16);
+        fn write_fails(&self, resource: u16, offset: u64) -> bool;
+        fn sync_fails(&self, resource: u16) -> bool;
+    }
+
+    impl Backing for Mock {
+        fn read_into(&mut self, resource: u16, offset: u64, buf: &mut [u8]) {
+            Mock::read_into(self, resource, offset, buf);
+        }
+
+        fn write_from(&mut self, resource: u16, offset: u64, buf: &[u8]) {
+            Mock::write_from(self, resource, offset, buf);
+        }
+
+        fn sync(&mut self, resource: u16) {
+            Mock::sync(self, resource);
+        }
+
+        fn write_fails(&self, _resource: u16, _offset: u64) -> bool {
+            false
+        }
+
+        fn sync_fails(&self, _resource: u16) -> bool {
+            false
+        }
+    }
+
+    fn run_read<B: Backing>(
         medium: &mut CdrBundleMedium,
-        mock: &mut Mock,
+        mock: &mut B,
         lba: u64,
         blocks: u16,
         bank: usize,
@@ -1279,9 +2010,9 @@ mod tests {
         }
     }
 
-    fn run_write(
+    fn run_write<B: Backing>(
         medium: &mut CdrBundleMedium,
-        mock: &mut Mock,
+        mock: &mut B,
         lba: u64,
         blocks: u16,
         payload: &[u8],
@@ -1310,8 +2041,17 @@ mod tests {
                     offset,
                     buf,
                 }) => {
-                    mock.write_from(resource, offset, buf);
-                    feedback = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                    if mock.write_fails(resource, offset) {
+                        feedback = Feedback::io_done(IoReceipt::test(
+                            0,
+                            Some(Fault::Io),
+                            Effect::UnknownRemainder,
+                        ));
+                    } else {
+                        mock.write_from(resource, offset, buf);
+                        feedback =
+                            Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                    }
                 }
                 PollStep::Complete(completion) => {
                     assert_eq!(received, payload.len(), "every host byte was received");
@@ -1322,9 +2062,18 @@ mod tests {
         }
     }
 
-    fn run_commit(medium: &mut CdrBundleMedium, mock: &mut Mock) -> Completion {
-        let mut data = [0u8; 0];
-        assert_eq!(medium.begin(MmcOp::Commit), Ok(()));
+    /// Run a no-data control operation, including its persistent TOC save.
+    fn run_control<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        op: MmcOp,
+        bank: usize,
+    ) -> Completion {
+        let mut data = std::vec![0u8; bank];
+        match medium.begin(op) {
+            Ok(()) => {}
+            Err(completion) => return completion,
+        }
         let mut feedback = Feedback::begin();
         loop {
             match medium.poll(feedback, &mut data) {
@@ -1339,16 +2088,58 @@ mod tests {
                     feedback = Feedback::plan_accepted();
                 }
                 PollStep::Io(StorageOp::Sync { resource }) => {
-                    mock.sync(resource);
-                    feedback = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                    if mock.sync_fails(resource) {
+                        feedback =
+                            Feedback::io_done(IoReceipt::test(0, Some(Fault::Io), Effect::Known));
+                    } else {
+                        mock.sync(resource);
+                        feedback = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                    }
+                }
+                PollStep::Io(StorageOp::Write {
+                    resource,
+                    offset,
+                    buf,
+                }) => {
+                    if mock.write_fails(resource, offset) {
+                        feedback = Feedback::io_done(IoReceipt::test(
+                            0,
+                            Some(Fault::Io),
+                            Effect::UnknownRemainder,
+                        ));
+                    } else {
+                        mock.write_from(resource, offset, buf);
+                        feedback =
+                            Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                    }
                 }
                 PollStep::Complete(completion) => return completion,
-                other => panic!("unexpected commit step: {other:?}"),
+                other => panic!("unexpected control step: {other:?}"),
             }
         }
     }
 
-    fn write_one(medium: &mut CdrBundleMedium, mock: &mut Mock, lba: u64) {
+    fn run_commit<B: Backing>(medium: &mut CdrBundleMedium, mock: &mut B) -> Completion {
+        run_control(medium, mock, MmcOp::Commit, 4096)
+    }
+
+    fn close_track<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        function: u8,
+    ) -> Completion {
+        run_control(medium, mock, MmcOp::Close { function }, 4096)
+    }
+
+    fn reserve_medium<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        size: u32,
+    ) -> Completion {
+        run_control(medium, mock, MmcOp::ReserveTrack { size }, 4096)
+    }
+
+    fn write_one<B: Backing>(medium: &mut CdrBundleMedium, mock: &mut B, lba: u64) {
         let payload = std::vec![0x5Au8; 2048];
         assert_eq!(
             run_write(medium, mock, lba, 1, &payload, 2048),
@@ -1498,14 +2289,8 @@ mod tests {
             Err(Completion::Check(LBA_OUT_OF_RANGE))
         );
 
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 2 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
         assert!(medium.attrs().write_protected);
         assert_eq!(
             medium.begin(MmcOp::Write { lba: 1, blocks: 1 }),
@@ -1525,18 +2310,17 @@ mod tests {
             Err(Completion::Check(INVALID_FIELD))
         );
         // Track 1 has no pre-gap, so the whole capacity is available to it.
-        assert_eq!(
-            CdrBundleMedium::with_capacity(400).begin(MmcOp::ReserveTrack { size: 300 }),
-            Err(Completion::Good)
-        );
+        let mut first = CdrBundleMedium::with_capacity(400);
+        let mut mock = Mock::default();
+        assert_eq!(reserve_medium(&mut first, &mut mock, 300), Completion::Good);
         assert_eq!(
             CdrBundleMedium::with_capacity(400).begin(MmcOp::ReserveTrack { size: 401 }),
             Err(Completion::Check(INVALID_FIELD))
         );
 
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 500 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 500),
+            Completion::Good
         );
         let reserved = medium
             .track_info(TrackInfoRequest::Number(1))
@@ -1563,10 +2347,7 @@ mod tests {
         assert_eq!(after_write.nwa, 1);
         assert_eq!(after_write.free_blocks, 499);
 
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         let closed = medium
             .track_info(TrackInfoRequest::Number(1))
             .expect("closed track");
@@ -1585,10 +2366,7 @@ mod tests {
         let mut medium = CdrBundleMedium::with_capacity(1000);
         let mut mock = Mock::default();
         write_one(&mut medium, &mut mock, 0);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
 
         // Track 2 starts at 300 and its user data starts at 450, leaving 700
         // blocks. The pre-gap counts against that space.
@@ -1597,8 +2375,8 @@ mod tests {
             Err(Completion::Check(INVALID_FIELD))
         );
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 550 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 550),
+            Completion::Good
         );
     }
 
@@ -1613,14 +2391,8 @@ mod tests {
             Err(Completion::Check(SESSION_FIXATION_INCOMPLETE_TRACK))
         );
 
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 2 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
         assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
         let info = medium.disc_info();
         assert_eq!(info.status, DiscStatus::Finalized);
@@ -1639,20 +2411,26 @@ mod tests {
     #[test]
     fn finalize_blank_is_a_noop() {
         let mut medium = CdrBundleMedium::with_capacity(4096);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 2 }),
-            Err(Completion::Good)
-        );
+        let mut store = StoreMock::default();
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
         assert_eq!(medium.disc_state(), CdrDiscState::Blank);
         assert!(!medium.attrs().write_protected);
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+        assert!(!medium.needs_save());
+        let reopened =
+            CdrBundleMedium::open(&store.slot(0), 0, Recovery::Delete).expect("blank TOC");
+        assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
+        assert_eq!(reopened.toc_seq(), 1);
     }
 
     #[test]
     fn finalize_rejects_a_reserved_track_without_data() {
         let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut mock = Mock::default();
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 500 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 500),
+            Completion::Good
         );
         assert_eq!(
             medium.begin(MmcOp::Close { function: 2 }),
@@ -1660,18 +2438,12 @@ mod tests {
         );
         // Closing the empty reserved track leaves it complete but empty, so
         // session fixation is still a no-op rather than a finalize.
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         let closed = medium
             .track_info(TrackInfoRequest::Number(1))
             .expect("closed track");
         assert_eq!(closed.length, 500);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 2 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
         assert_eq!(medium.disc_state(), CdrDiscState::Appendable);
         assert!(!medium.attrs().write_protected);
     }
@@ -1681,8 +2453,8 @@ mod tests {
         let mut medium = CdrBundleMedium::with_capacity(4096);
         let mut mock = Mock::default();
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 500 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 500),
+            Completion::Good
         );
         write_one(&mut medium, &mut mock, 0);
         assert_eq!(
@@ -1698,7 +2470,9 @@ mod tests {
         write_one(&mut medium, &mut mock, 0);
 
         assert_eq!(run_commit(&mut medium, &mut mock), Completion::Good);
-        assert_eq!(mock.syncs, std::vec![0]);
+        // The aggregate data is synced before the TOC slot is written and
+        // synced.
+        assert_eq!(mock.syncs, std::vec![0, 1]);
         let info = medium
             .track_info(TrackInfoRequest::Number(1))
             .expect("closed track");
@@ -1753,18 +2527,12 @@ mod tests {
         let mut medium = CdrBundleMedium::with_capacity(1024);
         let mut mock = Mock::default();
         write_one(&mut medium, &mut mock, 0);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
 
         // Track 1 is padded to 300 blocks; track 2 starts at 300 and its user
         // data starts after a 150-block pre-gap at 450.
         write_one(&mut medium, &mut mock, 450);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         mock.reads.clear();
         mock.writes.clear();
 
@@ -1792,15 +2560,9 @@ mod tests {
         let mut medium = CdrBundleMedium::with_capacity(1024);
         let mut mock = Mock::default();
         write_one(&mut medium, &mut mock, 0);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         write_one(&mut medium, &mut mock, 450);
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         mock.reads.clear();
         assert_eq!(medium.track(1).expect("track 1").start_lba, 0);
         assert_eq!(
@@ -1869,9 +2631,10 @@ mod tests {
     #[test]
     fn track_info_lba_covers_pregaps_and_reserved_allocations() {
         let mut medium = CdrBundleMedium::with_capacity(1024);
+        let mut mock = Mock::default();
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 500 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 500),
+            Completion::Good
         );
         for lba in [0, 1, 499] {
             assert_eq!(
@@ -1889,14 +2652,11 @@ mod tests {
             Some(TrackStatus::Invisible)
         );
 
-        assert_eq!(
-            medium.begin(MmcOp::Close { function: 1 }),
-            Err(Completion::Good)
-        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         // Track 2 starts at 500 and its first user block is 650.
         assert_eq!(
-            medium.begin(MmcOp::ReserveTrack { size: 300 }),
-            Err(Completion::Good)
+            reserve_medium(&mut medium, &mut mock, 300),
+            Completion::Good
         );
         let track = medium.track(2).expect("track 2");
         assert_eq!(track.start_lba, 650);
@@ -2065,5 +2825,1092 @@ mod tests {
         assert_eq!(info.length, 1);
         assert!(!medium.active());
         assert_eq!(medium.begin(MmcOp::Write { lba: 1, blocks: 1 }), Ok(()));
+    }
+
+    // ── Persistent TOC ──────────────────────────────────────────────────
+
+    const VALID_BODY: &str = "\
+disc_type = cdr
+disc_state = appendable
+capacity_sectors = 1000
+medium_leadin = -11077
+[track.1]
+status = reserved
+session = 1
+start_lba = 0
+data_start_lba = 0
+allocated = 500
+length = 0
+written = 0
+nwa = 0
+kind = data
+reserved = 1
+[session.1]
+first_track = 1
+last_track = 1
+start_lba = 0
+lead_out_lba = 0
+closed = 0
+end = 1
+";
+
+    /// Build a full slot from a hand-written body (`slot` 0, `seq` 1).
+    fn slot_from_body(body: &str) -> std::vec::Vec<u8> {
+        slot_from_body_at(0, 1, body)
+    }
+
+    fn slot_from_body_at(slot: u8, seq: u32, body: &str) -> std::vec::Vec<u8> {
+        let slot_size = TOC_SLOT_DEFAULT as usize;
+        let body_len = body.len();
+        assert!(TOC_HEADER_LEN + body_len < slot_size, "body fits");
+        let mut out = std::vec![0u8; slot_size];
+        out[TOC_HEADER_LEN..TOC_HEADER_LEN + body_len].copy_from_slice(body.as_bytes());
+        let padding = slot_size - TOC_HEADER_LEN - body_len;
+        assert_eq!(
+            toc::render_padding(padding, 0, &mut out[TOC_HEADER_LEN + body_len..]),
+            padding
+        );
+        let header = toc::header_bytes(
+            slot,
+            TOC_SLOT_DEFAULT,
+            toc::max_tracks_for_slot(TOC_SLOT_DEFAULT),
+            body_len as u32,
+            toc::checksum(body.as_bytes()),
+            seq,
+        );
+        out[..TOC_HEADER_LEN].copy_from_slice(&header);
+        out
+    }
+
+    fn open_body(body: &str) -> Result<CdrBundleMedium, TocError> {
+        CdrBundleMedium::open(&slot_from_body(body), 0, Recovery::Delete)
+    }
+
+    #[test]
+    fn toc_layout_helpers_name_slots_and_tracks() {
+        assert_eq!(toc_resource(0), 1);
+        assert_eq!(toc_resource(1), 2);
+        assert_eq!(toc_file(0), "toc.0");
+        assert_eq!(toc_file(1), "toc.1");
+        assert_eq!(track_resource(1), 17);
+        assert_eq!(track_resource(99), 115);
+        assert_eq!(track_file(1).as_str(), "track_1.bin");
+        assert_eq!(track_file(65_535).as_str(), "track_65535.bin");
+        assert_eq!(TOC_HEADER_LEN, 256);
+        assert_eq!(TOC_SLOT_MIN, 4096);
+        assert_eq!(TOC_SLOT_DEFAULT, 64 * 1024);
+        assert_eq!(TOC_SLOT_MAX, 64 * 1024);
+    }
+
+    #[test]
+    fn toc_round_trip_blank_write_close_and_continue() {
+        let mut medium = CdrBundleMedium::blank(CdrCapacity::Cdr74);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+
+        assert_eq!(medium.slot_size(), TOC_SLOT_DEFAULT);
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+        let slot0 = store.slot(0);
+        assert_eq!(slot0.len(), TOC_SLOT_DEFAULT as usize);
+        let header = TocHeader::parse(&slot0).expect("header");
+        assert_eq!(header.slot, 0);
+        assert_eq!(header.seq, 1);
+        assert_eq!(header.slot_size, TOC_SLOT_DEFAULT);
+        assert_eq!(slot0[slot0.len() - 1], b'\n');
+        let body_end = TOC_HEADER_LEN + header.body_len as usize;
+        let text = std::str::from_utf8(&slot0[TOC_HEADER_LEN..body_end]).expect("body");
+        assert!(text.contains("disc_state = appendable\n"));
+        assert!(text.contains("[track.1]\nstatus = complete\n"));
+        assert!(text.contains("end = 1\n"));
+        assert!(slot0[body_end..]
+            .iter()
+            .all(|byte| *byte == b';' || *byte == b'\n'));
+
+        let reopened = CdrBundleMedium::open(&slot0, 0, Recovery::Delete).expect("reopen");
+        assert_eq!(reopened.capacity_sectors(), 333_000);
+        assert_eq!(reopened.toc_seq(), 1);
+        assert_eq!(reopened.current_slot(), 0);
+        assert_eq!(reopened.disc_state(), CdrDiscState::Appendable);
+        assert_eq!(
+            reopened.track_numbers().collect::<std::vec::Vec<_>>(),
+            std::vec![1]
+        );
+        let info = reopened
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.status, TrackStatus::Complete);
+        assert_eq!(info.length, 300);
+
+        // Continue on the reopened medium; the next save alternates to slot 1.
+        let mut next = reopened;
+        write_one(&mut next, &mut store, 450);
+        assert_eq!(close_track(&mut next, &mut store, 1), Completion::Good);
+        assert_eq!(next.toc_seq(), 2);
+        assert_eq!(next.current_slot(), 1);
+        let slot1 = store.slot(1);
+        let reopened = CdrBundleMedium::open(&slot1, 0, Recovery::Delete).expect("second reopen");
+        assert_eq!(reopened.toc_seq(), 2);
+        assert_eq!(
+            reopened.track_numbers().collect::<std::vec::Vec<_>>(),
+            std::vec![1, 2]
+        );
+        assert_eq!(store.slot(0), slot0, "the older slot is untouched");
+    }
+
+    #[test]
+    fn toc_save_alternates_and_a_torn_newest_slot_falls_back() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        write_one(&mut medium, &mut store, 450);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+
+        let slot0 = store.slot(0);
+        let slot1 = store.slot(1);
+        assert_eq!(
+            CdrBundleMedium::open(&slot0, 0, Recovery::Delete)
+                .unwrap()
+                .toc_seq(),
+            1
+        );
+        assert_eq!(
+            CdrBundleMedium::open(&slot1, 0, Recovery::Delete)
+                .unwrap()
+                .toc_seq(),
+            2
+        );
+
+        // Torn newest slot: the header survives but the body does not.
+        let mut torn = slot1.clone();
+        let end = torn
+            .windows(6)
+            .position(|window| window == b"end = ")
+            .expect("end line");
+        for byte in &mut torn[end..] {
+            *byte = b'x';
+        }
+        assert!(CdrBundleMedium::open(&torn, 0, Recovery::Delete).is_err());
+        let older = CdrBundleMedium::open(&slot0, 0, Recovery::Delete).expect("older wins");
+        assert_eq!(older.toc_seq(), 1);
+        assert_eq!(older.track_numbers().count(), 1);
+
+        // A truncated slot is rejected too.
+        assert!(CdrBundleMedium::open(&slot1[..128], 0, Recovery::Delete).is_err());
+    }
+
+    #[test]
+    fn toc_parser_rejects_malformed_slots() {
+        let mut bad_magic = slot_from_body(VALID_BODY);
+        bad_magic[8..20].copy_from_slice(b"snow_bad_bnd");
+        assert_eq!(
+            CdrBundleMedium::open(&bad_magic, 0, Recovery::Delete).err(),
+            Some(TocError::BadMagic)
+        );
+
+        let mut bad_version = slot_from_body(VALID_BODY);
+        let at = bad_version
+            .windows(9)
+            .position(|window| window == b"version =")
+            .expect("version");
+        bad_version[at + 10] = b'2';
+        assert_eq!(
+            CdrBundleMedium::open(&bad_version, 0, Recovery::Delete).err(),
+            Some(TocError::BadVersion)
+        );
+
+        let mut bad_header = slot_from_body(VALID_BODY);
+        let at = bad_header
+            .windows(10)
+            .position(|window| window == b"max_tracks")
+            .expect("max_tracks");
+        bad_header[at] = b'x';
+        assert_eq!(
+            CdrBundleMedium::open(&bad_header, 0, Recovery::Delete).err(),
+            Some(TocError::BadHeader)
+        );
+
+        let truncated_line = &VALID_BODY[..VALID_BODY.len() - 1];
+        assert!(open_body(truncated_line).is_err());
+
+        for body in [
+            VALID_BODY.replace("end = 1\n", ""),
+            format!("{VALID_BODY}[track.1]\nstatus = complete\n"),
+            VALID_BODY.replace("kind = data", "session = 1"),
+            VALID_BODY.replace("kind = data", "bogus = data"),
+            VALID_BODY.replace("kind = data", "kind"),
+            VALID_BODY
+                .replace("data_start_lba = 0", "data_start_lba = 10")
+                .replace("nwa = 0", "nwa = 5"),
+            VALID_BODY
+                .replace("allocated = 500", "allocated = 10")
+                .replace("nwa = 0", "nwa = 20"),
+            VALID_BODY
+                .replace("length = 0", "length = 10")
+                .replace("written = 0", "written = 5"),
+            VALID_BODY.replace("last_track = 1", "last_track = 2"),
+            VALID_BODY.replace("disc_type = cdr", "disc_type = dvd"),
+            format!("[unknown]\nkey = value\n{VALID_BODY}"),
+        ] {
+            assert!(
+                CdrBundleMedium::open(&slot_from_body(&body), 0, Recovery::Delete).is_err(),
+                "body must be rejected: {body}"
+            );
+        }
+
+        let good = slot_from_body(VALID_BODY);
+        assert_eq!(
+            CdrBundleMedium::open(&good[..8192], 0, Recovery::Delete).err(),
+            Some(TocError::Invalid)
+        );
+
+        let mut too_large = good.clone();
+        let at = too_large
+            .windows(10)
+            .position(|window| window == b"slot_size ")
+            .expect("slot_size");
+        too_large[at + 12..at + 17].copy_from_slice(b"65537");
+        assert_eq!(
+            CdrBundleMedium::open(&too_large, 0, Recovery::Delete).err(),
+            Some(TocError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn toc_recovery_delete_and_read_only() {
+        let deleted = open_body(VALID_BODY).expect("delete recovery");
+        assert_eq!(deleted.disc_state(), CdrDiscState::Blank);
+        assert_eq!(deleted.attrs().tracks, 0);
+        assert_eq!(deleted.attrs().sessions, 0);
+        assert_eq!(deleted.track_numbers().count(), 0);
+        assert!(!deleted.attrs().write_protected);
+        assert!(
+            deleted.needs_save(),
+            "the compacted TOC still has to be saved"
+        );
+
+        let mut frozen = CdrBundleMedium::open(&slot_from_body(VALID_BODY), 0, Recovery::ReadOnly)
+            .expect("read-only recovery");
+        assert_eq!(frozen.disc_state(), CdrDiscState::Finalized);
+        assert!(frozen.attrs().write_protected);
+        let info = frozen
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.status, TrackStatus::Complete);
+        assert_eq!(info.length, 0);
+        assert_eq!(
+            frozen.begin(MmcOp::Write { lba: 0, blocks: 1 }),
+            Err(Completion::Check(WRITE_PROTECTED))
+        );
+        assert_eq!(
+            frozen.begin(MmcOp::ReserveTrack { size: 300 }),
+            Err(Completion::Check(WRITE_PROTECTED))
+        );
+        assert_eq!(
+            frozen.begin(MmcOp::Close { function: 1 }),
+            Err(Completion::Check(WRITE_PROTECTED))
+        );
+
+        // A padded closed track keeps only its written prefix in read-only
+        // recovery.
+        let padded = VALID_BODY
+            .replace("status = reserved", "status = complete")
+            .replace("length = 0", "length = 1")
+            .replace("written = 0", "written = 300")
+            .replace("nwa = 0", "nwa = 300")
+            .replace("lead_out_lba = 0", "lead_out_lba = 300")
+            .replace("reserved = 1", "reserved = 0");
+        let frozen = CdrBundleMedium::open(&slot_from_body(&padded), 0, Recovery::ReadOnly)
+            .expect("padded read-only");
+        let info = frozen
+            .track_info(TrackInfoRequest::Number(1))
+            .expect("track 1");
+        assert_eq!(info.length, 1);
+        assert_eq!(info.nwa, 1);
+
+        // A complete record survives both recovery modes.
+        let complete = VALID_BODY
+            .replace("status = reserved", "status = complete")
+            .replace("reserved = 1", "reserved = 0");
+        assert_eq!(
+            open_body(&complete)
+                .expect("complete survives delete")
+                .attrs()
+                .tracks,
+            1
+        );
+        assert_eq!(
+            CdrBundleMedium::open(&slot_from_body(&complete), 0, Recovery::ReadOnly)
+                .expect("complete survives read-only")
+                .attrs()
+                .tracks,
+            1
+        );
+    }
+
+    #[test]
+    fn toc_save_streams_through_a_small_bank() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(
+            run_control(&mut medium, &mut store, MmcOp::Close { function: 1 }, 512),
+            Completion::Good
+        );
+        let slot_writes = store
+            .writes
+            .iter()
+            .filter(|(resource, _, _)| *resource == toc_resource(0))
+            .count();
+        assert!(slot_writes > 2, "the slot is written in several chunks");
+        let slot = store.slot(0);
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("parse");
+        assert_eq!(reopened.attrs().tracks, 1);
+        assert_eq!(reopened.toc_seq(), 1);
+    }
+
+    #[test]
+    fn toc_round_trips_32_tracks_and_16_sessions() {
+        let mut tracks: heapless::Vec<TrackEntry, MAX_TRACKS> = heapless::Vec::new();
+        let mut sessions: heapless::Vec<SessionEntry, MAX_SESSIONS> = heapless::Vec::new();
+        for number in 1..=32u16 {
+            let session = (number - 1) / 2 + 1;
+            let start_lba = u64::from(number - 1) * 450;
+            let data_start_lba = start_lba + if number == 1 { 0 } else { 150 };
+            let nwa = data_start_lba + 300;
+            let _ = tracks.push(TrackEntry {
+                number,
+                session,
+                start_lba,
+                data_start_lba,
+                allocated: 0,
+                length: 300,
+                written: 300,
+                nwa,
+                status: TrackStatus::Complete,
+                kind: TrackKind::Data,
+                reserved: false,
+            });
+        }
+        for number in 1..=16u16 {
+            let first_track = number * 2 - 1;
+            let last_track = number * 2;
+            let start_lba = tracks
+                .iter()
+                .find(|track| track.number == first_track)
+                .map_or(0, |track| track.start_lba);
+            let lead_out_lba = tracks
+                .iter()
+                .find(|track| track.number == last_track)
+                .map_or(0, |track| track.nwa);
+            let _ = sessions.push(SessionEntry {
+                number,
+                first_track,
+                last_track,
+                start_lba,
+                lead_out_lba,
+                closed: true,
+            });
+        }
+        let len = toc::body_len(
+            &tracks,
+            &sessions,
+            100_000,
+            MEDIUM_LEADIN,
+            CdrDiscState::Appendable,
+        );
+        let mut body = std::vec![0u8; len];
+        assert_eq!(
+            toc::render_body(
+                &tracks,
+                &sessions,
+                100_000,
+                MEDIUM_LEADIN,
+                CdrDiscState::Appendable,
+                0,
+                &mut body
+            ),
+            len
+        );
+        let text = std::str::from_utf8(&body).expect("utf8");
+        let slot = slot_from_body(text);
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("round trip");
+        assert_eq!(reopened.attrs().tracks, 32);
+        assert_eq!(reopened.attrs().sessions, 16);
+        assert_eq!(reopened.track_numbers().count(), 32);
+    }
+
+    #[test]
+    fn toc_body_too_large_fails_without_touching_the_previous_slot() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 300),
+            Completion::Good
+        );
+        let previous = store.slot(0);
+        assert!(!previous.is_empty());
+        medium.slot_size = 512;
+        assert_eq!(
+            close_track(&mut medium, &mut store, 1),
+            Completion::Check(INTERNAL_FAILURE)
+        );
+        assert_eq!(store.slot(0), previous);
+        assert_eq!(medium.toc_seq(), 1);
+        assert_eq!(medium.current_slot(), 0);
+        assert!(!medium.active());
+    }
+
+    fn newest_slot(store: &StoreMock) -> std::vec::Vec<u8> {
+        let mut best: Option<(TocHeader, std::vec::Vec<u8>)> = None;
+        for slot in [0u8, 1] {
+            let bytes = store.slot(slot);
+            let Ok(header) = TocHeader::parse(&bytes) else {
+                continue;
+            };
+            if bytes.len() != header.slot_size as usize {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(current, _)| header.newer_than(current))
+            {
+                best = Some((header, bytes));
+            }
+        }
+        best.expect("a valid slot").1
+    }
+
+    #[test]
+    fn toc_header_two_step_read_equal_seq_and_copied_slot() {
+        let slot0 = slot_from_body_at(0, 1, VALID_BODY);
+        let slot1 = slot_from_body_at(1, 1, VALID_BODY);
+        let h0 = TocHeader::parse(&slot0[..TOC_HEADER_LEN]).expect("header 0");
+        let h1 = TocHeader::parse(&slot1[..TOC_HEADER_LEN]).expect("header 1");
+        assert_eq!(h0.slot, 0);
+        assert_eq!(h1.slot, 1);
+        assert_eq!(h0.slot_size, slot0.len() as u32);
+        assert_eq!(h0.max_tracks, toc::max_tracks_for_slot(h0.slot_size));
+        assert!(h1.newer_than(&h0), "equal seq selects the higher slot");
+        assert!(!h0.newer_than(&h1));
+        assert_eq!(
+            CdrBundleMedium::open(&slot0, 0, Recovery::Delete)
+                .unwrap()
+                .current_slot(),
+            0
+        );
+        assert_eq!(
+            CdrBundleMedium::open(&slot1, 0, Recovery::Delete)
+                .unwrap()
+                .current_slot(),
+            1
+        );
+        assert_eq!(
+            TocHeader::parse(&slot0[..128]).err(),
+            Some(TocError::BadHeader)
+        );
+
+        // A slot copied into the other physical position keeps its stored
+        // index; the next save targets the other slot, never the one loaded.
+        let copied = slot_from_body_at(1, 5, VALID_BODY);
+        assert_eq!(
+            CdrBundleMedium::open_at(0, &copied, 0, Recovery::Delete).err(),
+            Some(TocError::Invalid),
+            "a copied slot fails the physical-position check"
+        );
+        let mut medium = CdrBundleMedium::open(&copied, 0, Recovery::Delete).expect("copied slot");
+        assert_eq!(medium.current_slot(), 1);
+        let mut store = StoreMock::default();
+        assert_eq!(run_commit(&mut medium, &mut store), Completion::Good);
+        assert!(!store.slot(0).is_empty());
+        assert!(store.slot(1).is_empty());
+
+        // A capacity hint that disagrees with the stored value is rejected.
+        assert_eq!(
+            CdrBundleMedium::open(&slot0, 1001, Recovery::Delete).err(),
+            Some(TocError::Invalid)
+        );
+    }
+
+    #[test]
+    fn toc_rejects_hybrid_bodies_and_torn_headers() {
+        let old = slot_from_body_at(0, 1, VALID_BODY);
+        let new_body = VALID_BODY.replace("disc_state = appendable", "disc_state = finalized");
+        let new = slot_from_body_at(1, 2, &new_body);
+        let mut hybrid = new.clone();
+        for (index, byte) in hybrid.iter_mut().enumerate().skip(TOC_HEADER_LEN + 64) {
+            *byte = old[index];
+        }
+        assert!(CdrBundleMedium::open(&hybrid, 0, Recovery::Delete).is_err());
+        assert!(CdrBundleMedium::open(&old, 0, Recovery::Delete).is_ok());
+        assert_eq!(
+            TocHeader::parse(&new[..TOC_HEADER_LEN - 1]).err(),
+            Some(TocError::BadHeader)
+        );
+
+        let at = |bytes: &[u8], needle: &[u8]| {
+            bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("header field")
+        };
+        let mut bad_checksum = new.clone();
+        let p = at(&bad_checksum, b"checksum = ") + 11;
+        bad_checksum[p] = if bad_checksum[p] == b'0' { b'1' } else { b'0' };
+        assert!(CdrBundleMedium::open(&bad_checksum, 0, Recovery::Delete).is_err());
+
+        let mut bad_slot = new.clone();
+        let p = at(&bad_slot, b"slot = ") + 7;
+        bad_slot[p] = b'2';
+        assert_eq!(
+            CdrBundleMedium::open(&bad_slot, 0, Recovery::Delete).err(),
+            Some(TocError::Invalid)
+        );
+
+        let mut bad_body_len = new.clone();
+        let p = at(&bad_body_len, b"body_len = ") + 11;
+        bad_body_len[p] = b'0';
+        assert!(CdrBundleMedium::open(&bad_body_len, 0, Recovery::Delete).is_err());
+
+        // The old slot still wins after a torn new header.
+        let mut torn = new.clone();
+        torn[..TOC_HEADER_LEN].fill(b';');
+        assert!(CdrBundleMedium::open(&torn, 0, Recovery::Delete).is_err());
+        assert_eq!(
+            CdrBundleMedium::open(&old, 0, Recovery::Delete)
+                .unwrap()
+                .toc_seq(),
+            1
+        );
+    }
+
+    #[test]
+    fn toc_exact_slot_bytes_and_blank_round_trip() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        let slot = store.slot(0);
+        let header = TocHeader::parse(&slot[..TOC_HEADER_LEN]).expect("header");
+        assert!(slot.starts_with(b"magic = snow_cdr_bnd\n"));
+        assert_eq!(header.slot, 0);
+        assert_eq!(header.seq, 1);
+        assert_eq!(header.slot_size, TOC_SLOT_DEFAULT);
+        assert_eq!(slot.len(), TOC_SLOT_DEFAULT as usize);
+        assert_eq!(slot[slot.len() - 1], b'\n');
+        let body_end = TOC_HEADER_LEN + header.body_len as usize;
+        let body = std::str::from_utf8(&slot[TOC_HEADER_LEN..body_end]).expect("body");
+        assert!(body.contains("disc_state = blank\n"));
+        assert!(body.ends_with("end = 1\n"));
+        assert_eq!(
+            toc::checksum(&slot[TOC_HEADER_LEN..body_end]),
+            header.checksum
+        );
+        assert!(slot[body_end..]
+            .iter()
+            .all(|byte| *byte == b';' || *byte == b'\n'));
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("blank reopen");
+        assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
+        assert_eq!(reopened.toc_seq(), 1);
+        assert_eq!(reopened.current_slot(), 0);
+    }
+
+    #[test]
+    fn toc_close_flushes_data_before_the_toc() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        let start = store.events.len();
+        assert!(matches!(
+            store.events[start - 1],
+            StoreEv::Write(resource, _, _) if resource == track_resource(1)
+        ));
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        let tail = &store.events[start..];
+        assert!(matches!(tail.first(), Some(StoreEv::Sync(0))));
+        assert!(matches!(
+            tail.last(),
+            Some(StoreEv::Sync(resource)) if *resource == TOC_RESOURCE_0
+        ));
+        let slot_writes: std::vec::Vec<(u64, usize)> = tail
+            .iter()
+            .filter_map(|event| match event {
+                StoreEv::Write(resource, offset, len) if *resource == TOC_RESOURCE_0 => {
+                    Some((*offset, *len))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slot_writes.first().map(|(offset, _)| *offset),
+            Some(TOC_HEADER_LEN as u64),
+            "the body is written first"
+        );
+        assert_eq!(
+            slot_writes.last().map(|(offset, _)| *offset),
+            Some(0),
+            "the header is written last"
+        );
+    }
+
+    #[test]
+    fn toc_save_failures_keep_needs_save_and_retry() {
+        // CLOSE 1: a TOC write failure keeps the transition and retries.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        store.fail_write = true;
+        assert_eq!(
+            close_track(&mut medium, &mut store, 1),
+            Completion::Check(WRITE_ERROR)
+        );
+        assert!(medium.needs_save());
+        assert_eq!(medium.toc_seq(), 0);
+        store.fail_write = false;
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert!(!medium.needs_save());
+        assert_eq!(medium.toc_seq(), 1);
+
+        // A header-last failure with a 256/512-byte bank leaves the old slot.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 300),
+            Completion::Good
+        );
+        let old = store.slot(0);
+        store.fail_toc_header = true;
+        assert_eq!(
+            run_control(&mut medium, &mut store, MmcOp::Close { function: 1 }, 256),
+            Completion::Check(WRITE_ERROR)
+        );
+        assert!(medium.needs_save());
+        assert_eq!(
+            CdrBundleMedium::open(&old, 0, Recovery::Delete)
+                .unwrap()
+                .toc_seq(),
+            1
+        );
+        store.fail_toc_header = false;
+        assert_eq!(
+            run_control(&mut medium, &mut store, MmcOp::Close { function: 1 }, 512),
+            Completion::Good
+        );
+        assert!(!medium.needs_save());
+
+        // CLOSE 1: a slot-sync failure is retryable.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 300),
+            Completion::Good
+        );
+        store.fail_sync_resource = Some(TOC_RESOURCE_1);
+        assert_eq!(
+            close_track(&mut medium, &mut store, 1),
+            Completion::Check(MEDIUM_ERROR)
+        );
+        assert!(medium.needs_save());
+        store.fail_sync_resource = None;
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert!(!medium.needs_save());
+
+        // CLOSE 2: a slot-sync failure is retryable.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        store.fail_sync_resource = Some(TOC_RESOURCE_1);
+        assert_eq!(
+            close_track(&mut medium, &mut store, 2),
+            Completion::Check(MEDIUM_ERROR)
+        );
+        assert!(medium.needs_save());
+        store.fail_sync_resource = None;
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert!(!medium.needs_save());
+
+        // CLOSE 2: a TOC write failure is retryable.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        store.fail_write = true;
+        assert_eq!(
+            close_track(&mut medium, &mut store, 2),
+            Completion::Check(WRITE_ERROR)
+        );
+        assert!(medium.needs_save());
+        store.fail_write = false;
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert!(!medium.needs_save());
+
+        // COMMIT: a data-sync failure is retryable.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        store.fail_sync = true;
+        assert_eq!(
+            run_commit(&mut medium, &mut store),
+            Completion::Check(MEDIUM_ERROR)
+        );
+        assert!(medium.needs_save());
+        store.fail_sync = false;
+        assert_eq!(run_commit(&mut medium, &mut store), Completion::Good);
+        assert!(!medium.needs_save());
+
+        // COMMIT: a TOC write failure is retryable.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        store.fail_write = true;
+        assert_eq!(
+            run_commit(&mut medium, &mut store),
+            Completion::Check(WRITE_ERROR)
+        );
+        assert!(medium.needs_save());
+        store.fail_write = false;
+        assert_eq!(run_commit(&mut medium, &mut store), Completion::Good);
+        assert!(!medium.needs_save());
+    }
+
+    #[test]
+    fn toc_reserve_rolls_back_when_the_save_fails() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        store.fail_write = true;
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 500),
+            Completion::Check(WRITE_ERROR)
+        );
+        assert_eq!(medium.attrs().tracks, 0);
+        assert_eq!(medium.attrs().sessions, 0);
+        assert!(!medium.needs_save());
+        store.fail_write = false;
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 500),
+            Completion::Good
+        );
+        assert_eq!(medium.attrs().tracks, 1);
+        assert!(!medium.needs_save());
+
+        // A slot-sync failure rolls the reservation back too.
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        store.fail_sync_resource = Some(TOC_RESOURCE_0);
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 500),
+            Completion::Check(MEDIUM_ERROR)
+        );
+        assert_eq!(medium.attrs().tracks, 0);
+        assert!(!medium.needs_save());
+        store.fail_sync_resource = None;
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 500),
+            Completion::Good
+        );
+    }
+
+    #[test]
+    fn toc_99_tracks_at_slot_max_and_41_rejected_at_16k() {
+        let mut medium = CdrBundleMedium::with_capacity(100_000);
+        let mut store = StoreMock::default();
+        for index in 0..99 {
+            write_one(&mut medium, &mut store, index * 450);
+            assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        }
+        let slot = newest_slot(&store);
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("99 tracks");
+        assert_eq!(reopened.attrs().tracks, 99);
+        assert_eq!(reopened.attrs().sessions, 1);
+        assert_eq!(reopened.toc_seq(), 99);
+
+        let mut medium =
+            CdrBundleMedium::with_capacity_and_slot(100_000, 16 * 1024).expect("16 KiB slot");
+        let mut store = StoreMock::default();
+        for index in 0..40 {
+            write_one(&mut medium, &mut store, index * 450);
+            assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        }
+        assert_eq!(medium.attrs().tracks, 40);
+        assert_eq!(
+            medium.begin(MmcOp::Write {
+                lba: 40 * 450,
+                blocks: 1
+            }),
+            Err(Completion::Check(INVALID_FIELD)),
+            "the implicit first write is rejected at the slot cap"
+        );
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 300),
+            Completion::Check(INVALID_FIELD)
+        );
+        assert_eq!(medium.attrs().tracks, 40);
+        assert!(!medium.needs_save());
+    }
+
+    #[test]
+    fn toc_round_trips_99_tracks_and_16_sessions() {
+        let mut tracks: heapless::Vec<TrackEntry, MAX_TRACKS> = heapless::Vec::new();
+        let mut sessions: heapless::Vec<SessionEntry, MAX_SESSIONS> = heapless::Vec::new();
+        for number in 1..=99u16 {
+            let session = ((number - 1) / 6 + 1).min(16);
+            let start_lba = u64::from(number - 1) * 450;
+            let data_start_lba = start_lba + if number == 1 { 0 } else { 150 };
+            let nwa = data_start_lba + 300;
+            let _ = tracks.push(TrackEntry {
+                number,
+                session,
+                start_lba,
+                data_start_lba,
+                allocated: 0,
+                length: 300,
+                written: 300,
+                nwa,
+                status: TrackStatus::Complete,
+                kind: TrackKind::Data,
+                reserved: false,
+            });
+        }
+        for number in 1..=16u16 {
+            let first_track = (number - 1) * 6 + 1;
+            let last_track = if number == 16 { 99 } else { number * 6 };
+            let start_lba = tracks
+                .iter()
+                .find(|track| track.number == first_track)
+                .map_or(0, |track| track.start_lba);
+            let lead_out_lba = tracks
+                .iter()
+                .find(|track| track.number == last_track)
+                .map_or(0, |track| track.nwa);
+            let _ = sessions.push(SessionEntry {
+                number,
+                first_track,
+                last_track,
+                start_lba,
+                lead_out_lba,
+                closed: true,
+            });
+        }
+        let len = toc::body_len(
+            &tracks,
+            &sessions,
+            100_000,
+            MEDIUM_LEADIN,
+            CdrDiscState::Appendable,
+        );
+        let mut body = std::vec![0u8; len];
+        assert_eq!(
+            toc::render_body(
+                &tracks,
+                &sessions,
+                100_000,
+                MEDIUM_LEADIN,
+                CdrDiscState::Appendable,
+                0,
+                &mut body
+            ),
+            len
+        );
+        let text = std::str::from_utf8(&body).expect("utf8");
+        let slot = slot_from_body_at(0, 1, text);
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("99/16");
+        assert_eq!(reopened.attrs().tracks, 99);
+        assert_eq!(reopened.attrs().sessions, 16);
+    }
+
+    #[test]
+    fn toc_parser_rejects_non_contiguous_tracks_and_sessions() {
+        let gap_body = "\
+disc_type = cdr
+disc_state = appendable
+capacity_sectors = 4000
+medium_leadin = -11077
+[track.1]
+status = complete
+session = 1
+start_lba = 0
+data_start_lba = 0
+allocated = 0
+length = 300
+written = 300
+nwa = 300
+kind = data
+reserved = 0
+[track.3]
+status = complete
+session = 1
+start_lba = 600
+data_start_lba = 750
+allocated = 0
+length = 300
+written = 300
+nwa = 1050
+kind = data
+reserved = 0
+[session.1]
+first_track = 1
+last_track = 3
+start_lba = 0
+lead_out_lba = 1050
+closed = 0
+end = 1
+";
+        assert!(open_body(gap_body).is_err());
+
+        let session_gap = "\
+disc_type = cdr
+disc_state = appendable
+capacity_sectors = 4000
+medium_leadin = -11077
+[track.1]
+status = complete
+session = 1
+start_lba = 0
+data_start_lba = 0
+allocated = 0
+length = 300
+written = 300
+nwa = 300
+kind = data
+reserved = 0
+[track.2]
+status = complete
+session = 2
+start_lba = 300
+data_start_lba = 450
+allocated = 0
+length = 300
+written = 300
+nwa = 750
+kind = data
+reserved = 0
+[track.3]
+status = complete
+session = 2
+start_lba = 750
+data_start_lba = 900
+allocated = 0
+length = 300
+written = 300
+nwa = 1200
+kind = data
+reserved = 0
+[session.1]
+first_track = 1
+last_track = 1
+start_lba = 0
+lead_out_lba = 300
+closed = 1
+[session.2]
+first_track = 3
+last_track = 3
+start_lba = 750
+lead_out_lba = 1200
+closed = 1
+end = 1
+";
+        assert!(open_body(session_gap).is_err());
+    }
+
+    #[test]
+    fn toc_delete_compacts_the_unclosed_tail() {
+        let body = "\
+disc_type = cdr
+disc_state = appendable
+capacity_sectors = 4000
+medium_leadin = -11077
+[track.1]
+status = complete
+session = 1
+start_lba = 0
+data_start_lba = 0
+allocated = 0
+length = 300
+written = 300
+nwa = 300
+kind = data
+reserved = 0
+[track.2]
+status = incomplete
+session = 1
+start_lba = 300
+data_start_lba = 450
+allocated = 0
+length = 10
+written = 10
+nwa = 460
+kind = data
+reserved = 0
+[track.3]
+status = complete
+session = 1
+start_lba = 460
+data_start_lba = 610
+allocated = 0
+length = 300
+written = 300
+nwa = 910
+kind = data
+reserved = 0
+[session.1]
+first_track = 1
+last_track = 3
+start_lba = 0
+lead_out_lba = 910
+closed = 0
+end = 1
+";
+        let slot = slot_from_body_at(0, 1, body);
+        let mut medium = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("compacted");
+        assert_eq!(medium.attrs().tracks, 1);
+        assert!(medium.needs_save());
+        let mut store = StoreMock::default();
+        assert_eq!(run_commit(&mut medium, &mut store), Completion::Good);
+        let saved = store.slot(1);
+        let reopened = CdrBundleMedium::open(&saved, 0, Recovery::Delete).expect("reopened");
+        assert_eq!(reopened.attrs().tracks, 1);
+        assert_eq!(reopened.attrs().sessions, 1);
+        assert_eq!(
+            reopened.track_numbers().collect::<std::vec::Vec<_>>(),
+            std::vec![1]
+        );
+    }
+
+    #[test]
+    fn toc_slot_size_bounds() {
+        assert!(matches!(
+            CdrBundleMedium::with_capacity_and_slot(1000, 0),
+            Err(TocError::BadSlotSize)
+        ));
+        assert!(matches!(
+            CdrBundleMedium::with_capacity_and_slot(1000, TOC_HEADER_LEN as u32),
+            Err(TocError::BadSlotSize)
+        ));
+        assert!(matches!(
+            CdrBundleMedium::with_capacity_and_slot(1000, 1024),
+            Err(TocError::BadSlotSize)
+        ));
+        assert!(CdrBundleMedium::with_capacity_and_slot(1000, TOC_SLOT_MIN).is_ok());
+        assert!(CdrBundleMedium::with_capacity_and_slot(1000, TOC_SLOT_MAX).is_ok());
+        assert!(matches!(
+            CdrBundleMedium::with_capacity_and_slot(1000, TOC_SLOT_MAX + 1),
+            Err(TocError::TooLarge)
+        ));
+
+        // The minimum slot is enough for one track and rejects a second.
+        let mut medium =
+            CdrBundleMedium::with_capacity_and_slot(1000, TOC_SLOT_MIN).expect("minimum slot");
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        let mut reopened =
+            CdrBundleMedium::open(&store.slot(0), 1000, Recovery::Delete).expect("one track");
+        assert_eq!(reopened.attrs().tracks, 1);
+        assert_eq!(
+            reopened.begin(MmcOp::ReserveTrack { size: 300 }),
+            Err(Completion::Check(INVALID_FIELD))
+        );
     }
 }

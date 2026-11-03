@@ -26,8 +26,8 @@ cdrom = ["scsi"]
 livefs = ["cdrom"]
 usb = ["scsi"]
 bundle = ["snowscsi-common/bundle"]
-# Recordable in-memory CD-R medium.
-cdr-bundle = []
+# Recordable CD-R medium with a persistent TOC.
+cdr-bundle = ["dep:ini_core"]
 log = ["dep:log", "snowscsi-common/log"]
 defmt = ["dep:defmt", "embedded-io/defmt", "snowscsi-common/defmt"]
 # Async facade: model-agnostic async seams (no runtime binding).
@@ -38,6 +38,7 @@ embassy = ["async-io", "usb", "dep:embassy-usb", "dep:embassy-time"]
 [dependencies]
 embedded-io.workspace = true
 heapless.workspace = true
+ini_core = { version = "0.2", default-features = false, optional = true }
 snowscsi-common.workspace = true
 snowscsi-iso9660.workspace = true
 log = { workspace = true, optional = true }

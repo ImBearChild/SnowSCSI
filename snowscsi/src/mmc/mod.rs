@@ -40,7 +40,9 @@ pub use self::attrs::{
     TrackInfoRequest, TrackKind, TrackStatus,
 };
 #[cfg(feature = "cdr-bundle")]
-pub use self::cdr_bundle::{CdrBundleMedium, CdrBundleState, CdrCapacity, CdrDiscState};
+pub use self::cdr_bundle::{
+    CdrBundleMedium, CdrBundleState, CdrCapacity, CdrDiscState, Recovery, TocError, TocHeader,
+};
 pub use self::drive::{MmcCaps, MmcDrive};
 #[cfg(feature = "dvdram")]
 pub use self::dvdram::{DvdRamMedium, DvdRamState};

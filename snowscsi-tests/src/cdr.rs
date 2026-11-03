@@ -13,7 +13,7 @@ use snowscsi::core::{
     cons, CommandContext, Completion, Cons, DataPlan, Delivery, Direction, Fault, Here, LuImpl,
     Nil, Spc, StaticTarget, Target, INVALID_FIELD, LBA_OUT_OF_RANGE, WRITE_PROTECTED,
 };
-use snowscsi::mmc::{CdrBundleMedium, CdrCapacity, MmcDrive};
+use snowscsi::mmc::{CdrBundleMedium, CdrCapacity, CdrDiscState, MmcDrive, MmcMedium, Recovery};
 
 const WRITE_10: u8 = 0x2A;
 const SYNC_CACHE_10: u8 = 0x35;
@@ -22,6 +22,7 @@ const READ_TOC: u8 = 0x43;
 const GET_CONFIGURATION: u8 = 0x46;
 const READ_DISC_INFORMATION: u8 = 0x51;
 const READ_TRACK_INFORMATION: u8 = 0x52;
+const RESERVE_TRACK: u8 = 0x53;
 const CLOSE_TRACK_SESSION: u8 = 0x5B;
 const FORMAT_UNIT: u8 = 0x04;
 const BLANK: u8 = 0xA1;
@@ -40,56 +41,81 @@ const SECTORS: u64 = 333_000;
 enum Ev {
     Read(u16, u64, usize),
     Write(u16, u64, usize),
-    Sync,
+    Sync(u16),
 }
 
 struct Plane {
-    mem: Vec<u8>,
+    /// One independent byte plane per storage resource, so a TOC slot write
+    /// can never clobber track payload.
+    mem: std::collections::HashMap<u16, Vec<u8>>,
+    len: usize,
     log: Vec<Ev>,
 }
 
 impl Plane {
     fn new(len: usize) -> Self {
         Self {
-            mem: vec![0xEE; len],
+            mem: std::collections::HashMap::new(),
+            len,
             log: Vec::new(),
         }
+    }
+
+    fn plane(&mut self, resource: u16) -> &mut Vec<u8> {
+        let len = self
+            .len
+            .max(snowscsi::mmc::cdr_bundle::TOC_SLOT_MAX as usize);
+        self.mem.entry(resource).or_insert_with(|| vec![0xEE; len])
+    }
+
+    fn slot(&self, slot: u8) -> Vec<u8> {
+        let mut bytes = self
+            .mem
+            .get(&snowscsi::mmc::cdr_bundle::toc_resource(slot))
+            .cloned()
+            .unwrap_or_default();
+        bytes.truncate(snowscsi::mmc::cdr_bundle::TOC_SLOT_DEFAULT as usize);
+        bytes
     }
 }
 
 impl SyncStorage for Plane {
     fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+        let start = req.offset as usize;
+        let end = start.saturating_add(match &buf {
+            IoBuf::None => 0,
+            IoBuf::Read(b) => b.len(),
+            IoBuf::Write(b) => b.len(),
+        });
         match (req.dir, buf) {
             (Direction::None, IoBuf::None) => {
-                self.log.push(Ev::Sync);
+                self.log.push(Ev::Sync(req.resource));
                 StorageReceipt::ok(0)
             }
             (Direction::ToHost, IoBuf::Read(b)) => {
                 self.log.push(Ev::Read(req.resource, req.offset, b.len()));
-                let start = req.offset as usize;
-                let end = start.saturating_add(b.len());
-                if end > self.mem.len() {
+                let plane = self.plane(req.resource);
+                if end > plane.len() {
                     return StorageReceipt::failed(
                         Fault::OutOfBounds,
                         0,
                         snowscsi::core::Effect::Known,
                     );
                 }
-                b.copy_from_slice(&self.mem[start..end]);
+                b.copy_from_slice(&plane[start..end]);
                 StorageReceipt::ok(b.len())
             }
             (Direction::FromHost, IoBuf::Write(b)) => {
                 self.log.push(Ev::Write(req.resource, req.offset, b.len()));
-                let start = req.offset as usize;
-                let end = start.saturating_add(b.len());
-                if end > self.mem.len() {
+                let plane = self.plane(req.resource);
+                if end > plane.len() {
                     return StorageReceipt::failed(
                         Fault::OutOfBounds,
                         0,
                         snowscsi::core::Effect::Known,
                     );
                 }
-                self.mem[start..end].copy_from_slice(b);
+                plane[start..end].copy_from_slice(b);
                 StorageReceipt::ok(b.len())
             }
             _ => StorageReceipt::failed(Fault::Contract, 0, snowscsi::core::Effect::Known),
@@ -231,6 +257,14 @@ fn write10(lba: u32, blocks: u16) -> [u8; 10] {
 fn sync_cache() -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = SYNC_CACHE_10;
+    cdb
+}
+
+fn reserve_track_cdb(arsv: bool, size: u32) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = RESERVE_TRACK;
+    cdb[1] = u8::from(arsv);
+    cdb[5..9].copy_from_slice(&size.to_be_bytes());
     cdb
 }
 
@@ -978,5 +1012,175 @@ fn cdr_recorder_control_sequence_returns_good_before_a_write() {
         &mut write_host,
         &mut work,
         &mut scratch,
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESERVE TRACK and the persisted-TOC reopen path
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cdr_reserve_write_sync_close_and_reopen_from_a_slot() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; BLOCK]));
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    // RESERVE TRACK allocates 500 blocks and persists the reserved TOC.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &reserve_track_cdb(false, 500),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_track_information(1, 1, 48),
+            Direction::ToHost,
+            48,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[6], 0xC1, "reserved empty track");
+    assert_eq!(&work[24..28], &500u32.to_be_bytes(), "allocation");
+
+    // ARSV is not served.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &reserve_track_cdb(true, 500),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(INVALID_FIELD)
+    );
+
+    // WRITE one block, close the track with SYNCHRONIZE CACHE, then finalize.
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // SYNCHRONIZE CACHE orders the aggregate data sync before the TOC write
+    // and the slot sync.
+    let log = &storage.inner().log;
+    let data_sync = log
+        .iter()
+        .rposition(|event| *event == Ev::Sync(0))
+        .expect("aggregate data sync");
+    let toc_write = log
+        .iter()
+        .rposition(|event| matches!(event, Ev::Write(resource, _, _) if *resource != 0))
+        .expect("TOC write");
+    let toc_sync = log
+        .iter()
+        .rposition(|event| matches!(event, Ev::Sync(resource) if *resource != 0))
+        .expect("TOC sync");
+    assert!(data_sync < toc_write && toc_write < toc_sync);
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // Both TOC slots are written; the newest one reopens the finalized disc.
+    let slots = [storage.inner().slot(0), storage.inner().slot(1)];
+    let mut newest = None;
+    let mut newest_seq = 0;
+    for slot in &slots {
+        if let Ok(medium) = CdrBundleMedium::open(slot, SECTORS, Recovery::Delete) {
+            if medium.toc_seq() > newest_seq {
+                newest_seq = medium.toc_seq();
+                newest = Some(medium);
+            }
+        }
+    }
+    let reopened = newest.expect("a valid TOC slot");
+    assert_eq!(newest_seq, 3, "reserve, sync and close each saved");
+    assert_eq!(reopened.disc_state(), CdrDiscState::Finalized);
+    assert_eq!(
+        reopened.track_numbers().collect::<Vec<_>>(),
+        vec![1],
+        "one track survives"
+    );
+    let info = reopened
+        .track_info(snowscsi::mmc::TrackInfoRequest::Number(1))
+        .expect("track 1");
+    assert_eq!(info.length, 500, "the reservation is padded on close");
+
+    // A fresh target over the reopened medium serves the persisted layout.
+    let mut reopened_target: CdrTarget = Target::new(cons(
+        LuImpl::new(Spc::new(MmcDrive::new(reopened)), 1u8),
+        Nil,
+    ));
+    assert_eq!(
+        run(
+            &mut reopened_target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 0, 0, 20),
+            Direction::ToHost,
+            20,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[8..12], &0u32.to_be_bytes(), "track 1 start");
+    assert_eq!(&work[16..20], &500u32.to_be_bytes(), "lead-out");
+    assert_eq!(
+        run(
+            &mut reopened_target,
+            &mut storage,
+            &mut host,
+            &write10(500, 1),
+            Direction::FromHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(WRITE_PROTECTED)
     );
 }

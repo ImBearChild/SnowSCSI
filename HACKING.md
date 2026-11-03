@@ -76,8 +76,9 @@ Feature maps:
 - **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
-  `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (in-memory sequential
-  CD-R medium), `async-io` (→`usb` + `snowscsi-common/async-io`), `embassy`
+  `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (sequential CD-R medium
+  with an alternating persistent TOC), `async-io` (→`usb` +
+  `snowscsi-common/async-io`), `embassy`
   (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
   `defmt` forwards to `embedded-io/defmt` and
   `snowscsi-common/defmt` (no `snowscsi-iso9660` propagation: that crate has
@@ -103,6 +104,26 @@ Feature maps:
 
 `snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
+
+### CD-R storage resource contract
+
+The `cdr-bundle` medium (`CdrBundleMedium`) addresses the application's
+storage with these resource ids:
+
+- `0` — aggregate flush. `Sync { resource: 0 }` must flush every track
+  resource.
+- `1` / `2` — the two TOC slots (`toc.0` / `toc.1`).
+- `16 + n` — track `n` (`track_<n>.bin`).
+- Any other id is a contract fault; the medium never emits one.
+
+A track resource is created/truncated by its first write at offset `0`, and a
+short read zero-fills. A TOC save pre-opens/truncates the target slot once;
+the medium then writes the body/padding first (offset 256) and the 256-byte
+header at offset 0 last, so a plain write at offset 0 must **not** truncate an
+existing resource. A FUA write syncs its data, and both CLOSE TRACK SESSION and
+SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`) before
+writing and syncing the TOC slot. The medium never deletes track files; the
+application reconciles orphans with `CdrBundleMedium::track_numbers`.
 
 ## Commit Messages
 
