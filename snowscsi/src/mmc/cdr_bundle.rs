@@ -43,7 +43,7 @@ const MAX_TRACKS: usize = 99;
 /// Fixed session-table capacity.
 const MAX_SESSIONS: usize = 16;
 /// Features that are Current for a CD-R.
-const CDR_FEATURES: &[u16] = &[0x0010, 0x001E, 0x0021, 0x002D];
+const CDR_FEATURES: &[u16] = &[0x0010, 0x001D, 0x001E, 0x0021, 0x002D];
 
 /// ILLEGAL REQUEST / INVALID ADDRESS FOR WRITE.
 const INVALID_ADDRESS_FOR_WRITE: Sense = Sense::new(0x05, 0x21, 0x02);
@@ -1022,10 +1022,12 @@ impl MmcMedium for CdrBundleMedium {
     fn track_info(&self, request: TrackInfoRequest) -> Option<TrackInfo> {
         match request {
             TrackInfoRequest::Number(0) => Some(lead_in_info()),
-            TrackInfoRequest::Number(0xFF) => Some(self.invisible_info()),
+            TrackInfoRequest::Number(0xFF) => {
+                (self.disc != CdrDiscState::Finalized).then(|| self.invisible_info())
+            }
             TrackInfoRequest::Number(number) => {
                 if usize::from(number) == self.tracks.len() + 1 {
-                    Some(self.invisible_info())
+                    (self.disc != CdrDiscState::Finalized).then(|| self.invisible_info())
                 } else {
                     self.track_entry(number)
                         .map(|track| recorded_info(track, self.capacity))
@@ -1095,8 +1097,10 @@ impl MmcMedium for CdrBundleMedium {
                 CdrDiscState::Finalized => 3,
             },
             last_session_lead_in: match self.disc {
-                CdrDiscState::Appendable => Some(MEDIUM_LEADIN),
-                CdrDiscState::Blank | CdrDiscState::Finalized => None,
+                // A blank or appendable disc reports where the next lead-in
+                // will be recorded; only a complete disc reports FF.
+                CdrDiscState::Blank | CdrDiscState::Appendable => Some(MEDIUM_LEADIN),
+                CdrDiscState::Finalized => None,
             },
             last_possible_lead_out: match self.disc {
                 CdrDiscState::Finalized => None,
@@ -1125,19 +1129,39 @@ fn lead_in_info() -> TrackInfo {
     }
 }
 
+/// Free blocks for a CD track (MMC-6 6.26.3.16.1): the last possible lead-out
+/// is two blocks before the medium capacity, and TAO reserves the final two
+/// blocks, so the user-visible space is `capacity - nwa - 4`, clamped by the
+/// track's remaining allocation.
+fn cd_free_blocks(capacity: u64, nwa: u64, allocation: Option<u64>) -> u64 {
+    let available = capacity.saturating_sub(nwa).saturating_sub(4);
+    match allocation {
+        Some(remaining) => available.min(remaining),
+        None => available,
+    }
+}
+
 /// Project a recorded track into the track-information view.
 fn recorded_info(track: &TrackEntry, capacity: u64) -> TrackInfo {
     let consumed = track.nwa.saturating_sub(track.data_start_lba);
     let free_blocks = match track.status {
         TrackStatus::Complete => 0,
-        TrackStatus::Invisible => track.allocated,
-        TrackStatus::Reserved | TrackStatus::Incomplete => {
-            if track.reserved {
-                track.allocated.saturating_sub(consumed)
-            } else {
-                capacity.saturating_sub(track.data_start_lba.saturating_add(track.length))
-            }
-        }
+        TrackStatus::Invisible => cd_free_blocks(
+            capacity,
+            track.nwa,
+            Some(track.allocated.saturating_sub(consumed)),
+        ),
+        TrackStatus::Reserved => cd_free_blocks(
+            capacity,
+            track.nwa,
+            Some(track.allocated.saturating_sub(consumed)),
+        ),
+        TrackStatus::Incomplete if track.reserved => cd_free_blocks(
+            capacity,
+            track.nwa,
+            Some(track.allocated.saturating_sub(consumed)),
+        ),
+        TrackStatus::Incomplete => cd_free_blocks(capacity, track.nwa, None),
     };
     TrackInfo {
         number: track.number,
@@ -1168,14 +1192,15 @@ impl CdrBundleMedium {
         let number = self.tracks.len() as u16 + 1;
         let (_, data_start_lba) = self.next_positions();
         let allocated = self.capacity.saturating_sub(data_start_lba);
+        let nwa = self.current_nwa();
         TrackInfo {
             number,
             session: self.sessions.len() as u16 + 1,
             start_lba: signed_lba(data_start_lba),
             length: 0,
             allocated,
-            nwa: self.current_nwa(),
-            free_blocks: allocated,
+            nwa,
+            free_blocks: cd_free_blocks(self.capacity, nwa, Some(allocated)),
             status: TrackStatus::Invisible,
             kind: TrackKind::Data,
             packet: false,
@@ -1355,7 +1380,10 @@ mod tests {
         assert!(!attrs.write_protected);
         assert!(!attrs.needs_recovery);
         assert_eq!(attrs.profile, 0x0009);
-        assert_eq!(attrs.current_features, &[0x0010, 0x001E, 0x0021, 0x002D]);
+        assert_eq!(
+            attrs.current_features,
+            &[0x0010, 0x001D, 0x001E, 0x0021, 0x002D]
+        );
 
         let info = medium.disc_info();
         assert_eq!(info.status, DiscStatus::Empty);
@@ -1364,7 +1392,7 @@ mod tests {
         assert_eq!(info.first_track_last_session, 1);
         assert_eq!(info.last_track_last_session, 1);
         assert_eq!(info.last_session_state, 0);
-        assert_eq!(info.last_session_lead_in, None);
+        assert_eq!(info.last_session_lead_in, Some(-11_077));
         assert_eq!(info.last_possible_lead_out, Some(332_998));
         assert!(!info.erasable);
         assert_eq!(info.disc_type, 0xFF);
@@ -1388,7 +1416,7 @@ mod tests {
         assert_eq!(invisible.length, 0);
         assert_eq!(invisible.allocated, 333_000);
         assert_eq!(invisible.nwa, 0);
-        assert_eq!(invisible.free_blocks, 333_000);
+        assert_eq!(invisible.free_blocks, 332_996);
         assert_eq!(invisible.status, TrackStatus::Invisible);
         assert_eq!(
             medium.track_info(TrackInfoRequest::Number(1)),
@@ -1423,7 +1451,7 @@ mod tests {
         assert_eq!(info.length, 2);
         assert_eq!(info.allocated, 0, "an implicit track has no reservation");
         assert_eq!(info.nwa, 2);
-        assert_eq!(info.free_blocks, 359_998);
+        assert_eq!(info.free_blocks, 359_994);
         assert_eq!(info.status, TrackStatus::Incomplete);
 
         assert_eq!(

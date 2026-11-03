@@ -30,10 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write-once CD-R medium model over per-track storage resources: implicit and
   reserved tracks, NWA-ordered writes, track/session close and finalize,
   zero-filled pre-gap/padding/unwritten reads, and `SYNCHRONIZE CACHE` closing
-  the open track. This is medium behaviour only; the MMC drive still does not
-  expose RESERVE TRACK or the close functions. `TrackInfo::start_lba` and the
+  the open track. This is medium behaviour only; the MMC drive routes the
+  close functions and descriptor commands to it. `TrackInfo::start_lba` and the
   `DiscInfo` lead-in/lead-out are now signed so the CD lead-in address is
   representable.
+- **mmc**: `MmcDrive` now serves a CD-R through `CdrBundleMedium`: FORMAT
+  UNIT/BLANK reject write-once media, CLOSE TRACK SESSION routes close
+  functions 001b/010b to the medium, READ DISC/TRACK INFORMATION encode the
+  recordable disc and track state (MMC-6 DIB/TIB), READ CAPACITY reports the
+  last recorded block, GET CONFIGURATION reports profile `0x09` with the
+  incremental-streaming and CD-track-at-once features, and READ TOC formats 0
+  and 1 walk the recorded track/session layout.
 - **core**: `Flow`/`ServeExit` and a target that outlives the transport link
   (host eject hands the medium back through `ResourcesReady`).
 - **mmc**: `MmcCaps` (drive capabilities are LU state; the default `MmcDrive`

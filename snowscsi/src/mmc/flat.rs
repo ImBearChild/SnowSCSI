@@ -7,7 +7,8 @@
 //! medium never allocates and owns only geometry plus the in-flight step state.
 //!
 //! Audio sectors and writes are rejected in [`MmcMedium::begin`] with no IO;
-//! the drive handles the descriptor commands (TOC/DISC/TRACK/CLOSE) itself.
+//! the drive handles the descriptor commands (TOC/DISC/TRACK) itself and
+//! routes CLOSE TRACK SESSION here as a no-op success.
 
 use super::attrs::{
     DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackKind,
@@ -331,9 +332,10 @@ impl MmcMedium for FlatCdMedium {
                 return Err(Completion::Check(WRITE_PROTECTED));
             }
             MmcOp::Commit => Op::Sync,
+            // Read-only media are already closed; CLOSE is a no-op success.
+            MmcOp::Close { .. } => return Err(Completion::Good),
             // Drive-owned descriptor/format operations never reach the medium.
             MmcOp::Format { .. }
-            | MmcOp::Close { .. }
             | MmcOp::ReserveTrack { .. }
             | MmcOp::TrackInfo { .. }
             | MmcOp::DiscInfo => return Err(Completion::Check(INVALID_FIELD)),

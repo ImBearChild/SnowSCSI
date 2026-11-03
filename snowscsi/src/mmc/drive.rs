@@ -19,7 +19,8 @@
 //! 446, 501. This module has no runtime dependency on `cdrom`.
 
 use super::attrs::{
-    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, Session, Track, TrackKind,
+    DiscInfo, DiscStatus, MmcAttrs, MmcWriteMode, SectorKind, TrackInfo, TrackInfoRequest,
+    TrackKind, TrackStatus,
 };
 use super::medium::MmcMedium;
 use super::op::MmcOp;
@@ -56,18 +57,22 @@ const BLANK: u8 = 0xA1;
 /// READ CD.
 const READ_CD: u8 = 0xBE;
 
-/// READ TOC format 0 with both descriptors (track 0/1).
-const TOC_FULL_LEN: usize = 20;
 /// READ TOC format 0 for the lead-out track (0xAA).
 const TOC_LEADOUT_LEN: usize = 12;
 /// READ TOC format 1 (session list): 4-byte header + 8-byte descriptor.
 const TOC_SESSION_LEN: usize = 12;
+/// One TOC track descriptor.
+const TOC_DESCRIPTOR_LEN: usize = 8;
+/// Staging bound for a multi-track READ TOC response: 4-byte header, one
+/// descriptor per track (the CD track-number space is 1..=99) and the lead-out.
+const TOC_MAX_LEN: usize = 4 + TOC_DESCRIPTOR_LEN * (99 + 1);
 /// READ DISC INFORMATION standard payload.
 const DISC_INFO_LEN: usize = 34;
 /// READ TRACK INFORMATION payload.
 const TRACK_INFO_LEN: usize = 48;
-/// GET CONFIGURATION response: header plus the current feature set.
-const GET_CONFIG_LEN: usize = 128;
+/// GET CONFIGURATION response: header plus the current feature set. Sized for
+/// the worst case (12 profiles + every optional descriptor).
+const GET_CONFIG_LEN: usize = 256;
 
 /// CD data block length for the default sector size.
 const DATA_SECTOR_LEN: u64 = 2048;
@@ -270,13 +275,8 @@ enum Query {
     DiscInfo,
     /// READ TRACK INFORMATION encoded by the drive.
     TrackInfo {
-        /// Requested track number.
-        track: u16,
-    },
-    /// CLOSE TRACK SESSION: validated; the drive still owns the transition.
-    Close {
-        /// Decoded close operation (`function` is only 0 for now).
-        op: MmcOp,
+        /// Decoded address mode and track/session/LBA selector.
+        request: TrackInfoRequest,
     },
     /// FORMAT UNIT / BLANK zero-fill state machine.
     Format(FormatCmd),
@@ -515,20 +515,39 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let track = cdb[6];
-        if format == 0 && !matches!(track, 0 | 1 | 0xAA) {
-            return Err(Completion::Check(INVALID_FIELD));
-        }
-        if format == 1 && track != 0 {
-            return Err(Completion::Check(INVALID_FIELD));
-        }
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
         if attrs.sectors == 0 {
             return Err(Completion::Check(MEDIUM_NOT_PRESENT));
         }
-        let total = match (format, track) {
-            (0, 0xAA) => TOC_LEADOUT_LEN,
-            (0, _) => TOC_FULL_LEN,
-            _ => TOC_SESSION_LEN,
+        let total = if format == 0 {
+            // A track selector above the last recorded track addresses no
+            // existing descriptor; 0xAA selects only the lead-out.
+            if track != 0 && track != 0xAA && u16::from(track) > attrs.tracks.min(99) {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            // Track AAh describes the lead-out of the last complete session;
+            // a blank disc or an open last session has none (Table 474).
+            if self
+                .medium
+                .as_ref()
+                .is_some_and(|m| m.disc_info().last_session_state != 3)
+            {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            if track == 0xAA {
+                TOC_LEADOUT_LEN
+            } else {
+                let first = if track == 0 { 1 } else { u16::from(track) };
+                let last = attrs.tracks.min(99);
+                let descriptors = last.saturating_sub(first).saturating_add(1);
+                4 + TOC_DESCRIPTOR_LEN * (descriptors as usize + 1)
+            }
+        } else {
+            // Format 1 returns the last complete session only.
+            if track != 0 {
+                return Err(Completion::Check(INVALID_FIELD));
+            }
+            TOC_SESSION_LEN
         };
         let alloc = usize::from(be16(&cdb[7..9]));
         self.len = total.min(alloc);
@@ -573,32 +592,18 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(MEDIUM_NOT_PRESENT));
         }
         let number = be32(&cdb[2..6]);
-        let track = match ty {
-            0 => {
-                // LBA: must be within the medium; the single track is 1.
-                if u64::from(number) >= attrs.sectors {
-                    return Err(Completion::Check(LBA_OUT_OF_RANGE));
-                }
-                1u16
-            }
-            1 => {
-                // Track number: this medium has exactly one track.
-                if number != 1 {
-                    return Err(Completion::Check(INVALID_FIELD));
-                }
-                1u16
-            }
-            _ => {
-                // Session number (type 2): exactly one session.
-                if number != 1 {
-                    return Err(Completion::Check(INVALID_FIELD));
-                }
-                1u16
-            }
+        let request = match ty {
+            0 => TrackInfoRequest::Lba(u64::from(number)),
+            1 => TrackInfoRequest::Number(
+                u16::try_from(number).map_err(|_| Completion::Check(INVALID_FIELD))?,
+            ),
+            _ => TrackInfoRequest::Session(
+                u16::try_from(number).map_err(|_| Completion::Check(INVALID_FIELD))?,
+            ),
         };
         let alloc = usize::from(be16(&cdb[7..9]));
         self.len = TRACK_INFO_LEN.min(alloc);
-        self.query = Query::TrackInfo { track };
+        self.query = Query::TrackInfo { request };
         Ok(())
     }
 
@@ -653,25 +658,43 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.begin_media(MmcOp::ReadSectors { lba, blocks, kind }, bytes as u32)
     }
 
-    /// CLOSE TRACK SESSION: close function 0 only; read-only media is already
-    /// closed. MMC-6 Table 234: byte 1 = Immed, byte 2 bits 3-0 = function.
+    /// CLOSE TRACK SESSION: MMC-6 Table 234 (byte 1 bit 0 = Immed, byte 2
+    /// bits 2-0 = close function, bytes 4-5 = logical track number).
+    ///
+    /// CD-R/-RW accepts close function 001b (track) and 010b (session);
+    /// 000b and 011b..111b are reserved. The transition belongs to the medium,
+    /// which reports a no-op success with `Err(Completion::Good)`.
     fn prepare_close(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
         if cdb.len() < 10 {
             return Err(Completion::Check(INVALID_FIELD));
         }
-        if cdb[1] & 0xFE != 0 || cdb[2] != 0 || cdb[3..10] != [0; 7] {
+        if cdb[1] & 0xFE != 0 || cdb[2] & 0xF8 != 0 || cdb[3] != 0 || cdb[6..10] != [0; 4] {
             return Err(Completion::Check(INVALID_FIELD));
         }
         check_direction(ctx, Direction::None)?;
-        if self.medium.is_none() {
+        let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
+        if attrs.sectors == 0 {
             return Err(Completion::Check(MEDIUM_NOT_PRESENT));
         }
-        self.query = Query::Close {
-            op: MmcOp::Close {
-                function: cdb[2] & 0x07,
-            },
-        };
-        Ok(())
+        let function = cdb[2] & 0x07;
+        let track = be16(&cdb[4..6]);
+        match function {
+            // The invisible track (last + 1) and the open track are both
+            // addressable; 0 selects the default track.
+            1 => {
+                if track != 0 && track != 0xFF && track > attrs.tracks.saturating_add(1) {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+            }
+            // Closing the session/finalizing addresses no track.
+            2 => {
+                if track != 0 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+            }
+            _ => return Err(Completion::Check(INVALID_FIELD)),
+        }
+        self.begin_media(MmcOp::Close { function }, 0)
     }
 
     /// TEST UNIT READY: presence first, then the medium health latch.
@@ -725,6 +748,15 @@ impl<M: MmcMedium> MmcDrive<M> {
         if !attrs.write_accessible() {
             return Err(Completion::Check(WRITE_PROTECTED));
         }
+        // FORMAT UNIT is only meaningful on writable media; a write-once
+        // medium (CD-R) must never be zero-filled by a stray FORMAT/BLANK.
+        // Unformatted (`Blank`) media stay eligible.
+        if matches!(
+            attrs.write_mode,
+            MmcWriteMode::ReadOnly | MmcWriteMode::WriteOnce
+        ) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
         self.arm_zero_fill(attrs.sectors, attrs.block_len)?;
         self.query = Query::Format(FormatCmd {
             params: fmt_data,
@@ -749,6 +781,14 @@ impl<M: MmcMedium> MmcDrive<M> {
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
         if !attrs.write_accessible() {
             return Err(Completion::Check(WRITE_PROTECTED));
+        }
+        // Only a writable medium can be blanked; a write-once CD-R has no
+        // blanking semantics and must not be zero-filled.
+        if matches!(
+            attrs.write_mode,
+            MmcWriteMode::ReadOnly | MmcWriteMode::WriteOnce
+        ) {
+            return Err(Completion::Check(INVALID_FIELD));
         }
         self.arm_zero_fill(attrs.sectors, attrs.block_len)?;
         self.query = Query::Format(FormatCmd {
@@ -1054,20 +1094,18 @@ impl<M: MmcMedium> MmcDrive<M> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                let Some(track_info) = medium.track(1) else {
+                let info = medium.disc_info();
+                let attrs = medium.attrs();
+                let mut buf = [0u8; TOC_MAX_LEN];
+                let Some(encoded) =
+                    encode_toc(medium, info, attrs.tracks, msf, format, track, &mut buf)
+                else {
                     self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
+                    return PollStep::Complete(Completion::Check(INVALID_FIELD));
                 };
-                let Some(session) = medium.session(1) else {
-                    self.query = Query::None;
-                    return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
-                };
-                let lead_out = track_info
-                    .start_lba
-                    .saturating_add(track_info.blocks)
-                    .min(u64::from(u32::MAX)) as u32;
                 self.poll_encoded(fb, data, |out| {
-                    encode_toc(track_info, session, lead_out, msf, format, track, out);
+                    let n = encoded.min(out.len());
+                    out[..n].copy_from_slice(&buf[..n]);
                     true
                 })
             }
@@ -1077,53 +1115,34 @@ impl<M: MmcMedium> MmcDrive<M> {
                     self.query = Query::None;
                     return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                let erasable = matches!(
-                    attrs.write_mode,
-                    MmcWriteMode::Rewritable | MmcWriteMode::WriteOnce
-                );
                 self.poll_encoded(fb, data, |out| {
-                    encode_disc_info(info, attrs.sectors, erasable, out);
+                    encode_disc_info(info, attrs, out);
                     true
                 })
             }
-            Query::TrackInfo { track } => {
-                let number = if track == 0 || track == 0xFF {
-                    1
-                } else {
-                    track
+            Query::TrackInfo { request } => {
+                let Some(medium) = self.medium.as_ref() else {
+                    self.query = Query::None;
+                    return PollStep::Complete(Completion::Check(MEDIUM_NOT_PRESENT));
                 };
-                let found = self.medium.as_ref().and_then(|m| m.track(number));
-                self.poll_encoded(fb, data, |out| match found {
-                    Some(track) => {
-                        encode_track_info(track, out);
-                        true
-                    }
-                    None => false,
+                let found = medium.track_info(request);
+                let attrs = medium.attrs();
+                let Some(info) = found else {
+                    self.query = Query::None;
+                    // Table 493: an LBA beyond the last possible lead-out is
+                    // LBA OUT OF RANGE; only an invalid track/session number
+                    // is an invalid field.
+                    let sense = match request {
+                        TrackInfoRequest::Lba(_) => LBA_OUT_OF_RANGE,
+                        TrackInfoRequest::Number(_) | TrackInfoRequest::Session(_) => INVALID_FIELD,
+                    };
+                    return PollStep::Complete(Completion::Check(sense));
+                };
+                let recordable_cdr = attrs.write_mode == MmcWriteMode::WriteOnce;
+                self.poll_encoded(fb, data, |out| {
+                    encode_track_info(info, recordable_cdr, out);
+                    true
                 })
-            }
-            Query::Close { op } => {
-                self.query = Query::None;
-                // Validation admits only close function 0, so the decoded
-                // operation is a no-op for the medium until a recordable
-                // medium owns the close transition.
-                if let MmcOp::Close { function } = op {
-                    debug_assert_eq!(function, 0, "only close function 0 is admitted");
-                }
-                // CLOSE is the write-state transition; a writable medium gets
-                // its local metadata commit hook (no storage IO). A failure is
-                // reported as the command's CHECK.
-                if self.attrs().is_some_and(|a| a.write_accessible()) {
-                    if let Some(medium) = self.medium.as_mut() {
-                        if let Err(completion) = medium.commit() {
-                            return PollStep::Complete(if completion == Completion::Good {
-                                Completion::Good
-                            } else {
-                                completion
-                            });
-                        }
-                    }
-                }
-                PollStep::Complete(Completion::Good)
             }
             Query::Format(cmd) => {
                 if cmd.params {
@@ -1499,7 +1518,20 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             // geometry; READ CAPACITY must not fabricate LBA 0.
             return None;
         }
-        let last = attrs.sectors.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+        // A recordable disc reports the last recorded LBA (0 while blank);
+        // flat and rewritable media report their full geometry.
+        let last = self.medium.as_ref().map_or_else(
+            || attrs.sectors.saturating_sub(1),
+            |medium| {
+                let info = medium.disc_info();
+                if info.status == DiscStatus::Empty {
+                    0
+                } else {
+                    info.last_session_lba
+                }
+            },
+        );
+        let last = last.min(u64::from(u32::MAX)) as u32;
         Some(Capacity::new(last, attrs.block_len))
     }
 
@@ -1516,19 +1548,24 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         // than delegating (`Spc` would turn `None` into an unrelated reject).
         let attrs = self.attrs().unwrap_or(NO_MEDIUM_ATTRS);
         let present = attrs.sectors != 0;
-        let current_writable = matches!(
-            attrs.write_mode,
-            MmcWriteMode::Rewritable | MmcWriteMode::WriteOnce | MmcWriteMode::Blank
-        );
         // MMC-6 Table 87: no current profile while no medium is active. The
         // *supported* profile list is a drive property and always present.
-        let current_profile = if !present {
-            0x0000u16
-        } else if self.caps.random_writable() && current_writable {
-            0x0012u16
-        } else {
-            0x0008u16
-        };
+        let current_profile = if present { attrs.profile } else { 0x0000 };
+        // A recorder also reads stamped CDs, so 0x08 is Current alongside the
+        // mounted recordable profile.
+        let read_compatible = present
+            && matches!(
+                attrs.write_mode,
+                MmcWriteMode::WriteOnce | MmcWriteMode::Rewritable
+            );
+        let feature = |code: u16| present && attrs.current_features.contains(&code);
+        // The writable-CD feature descriptors only exist for a drive whose
+        // profile list includes a recordable CD profile.
+        let recordable_cd_caps = self
+            .caps
+            .profiles()
+            .iter()
+            .any(|code| matches!(code, 0x0009 | 0x000A));
         // MMC-6 Table 257: RT=01b returns only descriptors with Current=1;
         // RT=10b returns only the matching descriptor; RT=00b everything at
         // or above the starting feature.
@@ -1538,24 +1575,35 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             _ => code >= start_feature,
         };
         let mut buf = [0u8; GET_CONFIG_LEN];
+        if !fits(0, 8, buf.len()) {
+            return None;
+        }
         let mut off = 8usize;
         if include(0x0000, true) {
-            // Profile List: the drive's supported profiles; only the mounted
-            // medium's profile is Current.
+            // Profile List: the drive's supported profiles; the mounted
+            // profile and the read-compatible CD-ROM profile are Current.
             let entries = self.caps.profiles();
             let count = entries.len();
+            let len = 4 + 4 * count;
+            if !fits(off, len, buf.len()) {
+                return None;
+            }
             buf[off..off + 2].copy_from_slice(&0x0000u16.to_be_bytes());
             buf[off + 2] = 0x03; // version 0, persistent, current
             buf[off + 3] = (4 * count) as u8;
             for (i, code) in entries.iter().enumerate() {
                 let at = off + 4 + 4 * i;
+                let current = *code == current_profile || (read_compatible && *code == 0x0008);
                 buf[at..at + 2].copy_from_slice(&code.to_be_bytes());
-                buf[at + 3] = if *code == current_profile { 0x01 } else { 0x00 };
+                buf[at + 3] = u8::from(current);
             }
-            off += 4 + 4 * count;
+            off += len;
         }
         if include(0x0001, true) {
             // Core: version 2, persistent/current, SCSI family.
+            if !fits(off, 12, buf.len()) {
+                return None;
+            }
             buf[off..off + 2].copy_from_slice(&0x0001u16.to_be_bytes());
             buf[off + 2] = 0x0B;
             buf[off + 3] = 0x08;
@@ -1565,46 +1613,64 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
         }
         if include(0x0003, true) {
             // Removable Medium.
+            if !fits(off, 8, buf.len()) {
+                return None;
+            }
             buf[off..off + 2].copy_from_slice(&0x0003u16.to_be_bytes());
             buf[off + 2] = 0x0B;
             buf[off + 3] = 0x04;
             buf[off + 4] = 0x39;
             off += 8;
         }
-        if include(0x0010, present) {
+        if include(0x0010, feature(0x0010)) {
             // Random Readable: media-dependent current bit and data. MMC-6
             // §5.2.2.4: with Current=0 the dependent data is reserved (zero).
+            if !fits(off, 12, buf.len()) {
+                return None;
+            }
+            let current = feature(0x0010);
             buf[off..off + 2].copy_from_slice(&0x0010u16.to_be_bytes());
-            buf[off + 2] = if present { 0x01 } else { 0x00 };
+            buf[off + 2] = u8::from(current);
             buf[off + 3] = 0x08;
-            if present {
+            if current {
                 buf[off + 4..off + 8].copy_from_slice(&attrs.block_len.to_be_bytes());
                 buf[off + 9] = 0x01; // blocking = 1 (16-bit field)
             }
             off += 12;
         }
-        if include(0x001D, present) {
+        if include(0x001D, feature(0x001D)) {
             // MultiRead (mandatory companion of READ CD).
+            if !fits(off, 4, buf.len()) {
+                return None;
+            }
+            let current = feature(0x001D);
             buf[off..off + 2].copy_from_slice(&0x001Du16.to_be_bytes());
-            buf[off + 2] = if present { 0x01 } else { 0x00 };
+            buf[off + 2] = u8::from(current);
             buf[off + 3] = 0x00;
             off += 4;
         }
-        if include(0x001E, present) {
+        if include(0x001E, feature(0x001E)) {
             // CD Read.
+            if !fits(off, 8, buf.len()) {
+                return None;
+            }
+            let current = feature(0x001E);
             buf[off..off + 2].copy_from_slice(&0x001Eu16.to_be_bytes());
-            buf[off + 2] = if present { 0x09 } else { 0x08 };
+            buf[off + 2] = if current { 0x09 } else { 0x08 };
             buf[off + 3] = 0x04;
             off += 8;
         }
-        let writable_now = present && current_writable;
-        if self.caps.random_writable() && include(0x0020, writable_now) {
+        if self.caps.random_writable() && include(0x0020, feature(0x0020)) {
             // Random Writable (MMC-6 Table 113): version 1, last LBA,
             // block size, blocking, PP + reserved. Current=0 carries no data.
+            if !fits(off, 16, buf.len()) {
+                return None;
+            }
+            let current = feature(0x0020);
             buf[off..off + 2].copy_from_slice(&0x0020u16.to_be_bytes());
-            buf[off + 2] = if writable_now { 0x05 } else { 0x04 };
+            buf[off + 2] = if current { 0x05 } else { 0x04 };
             buf[off + 3] = 0x0C;
-            if writable_now {
+            if current {
                 let last = attrs.sectors.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
                 buf[off + 4..off + 8].copy_from_slice(&last.to_be_bytes());
                 buf[off + 8..off + 12].copy_from_slice(&attrs.block_len.to_be_bytes());
@@ -1613,15 +1679,51 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             }
             off += 16;
         }
-        if self.caps.random_writable() && include(0x0024, writable_now) {
-            // Defect Management (MMC-6 Table 123): version 1.
-            buf[off..off + 2].copy_from_slice(&0x0024u16.to_be_bytes());
-            buf[off + 2] = if writable_now { 0x05 } else { 0x04 };
+        if recordable_cd_caps && include(0x0021, feature(0x0021)) {
+            // Incremental Streaming Writable (MMC-6 Table 116): version 3,
+            // Data Type 0 (Mode 1) supported, no link sizes.
+            if !fits(off, 8, buf.len()) {
+                return None;
+            }
+            let current = feature(0x0021);
+            buf[off..off + 2].copy_from_slice(&0x0021u16.to_be_bytes());
+            buf[off + 2] = if current { 0x0D } else { 0x0C };
             buf[off + 3] = 0x04;
+            if current {
+                buf[off + 4..off + 6].copy_from_slice(&1u16.to_be_bytes());
+            }
+            off += 8;
+        }
+        if self.caps.random_writable() && include(0x0024, feature(0x0024)) {
+            // Defect Management (MMC-6 Table 123): version 1.
+            if !fits(off, 8, buf.len()) {
+                return None;
+            }
+            let current = feature(0x0024);
+            buf[off..off + 2].copy_from_slice(&0x0024u16.to_be_bytes());
+            buf[off + 2] = if current { 0x05 } else { 0x04 };
+            buf[off + 3] = 0x04;
+            off += 8;
+        }
+        if recordable_cd_caps && include(0x002D, feature(0x002D)) {
+            // CD Track at Once (MMC-6 Table 147): version 2, Data Type 0.
+            if !fits(off, 8, buf.len()) {
+                return None;
+            }
+            let current = feature(0x002D);
+            buf[off..off + 2].copy_from_slice(&0x002Du16.to_be_bytes());
+            buf[off + 2] = if current { 0x09 } else { 0x08 };
+            buf[off + 3] = 0x04;
+            if current {
+                buf[off + 6..off + 8].copy_from_slice(&1u16.to_be_bytes());
+            }
             off += 8;
         }
         // Data Length counts every byte after the 4-byte length field and is
         // declared in full even when the caller's allocation truncates.
+        if !fits(0, 8, buf.len()) {
+            return None;
+        }
         buf[0..4].copy_from_slice(&((off - 4) as u32).to_be_bytes());
         buf[6..8].copy_from_slice(&current_profile.to_be_bytes());
         if let Some(out) = out {
@@ -1766,54 +1868,93 @@ fn toc_address(lba: u32, msf: bool) -> [u8; 4] {
     [0x00, m as u8, s as u8, f as u8]
 }
 
-/// Encode READ TOC (`cdrom/drive.rs:998–1047`) using the medium's track and
-/// session values. Format 1 is the MMC-6 4-byte header + 8-byte descriptor
-/// (12 bytes total).
-fn encode_toc(
-    track: Track,
-    session: Session,
-    lead_out_lba: u32,
+/// ADR/CTL nibble for one track descriptor.
+fn toc_control(kind: TrackKind) -> u8 {
+    match kind {
+        TrackKind::Data => 0x14,  // ADR=1, CTL=4 (data)
+        TrackKind::Audio => 0x10, // ADR=1, CTL=0 (audio)
+    }
+}
+
+/// Encode READ TOC format 0 (track list + lead-out) or format 1 (last complete
+/// session) into `out`, returning the full response length.
+///
+/// Format 0 emits one descriptor per requested track and always appends the
+/// lead-out (`0xAA`, `last_session_lba + 1`). Format 1 emits the first track of
+/// the last complete session; a disc without a complete session is rejected.
+fn encode_toc<M: MmcMedium>(
+    medium: &M,
+    info: DiscInfo,
+    tracks: u16,
     msf: bool,
     format: u8,
     track_req: u8,
     out: &mut [u8],
-) {
-    let mut buf = [0u8; TOC_FULL_LEN];
-    let ctl = match track.kind {
-        TrackKind::Data => 0x14,  // ADR=1, CTL=4 (data)
-        TrackKind::Audio => 0x10, // ADR=1, CTL=0 (audio)
-    };
+) -> Option<usize> {
+    let last_track = tracks.min(99);
+    let mut buf = [0u8; TOC_MAX_LEN];
     let total = if format == 0 {
-        if track_req == 0xAA {
-            buf[0..2].copy_from_slice(&((TOC_LEADOUT_LEN - 2) as u16).to_be_bytes());
-            buf[2] = session.first_track.min(255) as u8;
-            buf[3] = session.last_track.min(255) as u8;
-            buf[5] = ctl;
-            buf[6] = 0xAA;
-            buf[8..12].copy_from_slice(&toc_address(lead_out_lba, msf));
-            TOC_LEADOUT_LEN
+        let first = info.first_track.max(1);
+        let start = if track_req == 0 {
+            first
         } else {
-            buf[0..2].copy_from_slice(&((TOC_FULL_LEN - 2) as u16).to_be_bytes());
-            buf[2] = session.first_track.min(255) as u8;
-            buf[3] = session.last_track.min(255) as u8;
-            buf[5] = ctl;
-            buf[6] = track.number.min(255) as u8;
-            buf[8..12].copy_from_slice(&toc_address(
-                track.start_lba.min(u64::from(u32::MAX)) as u32,
-                msf,
-            ));
-            buf[13] = ctl;
-            buf[14] = 0xAA;
-            buf[16..20].copy_from_slice(&toc_address(lead_out_lba, msf));
-            TOC_FULL_LEN
+            u16::from(track_req).max(first)
+        };
+        let descriptors = if track_req == 0xAA {
+            0
+        } else {
+            last_track.saturating_sub(start).saturating_add(1)
+        };
+        let total = 4 + TOC_DESCRIPTOR_LEN * (descriptors as usize + 1);
+        if total > buf.len() {
+            return None;
         }
+        buf[0..2].copy_from_slice(&((total - 2) as u16).to_be_bytes());
+        buf[2] = first.min(255) as u8;
+        buf[3] = last_track.min(255) as u8;
+        let mut at = 4usize;
+        if track_req != 0xAA {
+            for number in start..=last_track {
+                let track = medium.track(number)?;
+                let ctl = toc_control(track.kind);
+                buf[at + 1] = ctl;
+                buf[at + 2] = track.number.min(255) as u8;
+                buf[at + 4..at + 8].copy_from_slice(&toc_address(
+                    track.start_lba.min(u64::from(u32::MAX)) as u32,
+                    msf,
+                ));
+                at += TOC_DESCRIPTOR_LEN;
+            }
+        }
+        // The lead-out follows the last program-area track.
+        let lead_out = info
+            .last_session_lba
+            .saturating_add(1)
+            .min(u64::from(u32::MAX)) as u32;
+        let ctl = match medium.track(last_track) {
+            Some(track) => toc_control(track.kind),
+            None if track_req == 0xAA => 0x14,
+            None => return None,
+        };
+        buf[at + 1] = ctl;
+        buf[at + 2] = 0xAA;
+        buf[at + 4..at + 8].copy_from_slice(&toc_address(lead_out, msf));
+        total
     } else {
-        // Format 1: first/last complete session + one 8-byte descriptor.
+        // Format 1: the last complete session. An incomplete last session
+        // leaves the previous (closed) one as the last complete session.
+        let last_complete = match info.status {
+            DiscStatus::Finalized => info.sessions,
+            DiscStatus::Incomplete if info.sessions > 1 => info.sessions - 1,
+            _ => return None,
+        };
+        let session = medium.session(last_complete)?;
+        let track = medium.track(session.first_track)?;
         buf[0..2].copy_from_slice(&((TOC_SESSION_LEN - 2) as u16).to_be_bytes());
-        buf[2] = session.number.min(255) as u8;
-        buf[3] = session.number.min(255) as u8;
-        buf[5] = ctl;
-        buf[6] = session.first_track.min(255) as u8;
+        buf[2] = 0x01;
+        buf[3] = last_complete.min(255) as u8;
+        buf[5] = toc_control(track.kind);
+        buf[6] = track.number.min(255) as u8;
         buf[8..12].copy_from_slice(&toc_address(
             track.start_lba.min(u64::from(u32::MAX)) as u32,
             msf,
@@ -1822,14 +1963,33 @@ fn encode_toc(
     };
     let n = total.min(out.len());
     out[..n].copy_from_slice(&buf[..n]);
+    Some(total)
 }
 
-/// Encode READ DISC INFORMATION (`cdrom/common.rs:1213–1237`).
+/// MSF field for READ DISC INFORMATION: binary M/S/F with the usual `+150`
+/// offset. A negative lead-in address wraps inside a 100-minute disc; `None`
+/// (but applicable) is `FF FF FF FF`.
+fn disc_msf(lba: Option<i64>) -> [u8; 4] {
+    let Some(lba) = lba else {
+        return [0xFF; 4];
+    };
+    let mut value = lba.saturating_add(150);
+    if value < 0 {
+        value = value.saturating_add(100 * 60 * 75);
+    }
+    let m = value / (75 * 60);
+    let s = (value / 75) % 60;
+    let f = value % 75;
+    [0x00, m as u8, s as u8, f as u8]
+}
+
+/// Encode READ DISC INFORMATION (MMC-6 Table 365).
 ///
-/// Byte 2 carries erasable (bit 6), state of last session (bits 3-2) and disc
-/// status (bits 1-0); `writable` is a separate policy fact and must not be
-/// substituted for erasable.
-fn encode_disc_info(info: DiscInfo, sectors: u64, erasable: bool, out: &mut [u8]) {
+/// Byte 2 carries erasable (bit 4), state of last session (bits 3-2) and disc
+/// status (bits 1-0). The Erasable bit is only set for rewritable media; a
+/// write-once CD-R reports `0`. CD media encode the lead-in and lead-out
+/// addresses as MSF; other media keep the LBA form.
+fn encode_disc_info(info: DiscInfo, attrs: MmcAttrs, out: &mut [u8]) {
     let mut buf = [0u8; DISC_INFO_LEN];
     buf[0..2].copy_from_slice(&((DISC_INFO_LEN - 2) as u16).to_be_bytes());
     let status = match info.status {
@@ -1838,40 +1998,91 @@ fn encode_disc_info(info: DiscInfo, sectors: u64, erasable: bool, out: &mut [u8]
         DiscStatus::Finalized => 2,
         DiscStatus::Other(raw) => raw & 0x03,
     };
-    // State of Last Session (MMC-6 Table 366): complete only when finalized.
-    let last_session = match info.status {
-        DiscStatus::Finalized => 3u8,
-        DiscStatus::Incomplete => 1,
-        DiscStatus::Empty | DiscStatus::Other(_) => 0,
-    };
-    buf[2] = (u8::from(erasable) << 6) | (last_session << 2) | status;
-    buf[3] = 0x01; // first track number
+    let erasable = info.erasable && matches!(attrs.write_mode, MmcWriteMode::Rewritable);
+    buf[2] = (u8::from(erasable) << 4) | ((info.last_session_state & 0x03) << 2) | status;
+    buf[3] = info.first_track.min(255) as u8;
     buf[4] = info.sessions.min(255) as u8;
-    buf[5] = 0x01; // first track in the last session
-    buf[6] = 0x01; // last track in the last session
+    buf[5] = info.first_track_last_session.min(255) as u8;
+    buf[6] = info.last_track_last_session.min(255) as u8;
     buf[7] = 0x20; // URU=1, MRW status 0
-                   // Bytes 9–19 stay zero (MSB halves, identification, last session lead-in).
-    let lead_out = sectors.min(u64::from(u32::MAX)) as u32;
-    buf[20..24].copy_from_slice(&lead_out.to_be_bytes());
+    buf[8] = info.disc_type;
+    buf[9] = (info.sessions >> 8).min(255) as u8;
+    buf[10] = (info.first_track_last_session >> 8).min(255) as u8;
+    buf[11] = (info.last_track_last_session >> 8).min(255) as u8;
+    let cdrw = matches!(attrs.profile, 0x0009 | 0x000A);
+    if cdrw {
+        // CD-R/RW: the lead-in address is negative and wraps within 100
+        // minutes; a complete disc reports FF for both fields.
+        buf[16..20].copy_from_slice(&disc_msf(info.last_session_lead_in));
+        buf[20..24].copy_from_slice(&disc_msf(info.last_possible_lead_out));
+    } else if matches!(attrs.profile, 0x0008) {
+        // A stamped/read-only CD is complete.
+        buf[16..20].copy_from_slice(&[0xFF; 4]);
+        buf[20..24].copy_from_slice(&[0xFF; 4]);
+    } else {
+        // Non-CD media: no Disc Type and zeroed lead-in/lead-out fields
+        // (MMC-6 6.21.3.1.15/17/18).
+        buf[8] = 0x00;
+    }
     let n = DISC_INFO_LEN.min(out.len());
     out[..n].copy_from_slice(&buf[..n]);
 }
 
-/// Encode READ TRACK INFORMATION (`cdrom/drive.rs:1257–1307`).
-fn encode_track_info(track: Track, out: &mut [u8]) {
+/// Encode READ TRACK INFORMATION (MMC-6 Table 494).
+///
+/// RT/Blank follow the track state and the medium class (Tables 497/502):
+/// non-recordable media always report RT=0; a recordable CD-R marks invisible
+/// and reserved tracks appropriately, distinguishes an empty reserved track
+/// from a partially recorded one, and only marks a closed track RT=1. The
+/// lead-in pseudo-track (number 0) reports no NWA and a negative start address.
+fn encode_track_info(info: TrackInfo, recordable_cdr: bool, out: &mut [u8]) {
     let mut buf = [0u8; TRACK_INFO_LEN];
     buf[0..2].copy_from_slice(&((TRACK_INFO_LEN - 2) as u16).to_be_bytes());
-    buf[2] = track.number.min(255) as u8;
-    buf[3] = track.session.min(255) as u8;
-    if track.kind == TrackKind::Data {
-        buf[5] = 0x04; // Track Mode: data (Q control)
-        buf[6] = 0x01; // Data Mode: Mode 1
+    let lead_in = info.number == 0;
+    buf[2] = info.number.min(255) as u8;
+    buf[3] = info.session.min(255) as u8;
+    // Track Mode is the Q control nibble: 0x04 data, 0x00 audio/lead-in.
+    buf[5] = if info.kind == TrackKind::Data && !lead_in {
+        0x04
+    } else {
+        0x00
+    };
+    let (rt, blank) = if lead_in {
+        (0u8, 0u8)
+    } else if !recordable_cdr {
+        // Table 497: non-recordable media report RT=0, and the Blank bit has
+        // no meaning outside CD-R/-RW.
+        (0, 0)
+    } else {
+        match info.status {
+            TrackStatus::Invisible => (0, 1),
+            TrackStatus::Reserved if info.length == 0 => (1, 1),
+            TrackStatus::Reserved => (1, 0),
+            TrackStatus::Incomplete => (0, 0),
+            TrackStatus::Complete => (1, 0),
+        }
+    };
+    let nwa_valid = !lead_in && !matches!(info.status, TrackStatus::Complete);
+    let packet = u8::from(info.packet);
+    let data_mode = if lead_in { 0u8 } else { 0x01 };
+    buf[6] = (rt << 7) | (blank << 6) | (packet << 5) | data_mode;
+    buf[7] = if nwa_valid { 0x01 } else { 0x00 }; // NWA_V bit 0, LRA_V = 0
+    buf[8..12].copy_from_slice(&(info.start_lba as u32).to_be_bytes());
+    buf[12..16].copy_from_slice(&(info.nwa.min(u64::from(u32::MAX)) as u32).to_be_bytes());
+    if nwa_valid {
+        buf[16..20]
+            .copy_from_slice(&(info.free_blocks.min(u64::from(u32::MAX)) as u32).to_be_bytes());
     }
-    buf[7] = 0x00; // reserved; NWA_V = 0 (no writable track here)
-                   // Bytes 8–19: free blocks, next writable address and NWA validity stay 0.
-    buf[20..24].copy_from_slice(&16u32.to_be_bytes()); // packet size
-    let capacity = track.blocks.min(u64::from(u32::MAX)) as u32;
-    buf[24..28].copy_from_slice(&capacity.to_be_bytes());
+    // Bytes 20-23 stay zero: this is a TAO/variable-packet medium, not a
+    // fixed-packet one.
+    let size = info.length.max(info.allocated).min(u64::from(u32::MAX)) as u32;
+    buf[24..28].copy_from_slice(&size.to_be_bytes());
+    if nwa_valid {
+        let lra = info.nwa.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+        buf[28..32].copy_from_slice(&lra.to_be_bytes());
+    }
+    buf[32] = (info.number >> 8) as u8;
+    buf[33] = (info.session >> 8) as u8;
     let n = TRACK_INFO_LEN.min(out.len());
     out[..n].copy_from_slice(&buf[..n]);
 }
@@ -1937,6 +2148,11 @@ fn check_range(lba: u64, blocks: u64, sectors: u64) -> Result<(), Completion> {
     Ok(())
 }
 
+/// Whether `at..at + len` is inside a staging buffer of `cap` bytes.
+fn fits(at: usize, len: usize, cap: usize) -> bool {
+    at.checked_add(len).is_some_and(|end| end <= cap)
+}
+
 /// Big-endian 16-bit field.
 fn be16(bytes: &[u8]) -> u16 {
     (u16::from(bytes[0]) << 8) | u16::from(bytes[1])
@@ -1960,7 +2176,7 @@ mod tests {
     use super::*;
     use crate::core::storage::{HostReceipt, IoReceipt, StorageOp};
     use crate::core::{Effect, InterruptReason as Irq, TargetId};
-    use crate::mmc::attrs::Session;
+    use crate::mmc::attrs::{Session, Track};
     use crate::mmc::flat::FlatCdMedium;
     use std::cell::Cell;
 
@@ -2125,12 +2341,15 @@ mod tests {
         assert_eq!(&data[0..2], &[0x00, 0x20]);
         assert_eq!(data[2] & 0x03, 0x02); // Disc Status = finalized
         assert_eq!((data[2] >> 2) & 0x03, 0x03); // last session complete
+        assert_eq!(data[2] & 0x10, 0x00); // not erasable
         assert_eq!(data[3], 1);
         assert_eq!(data[4], 1);
         assert_eq!(data[5], 1);
         assert_eq!(data[6], 1);
         assert_eq!(data[7], 0x20);
-        assert_eq!(&data[20..24], &100u32.to_be_bytes());
+        // A finalized CD has no applicable lead-in/lead-out addresses.
+        assert_eq!(&data[16..20], &[0xFF; 4]);
+        assert_eq!(&data[20..24], &[0xFF; 4]);
     }
 
     #[test]
@@ -2146,9 +2365,9 @@ mod tests {
         assert_eq!(data[2], 1);
         assert_eq!(data[3], 1);
         assert_eq!(data[5], 0x04); // Track Mode: data
-        assert_eq!(data[6], 0x01); // Data Mode: Mode 1
-        assert_eq!(data[7], 0x00); // reserved, NWA_V=0
-        assert_eq!(&data[20..24], &16u32.to_be_bytes());
+        assert_eq!(data[6], 0x01); // non-recordable: RT=0, Data Mode 1
+        assert_eq!(data[7], 0x00); // NWA_V=0 on a closed track
+        assert_eq!(&data[20..24], &0u32.to_be_bytes()); // no fixed packets
         assert_eq!(&data[24..28], &100u32.to_be_bytes());
     }
 
@@ -2205,8 +2424,8 @@ mod tests {
         let profile = dev.spc_profile().expect("profile");
         let mut buf = [0u8; 128];
         let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
-        assert_eq!(n, 92);
-        assert_eq!(&buf[0..4], &88u32.to_be_bytes());
+        assert_eq!(n, 108);
+        assert_eq!(&buf[0..4], &104u32.to_be_bytes());
         assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
         // Profile List: the Hyper-Multi drive supports [0x12, 0x09, 0x08];
         // only the mounted CD-ROM profile is Current.
@@ -2245,6 +2464,30 @@ mod tests {
 
         // RT=01b returns only current features at or above the start.
         assert_eq!(profile.get_configuration(1, 0x0010, None), Some(32));
+    }
+
+    #[test]
+    fn get_configuration_stays_within_its_staging_buffer_with_twelve_profiles() {
+        // The capability list allows 12 entries; the profile list plus every
+        // optional descriptor must stay inside the fixed response buffer.
+        const PROFILES: [u16; 12] = [
+            0x12, 0x09, 0x08, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0A, 0x0B, 0x0C, 0x0D,
+        ];
+        let caps = MmcCaps::new(&PROFILES, &CDROM_CAPABILITIES_PAGE, true);
+        let dev = MmcDrive::new_with_caps(FlatCdMedium::read_only(1), caps);
+        let profile = dev.spc_profile().expect("profile");
+        let mut buf = [0u8; 256];
+        let n = profile
+            .get_configuration(0, 0, Some(&mut buf))
+            .expect("GC with 12 profiles");
+        assert_eq!(n, 144, "8 header + 52 profiles + 84 descriptors");
+        assert!(n <= GET_CONFIG_LEN);
+        assert_eq!(buf[11], 48, "12 profile entries");
+        assert_eq!(&buf[0..4], &140u32.to_be_bytes());
+        // A smaller caller allocation truncates legitimately; the declared
+        // response length still describes the full data.
+        let mut small = [0u8; 32];
+        assert_eq!(profile.get_configuration(0, 0, Some(&mut small)), Some(144));
     }
 
     #[test]
@@ -2355,26 +2598,44 @@ mod tests {
     }
 
     #[test]
-    fn close_track_session_is_validated_and_good() {
+    fn close_track_session_selects_the_medium_transition() {
         let mut dev = drive(100);
         let permit = permit();
         let mut cdb = [0u8; 10];
         cdb[0] = CLOSE_TRACK_SESSION;
-        assert_eq!(dev.prepare(&permit, ctx(Direction::None, 0), &cdb), Ok(()));
-        let mut data = [0u8; 0];
-        assert!(matches!(
-            dev.poll(&permit, Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Good)
-        ));
-        assert!(!dev.active());
-
-        cdb[1] = 0x00;
-        cdb[2] = 0x01; // close function 1 is unsupported
+        // Close function 000b is reserved.
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
-        cdb[2] = 0x00;
+
+        // Function 001b (track) is routed to the medium, which reports a
+        // no-op success for already-closed media.
+        cdb[2] = 0x01;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Good)
+        );
+        assert!(!dev.active());
+
+        // Function 010b (session) is also a no-op success on a read-only CD.
+        cdb[2] = 0x02;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Good)
+        );
+
+        // Functions 011b..111b are reserved for CD-R/-RW.
+        for function in 3..=7 {
+            cdb[2] = function;
+            assert_eq!(
+                dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+                Err(Completion::Check(INVALID_FIELD)),
+                "close function {function} must be rejected"
+            );
+        }
+
+        cdb[2] = 0x01;
         cdb[1] = 0x02; // reserved byte 1 bit
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
@@ -2402,6 +2663,26 @@ mod tests {
     }
 
     // ── FORMAT/BLANK long-operation fixtures ──────────────────────────
+
+    #[test]
+    fn format_and_blank_admit_an_unformatted_blank_medium() {
+        let permit = permit();
+        let mut dev = MmcDrive::new(SpyMedium::new(MmcWriteMode::Blank, 1));
+        let cdb = [FORMAT_UNIT, 0, 0, 0, 0, 0];
+        assert_eq!(dev.prepare(&permit, ctx(Direction::None, 0), &cdb), Ok(()));
+        assert!(matches!(
+            dev.long,
+            LongOp::Foreground { .. } | LongOp::Settled { .. }
+        ));
+        dev.interrupt(&permit, Irq::Reset, KnownEffects::NONE)
+            .expect("interrupt");
+
+        let blank = [BLANK, 0, 0, 0, 0, 0];
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &blank),
+            Ok(())
+        );
+    }
 
     /// Medium double that records how often the drive touched it.
     struct SpyMedium {
@@ -3233,27 +3514,28 @@ mod tests {
     }
 
     #[test]
-    fn close_commits_only_writable_media() {
+    fn close_routes_to_the_medium_without_a_local_commit() {
         let permit = permit();
         let mut cdb = [0u8; 10];
         cdb[0] = CLOSE_TRACK_SESSION;
-        let mut data = [0u8; 0];
+        cdb[2] = 0x01; // close function 001b
 
         let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
-        assert_eq!(dev.prepare(&permit, ctx(Direction::None, 0), &cdb), Ok(()));
-        assert!(matches!(
-            dev.poll(&permit, Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Good)
-        ));
-        assert_eq!(dev.medium().expect("medium").commit_calls.get(), 1);
-
-        let mut dev = MmcDrive::new(SpyMedium::read_only(2));
-        assert_eq!(dev.prepare(&permit, ctx(Direction::None, 0), &cdb), Ok(()));
-        assert!(matches!(
-            dev.poll(&permit, Feedback::begin(), &mut data),
-            PollStep::Complete(Completion::Good)
-        ));
-        assert_eq!(dev.medium().expect("medium").commit_calls.get(), 0);
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
+            Err(Completion::Good)
+        );
+        let medium = dev.medium().expect("medium");
+        assert_eq!(
+            medium.begin_calls.get(),
+            1,
+            "the medium owns the transition"
+        );
+        assert_eq!(
+            medium.commit_calls.get(),
+            0,
+            "CLOSE is not a metadata commit"
+        );
     }
 
     #[test]
@@ -3520,7 +3802,7 @@ mod tests {
         assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
         // GC/GESN answer explicitly with the zero-sector view instead of
         // delegating to `Spc` (which would reject for an unrelated reason).
-        assert_eq!(profile.get_configuration(0, 0, None), Some(92));
+        assert_eq!(profile.get_configuration(0, 0, None), Some(108));
         assert_eq!(profile.event_status(0x10, None), Some(8));
 
         let mut cdb = [0u8; 10];
@@ -3548,7 +3830,7 @@ mod tests {
         let n = profile
             .get_configuration(0, 0, Some(&mut buf))
             .expect("GC on an empty drive");
-        assert_eq!(n, 92);
+        assert_eq!(n, 108);
         assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
         assert_eq!(&buf[12..14], &0x12u16.to_be_bytes());
         assert_eq!(buf[15], 0);
@@ -3622,8 +3904,12 @@ mod tests {
             );
             let profile = mixed.spc_profile().expect("profile");
             let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
-            assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
+            // The mounted medium still owns the Current profile, even when
+            // the capability set does not advertise random writing.
+            assert_eq!(&buf[6..8], &0x0012u16.to_be_bytes());
             assert!(feature_at(&buf, n, 0x0020).is_none());
+            assert!(feature_at(&buf, n, 0x0021).is_none());
+            assert!(feature_at(&buf, n, 0x002D).is_none());
         }
     }
 
@@ -3865,12 +4151,14 @@ mod tests {
         let mut cdb = [0u8; 10];
         cdb[0] = READ_TRACK_INFORMATION;
         cdb[8] = 48;
+        let mut data = [0u8; 64];
 
+        // A track number beyond the medium has no descriptor.
         cdb[1] = 1; // track number type
         cdb[2..6].copy_from_slice(&5u32.to_be_bytes());
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::ToHost, 48), &cdb),
-            Err(Completion::Check(INVALID_FIELD))
+            run_query(&mut dev, &cdb, 48, &mut data),
+            Completion::Check(INVALID_FIELD)
         );
 
         cdb[1] = 3; // reserved type
@@ -3879,11 +4167,12 @@ mod tests {
             Err(Completion::Check(INVALID_FIELD))
         );
 
+        // An LBA outside every track has no descriptor either.
         cdb[1] = 0; // LBA type
         cdb[2..6].copy_from_slice(&101u32.to_be_bytes());
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::ToHost, 48), &cdb),
-            Err(Completion::Check(LBA_OUT_OF_RANGE))
+            run_query(&mut dev, &cdb, 48, &mut data),
+            Completion::Check(LBA_OUT_OF_RANGE)
         );
     }
 
@@ -3921,10 +4210,10 @@ mod tests {
         assert_eq!(&buf[16..18], &0x0009u16.to_be_bytes());
         assert_eq!(buf[19], 0x00);
         assert_eq!(&buf[20..22], &0x0008u16.to_be_bytes());
-        assert_eq!(buf[23], 0x00);
+        assert_eq!(buf[23], 0x01, "CD-ROM is read-compatible with DVD-RAM");
 
         let mut at = 8usize;
-        let mut codes = [0u16; 8];
+        let mut codes = [0u16; 10];
         let mut n = 0usize;
         while at + 4 <= total && n < codes.len() {
             let code = u16::from_be_bytes([buf[at], buf[at + 1]]);
@@ -3934,8 +4223,11 @@ mod tests {
         }
         assert!(codes[..n].contains(&0x0020), "Random Writable");
         assert!(codes[..n].contains(&0x0024), "Defect Management");
+        assert!(codes[..n].contains(&0x0021), "Incremental Streaming");
+        assert!(codes[..n].contains(&0x002D), "CD Track at Once");
         // Descriptor arithmetic: profile list (2), core, removable, readable,
-        // multiread, CD read -> Random Writable at 64, Defect Management at 80.
+        // multiread, CD read -> Random Writable at 68, Incremental Streaming
+        // at 84, Defect Management at 92, CD Track at Once at 100.
         assert_eq!(&buf[68..70], &[0x00, 0x20]);
         assert_eq!(buf[70], 0x05); // version 1, current
         assert_eq!(buf[71], 0x0C);
@@ -3943,9 +4235,13 @@ mod tests {
         assert_eq!(&buf[76..80], &2048u32.to_be_bytes());
         assert_eq!(&buf[80..82], &16u16.to_be_bytes());
         assert_eq!(buf[82], 0x00); // PP
-        assert_eq!(&buf[84..86], &[0x00, 0x24]);
-        assert_eq!(buf[86], 0x05);
-        assert_eq!(buf[87], 0x04);
+        assert_eq!(&buf[84..86], &[0x00, 0x21]);
+        assert_eq!(buf[86], 0x0C, "Incremental Streaming not current");
+        assert_eq!(&buf[92..94], &[0x00, 0x24]);
+        assert_eq!(buf[94], 0x05);
+        assert_eq!(buf[95], 0x04);
+        assert_eq!(&buf[100..102], &[0x00, 0x2D]);
+        assert_eq!(buf[102], 0x08, "CD Track at Once not current");
     }
 
     #[test]
@@ -3999,5 +4295,205 @@ mod tests {
             dev.prepare(&permit, ctx(Direction::ToHost, 48), &cdb),
             Err(Completion::Check(INVALID_FIELD))
         );
+    }
+
+    fn cdr_attrs() -> MmcAttrs {
+        MmcAttrs {
+            write_mode: MmcWriteMode::WriteOnce,
+            block_len: 2048,
+            sectors: 333_000,
+            tracks: 0,
+            sessions: 0,
+            write_protected: false,
+            needs_recovery: false,
+            profile: 0x0009,
+            current_features: &[0x0010, 0x001D, 0x001E, 0x0021, 0x002D],
+        }
+    }
+
+    fn blank_disc_info() -> DiscInfo {
+        DiscInfo {
+            status: DiscStatus::Empty,
+            sessions: 1,
+            last_session_lba: 0,
+            writable: false,
+            erasable: false,
+            first_track: 1,
+            first_track_last_session: 1,
+            last_track_last_session: 1,
+            last_session_state: 0,
+            last_session_lead_in: Some(-11_077),
+            last_possible_lead_out: Some(332_998),
+            disc_type: 0xFF,
+        }
+    }
+
+    #[test]
+    fn disc_information_encoder_offsets() {
+        let mut buf = [0u8; DISC_INFO_LEN];
+        encode_disc_info(blank_disc_info(), cdr_attrs(), &mut buf);
+        assert_eq!(&buf[0..2], &((DISC_INFO_LEN - 2) as u16).to_be_bytes());
+        // Data Type 0, not erasable, empty session, empty disc.
+        assert_eq!(buf[2], 0x00);
+        assert_eq!(buf[3], 1, "first track on disc");
+        assert_eq!(buf[4], 1, "number of sessions");
+        assert_eq!(buf[5], 1, "first track in last session");
+        assert_eq!(buf[6], 1, "last track in last session");
+        assert_eq!(buf[7], 0x20, "URU");
+        assert_eq!(buf[8], 0xFF, "unknown disc type");
+        assert_eq!(&buf[9..12], &[0, 0, 0], "MSB halves");
+        assert_eq!(&buf[12..16], &[0; 4], "disc identification");
+        // Blank/appendable CD-R report the next lead-in; -11_077 wraps to
+        // 97:34:23 within a 100-minute disc.
+        assert_eq!(&buf[16..20], &[0x00, 0x61, 0x22, 0x17]);
+        // 332_998 + 150 = 74:01:73 in binary M/S/F.
+        assert_eq!(&buf[20..24], &[0x00, 0x4A, 0x01, 0x49]);
+
+        // An appendable CD-R reports the incomplete disc/session state.
+        let mut info = blank_disc_info();
+        info.status = DiscStatus::Incomplete;
+        info.last_session_state = 1;
+        let mut buf = [0u8; DISC_INFO_LEN];
+        encode_disc_info(info, cdr_attrs(), &mut buf);
+        assert_eq!(buf[2], 0x05, "incomplete disc / session");
+
+        // A complete CD-R reports FF for both addresses.
+        let mut info = blank_disc_info();
+        info.status = DiscStatus::Finalized;
+        info.last_session_state = 3;
+        info.last_session_lead_in = None;
+        info.last_possible_lead_out = None;
+        let mut buf = [0u8; DISC_INFO_LEN];
+        encode_disc_info(info, cdr_attrs(), &mut buf);
+        assert_eq!(&buf[16..20], &[0xFF; 4]);
+        assert_eq!(&buf[20..24], &[0xFF; 4]);
+
+        // A rewritable medium sets Erasable (bit 4). Non-CD media report no
+        // disc type and zeroed lead-in/lead-out fields.
+        let mut attrs = cdr_attrs();
+        attrs.write_mode = MmcWriteMode::Rewritable;
+        attrs.profile = 0x0012;
+        let mut info = blank_disc_info();
+        info.erasable = true;
+        let mut buf = [0u8; DISC_INFO_LEN];
+        encode_disc_info(info, attrs, &mut buf);
+        assert_eq!(buf[2], 0x10, "Erasable<<4 only");
+        assert_eq!(buf[8], 0x00, "no CD disc type");
+        assert_eq!(&buf[16..24], &[0u8; 8], "non-CD lead-in/lead-out");
+    }
+
+    #[test]
+    fn track_information_encoder_offsets() {
+        // Invisible track: blank, NWA valid at LBA 0, full free space.
+        let invisible = TrackInfo {
+            number: 1,
+            session: 1,
+            start_lba: 0,
+            length: 0,
+            allocated: 333_000,
+            nwa: 0,
+            free_blocks: 332_996,
+            status: TrackStatus::Invisible,
+            kind: TrackKind::Data,
+            packet: false,
+        };
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(invisible, true, &mut buf);
+        assert_eq!(&buf[0..2], &((TRACK_INFO_LEN - 2) as u16).to_be_bytes());
+        assert_eq!(buf[2], 1, "track LSB");
+        assert_eq!(buf[3], 1, "session LSB");
+        assert_eq!(buf[5], 0x04, "data track mode");
+        assert_eq!(buf[6], 0x41, "Blank=1, Data Mode 1");
+        assert_eq!(buf[7], 0x01, "NWA_V (bit 0)");
+        assert_eq!(&buf[8..12], &0u32.to_be_bytes(), "track start");
+        assert_eq!(&buf[12..16], &0u32.to_be_bytes(), "NWA");
+        assert_eq!(&buf[16..20], &332_996u32.to_be_bytes(), "free blocks");
+        assert_eq!(&buf[20..24], &0u32.to_be_bytes(), "no fixed packets");
+        assert_eq!(&buf[24..28], &333_000u32.to_be_bytes(), "track size");
+        assert_eq!(&buf[28..32], &0u32.to_be_bytes(), "NWA-1");
+        assert_eq!((buf[32], buf[33], buf[34]), (0, 0, 0), "track/session MSB");
+
+        // An empty reserved track is RT=1/Blank=1; a partially recorded one
+        // is RT=1/Blank=0.
+        let reserved = TrackInfo {
+            number: 2,
+            session: 1,
+            start_lba: 400,
+            length: 0,
+            allocated: 500,
+            nwa: 400,
+            free_blocks: 500,
+            status: TrackStatus::Reserved,
+            kind: TrackKind::Data,
+            packet: false,
+        };
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(reserved, true, &mut buf);
+        assert_eq!(buf[6], 0xC1, "reserved empty: RT=1, Blank=1");
+        assert_eq!(buf[7], 0x01, "NWA_V");
+
+        let mut reserved_with_data = reserved;
+        reserved_with_data.length = 40;
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(reserved_with_data, true, &mut buf);
+        assert_eq!(buf[6], 0x81, "reserved with data: RT=1, Blank=0");
+
+        // An incomplete track is RT=0/Blank=0.
+        let mut incomplete = reserved;
+        incomplete.status = TrackStatus::Incomplete;
+        incomplete.length = 40;
+        incomplete.allocated = 0;
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(incomplete, true, &mut buf);
+        assert_eq!(buf[6], 0x01, "incomplete: RT=0, Blank=0");
+
+        // A closed track has RT=1 and no valid NWA/free blocks.
+        let complete = TrackInfo {
+            number: 2,
+            session: 1,
+            start_lba: 100,
+            length: 10,
+            allocated: 10,
+            nwa: 110,
+            free_blocks: 0,
+            status: TrackStatus::Complete,
+            kind: TrackKind::Data,
+            packet: false,
+        };
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(complete, true, &mut buf);
+        assert_eq!(buf[2], 2);
+        assert_eq!(buf[6], 0x81, "RT=1, Data Mode 1");
+        assert_eq!(buf[7], 0x00, "no NWA_V");
+        assert_eq!(&buf[8..12], &100u32.to_be_bytes());
+        assert_eq!(&buf[16..20], &0u32.to_be_bytes());
+        assert_eq!(&buf[24..28], &10u32.to_be_bytes());
+        assert_eq!(&buf[28..32], &0u32.to_be_bytes());
+
+        // Non-recordable media always report RT=0 (Table 497).
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(complete, false, &mut buf);
+        assert_eq!(buf[6], 0x01, "non-recordable: RT=0, Blank=0");
+
+        // The lead-in pseudo-track reports no NWA and a negative start.
+        let lead_in = TrackInfo {
+            number: 0,
+            session: 0,
+            start_lba: -11_077,
+            length: 0,
+            allocated: 0,
+            nwa: 0,
+            free_blocks: 0,
+            status: TrackStatus::Complete,
+            kind: TrackKind::Data,
+            packet: false,
+        };
+        let mut buf = [0u8; TRACK_INFO_LEN];
+        encode_track_info(lead_in, true, &mut buf);
+        assert_eq!(buf[2], 0);
+        assert_eq!(buf[5], 0x00, "lead-in track mode");
+        assert_eq!(buf[6], 0x00, "RT=Blank=0");
+        assert_eq!(buf[7], 0x00, "no NWA");
+        assert_eq!(&buf[8..12], &(-11_077i32 as u32).to_be_bytes());
     }
 }

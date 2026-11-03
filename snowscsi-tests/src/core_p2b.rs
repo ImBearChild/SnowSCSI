@@ -1942,9 +1942,10 @@ fn mmc_dvdram_read_disc_information_is_finalized() {
         Ok(Completion::Good)
     );
     assert_eq!(&work[0..2], &32u16.to_be_bytes());
-    // erasable = 1, state of last session = 3 (complete), status = 2 (finalized)
-    assert_eq!(work[2], 0x4E);
+    // erasable = 1 (bit 4), state of last session = 3 (complete), status = 2
+    assert_eq!(work[2], 0x1E);
     assert_eq!(work[3], 1);
     assert_eq!(work[4], 1);
-    assert_eq!(&work[20..24], &4u32.to_be_bytes());
+    assert_eq!(work[8], 0, "non-CD media report no disc type");
+    assert_eq!(&work[16..24], &[0u8; 8], "non-CD lead-in/lead-out");
 }

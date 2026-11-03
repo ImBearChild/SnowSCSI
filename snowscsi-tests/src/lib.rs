@@ -61,5 +61,8 @@ mod core_p4;
 #[cfg(test)]
 mod card_reader;
 
+#[cfg(test)]
+mod cdr;
+
 #[cfg(all(test, has_libiscsi))]
 mod whitebox;
