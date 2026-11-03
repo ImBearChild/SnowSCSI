@@ -20,6 +20,7 @@ use snowscsi::mmc::{
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2A;
+const READ_CD: u8 = 0xBE;
 const SYNC_CACHE_10: u8 = 0x35;
 const READ_CAPACITY_10: u8 = 0x25;
 const READ_TOC: u8 = 0x43;
@@ -358,6 +359,16 @@ fn read10(lba: u32, blocks: u16) -> [u8; 10] {
     cdb
 }
 
+fn read_cd(lba: u32, blocks: u16) -> [u8; 12] {
+    let mut cdb = [0u8; 12];
+    cdb[0] = READ_CD;
+    cdb[1] = 0x04; // Expected Sector Type = CD-DA
+    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+    cdb[6..9].copy_from_slice(&u32::from(blocks).to_be_bytes()[1..]);
+    cdb[9] = 0x10; // Main Channel Selection: user data
+    cdb
+}
+
 /// SEND OPC INFORMATION with a parameter table of `len` bytes.
 fn send_opc(len: u16) -> [u8; 10] {
     let mut cdb = [0u8; 10];
@@ -419,6 +430,15 @@ fn tao_mode_page() -> Vec<u8> {
     page[10] = 0x01; // Write Type = Track-at-Once
     page[11] = 0x04; // Track Mode = data
     page[12] = 0x08; // Data Block Type = Mode 1
+    page
+}
+
+/// The same page for CD-DA audio: Track Mode 0 and Data Block Type 0 (2352
+/// bytes per host block).
+fn audio_mode_page() -> Vec<u8> {
+    let mut page = tao_mode_page();
+    page[11] = 0x00; // Track Mode = audio
+    page[12] = 0x00; // Data Block Type = CD-DA raw
     page
 }
 
@@ -3532,4 +3552,152 @@ fn cdrw_dummy_trace_and_format_unit() {
             .any(|ev| matches!(ev, Ev::Write(0, _, _))),
         "FORMAT/BLANK simulation must not zero-fill"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CD-DA audio: Track Mode 0 / DBT 0, 2352-byte Data-Out, READ CD read-back
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cdr_audio_track_trace_writes_and_reads_cd_da() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(64 * BLOCK));
+    let mut work = vec![0u8; 16 * 1024];
+    let mut scratch = vec![0u8; 4096];
+
+    // MODE SELECT page 0x05: Track-at-Once, Track Mode 0, DBT 0 (2352 bytes).
+    let params = audio_mode_page();
+    let mut select_host = BlockingHost::new(TestHost::new(params));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // One block at LBA 0 establishes the audio track, then a 2352-byte
+    // Data-Out at the non-zero LBA 1 extends it.
+    let first = vec![0x11u8; 2352];
+    let second: Vec<u8> = (0..2 * 2352)
+        .map(|index| (index as u8).wrapping_mul(23).wrapping_add(3))
+        .collect();
+    let mut host = BlockingHost::new(TestHost::new(first));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &write10(0, 1),
+            Direction::FromHost,
+            2352,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    let mut host = BlockingHost::new(TestHost::new(second.clone()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &write10(1, 2),
+            Direction::FromHost,
+            2 * 2352,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &sync_cache(),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // READ CD CD-DA returns the 2352-byte sectors written at LBA 1.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_cd(1, 2),
+            Direction::ToHost,
+            2 * 2352,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[..2 * 2352], second.as_slice());
+
+    // READ(10) is 2048-byte based and cannot address the audio track.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read10(0, 1),
+            Direction::ToHost,
+            BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(Sense::new(0x05, 0x64, 0x00))
+    );
+
+    // Close the session so READ TOC formats 0/1 describe the complete session.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &close_track_session(2, 0),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    for format in [0u8, 1] {
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &read_toc(false, format, 0, 64),
+                Direction::ToHost,
+                64,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good,
+            "READ TOC format {format}"
+        );
+        assert_eq!(work[5], 0x10, "ADR=1, CTL=0 (audio), format {format}");
+    }
 }

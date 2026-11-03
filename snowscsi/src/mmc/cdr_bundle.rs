@@ -28,6 +28,14 @@
 //! the next one after a 150-block pre-gap; pre-gaps and unwritten regions read
 //! as zeros without touching storage.
 //!
+//! Logical block accounting (capacity, LBA, NWA, track length and the TOC) is
+//! always in 2048-byte blocks, but a track resource stores its payload at the
+//! track kind's density: 2048 bytes per logical block for a data track and
+//! 2352 bytes per logical block for a CD-DA audio track. Track resource
+//! offsets are relative to the track's first user block, so a read or write
+//! must use the owning track's density; READ CD CD-DA and READ(10) therefore
+//! cannot share a span that crosses a differently sized track.
+//!
 //! Durability: a FUA write syncs its data before GOOD. `CLOSE TRACK SESSION`
 //! and `SYNCHRONIZE CACHE` both sync the aggregate data (`Sync { resource: 0 }`)
 //! before writing and syncing the TOC slot.
@@ -61,6 +69,8 @@ use crate::core::{
 
 /// CD data block length.
 const BLOCK_LEN: u32 = 2048;
+/// CD-DA audio sector length stored per logical block of an audio track.
+const AUDIO_SECTOR_LEN: u32 = 2352;
 /// Pre-gap before every track after the first.
 const PREGAP_BLOCKS: u64 = 150;
 /// Length of the 1-minute lead-in area at the start of every appended session.
@@ -83,10 +93,20 @@ const CDR_FEATURES: &[u16] = &[0x0010, 0x001D, 0x001E, 0x0021, 0x002D];
 
 /// ILLEGAL REQUEST / INVALID ADDRESS FOR WRITE.
 const INVALID_ADDRESS_FOR_WRITE: Sense = Sense::new(0x05, 0x21, 0x02);
+/// ILLEGAL REQUEST / ILLEGAL MODE FOR THIS TRACK.
+const ILLEGAL_MODE_FOR_THIS_TRACK: Sense = Sense::new(0x05, 0x64, 0x00);
 /// ILLEGAL REQUEST / SESSION FIXATION ERROR - INCOMPLETE TRACK IN SESSION.
 const SESSION_FIXATION_INCOMPLETE_TRACK: Sense = Sense::new(0x05, 0x72, 0x03);
 /// ILLEGAL REQUEST / EMPTY OR PARTIALLY WRITTEN RESERVED TRACK.
 const EMPTY_OR_PARTIALLY_WRITTEN_RESERVED_TRACK: Sense = Sense::new(0x05, 0x72, 0x04);
+
+/// Storage bytes per logical block for a track kind.
+const fn sector_len(kind: TrackKind) -> u32 {
+    match kind {
+        TrackKind::Data => BLOCK_LEN,
+        TrackKind::Audio => AUDIO_SECTOR_LEN,
+    }
+}
 
 /// Standard recordable CD capacities, expressed as the disc's lead-out start LBA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,10 +241,20 @@ pub(crate) struct SessionEntry {
 /// Backing action selected by [`MmcMedium::begin`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
-    /// Read `bytes` starting at `lba`.
-    Read { lba: u64, bytes: u32 },
-    /// Write `bytes` at `offset` into the track's resource.
-    Write { track: u16, offset: u64, bytes: u32 },
+    /// Read `bytes` starting at `lba`; `kind` fixes the per-block size.
+    Read {
+        lba: u64,
+        bytes: u32,
+        kind: TrackKind,
+    },
+    /// Write `bytes` at `offset` into the track's resource; `sector_len` is the
+    /// track's storage bytes per logical block.
+    Write {
+        track: u16,
+        offset: u64,
+        bytes: u32,
+        sector_len: u32,
+    },
     /// Consume `bytes` of host data without recording it (Test Write).
     TestWrite { bytes: u32 },
     /// Flush the backing (uncommitted data only).
@@ -634,7 +664,7 @@ impl CdrBundleMedium {
     }
 
     /// Validate a read range and return its byte count.
-    fn read_range(&self, lba: u64, blocks: u16) -> Result<u32, Completion> {
+    fn read_range(&self, lba: u64, blocks: u16, kind: TrackKind) -> Result<u32, Completion> {
         if blocks == 0 {
             return Ok(0);
         }
@@ -644,11 +674,61 @@ impl CdrBundleMedium {
         if end > self.capacity {
             return Err(Completion::Check(LBA_OUT_OF_RANGE));
         }
-        let bytes = u64::from(blocks) * u64::from(BLOCK_LEN);
+        let bytes = u64::from(blocks) * u64::from(sector_len(kind));
         if bytes > u64::from(u32::MAX) {
             return Err(Completion::Check(INVALID_FIELD));
         }
         Ok(bytes as u32)
+    }
+
+    /// Reject a read whose requested sector kind does not match every track it
+    /// touches.
+    ///
+    /// Logical block addressing stays 2048-byte based for both kinds, but the
+    /// storage layout differs (2048 vs 2352 bytes per block). A read that only
+    /// crosses gaps is valid for either kind (gaps zero-fill); a read that
+    /// touches an audio and a data track has no single consistent sector size.
+    fn check_read_kind(&self, lba: u64, blocks: u16, kind: TrackKind) -> Result<(), Completion> {
+        if blocks == 0 {
+            return Ok(());
+        }
+        let end = lba.saturating_add(u64::from(blocks));
+        for track in &self.tracks {
+            let start = track.data_start_lba;
+            let len = track.length.max(track.written).max(track.allocated);
+            let track_end = start.saturating_add(len);
+            if start < end && lba < track_end && track.kind != kind {
+                return Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `SectorKind::Auto` for a read at `lba`.
+    ///
+    /// The track containing the first block selects the sector size; an
+    /// untracked block (a gap or pre-gap) uses the logical 2048-byte size.
+    fn read_kind_at(&self, lba: u64) -> TrackKind {
+        self.tracks
+            .iter()
+            .find(|track| {
+                let start = track.data_start_lba;
+                let end =
+                    start.saturating_add(track.length.max(track.written).max(track.allocated));
+                (start..end).contains(&lba)
+            })
+            .map_or(TrackKind::Data, |track| track.kind)
+    }
+
+    /// Admit a read with an explicit sector kind.
+    fn admit_read(&mut self, lba: u64, blocks: u16, kind: TrackKind) -> Result<(), Completion> {
+        let bytes = self.read_range(lba, blocks, kind)?;
+        if bytes == 0 {
+            return Err(Completion::Good);
+        }
+        self.check_read_kind(lba, blocks, kind)?;
+        self.op = Some(Op::Read { lba, bytes, kind });
+        Ok(())
     }
 
     /// Start positions of the next track:
@@ -740,6 +820,7 @@ impl CdrBundleMedium {
         data_start_lba: u64,
         allocated: u64,
         status: TrackStatus,
+        kind: TrackKind,
         reserved: bool,
     ) -> Result<(), Completion> {
         self.ensure_session(number, session_start_lba)?;
@@ -755,7 +836,7 @@ impl CdrBundleMedium {
                 written: 0,
                 nwa: data_start_lba,
                 status,
-                kind: TrackKind::Data,
+                kind,
                 reserved,
             })
             .map_err(|_| Completion::Check(INVALID_FIELD))?;
@@ -773,7 +854,11 @@ impl CdrBundleMedium {
     }
 
     /// Admit a write, creating an implicit track when none is open.
-    fn admit_write(&mut self, lba: u64, blocks: u16) -> Result<(), Completion> {
+    ///
+    /// `kind` is the requested recording mode. A new track adopts it; a
+    /// reserved track that carries no data yet may still adopt it; an already
+    /// recorded track only accepts its own kind (`05/64/00` otherwise).
+    fn admit_write(&mut self, lba: u64, blocks: u16, kind: TrackKind) -> Result<(), Completion> {
         let end = lba
             .checked_add(u64::from(blocks))
             .ok_or(Completion::Check(LBA_OUT_OF_RANGE))?;
@@ -781,12 +866,15 @@ impl CdrBundleMedium {
             return Err(Completion::Check(LBA_OUT_OF_RANGE));
         }
 
-        let (number, session_start_lba, start_lba, data_start_lba, nwa, limit) =
+        let (number, session_start_lba, start_lba, data_start_lba, nwa, limit, block_bytes) =
             match self.open_track {
                 Some(number) => {
                     let track = self
                         .track_entry(number)
                         .ok_or(Completion::Check(INTERNAL_FAILURE))?;
+                    if track.written > 0 && track.kind != kind {
+                        return Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK));
+                    }
                     let limit = if track.reserved {
                         track.data_start_lba.saturating_add(track.allocated)
                     } else {
@@ -805,6 +893,7 @@ impl CdrBundleMedium {
                         track.data_start_lba,
                         track.nwa,
                         limit,
+                        sector_len(kind),
                     )
                 }
                 None => {
@@ -820,6 +909,7 @@ impl CdrBundleMedium {
                         data_start_lba,
                         data_start_lba,
                         self.capacity,
+                        sector_len(kind),
                     )
                 }
             };
@@ -839,6 +929,7 @@ impl CdrBundleMedium {
                 data_start_lba,
                 0,
                 TrackStatus::Incomplete,
+                kind,
                 false,
             )?;
             self.implicit_created = true;
@@ -847,13 +938,18 @@ impl CdrBundleMedium {
             .iter_mut()
             .find(|track| track.number == number && track.status != TrackStatus::Complete)
         {
+            if track.written == 0 {
+                // A reserved track was created without recording-mode
+                // information; its first real write decides data vs audio.
+                track.kind = kind;
+            }
             track.status = TrackStatus::Incomplete;
         }
 
         let offset = (lba - data_start_lba)
-            .checked_mul(u64::from(BLOCK_LEN))
+            .checked_mul(u64::from(block_bytes))
             .ok_or(Completion::Check(LBA_OUT_OF_RANGE))?;
-        let bytes = u64::from(blocks) * u64::from(BLOCK_LEN);
+        let bytes = u64::from(blocks) * u64::from(block_bytes);
         if bytes > u64::from(u32::MAX) {
             return Err(Completion::Check(INVALID_FIELD));
         }
@@ -861,6 +957,7 @@ impl CdrBundleMedium {
             track: number,
             offset,
             bytes: bytes as u32,
+            sector_len: block_bytes,
         });
         Ok(())
     }
@@ -870,14 +967,19 @@ impl CdrBundleMedium {
     /// Test Write consumes the host's data without touching the track/session
     /// tables, so the next writable address, the TOC and the backing all stay
     /// exactly as they were.
-    fn admit_test_write(&mut self, lba: u64, blocks: u16) -> Result<(), Completion> {
+    fn admit_test_write(
+        &mut self,
+        lba: u64,
+        blocks: u16,
+        kind: TrackKind,
+    ) -> Result<(), Completion> {
         let end = lba
             .checked_add(u64::from(blocks))
             .ok_or(Completion::Check(LBA_OUT_OF_RANGE))?;
         if end > self.capacity {
             return Err(Completion::Check(LBA_OUT_OF_RANGE));
         }
-        let bytes = u64::from(blocks) * u64::from(BLOCK_LEN);
+        let bytes = u64::from(blocks) * u64::from(sector_len(kind));
         if bytes > u64::from(u32::MAX) {
             return Err(Completion::Check(INVALID_FIELD));
         }
@@ -940,6 +1042,7 @@ impl CdrBundleMedium {
             data_start_lba,
             u64::from(size),
             TrackStatus::Reserved,
+            TrackKind::Data,
             true,
         )
     }
@@ -1517,13 +1620,14 @@ impl CdrBundleMedium {
             return self.finish(Completion::Check(INTERNAL_FAILURE));
         }
         let max_chunk = data.len();
-        let Some(Op::Read { lba, .. }) = self.op else {
+        let Some(Op::Read { lba, kind, .. }) = self.op else {
             return self.finish(Completion::Check(INTERNAL_FAILURE));
         };
+        let block_bytes = u64::from(sector_len(kind));
         let pos = lba
-            .saturating_mul(u64::from(BLOCK_LEN))
+            .saturating_mul(block_bytes)
             .saturating_add(u64::from(self.progress));
-        let current_lba = pos / u64::from(BLOCK_LEN);
+        let current_lba = pos / block_bytes;
 
         let recorded = self
             .tracks
@@ -1539,14 +1643,13 @@ impl CdrBundleMedium {
             let segment_end = track
                 .data_start_lba
                 .saturating_add(track.written)
-                .saturating_mul(u64::from(BLOCK_LEN));
+                .saturating_mul(block_bytes);
             let available = segment_end.saturating_sub(pos);
             let chunk = (remaining as u64).min(max_chunk as u64).min(available) as usize;
             if chunk == 0 {
                 return self.finish(Completion::Check(INTERNAL_FAILURE));
             }
-            let offset =
-                pos.saturating_sub(track.data_start_lba.saturating_mul(u64::from(BLOCK_LEN)));
+            let offset = pos.saturating_sub(track.data_start_lba.saturating_mul(block_bytes));
             self.chunk_len = chunk;
             self.phase = CdrBundleState::ReadIo;
             return PollStep::Io(StorageOp::Read {
@@ -1558,7 +1661,7 @@ impl CdrBundleMedium {
 
         let mut boundary = pos.saturating_add(remaining as u64);
         for track in &self.tracks {
-            let at = track.data_start_lba.saturating_mul(u64::from(BLOCK_LEN));
+            let at = track.data_start_lba.saturating_mul(block_bytes);
             if at > pos && at < boundary {
                 boundary = at;
             }
@@ -1683,22 +1786,15 @@ impl MmcMedium for CdrBundleMedium {
         }
         match op {
             MmcOp::Read { lba, blocks } => {
-                let bytes = self.read_range(lba, blocks)?;
-                if bytes == 0 {
-                    return Err(Completion::Good);
-                }
-                self.op = Some(Op::Read { lba, bytes });
+                self.admit_read(lba, blocks, TrackKind::Data)?;
             }
             MmcOp::ReadSectors { lba, blocks, kind } => match kind {
-                SectorKind::Auto | SectorKind::Data2048 => {
-                    let bytes = self.read_range(lba, blocks)?;
-                    if bytes == 0 {
-                        return Err(Completion::Good);
-                    }
-                    self.op = Some(Op::Read { lba, bytes });
+                SectorKind::Auto => {
+                    let resolved = self.read_kind_at(lba);
+                    self.admit_read(lba, blocks, resolved)?;
                 }
-                // No audio plane on this data medium.
-                SectorKind::Audio2352 => return Err(Completion::Check(INVALID_FIELD)),
+                SectorKind::Data2048 => self.admit_read(lba, blocks, TrackKind::Data)?,
+                SectorKind::Audio2352 => self.admit_read(lba, blocks, TrackKind::Audio)?,
             },
             MmcOp::Write { lba, blocks } => {
                 if self.write_protected() {
@@ -1708,9 +1804,9 @@ impl MmcMedium for CdrBundleMedium {
                     return Err(Completion::Good);
                 }
                 if self.test_write {
-                    self.admit_test_write(lba, blocks)?;
+                    self.admit_test_write(lba, blocks, TrackKind::Data)?;
                 } else {
-                    self.admit_write(lba, blocks)?;
+                    self.admit_write(lba, blocks, TrackKind::Data)?;
                 }
             }
             MmcOp::WriteSectors { lba, blocks, kind } => match kind {
@@ -1722,13 +1818,26 @@ impl MmcMedium for CdrBundleMedium {
                         return Err(Completion::Good);
                     }
                     if self.test_write {
-                        self.admit_test_write(lba, blocks)?;
+                        self.admit_test_write(lba, blocks, TrackKind::Data)?;
                     } else {
-                        self.admit_write(lba, blocks)?;
+                        self.admit_write(lba, blocks, TrackKind::Data)?;
                     }
                 }
-                // Physical audio writes are not simulated and stay rejected.
-                SectorKind::Audio2352 => return Err(Completion::Check(INVALID_FIELD)),
+                // CD-DA audio keeps 2352 bytes per logical block in its track
+                // resource; the LBA/NWA accounting stays 2048-byte based.
+                SectorKind::Audio2352 => {
+                    if self.write_protected() {
+                        return Err(Completion::Check(WRITE_PROTECTED));
+                    }
+                    if blocks == 0 {
+                        return Err(Completion::Good);
+                    }
+                    if self.test_write {
+                        self.admit_test_write(lba, blocks, TrackKind::Audio)?;
+                    } else {
+                        self.admit_write(lba, blocks, TrackKind::Audio)?;
+                    }
+                }
             },
             MmcOp::Commit => {
                 // A TAO recorder relies on SYNCHRONIZE CACHE to pad and close
@@ -1951,9 +2060,13 @@ impl MmcMedium for CdrBundleMedium {
                     return self.finish(Completion::Check(INTERNAL_FAILURE));
                 };
                 let confirmed = receipt.confirmed().min(chunk);
-                let before = u64::from(self.progress) / u64::from(BLOCK_LEN);
+                let Some(Op::Write { sector_len, .. }) = self.op else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                let block_bytes = u64::from(sector_len);
+                let before = u64::from(self.progress) / block_bytes;
                 self.progress = self.progress.saturating_add(confirmed as u32);
-                let after = u64::from(self.progress) / u64::from(BLOCK_LEN);
+                let after = u64::from(self.progress) / block_bytes;
                 self.confirm_write(after.saturating_sub(before));
                 if let Some(fault) = receipt.error() {
                     return self.storage_sense(fault, IoContext::Write);
@@ -2003,14 +2116,18 @@ impl MmcMedium for CdrBundleMedium {
     }
 
     fn interrupt(&mut self, _reason: InterruptReason, known: KnownEffects) {
-        if let Some(Op::Write { track, .. }) = self.op {
+        if let Some(Op::Write {
+            track, sector_len, ..
+        }) = self.op
+        {
             // A write receipt the runner already observed may not have reached
             // the medium. Book its confirmed whole blocks before dropping the
             // operation state.
             let remaining = (self.total_bytes() as u64).saturating_sub(u64::from(self.progress));
             let confirmed = known.confirmed_write.min(remaining) as u32;
-            let before = u64::from(self.progress) / u64::from(BLOCK_LEN);
-            let after = u64::from(self.progress.saturating_add(confirmed)) / u64::from(BLOCK_LEN);
+            let block_bytes = u64::from(sector_len);
+            let before = u64::from(self.progress) / block_bytes;
+            let after = u64::from(self.progress.saturating_add(confirmed)) / block_bytes;
             self.confirm_write(after.saturating_sub(before));
 
             if self.implicit_created
@@ -2510,8 +2627,33 @@ mod tests {
         payload: &[u8],
         bank: usize,
     ) -> Completion {
+        run_write_kind(
+            medium,
+            mock,
+            lba,
+            blocks,
+            payload,
+            bank,
+            SectorKind::Data2048,
+        )
+    }
+
+    /// Run a `WRITE SECTORS` operation with an explicit sector kind.
+    #[allow(clippy::too_many_arguments)]
+    fn run_write_kind<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        lba: u64,
+        blocks: u16,
+        payload: &[u8],
+        bank: usize,
+        kind: SectorKind,
+    ) -> Completion {
         let mut data = std::vec![0u8; bank];
-        assert_eq!(medium.begin(MmcOp::Write { lba, blocks }), Ok(()));
+        assert_eq!(
+            medium.begin(MmcOp::WriteSectors { lba, blocks, kind }),
+            Ok(())
+        );
         let mut feedback = Feedback::begin();
         let mut received = 0usize;
         loop {
@@ -2550,6 +2692,49 @@ mod tests {
                     return completion;
                 }
                 other => panic!("unexpected write step: {other:?}"),
+            }
+        }
+    }
+
+    /// Run a `READ SECTORS` operation with an explicit sector kind.
+    fn run_read_kind<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        lba: u64,
+        blocks: u16,
+        kind: SectorKind,
+        bank: usize,
+    ) -> (std::vec::Vec<u8>, Completion) {
+        let mut data = std::vec![0u8; bank];
+        assert_eq!(
+            medium.begin(MmcOp::ReadSectors { lba, blocks, kind }),
+            Ok(())
+        );
+        let mut feedback = Feedback::begin();
+        let mut collected = std::vec::Vec::new();
+        loop {
+            match medium.poll(feedback, &mut data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::ToHost);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Read {
+                    resource,
+                    offset,
+                    buf,
+                }) => {
+                    let len = buf.len();
+                    mock.read_into(resource, offset, buf);
+                    feedback = Feedback::io_done(IoReceipt::test(len, None, Effect::Known));
+                }
+                PollStep::Send { bytes, prefetch } => {
+                    assert!(prefetch.is_none());
+                    collected.extend_from_slice(bytes);
+                    let len = bytes.len();
+                    feedback = Feedback::host_sent(HostReceipt::test(len, None));
+                }
+                PollStep::Complete(completion) => return (collected, completion),
+                other => panic!("unexpected read step: {other:?}"),
             }
         }
     }
@@ -5047,15 +5232,35 @@ end = 1
         assert_eq!(medium.attrs().tracks, 0);
         assert!(mock.writes.is_empty());
 
-        // Physical audio writes are not simulated.
+        // CD-DA audio writes are simulated the same way: 2352 bytes per
+        // logical block are consumed, nothing is recorded.
         assert_eq!(
             medium.begin(MmcOp::WriteSectors {
                 lba: 0,
                 blocks: 1,
                 kind: SectorKind::Audio2352,
             }),
-            Err(Completion::Check(INVALID_FIELD))
+            Ok(())
         );
+        let mut audio = std::vec![0u8; 2352];
+        match medium.poll(Feedback::begin(), &mut audio) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2352),
+            other => panic!("expected audio test-write publish, got {other:?}"),
+        }
+        match medium.poll(Feedback::plan_accepted(), &mut audio) {
+            PollStep::Receive { buf, .. } => assert_eq!(buf.len(), 2352),
+            other => panic!("expected audio test-write receive, got {other:?}"),
+        }
+        match medium.poll(
+            Feedback::host_received(HostReceipt::test(2352, None)),
+            &mut audio,
+        ) {
+            PollStep::Complete(Completion::Good) => {}
+            other => panic!("expected audio test-write completion, got {other:?}"),
+        }
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert!(mock.writes.is_empty());
     }
 
     #[test]
@@ -5202,5 +5407,298 @@ end = 1
         assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
         assert_eq!(close_track(&mut medium, &mut mock, 2), Completion::Good);
         assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+    }
+
+    #[test]
+    fn audio_write_stores_2352_byte_sectors_and_reads_back() {
+        let blocks: u16 = 4;
+        let payload: std::vec::Vec<u8> = (0..usize::from(blocks) * 2352)
+            .map(|index| (index as u8).wrapping_mul(7).wrapping_add(3))
+            .collect();
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                0,
+                blocks,
+                &payload,
+                4096,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+
+        // The track resource holds 2352 bytes per logical block, while the
+        // LBA/NWA accounting stays in 2048-byte blocks.
+        assert_eq!(
+            store.mem.get(&track_resource(1)).map(std::vec::Vec::len),
+            Some(usize::from(blocks) * 2352)
+        );
+        let track = medium.track(1).expect("track 1");
+        assert_eq!(track.kind, TrackKind::Audio);
+        assert_eq!(track.blocks, u64::from(blocks));
+        assert_eq!(
+            medium.track_info(TrackInfoRequest::Number(1)).unwrap().nwa,
+            4
+        );
+
+        // READ CD CD-DA reads the exact 2352-byte sectors back.
+        let (read, completion) = run_read_kind(
+            &mut medium,
+            &mut store,
+            0,
+            blocks,
+            SectorKind::Audio2352,
+            4096,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, payload);
+
+        // READ(10) and a data READ CD have a different block size and cannot
+        // address an audio track.
+        assert_eq!(
+            medium.begin(MmcOp::Read { lba: 0, blocks: 1 }),
+            Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK))
+        );
+        assert_eq!(
+            medium.begin(MmcOp::ReadSectors {
+                lba: 0,
+                blocks: 1,
+                kind: SectorKind::Data2048,
+            }),
+            Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK))
+        );
+    }
+
+    #[test]
+    fn audio_gap_read_zero_fills_2352_byte_sectors_without_storage_io() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut mock = Mock::default();
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut mock,
+                0,
+                1,
+                &std::vec![0x5A; 2352],
+                4096,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        // The closed track covers 0..300, so 300..450 is the pre-gap of the
+        // next track (which does not exist yet).
+        mock.reads.clear();
+        let (read, completion) = run_read_kind(
+            &mut medium,
+            &mut mock,
+            300,
+            150,
+            SectorKind::Audio2352,
+            150 * 2352,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read.len(), 150 * 2352);
+        assert!(read.iter().all(|byte| *byte == 0));
+        assert!(mock.reads.is_empty(), "a gap read issues no storage IO");
+    }
+
+    #[test]
+    fn mixed_mode_audio_and_data_tracks_keep_their_sector_sizes() {
+        let audio: std::vec::Vec<u8> = (0..2 * 2352)
+            .map(|index| (index as u8).wrapping_mul(11))
+            .collect();
+        let data: std::vec::Vec<u8> = (0..3 * 2048)
+            .map(|index| (index as u8).wrapping_mul(5).wrapping_add(1))
+            .collect();
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                0,
+                2,
+                &audio,
+                4096,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        // Track 1 pads to 300 blocks, so the data track starts after the
+        // 150-block pre-gap at LBA 450.
+        assert_eq!(medium.current_nwa(), 450);
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                450,
+                3,
+                &data,
+                4096,
+                SectorKind::Data2048,
+            ),
+            Completion::Good
+        );
+        assert_eq!(medium.track(1).expect("audio").kind, TrackKind::Audio);
+        assert_eq!(medium.track(2).expect("data").kind, TrackKind::Data);
+
+        let (read_audio, completion) =
+            run_read_kind(&mut medium, &mut store, 0, 2, SectorKind::Audio2352, 4096);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read_audio, audio);
+        let (read_data, completion) =
+            run_read_kind(&mut medium, &mut store, 450, 3, SectorKind::Data2048, 4096);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read_data, data);
+
+        // A read that spans both sector sizes has no valid interpretation.
+        assert_eq!(
+            medium.begin(MmcOp::ReadSectors {
+                lba: 0,
+                blocks: 451,
+                kind: SectorKind::Audio2352,
+            }),
+            Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK))
+        );
+        assert_eq!(
+            medium.begin(MmcOp::Read { lba: 0, blocks: 1 }),
+            Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK))
+        );
+        // A CD-DA READ CD cannot address the data track either.
+        assert_eq!(
+            medium.begin(MmcOp::ReadSectors {
+                lba: 450,
+                blocks: 1,
+                kind: SectorKind::Audio2352,
+            }),
+            Err(Completion::Check(ILLEGAL_MODE_FOR_THIS_TRACK))
+        );
+
+        // Finalize, persist and restore: both kinds and both payloads survive.
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        let slot = medium.current_slot();
+        let mut reopened =
+            CdrBundleMedium::open(&store.slot(slot), 4096, Recovery::Delete).expect("reopened");
+        assert_eq!(reopened.track(1).expect("audio").kind, TrackKind::Audio);
+        assert_eq!(reopened.track(2).expect("data").kind, TrackKind::Data);
+        let (read_audio, completion) =
+            run_read_kind(&mut reopened, &mut store, 0, 2, SectorKind::Audio2352, 4096);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read_audio, audio);
+        let (read_data, completion) = run_read_kind(
+            &mut reopened,
+            &mut store,
+            450,
+            3,
+            SectorKind::Data2048,
+            4096,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read_data, data);
+    }
+
+    #[test]
+    fn audio_track_after_data_uses_in_track_byte_offsets() {
+        let audio_a: std::vec::Vec<u8> = (0..2 * 2352)
+            .map(|index| (index as u8).wrapping_mul(3).wrapping_add(7))
+            .collect();
+        let audio_b: std::vec::Vec<u8> = (0..3 * 2352)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(1))
+            .collect();
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert_eq!(medium.current_nwa(), 450);
+
+        // Track 2 is audio and starts at LBA 450; its second write is at the
+        // non-zero in-track offset LBA 452 = byte offset 2 * 2352.
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                450,
+                2,
+                &audio_a,
+                16384,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                452,
+                3,
+                &audio_b,
+                16384,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+        let resource = track_resource(2);
+        let audio_writes: std::vec::Vec<_> = store
+            .writes
+            .iter()
+            .filter(|(found, _, _)| *found == resource)
+            .copied()
+            .collect();
+        assert_eq!(
+            audio_writes,
+            std::vec![(resource, 0, 2 * 2352), (resource, 2 * 2352, 3 * 2352)]
+        );
+        let bytes = store.mem.get(&resource).expect("track 2 payload");
+        assert_eq!(bytes.len(), 5 * 2352);
+        assert_eq!(&bytes[..2 * 2352], audio_a.as_slice());
+        assert_eq!(&bytes[2 * 2352..], audio_b.as_slice());
+
+        let expected: std::vec::Vec<u8> = audio_a.iter().chain(&audio_b).copied().collect();
+        let (read, completion) =
+            run_read_kind(&mut medium, &mut store, 450, 5, SectorKind::Audio2352, 4096);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn reserved_track_adopts_the_audio_kind_on_its_first_write() {
+        let mut medium = CdrBundleMedium::with_capacity(4096);
+        let mut store = StoreMock::default();
+        assert_eq!(
+            reserve_medium(&mut medium, &mut store, 500),
+            Completion::Good
+        );
+        // RESERVE TRACK carries no recording mode; the placeholder is data.
+        assert_eq!(medium.track(1).expect("reserved").kind, TrackKind::Data);
+        let payload = std::vec![0x7Bu8; 2352];
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut store,
+                0,
+                1,
+                &payload,
+                4096,
+                SectorKind::Audio2352,
+            ),
+            Completion::Good
+        );
+        assert_eq!(medium.track(1).expect("audio").kind, TrackKind::Audio);
+        assert_eq!(
+            store.mem.get(&track_resource(1)).map(std::vec::Vec::len),
+            Some(2352),
+            "the resource holds one 2352-byte audio sector"
+        );
+        let (read, completion) =
+            run_read_kind(&mut medium, &mut store, 0, 1, SectorKind::Audio2352, 4096);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, payload);
     }
 }

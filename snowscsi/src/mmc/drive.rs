@@ -111,6 +111,14 @@ const DATA_SECTOR_LEN: u64 = 2048;
 /// CD-DA audio sector length.
 const AUDIO_SECTOR_LEN: u64 = 2352;
 
+/// Host block length selected by the Write Parameters recording mode.
+const fn write_sector_len(kind: SectorKind) -> u32 {
+    match kind {
+        SectorKind::Audio2352 => AUDIO_SECTOR_LEN as u32,
+        _ => DATA_SECTOR_LEN as u32,
+    }
+}
+
 /// FORMAT UNIT parameter list length for a Multi-Media drive (MMC-6 §6.4.3.1:
 /// a 4-byte Format List Header plus the single 8-byte Format Descriptor).
 const FORMAT_PARAMS_LEN: usize = 12;
@@ -359,6 +367,12 @@ pub struct MmcDrive<M: MmcMedium> {
     /// This is target/LUN host state (like Test Write): it survives a link
     /// loss and is cleared when a medium is installed.
     multi_session: bool,
+    /// The sector interpretation selected by Write Parameters page 0x05.
+    ///
+    /// Target/LUN host state like Test Write and Multi-session: a TAO host
+    /// chooses data (Track Mode 4, 2048-byte blocks) or CD-DA audio (Track
+    /// Mode 0, 2352-byte blocks). Cleared to data when a medium is installed.
+    write_kind: SectorKind,
 }
 
 impl<M: MmcMedium> MmcDrive<M> {
@@ -377,6 +391,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             write_speed: 0,
             test_write: false,
             multi_session: false,
+            write_kind: SectorKind::Data2048,
         }
     }
 
@@ -451,6 +466,13 @@ impl<M: MmcMedium> MmcDrive<M> {
     #[must_use]
     pub const fn multi_session(&self) -> bool {
         self.multi_session
+    }
+
+    /// The host-selected Write Parameters sector kind (data or CD-DA audio).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn write_kind(&self) -> SectorKind {
+        self.write_kind
     }
 
     /// Borrow the installed medium.
@@ -549,15 +571,30 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(INVALID_FIELD));
         }
         check_range(lba, u64::from(blocks), attrs.sectors)?;
-        let bytes = u64::from(blocks) * u64::from(attrs.block_len);
+        // A write uses the host-selected block length: 2048 for a data track
+        // and 2352 for CD-DA audio (Write Parameters page 0x05). READ(10) is
+        // always the logical 2048-byte block size, whatever the write mode.
+        let (sector_len, op) = if write {
+            let op = if self.write_kind == SectorKind::Audio2352 {
+                MmcOp::WriteSectors {
+                    lba,
+                    blocks,
+                    kind: SectorKind::Audio2352,
+                }
+            } else {
+                MmcOp::Write { lba, blocks }
+            };
+            (u64::from(write_sector_len(self.write_kind)), op)
+        } else {
+            (u64::from(attrs.block_len), MmcOp::Read { lba, blocks })
+        };
+        let bytes = u64::from(blocks) * sector_len;
         if bytes > u64::from(u32::MAX) {
             return Err(Completion::Check(INVALID_FIELD));
         }
-        let op = if write {
-            MmcOp::Write { lba, blocks }
-        } else {
-            MmcOp::Read { lba, blocks }
-        };
+        if write && matches!(ctx.declared_host_bytes(), Some(declared) if declared != bytes) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
         // Test Write never records, so a FUA write needs no aggregate sync.
         self.begin_media_fua(op, bytes as u32, write && fua && !self.test_write)
     }
@@ -790,8 +827,9 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let kind = match expected {
-            0 | 2 => SectorKind::Data2048, // All types / Mode 1
-            1 => SectorKind::Audio2352,    // CD-DA
+            0 => SectorKind::Auto,      // All types: resolve from the track at LBA
+            1 => SectorKind::Audio2352, // CD-DA
+            2 => SectorKind::Data2048,  // Mode 1
             _ => return Err(Completion::Check(INVALID_FIELD)),
         };
         let lba = u64::from(be32(&cdb[2..6]));
@@ -810,7 +848,23 @@ impl<M: MmcMedium> MmcDrive<M> {
         check_range(lba, u64::from(blocks), attrs.sectors)?;
         let sector_len = match kind {
             SectorKind::Audio2352 => AUDIO_SECTOR_LEN,
-            SectorKind::Auto | SectorKind::Data2048 => DATA_SECTOR_LEN,
+            SectorKind::Data2048 => DATA_SECTOR_LEN,
+            // Expected Sector Type 000b ("all types") lets the track at the
+            // first LBA choose the payload size; untracked/gap blocks fall back
+            // to the logical 2048-byte size. The medium resolves the same LBA
+            // again and enforces the mixed-span rule.
+            SectorKind::Auto => {
+                let audio = self
+                    .medium
+                    .as_ref()
+                    .and_then(|medium| medium.track_info(TrackInfoRequest::Lba(lba)))
+                    .is_some_and(|info| info.kind == TrackKind::Audio);
+                if audio {
+                    AUDIO_SECTOR_LEN
+                } else {
+                    DATA_SECTOR_LEN
+                }
+            }
         };
         let bytes = u64::from(blocks) * sector_len;
         if bytes > u64::from(u32::MAX) {
@@ -1624,10 +1678,11 @@ impl<M: MmcMedium> MmcDrive<M> {
                             Ok(params) => {
                                 if let Some(params) = params {
                                     // A sequential CD recorder applies the requested
-                                    // test and multi-session modes to itself and to the
-                                    // medium.
+                                    // test, multi-session and write modes to itself and
+                                    // to the medium.
                                     self.test_write = params.test_write;
                                     self.multi_session = params.multi_session;
+                                    self.write_kind = params.kind;
                                     if let Some(medium) = self.medium.as_mut() {
                                         medium.set_test_write(params.test_write);
                                         medium.set_multi_session(params.multi_session);
@@ -1861,6 +1916,7 @@ impl<M: MmcMedium> Device for MmcDrive<M> {
         self.query = Query::None;
         self.test_write = false;
         self.multi_session = false;
+        self.write_kind = SectorKind::Data2048;
         medium.set_test_write(false);
         medium.set_multi_session(false);
         self.medium = Some(medium);
@@ -1912,6 +1968,7 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
                     attrs,
                     self.test_write,
                     self.multi_session,
+                    self.write_kind,
                     &mut pages[at..],
                 )?;
                 at += bytes;
@@ -1924,6 +1981,7 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
                 attrs,
                 self.test_write,
                 self.multi_session,
+                self.write_kind,
                 &mut pages,
             )?
         };
@@ -2297,15 +2355,18 @@ const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A,
 /// Write Parameters page 0x05 for the mounted medium.
 ///
 /// A sequential recordable CD (CD-R or CD-RW) advertises the mode it actually
-/// records with: Track-at-Once (Write Type 1), data track mode 4 and
-/// 2048-byte Mode 1 data blocks (Data Block Type 8). `test_write` is the
-/// current Test Write bit (byte 2 bit 4), which the host sets for
-/// `wodim -dummy`. Read-only and other rewritable media keep the default zero
-/// page and therefore never claim TAO or Test Write.
+/// records with: Track-at-Once (Write Type 1) and either data tracks (Track
+/// Mode 4, 2048-byte Mode 1 data blocks, Data Block Type 8) or CD-DA audio
+/// tracks (Track Mode 0, 2352-byte raw blocks, Data Block Type 0).
+/// `test_write` is the current Test Write bit (byte 2 bit 4), which the host
+/// sets for `wodim -dummy`, and `write_kind` is the host-selected recording
+/// mode. Read-only and other rewritable media keep the default zero page and
+/// therefore never claim TAO or Test Write.
 fn write_params_page(
     attrs: Option<MmcAttrs>,
     test_write: bool,
     multi_session: bool,
+    write_kind: SectorKind,
 ) -> [u8; WRITE_PARAMS_LEN] {
     let mut page = [0u8; WRITE_PARAMS_LEN];
     page[0] = 0x05;
@@ -2313,8 +2374,12 @@ fn write_params_page(
     if let Some(attrs) = attrs {
         if sequential_cd(attrs) {
             page[2] = 0x01 | if test_write { 0x10 } else { 0 }; // Test Write | TAO
-            page[3] = 0x04 | if multi_session { 0xC0 } else { 0 }; // Multi-session | Track Mode data
+            page[3] = 0x04 | if multi_session { 0xC0 } else { 0 }; // Multi-session
             page[4] = 0x08; // Data Block Type: Mode 1, 2048 bytes
+            if write_kind == SectorKind::Audio2352 {
+                page[3] = if multi_session { 0xC0 } else { 0 }; // Track Mode audio
+                page[4] = 0x00; // Data Block Type: CD-DA, 2352 bytes
+            }
         }
     }
     page
@@ -2333,6 +2398,7 @@ fn write_page(
     attrs: Option<MmcAttrs>,
     test_write: bool,
     multi_session: bool,
+    write_kind: SectorKind,
     out: &mut [u8],
 ) -> Option<usize> {
     if page == 0x05 {
@@ -2343,6 +2409,7 @@ fn write_page(
             attrs,
             test_write,
             multi_session,
+            write_kind,
         ));
         return Some(WRITE_PARAMS_LEN);
     }
@@ -2833,6 +2900,8 @@ struct WriteParams {
     /// Multi-session (`11b` of byte 3 bits 7-6): a session closure keeps the
     /// disc open for another session.
     multi_session: bool,
+    /// Track Mode/Data Block Type: 2048-byte Mode 1 data or 2352-byte CD-DA.
+    kind: SectorKind,
 }
 
 /// Validate a MODE SELECT parameter list.
@@ -2840,12 +2909,13 @@ struct WriteParams {
 /// The list must carry a mode header whose block-descriptor length is zero
 /// (MM drives have no block descriptors), followed by complete mode pages. On
 /// a sequential recordable CD (CD-R or CD-RW) the Write Parameters page must
-/// describe the supported recording mode: Track-at-Once with 2048-byte user
-/// blocks. Both Data Block Type 8 (Mode 1) and 10 (Mode 2 Form 1) are
-/// accepted because both carry 2048-byte user sectors in this model (`wodim
-/// -multi -tao` sends Mode 2 Form 1). Test Write is accepted and returned so
-/// the caller can apply it. Every other medium accepts and ignores page 0x05.
-/// A list without page 0x05 is a no-op.
+/// describe a supported recording mode: Track-at-Once with either 2048-byte
+/// data blocks (Track Mode 4 + Data Block Type 8/Mode 1 or 10/Mode 2 Form 1;
+/// `wodim -multi -tao` uses the latter) or 2352-byte CD-DA audio blocks (Track
+/// Mode 0 + Data Block Type 0). Any other combination is `24/00`. Test Write
+/// and Multi-session are accepted and returned so the caller can apply them.
+/// Every other medium accepts and ignores page 0x05. A list without page 0x05
+/// is a no-op.
 fn validate_mode_select(
     ten: bool,
     data: &[u8],
@@ -2878,8 +2948,8 @@ fn validate_mode_select(
         }
         if code == 0x05 && cdr_recorder {
             // MMC-6 7.4.4: the page is 32h (or 36h with vendor specific
-            // bytes). Byte 2 bit 4 is Test Write, bits 3-0 Write Type; byte 4
-            // bits 3-0 Data Block Type.
+            // bytes). Byte 2 bit 4 is Test Write, bits 3-0 Write Type; byte 3
+            // bits 3-0 Track Mode; byte 4 bits 3-0 Data Block Type.
             if payload != 0x32 && payload != 0x36 {
                 return Err(INVALID_FIELD);
             }
@@ -2889,13 +2959,17 @@ fn validate_mode_select(
                 // rejected rather than silently treated as TAO.
                 return Err(INVALID_FIELD);
             }
-            // Only 2048-byte user blocks are accepted: Data Block Type 8
-            // (Mode 1) and 10 (Mode 2 Form 1) both carry 2048-byte user
-            // sectors, and `wodim -multi -tao` uses the latter.
+            // Only two recorded forms are supported: 2048-byte user data
+            // (Track Mode 4 with DBT 8/Mode 1 or 10/Mode 2 Form 1) and
+            // 2352-byte CD-DA audio (Track Mode 0 with DBT 0/raw). Everything
+            // else is a mode this medium cannot write.
+            let track_mode = data[at + 3] & 0x0F;
             let dbt = data[at + 4] & 0x0F;
-            if dbt != 0x08 && dbt != 0x0A {
-                return Err(INVALID_FIELD);
-            }
+            let kind = match (track_mode, dbt) {
+                (4, 8) | (4, 10) => SectorKind::Data2048,
+                (0, 0) => SectorKind::Audio2352,
+                _ => return Err(INVALID_FIELD),
+            };
             // MMC-6 7.4.4 / Table 670: bits 7-6 of byte 3. `00b` forbids a
             // next session (no B0 pointer); `01b` is the CD `B0 = FF:FF:FF`
             // variant of "next session not allowed"; `11b` allows one. We do
@@ -2908,6 +2982,7 @@ fn validate_mode_select(
             params = Some(WriteParams {
                 test_write: byte2 & 0x10 != 0,
                 multi_session: multi == 3,
+                kind,
             });
         }
         at = end;
@@ -4718,6 +4793,7 @@ mod tests {
         let boundary = boundary();
         let mut dev: MmcDrive<SpyMedium> = MmcDrive::empty(MmcCaps::hyper_multi());
         dev.multi_session = true;
+        dev.write_kind = SectorKind::Audio2352;
 
         assert!(dev
             .install_medium(&boundary, SpyMedium::write_once(16))
@@ -4725,6 +4801,11 @@ mod tests {
         assert!(
             !dev.multi_session(),
             "the drive reports the multi-session selection cleared"
+        );
+        assert_eq!(
+            dev.write_kind(),
+            SectorKind::Data2048,
+            "a new medium starts in the data write mode"
         );
         let spy = dev.take_medium(&boundary).expect("medium");
         assert_eq!(spy.multi_session_calls.get(), 1);
@@ -5650,6 +5731,140 @@ mod tests {
         ))
     }
 
+    /// Minimal byte-plane backing for the command-level CD-R traces.
+    #[cfg(feature = "cdr-bundle")]
+    #[derive(Default)]
+    struct TrackStore {
+        mem: std::collections::HashMap<u16, std::vec::Vec<u8>>,
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    impl TrackStore {
+        fn write_from(&mut self, resource: u16, offset: u64, buf: &[u8]) {
+            let bytes = self.mem.entry(resource).or_default();
+            let end = offset as usize + buf.len();
+            if bytes.len() < end {
+                bytes.resize(end, 0);
+            }
+            bytes[offset as usize..end].copy_from_slice(buf);
+        }
+
+        fn read_into(&self, resource: u16, offset: u64, buf: &mut [u8]) {
+            let src = self
+                .mem
+                .get(&resource)
+                .map_or(&[][..], |bytes| bytes.as_slice());
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = src.get(offset as usize + index).copied().unwrap_or(0);
+            }
+        }
+    }
+
+    /// Drive a WRITE(10) data phase through the whole device.
+    #[cfg(feature = "cdr-bundle")]
+    fn run_write_drive(
+        dev: &mut MmcDrive<CdrBundleMedium>,
+        lba: u32,
+        blocks: u16,
+        payload: &[u8],
+        store: &mut TrackStore,
+    ) -> Completion {
+        let permit = permit();
+        let mut cdb = [0u8; 10];
+        cdb[0] = WRITE_10;
+        cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+        cdb[7..9].copy_from_slice(&blocks.to_be_bytes());
+        let mut data = std::vec![0u8; payload.len()];
+        match dev.prepare(
+            &permit,
+            ctx(Direction::FromHost, payload.len() as u64),
+            &cdb,
+        ) {
+            Ok(()) => {}
+            Err(completion) => return completion,
+        }
+        let mut feedback = Feedback::begin();
+        let mut received = 0usize;
+        loop {
+            match dev.poll(&permit, feedback, &mut data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::FromHost);
+                    assert_eq!(plan.bytes, payload.len() as u64);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Receive { buf, .. } => {
+                    let len = buf.len();
+                    buf.copy_from_slice(&payload[received..received + len]);
+                    received += len;
+                    feedback = Feedback::host_received(HostReceipt::test(len, None));
+                }
+                PollStep::Io(StorageOp::Write {
+                    resource,
+                    offset,
+                    buf,
+                }) => {
+                    store.write_from(resource, offset, buf);
+                    feedback = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(received, payload.len());
+                    return completion;
+                }
+                other => panic!("unexpected write step: {other:?}"),
+            }
+        }
+    }
+
+    /// Drive a READ CD data phase through the whole device.
+    #[cfg(feature = "cdr-bundle")]
+    fn run_read_cd_drive(
+        dev: &mut MmcDrive<CdrBundleMedium>,
+        lba: u32,
+        blocks: u16,
+        expected: u8,
+        expected_bytes: u64,
+        store: &TrackStore,
+    ) -> (std::vec::Vec<u8>, Completion) {
+        let permit = permit();
+        let mut cdb = [0u8; 12];
+        cdb[0] = READ_CD;
+        cdb[1] = (expected & 0x07) << 2; // Expected Sector Type
+        cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+        cdb[6..9].copy_from_slice(&u32::from(blocks).to_be_bytes()[1..]);
+        cdb[9] = 0x10; // Main Channel Selection: user data
+        let mut data = std::vec![0u8; expected_bytes as usize];
+        match dev.prepare(&permit, ctx(Direction::ToHost, expected_bytes), &cdb) {
+            Ok(()) => {}
+            Err(completion) => return (std::vec::Vec::new(), completion),
+        }
+        let mut feedback = Feedback::begin();
+        let mut collected = std::vec::Vec::new();
+        loop {
+            match dev.poll(&permit, feedback, &mut data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::ToHost);
+                    assert_eq!(plan.bytes, expected_bytes);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Read {
+                    resource,
+                    offset,
+                    buf,
+                }) => {
+                    let len = buf.len();
+                    store.read_into(resource, offset, buf);
+                    feedback = Feedback::io_done(IoReceipt::test(len, None, Effect::Known));
+                }
+                PollStep::Send { bytes, .. } => {
+                    collected.extend_from_slice(bytes);
+                    feedback = Feedback::host_sent(HostReceipt::test(bytes.len(), None));
+                }
+                PollStep::Complete(completion) => return (collected, completion),
+                other => panic!("unexpected read step: {other:?}"),
+            }
+        }
+    }
+
     #[cfg(feature = "cdr-bundle")]
     #[test]
     fn cdr_blank_and_read_header_are_rejected() {
@@ -6439,5 +6654,251 @@ mod tests {
             &[1, 0x14, 0, 0xA0, 1, 0x00, 0x00, 0, 1, 0x00, 0x00]
         );
         assert_eq!(&data[15..20], &[1, 0x14, 0, 0xA1, 1]);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn mode_select_accepts_audio_and_data_track_modes() {
+        let mut dev = cdr_drive();
+        let mut data = [0u8; 128];
+        for (track_mode, dbt, kind, reported_tm, reported_dbt) in [
+            (0u8, 0u8, SectorKind::Audio2352, 0u8, 0u8),
+            (4, 8, SectorKind::Data2048, 4, 8),
+            (4, 10, SectorKind::Data2048, 4, 8),
+        ] {
+            let page = test_write_params_page(1, track_mode, dbt, false);
+            let params = mode_select_params(true, &page);
+            let cdb = mode_select_cdb(true, params.len());
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &params, &mut data),
+                Completion::Good,
+                "track mode {track_mode}, dbt {dbt}"
+            );
+            assert_eq!(dev.write_kind(), kind);
+            let profile = dev.spc_profile().expect("profile");
+            let mut buf = [0u8; 64];
+            assert_eq!(
+                profile.mode_sense(true, 0x05, false, 0, Some(&mut buf)),
+                Some(60)
+            );
+            assert_eq!(
+                buf[11] & 0x0F,
+                reported_tm,
+                "MODE SENSE Track Mode for {track_mode}/{dbt}"
+            );
+            assert_eq!(
+                buf[12], reported_dbt,
+                "MODE SENSE Data Block Type for {track_mode}/{dbt}"
+            );
+        }
+
+        // Any other Track Mode/Data Block Type pair is 24/00.
+        for (track_mode, dbt) in [(0, 8), (0, 10), (2, 0), (4, 0), (4, 11)] {
+            let page = test_write_params_page(1, track_mode, dbt, false);
+            let params = mode_select_params(true, &page);
+            let cdb = mode_select_cdb(true, params.len());
+            assert_eq!(
+                run_receive(&mut dev, &cdb, &params, &mut data),
+                Completion::Check(INVALID_FIELD),
+                "track mode {track_mode}, dbt {dbt} must be rejected"
+            );
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_audio_track_command_trace_round_trips() {
+        let mut dev = cdr_drive();
+        let mut store = TrackStore::default();
+        let mut data = [0u8; 8192];
+        let blocks: u16 = 2;
+        let payload: std::vec::Vec<u8> = (0..usize::from(blocks) * 2352)
+            .map(|index| (index as u8).wrapping_mul(13).wrapping_add(9))
+            .collect();
+
+        // MODE SELECT page 0x05: TAO, Track Mode 0 (audio), DBT 0 (raw 2352).
+        let page = test_write_params_page(1, 0, 0, false);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert_eq!(dev.write_kind(), SectorKind::Audio2352);
+        let profile = dev.spc_profile().expect("profile");
+        let mut mode = [0u8; 64];
+        assert_eq!(
+            profile.mode_sense(true, 0x05, false, 0, Some(&mut mode)),
+            Some(60)
+        );
+        assert_eq!(mode[11] & 0x0F, 0, "Track Mode = audio");
+        assert_eq!(mode[12], 0, "Data Block Type = CD-DA");
+
+        // WRITE(10) with 2352-byte host blocks records an audio track.
+        assert_eq!(
+            run_write_drive(&mut dev, 0, blocks, &payload, &mut store),
+            Completion::Good
+        );
+        let medium = dev.medium().expect("medium");
+        let track = medium.track(1).expect("track 1");
+        assert_eq!(track.kind, TrackKind::Audio);
+        assert_eq!(track.blocks, u64::from(blocks));
+        assert_eq!(
+            store
+                .mem
+                .get(&crate::mmc::cdr_bundle::track_resource(1))
+                .map(std::vec::Vec::len),
+            Some(usize::from(blocks) * 2352)
+        );
+
+        // READ CD CD-DA serves the written audio bytes.
+        let (read, completion) =
+            run_read_cd_drive(&mut dev, 0, blocks, 1, u64::from(blocks) * 2352, &store);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, payload);
+
+        // READ(10) has 2048-byte blocks and cannot address the audio track.
+        let illegal_mode = Sense::new(0x05, 0x64, 0x00);
+        let permit = permit();
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 2048), &read_cdb(0, 1)),
+            Err(Completion::Check(illegal_mode))
+        );
+
+        // SYNCHRONIZE CACHE closes the track, CLOSE finalizes the disc.
+        assert_eq!(
+            run_control_drive(
+                &mut dev,
+                &[SYNC_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &mut data
+            ),
+            Completion::Good
+        );
+        assert_eq!(
+            run_control_drive(
+                &mut dev,
+                &[CLOSE_TRACK_SESSION, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+                &mut data
+            ),
+            Completion::Good
+        );
+
+        // READ TOC formats 0 and 1 report an audio (CTL=0) track.
+        let mut toc = [0u8; 10];
+        toc[0] = READ_TOC;
+        toc[8] = 64;
+        assert_eq!(run_query(&mut dev, &toc, 64, &mut data), Completion::Good);
+        assert_eq!(data[2], 1, "first track");
+        assert_eq!(data[3], 1, "last track");
+        assert_eq!(data[5], 0x10, "ADR=1, CTL=0 (audio)");
+        toc[2] = 0x01;
+        assert_eq!(run_query(&mut dev, &toc, 64, &mut data), Completion::Good);
+        assert_eq!(data[5], 0x10, "format 1 control is audio");
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn read_cd_expected_type_all_resolves_by_track() {
+        // Audio track: Expected Sector Type 000b uses 2352-byte sectors.
+        let mut dev = cdr_drive();
+        let mut store = TrackStore::default();
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 0, 0, false);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        let audio: std::vec::Vec<u8> = (0..2 * 2352)
+            .map(|index| (index as u8).wrapping_mul(19).wrapping_add(5))
+            .collect();
+        assert_eq!(
+            run_write_drive(&mut dev, 0, 2, &audio, &mut store),
+            Completion::Good
+        );
+        let (read, completion) = run_read_cd_drive(&mut dev, 0, 2, 0, 2 * 2352, &store);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, audio);
+
+        // Data track: the same expected type uses 2048-byte sectors.
+        let mut dev = cdr_drive();
+        let mut store = TrackStore::default();
+        let block: std::vec::Vec<u8> = (0..2048).map(|index| (index as u8) ^ 0xA5).collect();
+        assert_eq!(
+            run_write_drive(&mut dev, 0, 1, &block, &mut store),
+            Completion::Good
+        );
+        let (read, completion) = run_read_cd_drive(&mut dev, 0, 1, 0, 2048, &store);
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(read, block);
+
+        // A mixed span has no single sector size: 05/64/00.
+        let mut dev = cdr_drive();
+        let mut store = TrackStore::default();
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 0, 0, false);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert_eq!(
+            run_write_drive(&mut dev, 0, 1, &std::vec![0x5A; 2352], &mut store),
+            Completion::Good
+        );
+        assert_eq!(
+            run_control_drive(
+                &mut dev,
+                &[SYNC_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &mut data
+            ),
+            Completion::Good
+        );
+        let page = test_write_params_page(1, 4, 8, false);
+        let params = mode_select_params(true, &page);
+        let cdb = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &cdb, &params, &mut data),
+            Completion::Good
+        );
+        assert_eq!(
+            run_write_drive(&mut dev, 450, 1, &std::vec![0xA5; 2048], &mut store),
+            Completion::Good
+        );
+        let illegal_mode = Sense::new(0x05, 0x64, 0x00);
+        let (_, completion) = run_read_cd_drive(&mut dev, 0, 451, 0, 451 * 2352, &store);
+        assert_eq!(completion, Completion::Check(illegal_mode));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn write_data_out_length_must_match_the_selected_mode() {
+        let mut dev = cdr_drive();
+        let permit = permit();
+        let mut cdb = [0u8; 10];
+        cdb[0] = WRITE_10;
+        cdb[7..9].copy_from_slice(&1u16.to_be_bytes());
+
+        // Default data mode wants 2048 host bytes per block.
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 2352), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+
+        // Audio mode wants 2352 host bytes per block.
+        let mut data = [0u8; 128];
+        let page = test_write_params_page(1, 0, 0, false);
+        let params = mode_select_params(true, &page);
+        let select = mode_select_cdb(true, params.len());
+        assert_eq!(
+            run_receive(&mut dev, &select, &params, &mut data),
+            Completion::Good
+        );
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::FromHost, 2048), &cdb),
+            Err(Completion::Check(INVALID_FIELD))
+        );
     }
 }

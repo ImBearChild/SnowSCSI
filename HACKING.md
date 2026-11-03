@@ -224,6 +224,66 @@ to the same logical-block write path. Closing a session with `11b` does not
 raise the finalize media-change unit attention (the addressable extent is
 unchanged).
 
+### CD-DA audio tracks
+
+The same sequential recorder can burn an audio-only or mixed-mode disc, so
+`wodim -audio -tao` works. Write Parameters page 0x05 selects the recording
+mode together with Track-at-Once (Write Type 1):
+
+| Track Mode (byte 3 bits 3-0) | Data Block Type (byte 4 bits 3-0) | Meaning |
+|------------------------------|-----------------------------------|---------|
+| 4 | 8 (Mode 1) or 10 (Mode 2 Form 1) | 2048-byte user data |
+| 0 | 0 (raw) | CD-DA audio, 2352 bytes |
+| anything else | anything else | `ILLEGAL REQUEST / INVALID FIELD IN PARAMETER LIST` (`24/00`) |
+
+Track Mode 1 (pre-emphasised audio) and Track Mode 2 (copy-controlled audio)
+are not modelled and are rejected like every other unlisted pair; the TOC
+control nibble records audio/data only, not pre-emphasis or copy permission.
+
+The selection is target/LUN host state, like Test Write and Multi-session: it
+survives a link loss, is cleared to data when a medium is installed, and MODE
+SENSE page 0x05 reports the current Track Mode/DBT back to the host. A write
+uses that block length (`blocks * 2352` for audio) and validates the
+transport's declared Data-Out length against `blocks * block_len`; a
+mismatch is `ILLEGAL REQUEST / INVALID FIELD IN CDB` (`24/00`).
+
+The medium still addresses everything in 2048-byte logical blocks: capacity,
+READ CAPACITY, LBA, NWA, track length and the TOC are unchanged in units. The
+difference is storage density inside `track_<n>.bin`:
+
+- a data track stores 2048 bytes per logical block;
+- an audio track stores 2352 bytes per logical block (its user-data area, not
+  sync/header/sub-channel).
+
+The track resource offset is relative to the track's first user block, so an
+audio track starting at LBA 450 begins at file offset 0. `RESERVE TRACK`
+carries no recording mode: the reserved placeholder is data until its first
+real write fixes the kind. `MmcOp::Write` (WRITE(10) data path) stays data;
+`MmcOp::WriteSectors { kind: Audio2352 }` creates/extends an audio track.
+Test Write (`-dummy`) consumes the same per-kind byte count without recording.
+
+Readback splits by command:
+
+- `READ CD (0xBE)` with Expected Sector Type CD-DA (`1`) serves 2352-byte
+  sectors from an audio track and is the way to read audio data. Expected
+  Sector Type `000b` ("all types", used by `readom`) resolves the sector size
+  from the track at the starting LBA: audio -> 2352 bytes, data or an
+  untracked/gap block -> 2048 bytes. The mixed-span rule below still applies,
+  so an all-types read that crosses into a differently sized track is
+  `05/64/00`.
+- `READ(10)` is always the 2048-byte logical path. Addressing an audio track
+  with it fails `ILLEGAL REQUEST / ILLEGAL MODE FOR THIS TRACK` (`05/64/00`);
+  the converse (a data READ CD over a data track) is unchanged, and a CD-DA
+  READ CD over a data track is also `05/64/00`.
+- Gaps, pre-gaps and not-yet-recorded blocks still zero-fill at the requested
+  sector size. A single read may not span an audio and a data track: every
+  track it touches must match the requested kind, otherwise `05/64/00`.
+
+Track kind is already part of the persistent TOC body (`kind = data` /
+`kind = audio`), so closing/finalizing a disc and reopening it restores mixed
+audio/data tracks and their payload unchanged. The TOC slot format itself did
+not change.
+
 ## Commit Messages
 
 This project follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
@@ -372,6 +432,12 @@ Burn with cdrkit in Track-at-Once:
 wodim -v -tao dev=/dev/sr0 /path/image.iso
 ```
 
+To burn a CD-DA audio track instead, use `wodim -v -audio -tao dev=/dev/sr0
+/path/track.wav`: the host switches Write Parameters page 0x05 to Track Mode
+0/DBT 0, writes 2352-byte sectors, and reads them back with READ CD CD-DA
+(READ(10) is `05/64/00` on the audio track). Mixed-mode discs (a data track
+next to an audio track in the same session) are supported.
+
 `-tao` is mandatory: `-dao` (SAO), packet/raw write modes are rejected by
 MODE SELECT page 0x05 with ILLEGAL REQUEST. `-dummy` (Test Write) is accepted
 in TAO: the disc simulates the burn — the host's data phase is consumed, every
@@ -431,7 +497,7 @@ The bundle directory holds the durable state:
 | Path | Content |
 |------|---------|
 | `toc.0`, `toc.1` | Alternating TOC slots; the newer valid one wins |
-| `track_1.bin`, … | Track payload (`16 + n` storage resource) |
+| `track_1.bin`, … | Track payload (`16 + n` storage resource; 2048 bytes per block for data, 2352 for audio) |
 
 Stop the server and start it again on the same directory to prove the TOC is
 re-read (`open_at` checks each slot against its physical index, so a copied
@@ -450,9 +516,11 @@ Troubleshooting:
   at Once) Current; `0x20` (Random Writable) and `0x24` (Defect Management)
   are not.
 - **`Cannot init drive`** at burn startup — MODE SELECT page 0x05 was
-  rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
-  (data) and a 2048-byte user block type: Data Block Type 8 (Mode 1) or 10
-  (Mode 2 Form 1, which `wodim -multi -tao` uses); SAO, packet and raw are
+  rejected. It must request Write Type 1 (Track-at-Once) and one supported
+  recording mode: Track Mode 4 (data) with a 2048-byte user block type
+  (Data Block Type 8/Mode 1 or 10/Mode 2 Form 1, which `wodim -multi -tao`
+  uses), or Track Mode 0 (CD-DA audio) with Data Block Type 0 (2352 bytes).
+  SAO, packet, raw non-audio and mixed Track Mode/DBT combinations are
   refused. The Test Write bit (`-dummy`) is accepted and simulated.
   The Multi-session field (byte 3 bits 7-6) accepts `00b` (finalize on close),
   `01b` (also finalize-compatible; its B0 = FF form is not emitted) and `11b`

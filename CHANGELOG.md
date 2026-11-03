@@ -44,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mmc**: CD-DA audio tracks for the persistent `cdr-bundle` medium.
+  Write Parameters page 0x05 now parses Track Mode 0 + Data Block Type 0 as
+  2352-byte audio alongside Track Mode 4 + DBT 8/10 as 2048-byte data; all
+  other Track Mode/DBT combinations are newly rejected with `24/00` (including
+  pre-emphasised Track Mode 1 and copy-controlled Track Mode 2, which the
+  control nibble does not model). MODE SENSE reports the current mode and the
+  selection is cleared on medium install. An audio track stores 2352 bytes
+  per logical block in `track_<n>.bin` while capacity, LBA/NWA, track length
+  and the TOC stay in 2048-byte blocks. WRITE(10) in audio mode uses
+  `MmcOp::WriteSectors { kind: Audio2352 }` and validates the Data-Out length
+  against the selected block size (`24/00` on a mismatch); READ CD CD-DA (and
+  all-types expected sector type, resolved from the starting track) reads the
+  audio back, while READ(10) (and a data READ CD) over an audio track is
+  `05/64/00`. A read may not span differently sized tracks, gaps still
+  zero-fill, and mixed-mode discs plus close/finalize/persist/restore keep
+  each track's kind and payload. Test Write simulates the audio byte count
+  without recording.
 - **mmc**: multi-session CD-R/CD-RW for the persistent `cdr-bundle` medium.
   Write Parameters page 0x05 byte 3 bits 7-6 is parsed (`00b`/`01b` accepted
   as finalize-compatible, `11b` allows another session, `10b` → `24/00`), and
