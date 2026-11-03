@@ -218,6 +218,17 @@ pub trait Storage {
         let _ = lun;
     }
 
+    /// The target released `lun`'s resident pair (host eject).
+    ///
+    /// Called at a management boundary after the pair has been taken, so an
+    /// adapter whose backend is no longer addressable may drop it. Fixed
+    /// media keep the default no-op. A backend that buffers data must be
+    /// flushed by the host (`CLOSE`/`SYNCHRONIZE CACHE`) before the eject;
+    /// this hook cannot recover unsaved state.
+    fn resources_released(&mut self, lun: usize) {
+        let _ = lun;
+    }
+
     /// Start one operation from metadata alone.
     ///
     /// Returns a token that the adapter rejects on every poll when no slot is

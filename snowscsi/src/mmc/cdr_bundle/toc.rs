@@ -296,7 +296,7 @@ pub(crate) struct ParsedToc {
 
 /// Largest track count that fits a slot of `slot_size` bytes.
 #[must_use]
-pub(crate) fn max_tracks_for_slot(slot_size: u32) -> u16 {
+pub fn max_tracks_for_slot(slot_size: u32) -> u16 {
     let overhead = TOC_HEADER_LEN
         .saturating_add(GLOBAL_BODY_MAX)
         .saturating_add(MAX_SESSIONS.saturating_mul(SESSION_BODY_MAX))

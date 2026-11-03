@@ -38,9 +38,9 @@ use heapless::Vec;
 pub mod toc;
 
 pub use self::toc::{
-    toc_file, toc_resource, track_file, track_resource, Recovery, TocError, TocHeader,
-    TOC_HEADER_LEN, TOC_RESOURCE_0, TOC_RESOURCE_1, TOC_SLOT_DEFAULT, TOC_SLOT_MAX, TOC_SLOT_MIN,
-    TRACK_RESOURCE_BASE,
+    max_tracks_for_slot, toc_file, toc_resource, track_file, track_resource, Recovery, TocError,
+    TocHeader, TOC_HEADER_LEN, TOC_RESOURCE_0, TOC_RESOURCE_1, TOC_SLOT_DEFAULT, TOC_SLOT_MAX,
+    TOC_SLOT_MIN, TRACK_RESOURCE_BASE,
 };
 
 use super::attrs::{

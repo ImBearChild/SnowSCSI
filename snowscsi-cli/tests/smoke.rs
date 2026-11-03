@@ -1245,3 +1245,21 @@ fn serve_warns_on_block_and_cdblock_dual_mount() {
 
     let _ = std::fs::remove_file(&img);
 }
+
+#[cfg(all(unix, feature = "cdr-bundle"))]
+#[test]
+fn serve_starts_with_cdr_bundle() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cdrbundle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+
+    run_serve_until_ready_then_sigint(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path},medium=cdr74"),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

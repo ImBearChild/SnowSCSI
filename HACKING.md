@@ -125,6 +125,31 @@ SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`) before
 writing and syncing the TOC slot. The medium never deletes track files; the
 application reconciles orphans with `CdrBundleMedium::track_numbers`.
 
+The CLI application maps that contract onto a host directory with
+`--cdrom bundle=<dir>` (`cdr-bundle` feature):
+
+- **CLI bundle backing** — `OwnedPlane::CdrBundle` owns an
+  `FsPlaneAdapter<StdFsBackend>` plus the preset's sector count, and its
+  `exec(resource, …)` routes `1`/`2` to `toc.0`/`toc.1` and `16 + n`
+  (`1 <= n <= max_tracks_for_slot(slot_size)`) to `track_<n>.bin`. Track reads
+  return the readable prefix and zero-fill only the suffix (a missing file is
+  empty); a reused track id is truncated by its first write at offset `0`. TOC
+  slots stay strict. `open_cdr_medium` performs the documented two-step read
+  (256-byte header of both slots, then the newer valid slot in full) and uses
+  `open_at` with the physical index, so a copied slot is rejected. A missing
+  slot is a blank start, but an unreadable/malformed slot is an error unless
+  the other slot is valid. A stored TOC always wins over `medium=`: the CLI
+  passes capacity `0` on reopen and warns when the hint differs, so `medium=`
+  and `slot=` only describe a new blank bundle. A missing directory is created
+  with a warning for `recovery=delete`; `recovery=readonly` requires an
+  existing TOC and never creates one. `Sync` reaches the filesystem seam's
+  page-cache flush only (no fsync). Orphan track files are not removed in v1;
+  stale tails are ignored because the TOC bounds every read. On host eject the
+  LUN plane is dropped and unsaved state is lost, so the host must
+  CLOSE/SYNCHRONIZE CACHE before ejecting; the LUN stays empty (no automatic
+  reinsert). The same `exec` drives the inline and `--banks dual` worker paths,
+  so a bundle LUN is resource-correct on both.
+
 ## Commit Messages
 
 This project follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).

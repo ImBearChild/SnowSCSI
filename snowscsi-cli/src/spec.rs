@@ -7,16 +7,21 @@
 //! ```text
 //! SPEC    := <backing>[=<value>][,<opt>...]
 //! backing := img=<file> | imgdir=<dir> | ram=<size> | live=<dir>
-//!          | dvdram=<path|ram:<size>> | empty
+//!          | dvdram=<path|ram:<size>> | bundle=<dir> | empty
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
 //!          | size=<size> | removable
+//!          | medium=cdr74|cdr80|cdr90|cdr99 | slot=<bytes>
+//!          | recovery=delete|readonly
 //! ```
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
-//! exists, or whether an `imgdir=` directory is a new or existing bundle, is
-//! decided when the device is built. Legality is also feature-independent —
-//! a backing that needs a disabled feature parses fine and is rejected at
-//! build time with a feature-specific error.
+//! exists, or whether an `imgdir=`/`bundle=` directory is a new or existing
+//! bundle, is decided when the device is built. A backing whose *options* use
+//! a library type (the CD-R medium/recovery enums) is gated by the same
+//! feature; a `bundle=` spec without `cdr-bundle` is rejected by the parser.
+
+#[cfg(feature = "cdr-bundle")]
+use snowscsi::mmc::cdr_bundle::{CdrCapacity, Recovery, TOC_SLOT_MAX, TOC_SLOT_MIN};
 
 /// The flag a spec came from (which fixes the legal backing set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +64,20 @@ pub enum Backing {
     /// `dvdram=<path>` or `dvdram=ram:<size>` — DVD-RAM (MMC only).
     /// `path = None` means memory (the size lives in [`PlaneOpts`]).
     DvdRam { path: Option<String> },
+    /// `bundle=<dir>` — a persistent CD-R bundle (MMC only). The alternating
+    /// TOC slots and every track payload live in `dir` as `toc.0`/`toc.1` and
+    /// `track_<n>.bin`.
+    #[cfg(feature = "cdr-bundle")]
+    CdrBundle {
+        dir: String,
+        /// Nominal disc size for a new bundle; a stored TOC wins on reopen.
+        medium: CdrCapacity,
+        /// TOC slot size for a new bundle (`None` = medium default); a stored
+        /// TOC wins on reopen.
+        slot: Option<u32>,
+        /// What to do with an interrupted recording.
+        recovery: Recovery,
+    },
     /// `empty` — an enumerated drive with no medium (MMC only). The first
     /// medium is installed by the application; the LUN has no byte plane.
     Empty,
@@ -107,7 +126,33 @@ pub fn parse_all(block: &[String], cdrom: &[String]) -> Result<Vec<DeviceSpec>, 
             .map_err(|e| format!("invalid --cdrom spec '{raw}': {e}"))?;
         specs.push(spec);
     }
+    if let Some(dir) = duplicate_bundle_dir(&specs) {
+        return Err(format!(
+            "bundle directory '{dir}' is served by more than one LUN; \
+             use one directory per CD-R bundle"
+        ));
+    }
     Ok(specs)
+}
+
+/// The first bundle directory served by more than one LUN, if any.
+///
+/// Two write-once LUNs over one directory would interleave TOC saves and
+/// corrupt the disc, so this is an error rather than the dual-mount warning.
+pub fn duplicate_bundle_dir(specs: &[DeviceSpec]) -> Option<&str> {
+    #[cfg(feature = "cdr-bundle")]
+    {
+        let mut seen = std::collections::HashSet::new();
+        for spec in specs {
+            if let Backing::CdrBundle { dir, .. } = &spec.backing {
+                if !seen.insert(dir.as_str()) {
+                    return Some(dir.as_str());
+                }
+            }
+        }
+    }
+    let _ = specs;
+    None
 }
 
 /// Parse one `<backing>[=<value>][,<opt>...]` value for `family`.
@@ -118,6 +163,7 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
     };
     let opts = parse_opts(opts_str)?;
     let (backing, implicit_size) = parse_backing(backing_expr)?;
+    let backing = apply_bundle_opts(backing, &opts)?;
 
     // `dvdram=ram:<size>` carries its own size and takes no options at all.
     if matches!(backing, Backing::DvdRam { path: None }) && !opts_str.is_empty() {
@@ -145,7 +191,11 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
 
     let size = opts.size.or(implicit_size);
 
-    let read_only = matches!(role, DeviceRole::BlockCd | DeviceRole::MmcCd) || opts.read_only;
+    // A bundle is a writable sequential medium even though it has no byte
+    // plane: `ro` is rejected above, so the hint never makes it read-only.
+    let read_only = (!is_cdr_bundle(&backing)
+        && matches!(role, DeviceRole::BlockCd | DeviceRole::MmcCd))
+        || opts.read_only;
     Ok(DeviceSpec {
         raw: input.to_string(),
         role,
@@ -224,10 +274,90 @@ fn parse_backing(expr: &str) -> Result<(Backing, Option<u64>), String> {
                 None,
             ))
         }
+    } else if let Some(v) = expr.strip_prefix("bundle=") {
+        if v.is_empty() {
+            return Err("empty bundle= path".to_string());
+        }
+        parse_bundle(v).map(|backing| (backing, None))
     } else {
         Err(format!(
-            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, dvdram=, or empty"
+            "unknown backing '{expr}'; expected img=, imgdir=, ram=, live=, dvdram=, bundle=, or empty"
         ))
+    }
+}
+
+/// Build the default `bundle=` backing; [`apply_bundle_opts`] fills the
+/// `medium=`/`slot=`/`recovery=` overrides in afterwards.
+#[cfg(feature = "cdr-bundle")]
+fn parse_bundle(dir: &str) -> Result<Backing, String> {
+    Ok(Backing::CdrBundle {
+        dir: dir.to_string(),
+        medium: CdrCapacity::Cdr80,
+        slot: None,
+        recovery: Recovery::Delete,
+    })
+}
+
+#[cfg(not(feature = "cdr-bundle"))]
+fn parse_bundle(_dir: &str) -> Result<Backing, String> {
+    Err("bundle= requires the `cdr-bundle` feature".to_string())
+}
+
+/// Fold the `medium=`/`slot=`/`recovery=` overrides into a `bundle=` backing.
+fn apply_bundle_opts(backing: Backing, opts: &RawOpts) -> Result<Backing, String> {
+    #[cfg(feature = "cdr-bundle")]
+    if let Backing::CdrBundle { dir, .. } = backing {
+        let medium = match opts.medium.as_deref() {
+            Some(raw) => parse_medium(raw)?,
+            None => CdrCapacity::Cdr80,
+        };
+        let slot = opts.slot.as_deref().map(parse_slot).transpose()?;
+        let recovery = match opts.recovery.as_deref() {
+            Some(raw) => parse_recovery(raw)?,
+            None => Recovery::Delete,
+        };
+        return Ok(Backing::CdrBundle {
+            dir,
+            medium,
+            slot,
+            recovery,
+        });
+    }
+    let _ = opts;
+    Ok(backing)
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn parse_medium(raw: &str) -> Result<CdrCapacity, String> {
+    match raw {
+        "cdr74" => Ok(CdrCapacity::Cdr74),
+        "cdr80" => Ok(CdrCapacity::Cdr80),
+        "cdr90" => Ok(CdrCapacity::Cdr90),
+        "cdr99" => Ok(CdrCapacity::Cdr99),
+        other => Err(format!(
+            "invalid medium '{other}' (cdr74, cdr80, cdr90, cdr99)"
+        )),
+    }
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn parse_slot(raw: &str) -> Result<u32, String> {
+    let bytes = parse_size(raw).ok_or_else(|| format!("invalid slot size '{raw}'"))?;
+    let bytes = u32::try_from(bytes).map_err(|_| format!("slot size {bytes} is too large"))?;
+    if !(TOC_SLOT_MIN..=TOC_SLOT_MAX).contains(&bytes) {
+        return Err(format!(
+            "slot size {bytes} is outside {TOC_SLOT_MIN}..={TOC_SLOT_MAX}"
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn parse_recovery(raw: &str) -> Result<Recovery, String> {
+    match raw {
+        "delete" => Ok(Recovery::Delete),
+        "readonly" => Ok(Recovery::ReadOnly),
+        other => Err(format!("invalid recovery '{other}' (delete or readonly)")),
     }
 }
 
@@ -237,10 +367,15 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
             backing,
             Backing::Img { .. } | Backing::ImgDir { .. } | Backing::Ram { .. }
         ),
-        DeviceFamily::Cdrom => matches!(
-            backing,
-            Backing::Img { .. } | Backing::Live { .. } | Backing::DvdRam { .. } | Backing::Empty
-        ),
+        DeviceFamily::Cdrom => {
+            matches!(
+                backing,
+                Backing::Img { .. }
+                    | Backing::Live { .. }
+                    | Backing::DvdRam { .. }
+                    | Backing::Empty
+            ) || is_cdr_bundle(backing)
+        }
     };
     if ok {
         return Ok(());
@@ -251,9 +386,25 @@ fn check_backing(family: DeviceFamily, backing: &Backing) -> Result<(), String> 
         Backing::Ram { .. } => "ram",
         Backing::Live { .. } => "live",
         Backing::DvdRam { .. } => "dvdram",
+        #[cfg(feature = "cdr-bundle")]
+        Backing::CdrBundle { .. } => "bundle",
         Backing::Empty => "empty",
     };
     Err(format!("{key}= is not valid for {}", family.flag()))
+}
+
+/// Whether `backing` is the feature-gated CD-R bundle (always `false` without
+/// the feature, because the variant does not exist).
+fn is_cdr_bundle(backing: &Backing) -> bool {
+    #[cfg(feature = "cdr-bundle")]
+    {
+        matches!(backing, Backing::CdrBundle { .. })
+    }
+    #[cfg(not(feature = "cdr-bundle"))]
+    {
+        let _ = backing;
+        false
+    }
 }
 
 fn check_opts(
@@ -264,6 +415,28 @@ fn check_opts(
 ) -> Result<(), String> {
     let is_imgdir = matches!(backing, Backing::ImgDir { .. });
     let is_dvdram_file = matches!(backing, Backing::DvdRam { path: Some(_) });
+    let is_bundle = is_cdr_bundle(backing);
+
+    if is_bundle {
+        // The TOC owns the disc geometry and recovery policy: neither a
+        // read-only plane nor a block/chunk/geometry override applies.
+        if opts.ro_seen {
+            return Err("ro is not valid with bundle=<dir>".to_string());
+        }
+        if opts.sector.is_some() {
+            return Err("sector= is not valid with bundle=<dir>".to_string());
+        }
+        if opts.size.is_some() {
+            return Err("size= is not valid with bundle=<dir>".to_string());
+        }
+        if opts.chunk.is_some() {
+            return Err("chunk= is not valid with bundle=<dir>".to_string());
+        }
+    }
+    #[cfg(feature = "cdr-bundle")]
+    if !is_bundle && (opts.medium.is_some() || opts.slot.is_some() || opts.recovery.is_some()) {
+        return Err("medium=, slot=, and recovery= are only valid with bundle=<dir>".to_string());
+    }
 
     if opts.sector.is_some() {
         match (family, profile) {
@@ -307,8 +480,56 @@ struct RawOpts {
     sector: Option<u32>,
     chunk: Option<u64>,
     size: Option<u64>,
+    #[cfg(feature = "cdr-bundle")]
+    medium: Option<String>,
+    #[cfg(feature = "cdr-bundle")]
+    slot: Option<String>,
+    #[cfg(feature = "cdr-bundle")]
+    recovery: Option<String>,
     removable: bool,
     removable_seen: bool,
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn set_medium(o: &mut RawOpts, value: &str) -> Result<(), String> {
+    if o.medium.is_some() {
+        return Err("duplicate medium=".to_string());
+    }
+    o.medium = Some(value.to_string());
+    Ok(())
+}
+
+#[cfg(not(feature = "cdr-bundle"))]
+fn set_medium(_o: &mut RawOpts, _value: &str) -> Result<(), String> {
+    Err("medium= requires the `cdr-bundle` feature".to_string())
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn set_slot(o: &mut RawOpts, value: &str) -> Result<(), String> {
+    if o.slot.is_some() {
+        return Err("duplicate slot=".to_string());
+    }
+    o.slot = Some(value.to_string());
+    Ok(())
+}
+
+#[cfg(not(feature = "cdr-bundle"))]
+fn set_slot(_o: &mut RawOpts, _value: &str) -> Result<(), String> {
+    Err("slot= requires the `cdr-bundle` feature".to_string())
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn set_recovery(o: &mut RawOpts, value: &str) -> Result<(), String> {
+    if o.recovery.is_some() {
+        return Err("duplicate recovery=".to_string());
+    }
+    o.recovery = Some(value.to_string());
+    Ok(())
+}
+
+#[cfg(not(feature = "cdr-bundle"))]
+fn set_recovery(_o: &mut RawOpts, _value: &str) -> Result<(), String> {
+    Err("recovery= requires the `cdr-bundle` feature".to_string())
 }
 
 fn parse_opts(s: &str) -> Result<RawOpts, String> {
@@ -347,6 +568,12 @@ fn parse_opts(s: &str) -> Result<RawOpts, String> {
                 return Err("duplicate size=".to_string());
             }
             o.size = Some(parse_size(v).ok_or_else(|| format!("invalid size '{v}'"))?);
+        } else if let Some(v) = opt.strip_prefix("medium=") {
+            set_medium(&mut o, v)?;
+        } else if let Some(v) = opt.strip_prefix("slot=") {
+            set_slot(&mut o, v)?;
+        } else if let Some(v) = opt.strip_prefix("recovery=") {
+            set_recovery(&mut o, v)?;
         } else if opt == "removable" {
             if o.removable_seen {
                 return Err("duplicate removable".to_string());
@@ -404,6 +631,8 @@ pub fn mounted_paths(specs: &[DeviceSpec]) -> Vec<MountedPath<'_>> {
                 Backing::ImgDir { dir } => Some((dir.as_str(), kind)),
                 Backing::Live { dir } => Some((dir.as_str(), kind)),
                 Backing::DvdRam { path: Some(p) } => Some((p.as_str(), kind)),
+                #[cfg(feature = "cdr-bundle")]
+                Backing::CdrBundle { dir, .. } => Some((dir.as_str(), kind)),
                 Backing::DvdRam { path: None } | Backing::Ram { .. } | Backing::Empty => None,
             }
         })
@@ -717,5 +946,138 @@ mod tests {
         let w = check_dual_mount(&specs);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("'d'"));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_defaults() {
+        let spec = cdrom("bundle=/tmp/disc").expect("bundle cdrom");
+        assert_eq!(spec.role, DeviceRole::MmcCd);
+        assert_eq!(
+            spec.backing,
+            Backing::CdrBundle {
+                dir: "/tmp/disc".to_string(),
+                medium: CdrCapacity::Cdr80,
+                slot: None,
+                recovery: Recovery::Delete,
+            }
+        );
+        // The MMC role is always read-only for flat media; a bundle is a
+        // writable sequential medium over a directory.
+        assert!(!spec.plane.read_only);
+        assert_eq!(spec.plane.sector, 512);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_options() {
+        let spec = cdrom("bundle=/tmp/disc,medium=cdr74,slot=8192,recovery=readonly").unwrap();
+        assert_eq!(
+            spec.backing,
+            Backing::CdrBundle {
+                dir: "/tmp/disc".to_string(),
+                medium: CdrCapacity::Cdr74,
+                slot: Some(8192),
+                recovery: Recovery::ReadOnly,
+            }
+        );
+
+        for (raw, want) in [
+            ("cdr74", CdrCapacity::Cdr74),
+            ("cdr80", CdrCapacity::Cdr80),
+            ("cdr90", CdrCapacity::Cdr90),
+            ("cdr99", CdrCapacity::Cdr99),
+        ] {
+            let spec = cdrom(&format!("bundle=d,medium={raw}")).unwrap();
+            let Backing::CdrBundle { medium, .. } = spec.backing else {
+                panic!("expected a bundle backing");
+            };
+            assert_eq!(medium, want);
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_bad_values() {
+        assert!(cdrom("bundle=d,medium=bogus").is_err());
+        assert!(cdrom("bundle=d,slot=bogus").is_err());
+        assert!(cdrom("bundle=d,slot=1K").is_err(), "below TOC_SLOT_MIN");
+        assert!(cdrom("bundle=d,slot=128K").is_err(), "above TOC_SLOT_MAX");
+        assert!(cdrom("bundle=d,recovery=bogus").is_err());
+        assert!(cdrom("bundle=d,medium=cdr80,medium=cdr74").is_err());
+        assert!(cdrom("bundle=d,slot=8K,slot=16K").is_err());
+        assert!(cdrom("bundle=d,recovery=delete,recovery=readonly").is_err());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_is_cdrom_only() {
+        assert!(block("bundle=d").is_err());
+        assert!(block("bundle=d,medium=cdr74").is_err());
+        assert!(cdrom("bundle=d").is_ok());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_options_only_with_bundle() {
+        assert!(cdrom("img=x,medium=cdr74").is_err());
+        assert!(cdrom("img=x,slot=8K").is_err());
+        assert!(cdrom("img=x,recovery=delete").is_err());
+        assert!(cdrom("live=x,slot=8K").is_err());
+        assert!(cdrom("empty,medium=cdr74").is_err());
+        assert!(block("img=x,medium=cdr74").is_err());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_rejects_plane_and_geometry_opts() {
+        assert!(cdrom("bundle=d,ro").is_err());
+        assert!(cdrom("bundle=d,sector=2048").is_err());
+        assert!(cdrom("bundle=d,size=1M").is_err());
+        assert!(cdrom("bundle=d,chunk=1M").is_err());
+        assert!(cdrom("bundle=d,profile=cd").is_err());
+        assert!(cdrom("bundle=d,removable").is_err());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn duplicate_bundle_dirs_are_rejected() {
+        let err = parse_all(
+            &[],
+            &[
+                "bundle=/tmp/disc".to_string(),
+                "bundle=/tmp/disc".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("more than one LUN"), "{err}");
+
+        assert!(parse_all(
+            &[],
+            &["bundle=/tmp/a".to_string(), "bundle=/tmp/b".to_string()]
+        )
+        .is_ok());
+        // A block `imgdir=` over the same path is a different device and only
+        // gets the dual-mount warning.
+        assert!(parse_all(
+            &["imgdir=/tmp/disc".to_string()],
+            &["bundle=/tmp/disc".to_string()]
+        )
+        .is_ok());
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_dir_is_a_mounted_path() {
+        let specs = parse_all(&[], &["bundle=/tmp/disc".to_string()]).unwrap();
+        assert_eq!(mounted_paths(&specs), vec![("/tmp/disc", "cdrom")]);
+        assert!(check_dual_mount(&specs).is_empty());
+
+        let specs = parse_all(
+            &["imgdir=/tmp/disc".to_string()],
+            &["bundle=/tmp/disc".to_string()],
+        )
+        .unwrap();
+        assert_eq!(check_dual_mount(&specs).len(), 1);
     }
 }

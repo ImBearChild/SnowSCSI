@@ -19,8 +19,11 @@
 //!   `live=<dir>` (live ISO9660 over a directory),
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
-//!   never writes file-system structures), or `empty` (an enumerated drive
-//!   with no medium; the application installs the first one).
+//!   never writes file-system structures), `bundle=<dir>[,medium=…][,slot=…]
+//!   [,recovery=…]` (a persistent CD-R: `toc.0`/`toc.1` plus
+//!   `track_<n>.bin` in the directory, reopened from its newest valid TOC
+//!   slot; requires the `cdr-bundle` feature), or `empty` (an enumerated
+//!   drive with no medium; the application installs the first one).
 //!
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
@@ -53,11 +56,13 @@ use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::media::LiveData;
 use snowscsi::common::flat_bundle::FlatBundle;
+#[cfg(feature = "cdr-bundle")]
+use snowscsi::common::fs_plane::FsPlaneAdapter;
 #[cfg(feature = "bundle")]
 use snowscsi::common::fs_storage::OpenOptions;
 use snowscsi::common::seekable_storage::{FlatData, StorageError};
 use snowscsi::core::slots::{SlotPool, SlotTask};
-use snowscsi::core::storage::IoReq;
+use snowscsi::core::storage::{IoReq, Storage};
 use snowscsi::core::Direction;
 use snowscsi::core::{Lu, Spc, Writability};
 use snowscsi::iscsi::pdu::BHS_SIZE;
@@ -78,6 +83,8 @@ use spec::{Backing, DeviceRole, DeviceSpec};
 #[cfg(feature = "tokio")]
 use stack::tokio_conn::TokioConn;
 use stack::worker::WorkerStore;
+#[cfg(feature = "cdr-bundle")]
+use stack::BundleStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 #[cfg(feature = "tokio")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -185,8 +192,11 @@ struct ServeArgs {
 
     /// CD-ROM device (core `MmcDrive`, full MMC): `img=<iso>`, `live=<dir>`
     /// (live ISO9660 over a directory), `dvdram=<path|ram:<size>>[,size=…]`
-    /// (random-writable DVD-RAM), or `empty` (an enumerated drive with no
-    /// medium). Repeatable; these LUNs follow the `--block` LUNs.
+    /// (random-writable DVD-RAM), `bundle=<dir>[,medium=cdr74|cdr80|cdr90|
+    /// cdr99][,slot=<bytes>][,recovery=delete|readonly]` (a persistent CD-R
+    /// whose `toc.0`/`toc.1` and `track_<n>.bin` live in the directory;
+    /// requires the `cdr-bundle` feature), or `empty` (an enumerated drive
+    /// with no medium). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -632,6 +642,34 @@ fn build_core_slots(
                 )));
                 log::debug!("LUN {lun}: DvdRam DVD-RAM ({cap} bytes)");
             }
+            #[cfg(feature = "cdr-bundle")]
+            (
+                DeviceRole::MmcCd,
+                Backing::CdrBundle {
+                    medium, recovery, ..
+                },
+            ) => {
+                // The TOC read needs the filesystem plane, so the medium is
+                // restored here rather than in `build_planes`.
+                let mut plane = plane;
+                let medium = match plane.open_cdr_medium(medium.sectors(), *recovery) {
+                    Ok(medium) => medium,
+                    Err(e) => {
+                        eprintln!("snowscsi: bundle: LUN {lun}: {e}");
+                        return Err(());
+                    }
+                };
+                let sectors = medium.capacity_sectors();
+                planes.push(Some(plane));
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
+                    Spc::new(MmcDrive::new(CliMedium::CdrBundle(medium))),
+                    backing,
+                )));
+                // A host eject detaches the pair and leaves the LUN empty (no
+                // automatic reinsert): the TOC is already saved on CLOSE/SYNC,
+                // and restarting the server re-reads the directory.
+                log::debug!("LUN {lun}: CD-R bundle ({sectors} sectors)");
+            }
             _ => {
                 eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
                 return Err(());
@@ -829,9 +867,9 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
 ///
 /// The library slot pool needs a dual-bank asynchronous session over planes it
 /// can drive without blocking the runtime: a file/block device (re-registered
-/// with Tokio) or a memory plane. A live ISO scan or a chunked bundle reads
-/// through its own blocking scanner, so those configurations keep the
-/// thread-bridged worker.
+/// with Tokio) or a memory plane. A live ISO scan, a chunked bundle, or a
+/// persistent CD-R bundle reads through its own blocking filesystem plane, so
+/// those configurations keep the thread-bridged worker.
 fn pool_capable(specs: &[DeviceSpec], config: &ServeConfig) -> bool {
     if config.wire != Wire::Async || config.banks != Banks::Dual {
         return false;
@@ -1194,6 +1232,7 @@ where
                 // The target is per-connection here; take the detached pair so
                 // the slot does not keep a resident result.
                 let _ = target.take_rt(lun);
+                storage.resources_released(lun);
             },
             _ = shutdown.notified() => {
                 session.connection_lost();
@@ -1585,6 +1624,13 @@ fn open_img_plane(path: &str, writable: bool) -> Result<OwnedPlane, ()> {
 /// same value can be moved onto a worker thread or an asynchronous backend
 /// task later.
 fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
+    if let Some(dir) = spec::duplicate_bundle_dir(specs) {
+        eprintln!(
+            "snowscsi: bundle directory '{dir}' is served by more than one LUN; \
+             use one directory per CD-R bundle"
+        );
+        return Err(());
+    }
     let mut planes = Vec::with_capacity(specs.len());
     for spec in specs {
         let plane = match &spec.backing {
@@ -1650,6 +1696,31 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
             Backing::ImgDir { .. } => {
                 eprintln!("snowscsi: imgdir= requires the `bundle` feature");
                 return Err(());
+            }
+            #[cfg(feature = "cdr-bundle")]
+            Backing::CdrBundle {
+                dir,
+                medium,
+                slot,
+                recovery,
+            } => {
+                if !Path::new(dir).is_dir() {
+                    if *recovery == snowscsi::mmc::cdr_bundle::Recovery::ReadOnly {
+                        eprintln!(
+                            "snowscsi: bundle: read-only recovery requires an existing \
+                             directory with a TOC: {dir}"
+                        );
+                        return Err(());
+                    }
+                    // The FsStorage seam has no mkdir — the host (CLI) owns
+                    // directory creation, exactly as for `imgdir=`.
+                    log::warn!("bundle: {dir} does not exist; creating a new blank CD-R");
+                    std::fs::create_dir_all(dir).map_err(|e| {
+                        eprintln!("snowscsi: bundle: failed to create directory {dir}: {e}");
+                    })?;
+                }
+                let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
+                OwnedPlane::CdrBundle(BundleStore::new(fs, medium.sectors(), *slot))
             }
             Backing::Ram { size } => {
                 let bytes = usize::try_from(*size).map_err(|_| {
@@ -2112,6 +2183,7 @@ fn run_serve_usb(
                             // serving with the SAME target/runner: another LUN
                             // may still have a resident long-operation receipt.
                             let _ = target.take_rt(lun);
+                            store.resources_released(lun);
                             log::info!("LUN {lun}: medium ejected by the host");
                         }
                         Ok(snowscsi::core::ServeExit::Paused) => {
@@ -2167,6 +2239,7 @@ fn run_serve_usb(
                             // `ResourcesReady` is not a rebuild point: take the
                             // pair and keep the same target/runner serving.
                             let _ = target.take_rt(lun);
+                            storage.resources_released(lun);
                             log::info!("LUN {lun}: medium ejected by the host");
                             if Some(lun) == removable_lun {
                                 storage.set_plane(lun, None);
@@ -3159,6 +3232,87 @@ mod tests {
     fn print_config_flag_parses() {
         let args = parse_serve(&["--usb", "--print-config"]);
         assert!(args.print_config);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn print_config_accepts_a_cdr_bundle() {
+        let Cli::Serve(args) = Cli::try_parse_from([
+            "snowscsi",
+            "serve",
+            "--cdrom",
+            "bundle=/tmp/disc,medium=cdr74",
+            "--usb",
+            "--print-config",
+        ])
+        .unwrap() else {
+            panic!("expected Serve");
+        };
+        assert!(args.print_config);
+        let specs = spec::parse_all(&args.block, &args.cdrom).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].role, DeviceRole::MmcCd);
+        let cfg = resolve_config(&args).unwrap();
+        assert_eq!(
+            cfg.line(specs.len(), pool_capable(&specs, &cfg)),
+            format!(
+                "wire=blocking banks=single storage=inline per_bank={DEFAULT_WORK_BUF_SIZE} \
+                 work={DEFAULT_WORK_BUF_SIZE} scratch=0 lun=1"
+            )
+        );
+
+        // A bundle always owns a blocking filesystem scanner, so even the
+        // dual-bank async switches cannot hand it to the library slot pool.
+        let async_dual = ServeConfig {
+            wire: Wire::Async,
+            banks: Banks::Dual,
+            work_size: ISCSI_DUAL_WORK_BUF_SIZE,
+            scratch_len: None,
+        };
+        assert!(!pool_capable(&specs, &async_dual));
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn build_planes_creates_a_missing_cdr_bundle_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "snowscsi_cli_bundle_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
+        let planes = build_planes(&specs).expect("bundle plane");
+        assert!(dir.is_dir(), "the CLI owns directory creation");
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].capacity(), 360_000 * 2048);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn build_planes_refuses_to_create_a_readonly_recovery_bundle() {
+        let dir = std::env::temp_dir().join(format!(
+            "snowscsi_cli_bundle_ro_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let specs = spec::parse_all(
+            &[],
+            &[format!("bundle={},recovery=readonly", dir.display())],
+        )
+        .unwrap();
+        assert!(build_planes(&specs).is_err());
+        assert!(!dir.exists(), "read-only recovery must not create a disc");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

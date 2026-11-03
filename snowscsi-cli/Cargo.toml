@@ -22,8 +22,8 @@ doc = false
 
 [features]
 default = ["full"]
-full = ["std", "scsi", "iscsi", "dvdram", "cdrom", "livefs", "usb", "bundle", "log",
-        "tokio", "dep:clap", "dep:ctrlc", "dep:env_logger"]
+full = ["std", "scsi", "iscsi", "dvdram", "cdrom", "livefs", "usb", "bundle", "cdr-bundle",
+        "log", "tokio", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 std = ["snowscsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 scsi = ["snowscsi/scsi"]
 dvdram = ["snowscsi/dvdram"]
@@ -32,6 +32,9 @@ cdrom = ["snowscsi/cdrom"]
 livefs = ["snowscsi/livefs"]
 usb = ["snowscsi/usb"]
 bundle = ["snowscsi/bundle"]
+# Persistent CD-R bundle backing (`--cdrom bundle=<dir>`): the library's
+# sequential write-once medium with its alternating `toc.0`/`toc.1` slots.
+cdr-bundle = ["snowscsi/cdr-bundle"]
 log = ["snowscsi/log", "dep:log"]
 defmt = ["snowscsi/defmt"]
 # Tokio binding for the runtime-agnostic async seams (`--wire async`). The

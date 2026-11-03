@@ -490,6 +490,7 @@ pub fn serve<P>(
         // recreated), so take it here to clear the slot's resident result.
         if let ServeExit::Outcome(RunOutcome::ResourcesReady { lun }) = exit {
             let _ = target.take_rt(lun);
+            storage.resources_released(lun);
         }
     }
 }

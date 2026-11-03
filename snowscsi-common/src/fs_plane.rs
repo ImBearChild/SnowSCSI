@@ -21,6 +21,25 @@ pub trait FsPlane {
     /// Read `buf.len()` bytes at byte offset `off` of the file at `path`.
     fn read(&mut self, path: &str, off: u64, buf: &mut [u8]) -> Result<(), FsError>;
 
+    /// Return the current length in bytes of the file at `path`.
+    ///
+    /// The default is unsupported: a backend without a size primitive cannot
+    /// distinguish a short file from a missing one. Callers that only need a
+    /// best-effort prefix (the CD-R track reader) treat `NotFound` as empty.
+    fn len(&mut self, path: &str) -> Result<u64, FsError> {
+        let _ = path;
+        Err(FsError::Io(IoErrorKind::Unsupported))
+    }
+
+    /// Truncate the file at `path` to zero length, creating it when absent.
+    ///
+    /// The default is unsupported. Callers that reuse a resource id must
+    /// truncate before writing a new payload at offset 0.
+    fn truncate(&mut self, path: &str) -> Result<(), FsError> {
+        let _ = path;
+        Err(FsError::Io(IoErrorKind::Unsupported))
+    }
+
     /// Write `buf` at byte offset `off` of the file at `path` (creating it).
     fn write(&mut self, path: &str, off: u64, buf: &[u8]) -> Result<(), FsError>;
 
@@ -129,6 +148,32 @@ impl<F: FsStorage, const N: usize> FsPlane for FsPlaneAdapter<F, N> {
             ReadExactError::UnexpectedEof => FsError::OutOfBounds,
             ReadExactError::Other(e) => FsError::Io(e.kind()),
         })
+    }
+
+    fn len(&mut self, path: &str) -> Result<u64, FsError> {
+        // Seek-to-end is the only size query the embedded-io file seam has.
+        let i = match self.touch(path) {
+            Some(i) => i,
+            None => {
+                let file = self.fs.open(path, OpenOptions::read_only())?;
+                self.insert(path, file, false)?
+            }
+        };
+        let file = &mut self.slots[i].file;
+        file.seek(embedded_io::SeekFrom::End(0))
+            .map_err(|e| FsError::Io(e.kind()))
+    }
+
+    fn truncate(&mut self, path: &str) -> Result<(), FsError> {
+        // Drop any cached handle first: the reopened handle must be the one
+        // carrying the truncation, not a stale read-only view.
+        if let Some(i) = self.slots.iter().position(|s| s.path.as_str() == path) {
+            let slot = self.slots.swap_remove(i);
+            self.fs.close(slot.file);
+        }
+        let file = self.fs.open(path, OpenOptions::create_or_truncate())?;
+        self.insert(path, file, true)?;
+        Ok(())
     }
 
     fn write(&mut self, path: &str, off: u64, buf: &[u8]) -> Result<(), FsError> {
@@ -407,6 +452,34 @@ mod tests {
         let mut p = FsPlaneAdapter::<_, 8>::new(fs);
         p.write("a", 0, b"abc").unwrap();
         assert_eq!(p.read("a", 0, &mut [0u8; 4]), Err(FsError::OutOfBounds));
+    }
+
+    #[test]
+    fn len_reports_file_size_and_missing_is_not_found() {
+        let (fs, _store, _closes) = MockFs::new();
+        let mut p = FsPlaneAdapter::<_, 8>::new(fs);
+        p.write("a", 0, b"abc").unwrap();
+        assert_eq!(p.len("a"), Ok(3));
+        p.write("a", 5, b"x").unwrap();
+        assert_eq!(p.len("a"), Ok(6), "seek-end reports the grown size");
+        assert_eq!(p.len("missing"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn truncate_clears_an_existing_file_and_creates_a_missing_one() {
+        let (fs, _store, _closes) = MockFs::new();
+        let mut p = FsPlaneAdapter::<_, 8>::new(fs);
+        p.write("a", 0, b"abcdef").unwrap();
+        p.truncate("a").unwrap();
+        assert_eq!(p.len("a"), Ok(0));
+        assert_eq!(p.read("a", 0, &mut [0u8; 1]), Err(FsError::OutOfBounds));
+
+        p.truncate("new").unwrap();
+        assert_eq!(p.len("new"), Ok(0));
+        p.write("new", 0, b"z").unwrap();
+        let mut out = [0u8; 1];
+        p.read("new", 0, &mut out).unwrap();
+        assert_eq!(&out, b"z");
     }
 
     #[test]

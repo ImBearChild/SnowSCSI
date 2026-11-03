@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SENSE/GET CONFIGURATION; `MmcDrive::empty(caps)` and
   `LuImpl::empty(device)`.
 - **core**: `Spc::with_identity` for per-LU INQUIRY identity strings.
+- **core**: `Storage::resources_released` (default no-op) reports a host eject
+  after the detached pair has been taken, so an adapter can drop a backend
+  that is no longer addressable.
 - **cli**: `--cdrom empty` serves an enumerated drive with no medium.
 - **block**: removable block media — `BlockAttrs::with_removable()` reports
   INQUIRY RMB=1 and lets a host START STOP UNIT eject the pair; the LUN stays
@@ -81,6 +84,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: `--block img=<file>,removable` USB card-reader demo (one removable
   slot, `profile=block`, `img=` only, not with `--banks dual`): eject drops
   the plane and a background watcher installs a stable replacement file.
+- **cli**: `--cdrom bundle=<dir>[,medium=cdr74|cdr80|cdr90|cdr99][,slot=<bytes>]
+  [,recovery=delete|readonly]` (`cdr-bundle` feature) serves a persistent CD-R
+  whose alternating TOC slots and track payloads live in the directory as
+  `toc.0`/`toc.1` and `track_<n>.bin`. The LUN is restored from the newer valid
+  TOC slot with `open_at`, so a copied/restored slot is rejected and
+  `current_slot` matches the file it came from. A **stored TOC wins** over the
+  `medium=` hint (the CLI passes capacity `0` on reopen and warns on a
+  mismatch); `medium=`/`slot=` only describe a new blank bundle. A missing
+  directory still starts a blank disc with a warning, but `recovery=readonly`
+  requires an existing TOC, and an unreadable/malformed slot is an error rather
+  than a silent overwrite. Track reads return the readable prefix followed by
+  zeros (a missing track file is empty), and the first write at offset `0`
+  truncates a reused track id. `Sync` settles the page cache only (the
+  `FsStorage` seam has no fsync); orphan track files are left in place. Host
+  eject drops the LUN plane and any unsaved state — the host must
+  CLOSE/SYNCHRONIZE CACHE first. The same resource mapping covers
+  `--banks dual`, so a bundle LUN can run on the worker path.
+- **common**: `FsPlane::len` (seek-to-end size) and `FsPlane::truncate`
+  (create/truncate), both defaulting to `Unsupported`, so a path-addressed
+  backend can expose resource reuse without a new store-op variant.
+- **mmc**: `cdr_bundle::max_tracks_for_slot` exposes the TOC track capacity, so
+  applications can bound `16 + n` resource ids to the configured slot.
 
 ## [0.2.0] - 2026-10-18
 

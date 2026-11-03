@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::Scope;
 
-use snowscsi::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
+use snowscsi::common::seekable_storage::StorageError;
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{Direction, Effect, Fault};
 
@@ -126,12 +126,21 @@ struct WorkerPlane {
     /// `None` while the buffer is on the worker thread.
     buf: Option<Vec<u8>>,
     per_bank: usize,
+    /// The backing plane is a persistent CD-R bundle, so a host eject drops
+    /// it instead of leaving it addressable.
+    bundle: bool,
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     wake: Arc<WorkerWake>,
 }
 
 impl WorkerPlane {
-    fn new(tx: Sender<Job>, rx: Receiver<Done>, per_bank: usize, wake: Arc<WorkerWake>) -> Self {
+    fn new(
+        tx: Sender<Job>,
+        rx: Receiver<Done>,
+        per_bank: usize,
+        bundle: bool,
+        wake: Arc<WorkerWake>,
+    ) -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
             tx,
@@ -139,6 +148,7 @@ impl WorkerPlane {
             next_tag: 1,
             buf: Some(vec![0u8; per_bank]),
             per_bank,
+            bundle,
             wake,
         }
     }
@@ -434,12 +444,15 @@ impl WorkerStore {
                 workers.push(None);
                 continue;
             };
+            let bundle = plane.is_cdr_bundle();
             let (job_tx, job_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
             let wake = Arc::new(WorkerWake::new());
             let worker_wake = Arc::clone(&wake);
             scope.spawn(move || worker_loop(plane, job_rx, done_tx, worker_wake));
-            workers.push(Some(WorkerPlane::new(job_tx, done_rx, per_bank, wake)));
+            workers.push(Some(WorkerPlane::new(
+                job_tx, done_rx, per_bank, bundle, wake,
+            )));
         }
         Self {
             planes: workers,
@@ -469,10 +482,11 @@ fn worker_loop(
         let mut buf = job.buf;
         let len = job.req.len as usize;
         let result = match job.req.dir {
-            Direction::ToHost => plane.read_at(job.req.offset, &mut buf[..len]),
-            Direction::FromHost => plane.write_at(job.req.offset, &buf[..len]),
-            Direction::None => plane.sync(),
-        };
+            Direction::ToHost => plane.exec(job.req, IoBuf::Read(&mut buf[..len])),
+            Direction::FromHost => plane.exec(job.req, IoBuf::Write(&buf[..len])),
+            Direction::None => plane.exec(job.req, IoBuf::None),
+        }
+        .map(|_| ());
         if done
             .send(Done {
                 tag: job.tag,
@@ -490,6 +504,25 @@ fn worker_loop(
 impl Storage for WorkerStore {
     fn select_lun(&mut self, lun: usize) {
         self.lun = lun;
+    }
+
+    fn resources_released(&mut self, lun: usize) {
+        // Dropping the WorkerPlane closes its channels; the worker finishes any
+        // in-flight job, sees the closed result channel and drops the plane
+        // (closing its cached handles). A bundle cannot be re-addressed after
+        // a host eject, and unflushed writes are lost.
+        let is_bundle = self
+            .planes
+            .get(lun)
+            .and_then(Option::as_ref)
+            .is_some_and(|plane| plane.bundle);
+        if is_bundle {
+            log::warn!(
+                "LUN {lun}: CD-R bundle ejected; unsaved writes are lost \
+                 (the host must CLOSE/SYNCHRONIZE CACHE before eject)"
+            );
+            self.planes[lun] = None;
+        }
     }
 
     fn begin_exec(&mut self, req: IoReq) -> IoToken {
@@ -831,5 +864,77 @@ mod tests {
                 store.cancel(token);
             }
         });
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn bundle_plane(tag: &str) -> (std::path::PathBuf, OwnedPlane) {
+        use crate::stack::BundleStore;
+        use snowscsi::common::fs_plane::FsPlaneAdapter;
+        use snowscsi::scsi::fs_backend::StdFsBackend;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "snowscsi_worker_{tag}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
+        let plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 360_000, None));
+        (dir, plane)
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn bundle_resources_route_through_the_worker() {
+        let (dir, plane) = bundle_plane("route");
+        std::thread::scope(|scope| {
+            let mut store = WorkerStore::new(scope, vec![Some(plane)], 8192);
+
+            let token = store.begin_exec(IoReq {
+                resource: 17,
+                offset: 0,
+                len: 4,
+                dir: Direction::FromHost,
+            });
+            assert_eq!(
+                poll_write(&mut store, token, b"data"),
+                StorageReceipt::ok(4)
+            );
+
+            let token = store.begin_exec(IoReq {
+                resource: 17,
+                offset: 0,
+                len: 4,
+                dir: Direction::ToHost,
+            });
+            let mut out = [0u8; 4];
+            assert_eq!(
+                poll_read(&mut store, token, &mut out),
+                StorageReceipt::ok(4)
+            );
+            assert_eq!(&out, b"data");
+
+            assert!(store.sync().is_ok());
+        });
+        assert!(dir.join("track_1.bin").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn resources_released_drops_a_bundle_plane() {
+        let (dir, plane) = bundle_plane("drop");
+        std::thread::scope(|scope| {
+            let mut store = WorkerStore::new(scope, vec![Some(plane)], 8192);
+            store.resources_released(0);
+            assert_eq!(store.begin_exec(read_req(0, 1)), invalid());
+            assert!(store.sync().is_ok());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
