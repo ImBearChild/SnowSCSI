@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::core::storage::Storage;
-use crate::core::{RunOutcome, RuntimeSet, ServeExit, Target};
+use crate::core::{BoundaryReject, ChangeResult, RunOutcome, RuntimeSet, ServeExit, Target};
 use crate::iscsi::conn::{read_exact, write_all, Conn};
 use crate::iscsi::pdu::BHS_SIZE;
 use crate::iscsi::target::{Action, Event, IscsiSession, TargetError};
@@ -405,8 +405,8 @@ where
     result
 }
 
-/// Serial accept loop: serve one connection at a time,
-/// with accept-failure backoff retry.
+/// Serial accept loop with an application eject callback: serve one
+/// connection at a time, with accept-failure backoff retry.
 ///
 /// Each accepted connection gets a fresh [`IscsiSession`] **and a fresh core
 /// [`Target`] over the same slots**: a new session starts from a clean
@@ -418,6 +418,11 @@ where
 /// `table` is the runtime slot table (the target rebinds its owner per
 /// connection) and `storage` is shared across connections.
 ///
+/// `on_release` is called with a host-eject handback's `take_rt` result before
+/// the detached pair is dropped and [`Storage::resources_released`] runs. An
+/// application can inspect (and snapshot) the pair there; the callback runs on
+/// the accept-loop thread.
+///
 /// Note: `std::net::TcpListener::bind` uses the OS default listen backlog
 /// (SOMAXCONN), not the C `listen(fd, 1)`; the serial loop still queues a
 /// second connection in the backlog until the current one ends.
@@ -425,8 +430,8 @@ where
 /// `overlap` creates each connection's [`IscsiSession`] with
 /// [`IscsiSession::with_overlap`]; `work` is then the total of two equal banks
 /// and must satisfy the per-bank floor.
-#[allow(clippy::too_many_arguments)]
-pub fn serve<P>(
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn serve_with_release<P>(
     listener: TcpListener,
     stop: &AtomicBool,
     work: &mut [u8],
@@ -435,6 +440,7 @@ pub fn serve<P>(
     storage: &mut dyn Storage,
     read_timeout: Option<Duration>,
     overlap: bool,
+    on_release: &mut dyn FnMut(usize, &mut Result<ChangeResult<P>, BoundaryReject>),
 ) -> Result<(), TargetError> {
     if overlap {
         let total = work.len();
@@ -489,10 +495,42 @@ pub fn serve<P>(
         // A handback is unreachable on the next connection (the target is
         // recreated), so take it here to clear the slot's resident result.
         if let ServeExit::Outcome(RunOutcome::ResourcesReady { lun }) = exit {
-            let _ = target.take_rt(lun);
+            let mut taken = target.take_rt(lun);
+            // The application may snapshot the detached medium before the
+            // pair (and its backing handle) is dropped.
+            on_release(lun, &mut taken);
+            drop(taken);
             storage.resources_released(lun);
         }
     }
+}
+
+/// Serial accept loop without an eject callback.
+///
+/// A thin wrapper around [`serve_with_release`] with a no-op callback; see
+/// that entry for the connection, handback and bank contract.
+#[allow(clippy::too_many_arguments)]
+pub fn serve<P>(
+    listener: TcpListener,
+    stop: &AtomicBool,
+    work: &mut [u8],
+    scratch: &mut [u8],
+    table: &mut [&mut dyn crate::core::Lu<Pair = P>],
+    storage: &mut dyn Storage,
+    read_timeout: Option<Duration>,
+    overlap: bool,
+) -> Result<(), TargetError> {
+    serve_with_release(
+        listener,
+        stop,
+        work,
+        scratch,
+        table,
+        storage,
+        read_timeout,
+        overlap,
+        &mut |_, _| {},
+    )
 }
 
 #[cfg(test)]
@@ -503,6 +541,7 @@ mod tests {
     use crate::core::{Lu, LuImpl, NoMedium, Pair, Spc};
     use crate::iscsi::conn::{read_exact, write_all};
     use crate::iscsi::pdu::{flag, op, stage};
+    use crate::mmc::{FlatCdMedium, MmcDrive};
     use crate::MIN_DATA_LEN;
     use std::io::{Read as _, Write as _};
 
@@ -670,6 +709,79 @@ mod tests {
             .unwrap();
             handle.join().unwrap();
         });
+    }
+
+    /// A host eject over the blocking wire reaches the release callback with
+    /// the detached LUN and pair, before the storage resources are released.
+    #[test]
+    fn serve_with_release_sees_the_ejected_lun_and_pair() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let mut work = vec![0u8; MIN_DATA_LEN + BHS_SIZE];
+        let mut scratch = vec![0u8; MIN_DATA_LEN];
+        let mut slot = LuImpl::new(Spc::new(MmcDrive::new(FlatCdMedium::read_only(16))), 7u8);
+        let mut table: [&mut dyn Lu<Pair = Pair<FlatCdMedium, u8>>; 1] = [&mut slot];
+        let mut storage = BlockingStorage::new(Sink);
+        let mut released = Vec::new();
+
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let mut client = TcpStream::connect(addr).unwrap();
+
+                let text = REQ_TEXT.as_bytes();
+                send_pdu(&mut client, &login_bhs(text.len() as u32, 1), text);
+                let (bhs, _) = read_pdu(&mut client);
+                assert_eq!(bhs[0] & 0x3F, op::LOGIN_RESP);
+
+                // START STOP UNIT LoEj=1, Start=0 (host eject), no data.
+                let mut cmd = [0u8; 48];
+                cmd[0] = op::SCSI_CMD;
+                cmd[1] = 0x40;
+                cmd[16..20].copy_from_slice(&be32(1)); // ITT
+                cmd[24..28].copy_from_slice(&be32(0)); // CmdSN
+                cmd[28..32].copy_from_slice(&be32(0)); // ExpStatSN
+                cmd[32] = 0x1B;
+                cmd[36] = 0x02; // LoEj=1, Start=0
+                send_pdu(&mut client, &cmd, &[]);
+                let (resp, _) = read_pdu(&mut client);
+                assert_eq!(resp[0] & 0x3F, op::SCSI_RESP);
+                assert_eq!(resp[3], 0, "eject completes GOOD");
+
+                // The handback closes the connection only after the callback
+                // ran, so EOF is the ordering barrier for `stop`.
+                let mut byte = [0u8; 1];
+                assert_eq!(client.read(&mut byte).unwrap(), 0);
+                stop.store(true, Ordering::SeqCst);
+                if let Ok(poke) = TcpStream::connect(addr) {
+                    drop(poke);
+                }
+            });
+
+            serve_with_release(
+                listener,
+                &stop,
+                &mut work,
+                &mut scratch,
+                &mut table,
+                &mut storage,
+                Some(Duration::from_secs(5)),
+                false,
+                &mut |lun, taken| {
+                    let pair = taken
+                        .as_ref()
+                        .expect("host eject produces a result")
+                        .pair
+                        .as_ref()
+                        .expect("the ejected pair is present");
+                    released.push((lun, pair.backing));
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+        });
+
+        assert_eq!(released, vec![(0, 7)]);
     }
 
     /// A connection whose peer is already gone: every read returns EOF.

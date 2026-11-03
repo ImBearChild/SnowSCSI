@@ -29,8 +29,8 @@ use crate::core::{
     storage_fault_sense, BoundaryPermit, Capacity, CommandContext, CommandPermit, Completion,
     DataPlan, Delivery, Device, Direction, Effect, Fault, Feedback, FeedbackKind, InquiryData,
     InterruptReason, IoContext, KnownEffects, LongInfo, LongPhase, PollStep, RemovalEncoding,
-    Sense, SpcProfile, COMMAND_ABORTED, FORMAT_IN_PROGRESS, INTERNAL_FAILURE, INVALID_FIELD,
-    LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, WRITE_ERROR,
+    Sense, SpcProfile, COMMAND_ABORTED, FORMAT_IN_PROGRESS, ILLEGAL_REQUEST, INTERNAL_FAILURE,
+    INVALID_FIELD, LBA_OUT_OF_RANGE, MEDIUM_ERROR, MEDIUM_NOT_PRESENT, NEEDS_RECOVERY, WRITE_ERROR,
     WRITE_PROTECTED,
 };
 
@@ -46,6 +46,14 @@ const SYNC_CACHE_10: u8 = 0x35;
 const FORMAT_UNIT: u8 = 0x04;
 /// READ TOC/PMA/ATIP.
 const READ_TOC: u8 = 0x43;
+/// READ SUB-CHANNEL (MMC-2 legacy; not in MMC-6).
+const READ_SUBCHANNEL: u8 = 0x42;
+/// READ HEADER (MMC-2 packet-writing legacy; not in MMC-6).
+const READ_HEADER: u8 = 0x44;
+/// SEND CUE SHEET (SAO only).
+const SEND_CUE_SHEET: u8 = 0x5D;
+/// READ DISC STRUCTURE (DVD/BD vocabulary).
+const READ_DISC_STRUCTURE: u8 = 0xAD;
 /// READ DISC INFORMATION.
 const READ_DISC_INFORMATION: u8 = 0x51;
 /// READ TRACK INFORMATION.
@@ -127,6 +135,9 @@ const FORMAT_CHUNK_MAX: usize = 1024 * 1024;
 /// ILLEGAL REQUEST / INVALID FIELD IN PARAMETER LIST. `core::errors` has no
 /// constant for it because only the MMC FORMAT UNIT decoder needs it.
 const INVALID_FIELD_IN_PARAMETER_LIST: Sense = Sense::new(0x05, 0x26, 0x00);
+/// ILLEGAL REQUEST / COMMAND SEQUENCE ERROR. SEND CUE SHEET exists, but the
+/// drive is not in SAO mode (MMC-6 6.35.3.1).
+const COMMAND_SEQUENCE_ERROR: Sense = Sense::new(0x05, 0x2C, 0x00);
 
 /// Facts projected when no medium is installed (`take_medium`).
 ///
@@ -515,7 +526,15 @@ impl<M: MmcMedium> MmcDrive<M> {
             MODE_SELECT_10 => self.prepare_mode_select(ctx, cdb, true),
             SEND_OPC => self.prepare_send_opc(ctx, cdb),
             SET_CD_SPEED => self.prepare_set_cd_speed(ctx, cdb),
-            _ => Err(Completion::Check(INVALID_FIELD)),
+            // READ SUB-CHANNEL and READ HEADER were removed from MMC-6 (they
+            // are MMC-2/CD legacy), so they are unknown opcodes for this
+            // drive. SEND CUE SHEET exists but requires SAO, which the drive
+            // does not advertise (MMC-6 6.35.3.1). READ DISC STRUCTURE is
+            // DVD/BD vocabulary, so it stays INVALID FIELD IN CDB.
+            READ_SUBCHANNEL | READ_HEADER => Err(Completion::Check(ILLEGAL_REQUEST)),
+            SEND_CUE_SHEET => Err(Completion::Check(COMMAND_SEQUENCE_ERROR)),
+            READ_DISC_STRUCTURE => Err(Completion::Check(INVALID_FIELD)),
+            _ => Err(Completion::Check(ILLEGAL_REQUEST)),
         }
     }
 
@@ -5630,6 +5649,7 @@ mod tests {
     }
 
     /// Write Parameters page with the Multi-session field in bits 7-6 of byte 3.
+    #[cfg(feature = "cdr-bundle")]
     fn test_multi_session_page(multi: u8) -> Vec<u8> {
         let mut page = test_write_params_page(1, 4, 8, false);
         page[3] = ((multi & 0x03) << 6) | 0x04;
@@ -5865,6 +5885,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_and_unknown_opcodes_report_their_documented_sense() {
+        let mut dev = drive(16);
+        let permit = permit();
+        let cases = [
+            // MMC-2 legacy commands no longer defined by MMC-6.
+            (READ_SUBCHANNEL, ILLEGAL_REQUEST),
+            (READ_HEADER, ILLEGAL_REQUEST),
+            // Exists, but only in SAO mode.
+            (SEND_CUE_SHEET, COMMAND_SEQUENCE_ERROR),
+            // DVD/BD vocabulary only.
+            (READ_DISC_STRUCTURE, INVALID_FIELD),
+            // A genuinely unknown opcode.
+            (0xFF, ILLEGAL_REQUEST),
+        ];
+        for (opcode, sense) in cases {
+            let mut cdb = [0u8; 12];
+            cdb[0] = opcode;
+            assert_eq!(
+                dev.prepare(&permit, ctx(Direction::ToHost, 0), &cdb),
+                Err(Completion::Check(sense)),
+                "opcode {opcode:#04x}"
+            );
+        }
+    }
+
     #[cfg(feature = "cdr-bundle")]
     #[test]
     fn cdr_blank_and_read_header_are_rejected() {
@@ -5880,14 +5926,15 @@ mod tests {
             Err(Completion::Check(INVALID_FIELD))
         );
         // READ HEADER (0x44) is packet-writing vocabulary that MMC-6 no longer
-        // defines; it stays ILLEGAL REQUEST / INVALID FIELD IN CDB.
+        // defines; it is an unknown opcode, so ILLEGAL REQUEST /
+        // INVALID COMMAND OPERATION CODE.
         assert_eq!(
             dev.prepare(
                 &permit,
                 ctx(Direction::ToHost, 0),
                 &[0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0]
             ),
-            Err(Completion::Check(INVALID_FIELD))
+            Err(Completion::Check(ILLEGAL_REQUEST))
         );
 
         // The BLANK CDB is the full 12-byte form; a short CDB and reserved

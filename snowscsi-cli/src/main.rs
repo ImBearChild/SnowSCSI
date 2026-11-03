@@ -78,7 +78,7 @@ use snowscsi::iscsi::target::IscsiSession;
 use snowscsi::iscsi::target::TargetError;
 #[cfg(feature = "tokio")]
 use snowscsi::iscsi::transport::serve_conn_async;
-use snowscsi::iscsi::transport::{serve, DEFAULT_READ_TIMEOUT};
+use snowscsi::iscsi::transport::{serve_with_release, DEFAULT_READ_TIMEOUT};
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{FlatCdMedium, MmcDrive};
@@ -831,7 +831,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
         let per_bank = config.per_bank();
         std::thread::scope(|scope| {
             let mut store = WorkerStore::new(scope, planes, per_bank);
-            let res = serve(
+            let res = serve_with_release(
                 listener,
                 &stop,
                 &mut work,
@@ -840,6 +840,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
                 &mut store,
                 Some(DEFAULT_READ_TIMEOUT),
                 true,
+                &mut |lun, taken| preserve_ejected_cdr(specs, lun, taken),
             );
             if let Err((i, e)) = store.sync() {
                 eprintln!("snowscsi: sync failed for LUN {i}: {e}");
@@ -849,7 +850,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
         })
     } else {
         let mut storage = CliStorage::new(planes);
-        let res = serve(
+        let res = serve_with_release(
             listener,
             &stop,
             &mut work,
@@ -858,6 +859,7 @@ fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) 
             &mut storage,
             Some(DEFAULT_READ_TIMEOUT),
             false,
+            &mut |lun, taken| preserve_ejected_cdr(specs, lun, taken),
         );
         if let Err((i, e)) = storage.sync() {
             eprintln!("snowscsi: sync failed for LUN {i}: {e}");

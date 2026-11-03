@@ -162,13 +162,14 @@ The CLI application maps that contract onto a host directory with
   (`CliStorage`) and USB `--banks dual` (`WorkerStore`) first flush the bundle's
   track data, then render the next alternating slot (`CdrBundleMedium::toc_image`
   -> `toc.<slot>`) as a fsynced temp file renamed into place, so the slot switch
-  is atomic. The async iSCSI accept loop also snapshots, but its generic
-  `Storage + AsyncWake` seam has no sync entry point, so it cannot pre-flush
-  track data: a power loss right after that eject may still lose the last
-  unsynced track bytes. The blocking iSCSI wire (the default `--wire blocking`)
-  takes the pair inside `iscsi::serve` and has no snapshot hook, so it still
-  relies on the host's `CLOSE`/`SYNCHRONIZE CACHE`. A snapshot preserves an open
-  track or an unsaved transition best effort: nothing after the snapshot is
+  is atomic. Both iSCSI wires also snapshot: the async accept loop and the
+  blocking `serve_with_release` callback (the default `--wire blocking`)
+  preserve the ejected medium's TOC before its pair is released. Neither can
+  pre-flush track data through the generic `Storage` / `Storage + AsyncWake`
+  seam, so a power loss right after that eject may still lose the last
+  unsynced track bytes; the host's `CLOSE`/`SYNCHRONIZE CACHE` is what makes
+  that data durable. A snapshot preserves an open track or an unsaved
+  transition best effort: nothing after the snapshot is
   lost, but the disc is left **Appendable**, not finalized, and a host that
   never issued `CLOSE` may leave a partially recorded track. The LUN stays empty
   (no automatic reinsert). The same `exec` drives the inline and `--banks dual`
@@ -460,9 +461,14 @@ FORMAT UNIT is `24/00` on both kinds (only BLANK changes a CD-RW); BLANK never
 zero-fills the medium or deletes a track file: a reused `track_<n>.bin` is
 truncated by its first new write at offset 0, so old payload cannot leak into
 the new disc. The drive advertises profile `0x0A` (CD-RW) as Current and
-`0x09` (CD-R) stays in the supported list. READ HEADER (`0x44`) is deliberately
-not implemented: MMC-6 no longer defines it for this command set (it belongs to
-packet writing, which the bundle does not model), so it stays `24/00`.
+`0x09` (CD-R) stays in the supported list. Three CDB opcodes are deliberately
+not served: READ SUB-CHANNEL (`0x42`) and READ HEADER (`0x44`) were removed
+from MMC-6 (MMC-2/CD and packet-writing legacy), so they answer ILLEGAL
+REQUEST / INVALID COMMAND OPERATION CODE (`20/00`) like any unknown opcode;
+SEND CUE SHEET (`0x5D`) exists but requires SAO, which this drive does not
+advertise, so it answers ILLEGAL REQUEST / COMMAND SEQUENCE ERROR (`2C/00`);
+and READ DISC STRUCTURE (`0xAD`) is DVD/BD vocabulary, so it answers ILLEGAL
+REQUEST / INVALID FIELD IN CDB (`24/00`).
 
 Read the disc back:
 

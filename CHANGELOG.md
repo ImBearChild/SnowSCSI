@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **iscsi**: blocking `transport::serve_with_release` adds an eject callback
+  that receives a host handback's `take_rt` result before the pair is dropped.
+  The CLI uses it for `--wire blocking` (both inline and `--banks dual`), so an
+  ejected `--cdrom bundle=` LUN snapshots its TOC like the USB and async iSCSI
+  paths; none of the generic storage seams can pre-flush track data, so a
+  clean `CLOSE`/`SYNCHRONIZE CACHE` is still required for durability. `serve`
+  remains a thin wrapper with a no-op callback.
+- **mmc**: the drive now distinguishes unsupported opcodes from bad CDB
+  fields: READ SUB-CHANNEL (`0x42`), READ HEADER (`0x44`) and every unknown
+  opcode answer ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE (`20/00`);
+  SEND CUE SHEET (`0x5D`, SAO only) answers ILLEGAL REQUEST / COMMAND SEQUENCE
+  ERROR (`2C/00`); READ DISC STRUCTURE (`0xAD`, DVD/BD only) stays ILLEGAL
+  REQUEST / INVALID FIELD IN CDB (`24/00`).
 - **mmc**: CD-DA audio tracks for the persistent `cdr-bundle` medium.
   Write Parameters page 0x05 now parses Track Mode 0 + Data Block Type 0 as
   2352-byte audio alongside Track Mode 4 + DBT 8/10 as 2048-byte data; all
@@ -204,11 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and USB `--banks dual`) flush the
   bundle's track data, then render the next alternating TOC slot and install it
   atomically via a fsynced `toc.<slot>.tmp` rename; the async iSCSI accept loop
-  snapshots too but cannot pre-flush track data through its generic storage
-  seam, and the blocking iSCSI wire still has no snapshot hook (it takes the
-  pair inside `iscsi::serve`), so those paths rely on the host's
-  CLOSE/SYNCHRONIZE CACHE. A snapshot preserves an open track or an unsaved
-  transition best effort: nothing after the snapshot is lost, but the disc is
+  snapshots too, and the blocking iSCSI wire does so through
+  `serve_with_release` (the CLI passes the same bundle hook). None of those
+  generic paths can pre-flush track data through their storage seam, so they
+  rely on the host's CLOSE/SYNCHRONIZE CACHE. A snapshot preserves an open
+  track or an unsaved transition best effort: nothing after the snapshot is lost, but the disc is
   left Appendable (not finalized), and a host that never issued CLOSE may leave
   a partially recorded track. The same resource mapping covers `--banks dual`,
   so a bundle LUN can run on the worker path.
