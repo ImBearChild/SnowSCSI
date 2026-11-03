@@ -866,7 +866,11 @@ fn cdr_format_and_blank_are_rejected_without_touching_the_backing() {
         ),
         Completion::Good
     );
-    assert_eq!(&work[0..4], &0u32.to_be_bytes(), "blank disc last LBA");
+    assert_eq!(
+        &work[0..4],
+        &((CdrCapacity::Cdr74.sectors() - 3) as u32).to_be_bytes(),
+        "blank disc ATIP last writable LBA"
+    );
     assert_eq!(&work[4..8], &(BLOCK as u32).to_be_bytes());
 }
 
@@ -1763,5 +1767,40 @@ fn cdr_finalize_reports_a_medium_change_unit_attention() {
             &mut scratch,
         ),
         Completion::Good
+    );
+}
+
+#[test]
+fn cdr_blank_capacity_reports_the_recordable_extent() {
+    let mut target = cdr_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+
+    // A blank CD-R has no recorded session, but the ATIP extent is already
+    // known; the host sizes the block device from it before the first write.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_capacity(),
+            Direction::ToHost,
+            8,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    let capacity = CdrCapacity::Cdr74.sectors();
+    assert_eq!(
+        u32::from_be_bytes([work[0], work[1], work[2], work[3]]),
+        (capacity - 3) as u32,
+        "last writable LBA of the ATIP extent"
+    );
+    assert_eq!(
+        u32::from_be_bytes([work[4], work[5], work[6], work[7]]),
+        BLOCK as u32
     );
 }

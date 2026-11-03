@@ -310,13 +310,12 @@ blkid /dev/sr0                # ISO9660 signature / label
 mount -o ro /dev/sr0 /mnt     # or mount the raw device
 ```
 
-After a burn, Linux may still report the capacity it probed while the disc
-was blank (one block). The drive reports a medium-change unit attention when
-the finalize completes, but a burner's own `TEST UNIT READY` can consume it
-first; if `isoinfo`/`mount` still see a one-block device, restart the server
-on the same directory (the TOC is persistent) or re-plug the gadget.
-`sg_readcap /dev/sr0` queries the device directly and shows the recorded
-capacity meanwhile.
+A blank CD-R reports its ATIP extent in READ CAPACITY, so the block device
+is sized for the full disc before the first session and keeps that size
+after the burn. READ TOC stays `24h/00` while no complete session exists,
+which keeps the kernel's last-session probe at LBA 0. The finalize also
+reports a medium-change unit attention, although a burner's own `TEST UNIT
+READY` can consume it first.
 
 The bundle directory holds the durable state:
 

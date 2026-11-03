@@ -267,6 +267,10 @@ impl<D: Device> Spc<D> {
         // data (GOOD) and consumes it, but only after its own CDB checks pass.
         if opcode != INQUIRY && opcode != REPORT_LUNS && opcode != REQUEST_SENSE {
             if let Some(pending) = self.ua.next() {
+                crate::info!(
+                    "reporting unit attention {:?} for opcode {opcode:02x}",
+                    pending.class
+                );
                 return Err(Completion::Check(pending.sense));
             }
         }

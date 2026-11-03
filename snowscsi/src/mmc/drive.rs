@@ -1813,14 +1813,23 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             // geometry; READ CAPACITY must not fabricate LBA 0.
             return None;
         }
-        // A recordable disc reports the last recorded LBA (0 while blank);
-        // flat and rewritable media report their full geometry.
+        // A blank write-once disc has no recorded session, but its ATIP
+        // geometry already fixes the future lead-out; report that extent so
+        // the host can size the device before the first session. A blank
+        // read-only disc keeps the standard zero-sector view.
         let last = self.medium.as_ref().map_or_else(
             || attrs.sectors.saturating_sub(1),
             |medium| {
                 let info = medium.disc_info();
                 if info.status == DiscStatus::Empty {
-                    0
+                    if attrs.write_mode == MmcWriteMode::WriteOnce {
+                        info.last_possible_lead_out
+                            .unwrap_or(0)
+                            .max(0)
+                            .saturating_sub(1) as u64
+                    } else {
+                        0
+                    }
                 } else {
                     info.last_session_lba
                 }

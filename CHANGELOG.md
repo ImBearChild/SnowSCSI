@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mmc**: a blank write-once CD reports its ATIP extent in READ CAPACITY,
+  so the host sizes the block device before the first session; READ TOC
+  stays `24h/00` until a session completes.
 - **mmc**: recordable-medium vocabulary — `TrackStatus`, `TrackInfo`,
   `TrackInfoRequest`, and the defaulted `MmcMedium::track_info`; the
   `cdr-bundle` feature gate for a sequential CD-R medium.
