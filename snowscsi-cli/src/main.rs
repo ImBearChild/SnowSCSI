@@ -20,10 +20,10 @@
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
 //!   never writes file-system structures), `bundle=<dir>[,medium=…][,slot=…]
-//!   [,recovery=…]` (a persistent CD-R: `toc.0`/`toc.1` plus
-//!   `track_<n>.bin` in the directory, reopened from its newest valid TOC
-//!   slot; requires the `cdr-bundle` feature), or `empty` (an enumerated
-//!   drive with no medium; the application installs the first one).
+//!   [,recovery=…]` (a persistent CD-R or erasable CD-RW bundle:
+//!   `toc.0`/`toc.1` plus `track_<n>.bin` in the directory, reopened from its
+//!   newest valid TOC slot; requires the `cdr-bundle` feature), or `empty` (an
+//!   enumerated drive with no medium; the application installs the first one).
 //!
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
@@ -199,10 +199,11 @@ struct ServeArgs {
     /// CD-ROM device (core `MmcDrive`, full MMC): `img=<iso>`, `live=<dir>`
     /// (live ISO9660 over a directory), `dvdram=<path|ram:<size>>[,size=…]`
     /// (random-writable DVD-RAM), `bundle=<dir>[,medium=cdr74|cdr80|cdr90|
-    /// cdr99][,slot=<bytes>][,recovery=delete|readonly]` (a persistent CD-R
-    /// whose `toc.0`/`toc.1` and `track_<n>.bin` live in the directory;
-    /// requires the `cdr-bundle` feature), or `empty` (an enumerated drive
-    /// with no medium). Repeatable; these LUNs follow the `--block` LUNs.
+    /// cdr99|cdrw74|cdrw80|cdrw90|cdrw99][,slot=<bytes>][,recovery=delete|
+    /// readonly]` (a persistent CD-R or erasable CD-RW bundle whose
+    /// `toc.0`/`toc.1` and `track_<n>.bin` live in the directory; requires the
+    /// `cdr-bundle` feature), or `empty` (an enumerated drive with no
+    /// medium). Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -656,13 +657,16 @@ fn build_core_slots(
             (
                 DeviceRole::MmcCd,
                 Backing::CdrBundle {
-                    medium, recovery, ..
+                    medium,
+                    kind,
+                    recovery,
+                    ..
                 },
             ) => {
                 // The TOC read needs the filesystem plane, so the medium is
                 // restored here rather than in `build_planes`.
                 let mut plane = plane;
-                let medium = match plane.open_cdr_medium(medium.sectors(), *recovery) {
+                let medium = match plane.open_cdr_medium(medium.sectors(), *kind, *recovery) {
                     Ok(medium) => medium,
                     Err(e) => {
                         eprintln!("snowscsi: bundle: LUN {lun}: {e}");
@@ -680,7 +684,7 @@ fn build_core_slots(
                 // path snapshots the ejected medium's TOC best effort, so an
                 // open track or unsaved transition survives; restarting the
                 // server re-reads the directory.
-                log::debug!("LUN {lun}: CD-R bundle ({sectors} sectors)");
+                log::debug!("LUN {lun}: recordable CD bundle ({sectors} sectors)");
             }
             _ => {
                 eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
@@ -1667,7 +1671,7 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
     if let Some(dir) = spec::duplicate_bundle_dir(specs) {
         eprintln!(
             "snowscsi: bundle directory '{dir}' is served by more than one LUN; \
-             use one directory per CD-R bundle"
+             use one directory per recordable-CD bundle"
         );
         return Err(());
     }
@@ -1741,6 +1745,7 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
             Backing::CdrBundle {
                 dir,
                 medium,
+                kind: _,
                 slot,
                 recovery,
             } => {
@@ -1754,7 +1759,7 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
                     }
                     // The FsStorage seam has no mkdir — the host (CLI) owns
                     // directory creation, exactly as for `imgdir=`.
-                    log::warn!("bundle: {dir} does not exist; creating a new blank CD-R");
+                    log::warn!("bundle: {dir} does not exist; creating a new blank recordable CD");
                     std::fs::create_dir_all(dir).map_err(|e| {
                         eprintln!("snowscsi: bundle: failed to create directory {dir}: {e}");
                     })?;
@@ -2100,9 +2105,9 @@ fn preserve_ejected_cdr(
         return;
     };
     match stack::snapshot_cdr_eject(pair, dir) {
-        Ok(true) => log::info!("LUN {lun}: CD-R TOC snapshot written to {dir}"),
+        Ok(true) => log::info!("LUN {lun}: recordable-CD TOC snapshot written to {dir}"),
         Ok(false) => {}
-        Err(e) => log::warn!("LUN {lun}: CD-R TOC snapshot failed: {e}"),
+        Err(e) => log::warn!("LUN {lun}: recordable-CD TOC snapshot failed: {e}"),
     }
 }
 
@@ -2270,7 +2275,7 @@ fn run_serve_usb(
                             if cdr_bundle_dir(specs, lun).is_some() {
                                 if let Err((i, e)) = store.sync() {
                                     log::warn!(
-                                        "LUN {lun}: CD-R pre-eject flush failed for LUN {i}: {e}"
+                                        "LUN {lun}: recordable-CD pre-eject flush failed for LUN {i}: {e}"
                                     );
                                 }
                             }
@@ -2338,7 +2343,7 @@ fn run_serve_usb(
                             if cdr_bundle_dir(specs, lun).is_some() {
                                 if let Err((i, e)) = storage.sync() {
                                     log::warn!(
-                                        "LUN {lun}: CD-R pre-eject flush failed for LUN {i}: {e}"
+                                        "LUN {lun}: recordable-CD pre-eject flush failed for LUN {i}: {e}"
                                     );
                                 }
                             }

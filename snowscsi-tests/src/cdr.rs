@@ -14,7 +14,8 @@ use snowscsi::core::{
     Nil, Sense, Spc, StaticTarget, Target, INVALID_FIELD, LBA_OUT_OF_RANGE, WRITE_PROTECTED,
 };
 use snowscsi::mmc::{
-    CdrBundleMedium, CdrCapacity, CdrDiscState, FlatCdMedium, MmcDrive, MmcMedium, Recovery,
+    CdrBundleMedium, CdrCapacity, CdrDiscState, DiscKind, FlatCdMedium, MmcDrive, MmcMedium,
+    Recovery,
 };
 
 const READ_10: u8 = 0x28;
@@ -190,6 +191,24 @@ fn cdr_target_with(capacity: CdrCapacity) -> CdrTarget {
     ))
 }
 
+/// A target with the same drive/medium shape over an erasing CD-RW.
+fn cdrw_target() -> CdrTarget {
+    cdrw_target_with(CdrCapacity::Cdr74)
+}
+
+fn cdrw_target_with(capacity: CdrCapacity) -> CdrTarget {
+    Target::new(cons(
+        LuImpl::new(
+            Spc::new(MmcDrive::new(CdrBundleMedium::blank_disc(
+                DiscKind::Cdrw,
+                capacity,
+            ))),
+            1u8,
+        ),
+        Nil,
+    ))
+}
+
 fn ctx(direction: Direction, bytes: u64) -> CommandContext {
     CommandContext {
         lun: 0,
@@ -287,6 +306,14 @@ fn read_toc(msf: bool, format: u8, track: u8, alloc: u16) -> [u8; 10] {
 fn read_capacity() -> [u8; 10] {
     let mut cdb = [0u8; 10];
     cdb[0] = READ_CAPACITY_10;
+    cdb
+}
+
+/// BLANK CDB: byte 1 bit 5 = Immed, bits 2-0 = Blanking Type.
+fn blank_cdb(blanking: u8, immediate: bool) -> [u8; 12] {
+    let mut cdb = [0u8; 12];
+    cdb[0] = BLANK;
+    cdb[1] = (u8::from(immediate) << 5) | (blanking & 0x07);
     cdb
 }
 
@@ -452,18 +479,20 @@ fn cdr_get_configuration_reports_profile_and_writable_features() {
         Completion::Good
     );
 
-    assert_eq!(&work[0..4], &104u32.to_be_bytes());
+    assert_eq!(&work[0..4], &108u32.to_be_bytes());
     assert_eq!(&work[6..8], &0x0009u16.to_be_bytes(), "current CD-R");
-    // Profile List: [0x12, 0x09, 0x08]; the mounted CD-R and the
+    // Profile List: [0x12, 0x0A, 0x09, 0x08]; the mounted CD-R and the
     // read-compatible CD-ROM profile are Current.
     assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
     assert_eq!(work[15], 0);
-    assert_eq!(&work[16..18], &0x0009u16.to_be_bytes());
-    assert_eq!(work[19], 1);
-    assert_eq!(&work[20..22], &0x0008u16.to_be_bytes());
+    assert_eq!(&work[16..18], &0x000Au16.to_be_bytes());
+    assert_eq!(work[19], 0);
+    assert_eq!(&work[20..22], &0x0009u16.to_be_bytes());
     assert_eq!(work[23], 1);
+    assert_eq!(&work[24..26], &0x0008u16.to_be_bytes());
+    assert_eq!(work[27], 1);
 
-    let n = 108usize;
+    let n = 112usize;
     let at21 = feature_at(&work, n, 0x0021).expect("Incremental Streaming listed");
     assert_eq!(work[at21 + 2], 0x0D, "0x21 version 3, current");
     let at2d = feature_at(&work, n, 0x002D).expect("CD Track at Once listed");
@@ -1079,8 +1108,8 @@ fn cdr_format_and_blank_are_rejected_without_touching_the_backing() {
     );
 
     for cdb in [
-        [BLANK, 0, 0, 0, 0, 0],
-        [BLANK, 0x20, 0, 0, 0, 0], // IMMED
+        blank_cdb(0, false),
+        blank_cdb(0, true), // IMMED
     ] {
         assert_eq!(
             run(
@@ -1402,21 +1431,23 @@ fn cdr_cdrkit_tao_trace() {
         ),
         Completion::Good
     );
-    assert_eq!(&work[0..4], &104u32.to_be_bytes());
+    assert_eq!(&work[0..4], &108u32.to_be_bytes());
     assert_eq!(
         &work[6..8],
         &0x0009u16.to_be_bytes(),
         "current CD-R profile"
     );
-    // Profile list: CD-ROM (0x08) and CD-R (0x09) are Current; the
-    // read-compatible CD-RW profile (0x12) is listed but not Current.
+    // Profile list [0x12, 0x0A, 0x09, 0x08]: CD-ROM (0x08) and CD-R (0x09)
+    // are Current; 0x12 and the listed CD-RW profile (0x0A) are not.
     assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
     assert_eq!(work[15], 0, "0x12 not Current on a CD-R");
-    assert_eq!(&work[16..18], &0x0009u16.to_be_bytes());
-    assert_eq!(work[19], 1, "0x09 Current");
-    assert_eq!(&work[20..22], &0x0008u16.to_be_bytes());
-    assert_eq!(work[23], 1, "0x08 Current");
-    let listed = 108usize;
+    assert_eq!(&work[16..18], &0x000Au16.to_be_bytes());
+    assert_eq!(work[19], 0, "0x0A not Current on a CD-R");
+    assert_eq!(&work[20..22], &0x0009u16.to_be_bytes());
+    assert_eq!(work[23], 1, "0x09 Current");
+    assert_eq!(&work[24..26], &0x0008u16.to_be_bytes());
+    assert_eq!(work[27], 1, "0x08 Current");
+    let listed = 112usize;
     let at21 = feature_at(&work, listed, 0x0021).expect("Incremental Streaming");
     assert_eq!(work[at21 + 2] & 1, 1, "0x21 Current");
     let at2d = feature_at(&work, listed, 0x002D).expect("CD Track at Once");
@@ -2498,5 +2529,418 @@ fn cdr_appendable_reopened_capacity_keeps_the_atip_extent() {
         ),
         (SECTORS - 1) as u32,
         "an appendable restored from its TOC keeps the ATIP extent"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CD-RW: erasable sequential media
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn cdrw_blank_capacity_disc_info_atip_and_profile() {
+    let mut target = cdrw_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 256];
+    let mut scratch = vec![0u8; 64];
+    let extent = (CdrCapacity::Cdr74.sectors() - 1) as u32;
+
+    // A blank CD-RW is sized from the ATIP extent, exactly like a blank CD-R.
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent
+    );
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x00, "Empty disc");
+    assert_eq!(work[2] & 0x10, 0x10, "CD-RW is erasable");
+
+    // ATIP descriptor byte 2: bit7 set, disc type 1 (CD-RW), sub-type 0.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_toc(false, 4, 0, 28),
+            Direction::ToHost,
+            28,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[6], 0x80 | 0x40, "ATIP disc type 1");
+
+    // GET CONFIGURATION: current profile 0x0A, listed as a current entry.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &get_configuration(128),
+            Direction::ToHost,
+            128,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(&work[6..8], &0x000Au16.to_be_bytes(), "current CD-RW");
+    assert_eq!(&work[16..18], &0x000Au16.to_be_bytes());
+    assert_eq!(work[19], 1, "CD-RW profile is Current");
+}
+
+#[test]
+fn cdrw_blank_all_and_minimal_reset_the_disc_and_reburn_finalizes() {
+    let mut target = cdrw_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(vec![0x5A; 3 * BLOCK]));
+    let mut work = vec![0u8; 64];
+    let mut scratch = vec![0u8; 64];
+    let extent = (CdrCapacity::Cdr74.sectors() - 1) as u32;
+
+    write_one_block(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent,
+        "appendable CD-RW keeps the ATIP extent"
+    );
+
+    // SYNCHRONIZE CACHE closes the track; CLOSE SESSION finalizes it.
+    for cdb in [sync_cache(), close_track_session(2, 0)] {
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &cdb,
+                Direction::None,
+                0,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good
+        );
+    }
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        299,
+        "finalized CD-RW reports the recorded extent"
+    );
+
+    // BLANK all on a finalized CD-RW resets it to Blank and keeps the media.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &blank_cdb(0, true),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent,
+        "blanked CD-RW reports the ATIP extent"
+    );
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x00, "blank again");
+    assert_eq!(work[2] & 0x10, 0x10, "still erasable");
+
+    // Re-burn from LBA 0 and finalize again.
+    for cdb in [write10(0, 1), sync_cache(), close_track_session(2, 0)] {
+        let direction = if cdb[0] == WRITE_10 {
+            Direction::FromHost
+        } else {
+            Direction::None
+        };
+        let bytes = if cdb[0] == WRITE_10 { BLOCK as u64 } else { 0 };
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &cdb,
+                direction,
+                bytes,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good
+        );
+    }
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        299,
+        "the re-burn finalizes like a fresh disc"
+    );
+
+    // Minimal blank is also accepted, then a third burn finalizes again.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &blank_cdb(1, false),
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        extent
+    );
+    for cdb in [write10(0, 1), sync_cache(), close_track_session(2, 0)] {
+        let direction = if cdb[0] == WRITE_10 {
+            Direction::FromHost
+        } else {
+            Direction::None
+        };
+        let bytes = if cdb[0] == WRITE_10 { BLOCK as u64 } else { 0 };
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &cdb,
+                direction,
+                bytes,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good
+        );
+    }
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        299
+    );
+
+    // BLANK never takes the whole-medium zero-fill path.
+    assert!(
+        !storage
+            .inner()
+            .log
+            .iter()
+            .any(|ev| matches!(ev, Ev::Write(0, _, _))),
+        "BLANK must not zero-fill resource 0"
+    );
+}
+
+#[test]
+fn cdrw_dummy_trace_and_format_unit() {
+    let mut target = cdrw_target();
+    let mut storage = BlockingStorage::new(Plane::new(16 * BLOCK));
+    let mut host = BlockingHost::new(TestHost::new(Vec::new()));
+    let mut work = vec![0u8; 4096];
+    let mut scratch = vec![0u8; 4096];
+
+    consume_medium_change(
+        &mut target,
+        &mut storage,
+        &mut host,
+        &mut work,
+        &mut scratch,
+    );
+
+    // FORMAT UNIT is 24/00 on a sequential CD, never a zero-fill.
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &[FORMAT_UNIT, 0, 0, 0, 0, 0],
+            Direction::None,
+            0,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Check(INVALID_FIELD)
+    );
+
+    // MODE SELECT page 0x05 with Test Write + TAO/DBT 8 is accepted for a
+    // CD-RW through the profile-based sequential-CD predicate.
+    let mut select_host = BlockingHost::new(TestHost::new(dummy_mode_page()));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut select_host,
+            &mode_select10(60),
+            Direction::FromHost,
+            60,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+
+    // The simulated TAO trace reports GOOD and leaves the disc blank.
+    let payload = vec![0x5A; 3 * BLOCK];
+    let mut write_host = BlockingHost::new(TestHost::new(payload));
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut write_host,
+            &write10(0, 3),
+            Direction::FromHost,
+            3 * BLOCK as u64,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    for cdb in [sync_cache(), close_track_session(2, 0)] {
+        assert_eq!(
+            run(
+                &mut target,
+                &mut storage,
+                &mut host,
+                &cdb,
+                Direction::None,
+                0,
+                &mut work,
+                &mut scratch,
+            ),
+            Completion::Good
+        );
+    }
+
+    assert_eq!(
+        run(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &read_disc_information(34),
+            Direction::ToHost,
+            34,
+            &mut work,
+            &mut scratch,
+        ),
+        Completion::Good
+    );
+    assert_eq!(work[2] & 0x03, 0x00, "Test Write left the disc Empty");
+    assert_eq!(work[2] & 0x10, 0x10, "still erasable");
+    assert_eq!(
+        capacity_lba(
+            &mut target,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut scratch
+        ),
+        (CdrCapacity::Cdr74.sectors() - 1) as u32,
+        "Test Write does not shrink the medium"
+    );
+
+    // No recording command reached the backing payload or zero-filled it.
+    assert!(
+        !storage
+            .inner()
+            .log
+            .iter()
+            .any(|ev| matches!(ev, Ev::Write(0, _, _))),
+        "FORMAT/BLANK simulation must not zero-fill"
     );
 }

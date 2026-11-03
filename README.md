@@ -147,7 +147,7 @@ Both transports drive any `impl ScsiDevice` through
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget on Linux): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
 - [x] Writable DVD-RAM (`--cdrom dvdram=`, feature `dvdram`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
-- [x] Persistent CD-R bundle (`--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once disc for Track-at-Once burning (`wodim`/`cdrecord`; the TAO path is exercised by an in-process cdrkit trace and the manual `wodim` recipe in `HACKING.md`), with the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, and TOC snapshotting on eject. See the [CD-R storage resource contract](HACKING.md#cd-r-storage-resource-contract) for the directory layout and durability rules.
+- [x] Persistent CD-R/CD-RW bundle (`--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once or erasable disc for Track-at-Once burning (`wodim`/`cdrecord`; the TAO path is exercised by an in-process cdrkit trace and the manual `wodim` recipe in `HACKING.md`), with the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, CD-RW BLANK, and TOC snapshotting on eject. See the [CD-R/CD-RW storage resource contract](HACKING.md#cd-rcd-rw-storage-resource-contract) for the directory layout and durability rules.
 - [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`)
 
 ## Project structure

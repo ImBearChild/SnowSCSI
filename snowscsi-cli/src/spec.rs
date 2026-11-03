@@ -10,18 +10,19 @@
 //!          | dvdram=<path|ram:<size>> | bundle=<dir> | empty
 //! opt     := profile=block|cd | ro | sector=512|2048 | chunk=<size>
 //!          | size=<size> | removable
-//!          | medium=cdr74|cdr80|cdr90|cdr99 | slot=<bytes>
-//!          | recovery=delete|readonly
+//!          | medium=cdr74|cdr80|cdr90|cdr99|cdrw74|cdrw80|cdrw90|cdrw99
+//!          | slot=<bytes> | recovery=delete|readonly
 //! ```
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
 //! exists, or whether an `imgdir=`/`bundle=` directory is a new or existing
 //! bundle, is decided when the device is built. A backing whose *options* use
-//! a library type (the CD-R medium/recovery enums) is gated by the same
-//! feature; a `bundle=` spec without `cdr-bundle` is rejected by the parser.
+//! a library type (the recordable-CD medium/recovery enums) is gated by the
+//! same feature; a `bundle=` spec without `cdr-bundle` is rejected by the
+//! parser.
 
 #[cfg(feature = "cdr-bundle")]
-use snowscsi::mmc::cdr_bundle::{CdrCapacity, Recovery, TOC_SLOT_MAX, TOC_SLOT_MIN};
+use snowscsi::mmc::cdr_bundle::{CdrCapacity, DiscKind, Recovery, TOC_SLOT_MAX, TOC_SLOT_MIN};
 
 /// The flag a spec came from (which fixes the legal backing set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,14 +65,17 @@ pub enum Backing {
     /// `dvdram=<path>` or `dvdram=ram:<size>` — DVD-RAM (MMC only).
     /// `path = None` means memory (the size lives in [`PlaneOpts`]).
     DvdRam { path: Option<String> },
-    /// `bundle=<dir>` — a persistent CD-R bundle (MMC only). The alternating
-    /// TOC slots and every track payload live in `dir` as `toc.0`/`toc.1` and
-    /// `track_<n>.bin`.
+    /// `bundle=<dir>` — a persistent CD-R/CD-RW bundle (MMC only). The
+    /// alternating TOC slots and every track payload live in `dir` as
+    /// `toc.0`/`toc.1` and `track_<n>.bin`.
     #[cfg(feature = "cdr-bundle")]
     CdrBundle {
         dir: String,
         /// Nominal disc size for a new bundle; a stored TOC wins on reopen.
         medium: CdrCapacity,
+        /// Media kind for a new bundle (`medium=cdrwNN`); a stored TOC wins on
+        /// reopen. `None` means the default CD-R and never warns on reopen.
+        kind: Option<DiscKind>,
         /// TOC slot size for a new bundle (`None` = medium default); a stored
         /// TOC wins on reopen.
         slot: Option<u32>,
@@ -129,7 +133,7 @@ pub fn parse_all(block: &[String], cdrom: &[String]) -> Result<Vec<DeviceSpec>, 
     if let Some(dir) = duplicate_bundle_dir(&specs) {
         return Err(format!(
             "bundle directory '{dir}' is served by more than one LUN; \
-             use one directory per CD-R bundle"
+             use one directory per recordable-CD bundle"
         ));
     }
     Ok(specs)
@@ -293,6 +297,7 @@ fn parse_bundle(dir: &str) -> Result<Backing, String> {
     Ok(Backing::CdrBundle {
         dir: dir.to_string(),
         medium: CdrCapacity::Cdr80,
+        kind: None,
         slot: None,
         recovery: Recovery::Delete,
     })
@@ -307,9 +312,12 @@ fn parse_bundle(_dir: &str) -> Result<Backing, String> {
 fn apply_bundle_opts(backing: Backing, opts: &RawOpts) -> Result<Backing, String> {
     #[cfg(feature = "cdr-bundle")]
     if let Backing::CdrBundle { dir, .. } = backing {
-        let medium = match opts.medium.as_deref() {
-            Some(raw) => parse_medium(raw)?,
-            None => CdrCapacity::Cdr80,
+        let (medium, kind) = match opts.medium.as_deref() {
+            Some(raw) => {
+                let (medium, kind) = parse_medium(raw)?;
+                (medium, Some(kind))
+            }
+            None => (CdrCapacity::Cdr80, None),
         };
         let slot = opts.slot.as_deref().map(parse_slot).transpose()?;
         let recovery = match opts.recovery.as_deref() {
@@ -319,6 +327,7 @@ fn apply_bundle_opts(backing: Backing, opts: &RawOpts) -> Result<Backing, String
         return Ok(Backing::CdrBundle {
             dir,
             medium,
+            kind,
             slot,
             recovery,
         });
@@ -328,16 +337,27 @@ fn apply_bundle_opts(backing: Backing, opts: &RawOpts) -> Result<Backing, String
 }
 
 #[cfg(feature = "cdr-bundle")]
-fn parse_medium(raw: &str) -> Result<CdrCapacity, String> {
-    match raw {
-        "cdr74" => Ok(CdrCapacity::Cdr74),
-        "cdr80" => Ok(CdrCapacity::Cdr80),
-        "cdr90" => Ok(CdrCapacity::Cdr90),
-        "cdr99" => Ok(CdrCapacity::Cdr99),
-        other => Err(format!(
-            "invalid medium '{other}' (cdr74, cdr80, cdr90, cdr99)"
-        )),
-    }
+fn parse_medium(raw: &str) -> Result<(CdrCapacity, DiscKind), String> {
+    let invalid = || {
+        format!(
+            "invalid medium '{raw}' (cdr74, cdr80, cdr90, cdr99, cdrw74, cdrw80, cdrw90, cdrw99)"
+        )
+    };
+    let (prefix, kind) = if let Some(rest) = raw.strip_prefix("cdrw") {
+        (rest, DiscKind::Cdrw)
+    } else if let Some(rest) = raw.strip_prefix("cdr") {
+        (rest, DiscKind::Cdr)
+    } else {
+        return Err(invalid());
+    };
+    let capacity = match prefix {
+        "74" => CdrCapacity::Cdr74,
+        "80" => CdrCapacity::Cdr80,
+        "90" => CdrCapacity::Cdr90,
+        "99" => CdrCapacity::Cdr99,
+        _ => return Err(invalid()),
+    };
+    Ok((capacity, kind))
 }
 
 #[cfg(feature = "cdr-bundle")]
@@ -958,6 +978,7 @@ mod tests {
             Backing::CdrBundle {
                 dir: "/tmp/disc".to_string(),
                 medium: CdrCapacity::Cdr80,
+                kind: None,
                 slot: None,
                 recovery: Recovery::Delete,
             }
@@ -977,22 +998,28 @@ mod tests {
             Backing::CdrBundle {
                 dir: "/tmp/disc".to_string(),
                 medium: CdrCapacity::Cdr74,
+                kind: Some(DiscKind::Cdr),
                 slot: Some(8192),
                 recovery: Recovery::ReadOnly,
             }
         );
 
-        for (raw, want) in [
-            ("cdr74", CdrCapacity::Cdr74),
-            ("cdr80", CdrCapacity::Cdr80),
-            ("cdr90", CdrCapacity::Cdr90),
-            ("cdr99", CdrCapacity::Cdr99),
+        for (raw, want, want_kind) in [
+            ("cdr74", CdrCapacity::Cdr74, DiscKind::Cdr),
+            ("cdr80", CdrCapacity::Cdr80, DiscKind::Cdr),
+            ("cdr90", CdrCapacity::Cdr90, DiscKind::Cdr),
+            ("cdr99", CdrCapacity::Cdr99, DiscKind::Cdr),
+            ("cdrw74", CdrCapacity::Cdr74, DiscKind::Cdrw),
+            ("cdrw80", CdrCapacity::Cdr80, DiscKind::Cdrw),
+            ("cdrw90", CdrCapacity::Cdr90, DiscKind::Cdrw),
+            ("cdrw99", CdrCapacity::Cdr99, DiscKind::Cdrw),
         ] {
             let spec = cdrom(&format!("bundle=d,medium={raw}")).unwrap();
-            let Backing::CdrBundle { medium, .. } = spec.backing else {
+            let Backing::CdrBundle { medium, kind, .. } = spec.backing else {
                 panic!("expected a bundle backing");
             };
             assert_eq!(medium, want);
+            assert_eq!(kind, Some(want_kind));
         }
     }
 

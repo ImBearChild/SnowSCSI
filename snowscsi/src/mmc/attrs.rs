@@ -21,7 +21,7 @@ pub struct MmcAttrs {
     /// The medium reports a health failure until it is explicitly reinstalled.
     pub needs_recovery: bool,
     /// Current MMC profile of the mounted medium (`0x08` CD-ROM, `0x09` CD-R,
-    /// `0x12` DVD-RAM).
+    /// `0x0A` CD-RW, `0x12` DVD-RAM).
     pub profile: u16,
     /// Features that are Current for the mounted medium (feature codes).
     pub current_features: &'static [u16],

@@ -111,6 +111,17 @@ pub trait MmcMedium {
         None
     }
 
+    /// Whether [`MmcOp::Blank`] has medium semantics (an erasable disc).
+    ///
+    /// The drive uses this to route BLANK to the medium before the generic
+    /// whole-medium zero-fill path. The default is `false`: only a rewritable
+    /// medium with a real blank state (a CD-RW bundle) opts in. The medium
+    /// still owns the per-call validation (write-once, recovery latch, unsupported
+    /// blanking type).
+    fn blank_supported(&self) -> bool {
+        false
+    }
+
     /// The host entered or left the Write Parameters Test Write mode.
     ///
     /// A medium that can simulate writes must consume the host's data without

@@ -519,7 +519,7 @@ fn foreground_long_operation_blocks_take_and_management() {
         target.drive_static::<Here>(
             &mut storage,
             ctx(),
-            &[0xA1, 0x20, 0, 0, 0, 0],
+            &[0xA1, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             &mut work,
             &mut scratch,
         ),

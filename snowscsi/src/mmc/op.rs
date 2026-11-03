@@ -56,6 +56,20 @@ pub enum MmcOp {
         /// Number of blocks to format.
         blocks: u64,
     },
+    /// BLANK: return an erasable medium to its blank state.
+    ///
+    /// `blanking` is the CDB Blanking Type: `0` = blank all, `1` = minimal
+    /// blank (erase). The medium decides whether it is erasable and rejects a
+    /// type it does not implement; `immediate` is accepted because an erasable
+    /// medium completes the transition synchronously. This is deliberately
+    /// separate from [`Self::Format`]: a CD-RW blank rewrites the disc/TOC
+    /// state, it never zero-fills the payload.
+    Blank {
+        /// Blanking Type from CDB byte 1 bits 2-0.
+        blanking: u8,
+        /// Immed bit from CDB byte 1 bit 5.
+        immediate: bool,
+    },
     /// CLOSE TRACK SESSION: close function `001b` (track) or `010b` (session)
     /// on CD; changes the write state and commits as needed.
     Close {
@@ -97,5 +111,15 @@ mod tests {
             }
         );
         assert_ne!(SectorKind::Data2048, SectorKind::Audio2352);
+        assert_ne!(
+            MmcOp::Blank {
+                blanking: 0,
+                immediate: false,
+            },
+            MmcOp::Blank {
+                blanking: 1,
+                immediate: true,
+            }
+        );
     }
 }

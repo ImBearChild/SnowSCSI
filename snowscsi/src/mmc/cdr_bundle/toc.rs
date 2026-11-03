@@ -1,4 +1,4 @@
-//! Persistent TOC slot layout for the CD-R medium.
+//! Persistent TOC slot layout for the recordable CD medium (CD-R/CD-RW).
 //!
 //! A slot is a fixed-size INI document: a 256-byte header, the body with the
 //! disc/track/session layout, and `;` comment padding up to the configured slot
@@ -33,7 +33,9 @@ use core::fmt::Write as _;
 
 use heapless::{String, Vec};
 
-use super::{CdrDiscState, SessionEntry, TrackEntry, MAX_SESSIONS, MAX_TRACKS, MEDIUM_LEADIN};
+use super::{
+    CdrDiscState, DiscKind, SessionEntry, TrackEntry, MAX_SESSIONS, MAX_TRACKS, MEDIUM_LEADIN,
+};
 use crate::mmc::attrs::{TrackKind, TrackStatus};
 
 /// Length of the fixed slot header.
@@ -285,6 +287,8 @@ fn set_once<T: Copy>(slot: &mut Option<T>, value: T) -> Option<()> {
 pub(crate) struct ParsedToc {
     /// Header that produced this content.
     pub header: TocHeader,
+    /// Recordable media kind.
+    pub kind: DiscKind,
     /// Disc state.
     pub disc: CdrDiscState,
     /// Addressable logical blocks.
@@ -425,9 +429,10 @@ pub(crate) fn body_len(
     capacity: u64,
     leadin: i64,
     disc: CdrDiscState,
+    kind: DiscKind,
 ) -> usize {
     let mut counter = Counter(0);
-    write_body(tracks, sessions, capacity, leadin, disc, &mut counter);
+    write_body(tracks, sessions, capacity, leadin, disc, kind, &mut counter);
     counter.0
 }
 
@@ -438,19 +443,22 @@ pub(crate) fn body_checksum(
     capacity: u64,
     leadin: i64,
     disc: CdrDiscState,
+    kind: DiscKind,
 ) -> u32 {
     let mut sink = Checksum(0xFFFF_FFFF);
-    write_body(tracks, sessions, capacity, leadin, disc, &mut sink);
+    write_body(tracks, sessions, capacity, leadin, disc, kind, &mut sink);
     !sink.0
 }
 
 /// Render `out.len()` body bytes starting at body offset `at`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_body(
     tracks: &[TrackEntry],
     sessions: &[SessionEntry],
     capacity: u64,
     leadin: i64,
     disc: CdrDiscState,
+    kind: DiscKind,
     at: usize,
     out: &mut [u8],
 ) -> usize {
@@ -459,7 +467,7 @@ pub(crate) fn render_body(
         skip: at,
         written: 0,
     };
-    write_body(tracks, sessions, capacity, leadin, disc, &mut sink);
+    write_body(tracks, sessions, capacity, leadin, disc, kind, &mut sink);
     sink.written
 }
 
@@ -487,10 +495,11 @@ fn write_body(
     capacity: u64,
     leadin: i64,
     disc: CdrDiscState,
+    kind: DiscKind,
     sink: &mut impl LineSink,
 ) {
     let mut line = String::<BODY_LINE_MAX>::new();
-    let _ = write!(line, "disc_type = cdr");
+    let _ = write!(line, "disc_type = {}", disc_kind_text(kind));
     sink.line(&line);
     line.clear();
     let _ = write!(line, "disc_state = {}", disc_text(disc));
@@ -569,6 +578,21 @@ const fn disc_text(disc: CdrDiscState) -> &'static str {
         CdrDiscState::Blank => "blank",
         CdrDiscState::Appendable => "appendable",
         CdrDiscState::Finalized => "finalized",
+    }
+}
+
+const fn disc_kind_text(kind: DiscKind) -> &'static str {
+    match kind {
+        DiscKind::Cdr => "cdr",
+        DiscKind::Cdrw => "cdrw",
+    }
+}
+
+fn parse_disc_kind(value: &str) -> Option<DiscKind> {
+    match value {
+        "cdr" => Some(DiscKind::Cdr),
+        "cdrw" => Some(DiscKind::Cdrw),
+        _ => None,
     }
 }
 
@@ -651,6 +675,7 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
     let text = core::str::from_utf8(body).map_err(|_| TocError::Invalid)?;
 
     let mut globals = 0u8;
+    let mut kind = None;
     let mut disc = None;
     let mut capacity = None;
     let mut leadin = None;
@@ -683,9 +708,7 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
                     None => {
                         let bit = match key {
                             "disc_type" => {
-                                if value != "cdr" {
-                                    return Err(TocError::Invalid);
-                                }
+                                kind = Some(parse_disc_kind(value).ok_or(TocError::Invalid)?);
                                 0x01
                             }
                             "disc_state" => {
@@ -872,6 +895,7 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
         return Err(TocError::Invalid);
     }
     let disc = disc.ok_or(TocError::Invalid)?;
+    let kind = kind.ok_or(TocError::Invalid)?;
     let capacity = capacity.ok_or(TocError::Invalid)?;
     if capacity == 0 || (capacity_hint != 0 && capacity_hint != capacity) {
         return Err(TocError::Invalid);
@@ -943,6 +967,7 @@ pub(crate) fn parse(slot: &[u8], capacity_hint: u64) -> Result<ParsedToc, TocErr
 
     Ok(ParsedToc {
         header,
+        kind,
         disc,
         capacity,
         medium_leadin,

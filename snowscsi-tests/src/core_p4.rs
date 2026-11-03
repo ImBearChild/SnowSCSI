@@ -1177,13 +1177,15 @@ fn no_medium_gc_and_gesn_answer_explicitly_through_spc() {
         "GC must answer explicitly, not delegate"
     );
     assert_eq!(&work[6..8], &0x0000u16.to_be_bytes(), "no current profile");
-    assert_eq!(work[11], 12, "recorder, CD-R and CD-ROM stay listed");
+    assert_eq!(work[11], 16, "recorder, CD-RW, CD-R and CD-ROM stay listed");
     assert_eq!(&work[12..14], &0x0012u16.to_be_bytes());
     assert_eq!(work[15], 0, "no profile is current");
-    assert_eq!(&work[16..18], &0x0009u16.to_be_bytes());
+    assert_eq!(&work[16..18], &0x000Au16.to_be_bytes());
     assert_eq!(work[19], 0, "no profile is current");
-    assert_eq!(&work[20..22], &0x0008u16.to_be_bytes());
+    assert_eq!(&work[20..22], &0x0009u16.to_be_bytes());
     assert_eq!(work[23], 0, "no profile is current");
+    assert_eq!(&work[24..26], &0x0008u16.to_be_bytes());
+    assert_eq!(work[27], 0, "no profile is current");
 
     // MODE SENSE 0x2A is a drive query: it answers while the tray is empty,
     // from the drive capabilities rather than the (absent) medium.

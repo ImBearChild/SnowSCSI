@@ -326,9 +326,10 @@ impl MmcMedium for VendorMedium {
             }
             MmcOp::Commit => Op::Sync,
             // The drive owns descriptor/format decoding.
-            MmcOp::Format { .. } | MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
-                return Err(Completion::Check(INVALID_FIELD))
-            }
+            MmcOp::Format { .. }
+            | MmcOp::Blank { .. }
+            | MmcOp::TrackInfo { .. }
+            | MmcOp::DiscInfo => return Err(Completion::Check(INVALID_FIELD)),
             MmcOp::Close { .. } => return Err(Completion::Good),
             MmcOp::ReserveTrack { .. } => return Err(Completion::Check(INVALID_FIELD)),
         };

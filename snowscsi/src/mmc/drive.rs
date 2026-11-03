@@ -77,6 +77,15 @@ const TOC_SESSION_LEN: usize = 12;
 /// hosts size their own buffer for 28 bytes), so the ATIP Data Length is
 /// `ATIP_LEN - 2` = 26.
 const ATIP_LEN: usize = 28;
+/// Whether the mounted medium is a sequential recordable CD (CD-R or CD-RW).
+///
+/// The media kind is a profile property, not a write mode: a CD-RW is
+/// [`MmcWriteMode::Rewritable`], so testing `write_mode == WriteOnce` would
+/// wrongly exclude it from the TAO/recordable-CD paths.
+fn sequential_cd(attrs: MmcAttrs) -> bool {
+    matches!(attrs.profile, 0x0009 | 0x000A)
+}
+
 /// One ATIP descriptor (MMC-6 Table 488, without the optional S4 values).
 const ATIP_DESCRIPTOR_LEN: usize = ATIP_LEN - 4;
 /// One TOC track descriptor.
@@ -973,12 +982,19 @@ impl<M: MmcMedium> MmcDrive<M> {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
+        // A sequential recordable CD (CD-R/CD-RW) has no meaningful FORMAT
+        // UNIT: BLANK owns its state transition. Reject it before the
+        // write-protection gate so a finalized CD-RW reports 24/00 rather than
+        // 07/27 and never reaches the zero-fill path.
+        if sequential_cd(attrs) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
         if !attrs.write_accessible() {
             return Err(Completion::Check(WRITE_PROTECTED));
         }
-        // FORMAT UNIT is only meaningful on writable media; a write-once
-        // medium (CD-R) must never be zero-filled by a stray FORMAT/BLANK.
-        // Unformatted (`Blank`) media stay eligible.
+        // FORMAT UNIT is only meaningful on writable media; any other
+        // write-once medium must never be zero-filled. Unformatted (`Blank`)
+        // media stay eligible.
         if matches!(
             attrs.write_mode,
             MmcWriteMode::ReadOnly | MmcWriteMode::WriteOnce
@@ -993,25 +1009,62 @@ impl<M: MmcMedium> MmcDrive<M> {
         Ok(())
     }
 
-    /// BLANK: only blanking type 0 (zero-fill), IMMED from CDB byte 1 bit 5.
+    /// BLANK: an erasable medium blanks itself, otherwise type 0 zero-fills.
+    ///
+    /// The CDB is the 12-byte MMC-6 Table 229 form: byte 1 bit 5 = Immed,
+    /// bits 2-0 = Blanking Type, the rest of byte 1 reserved. A medium that
+    /// reports [`MmcMedium::blank_supported`] owns the transition (CD-RW:
+    /// reset the disc/TOC state), so BLANK never takes the whole-medium
+    /// zero-fill path there. Precedence for that medium-owned path is fixed by
+    /// the medium: sequential CD (CD-R) → `24/00`, recovery latch → `07/27`,
+    /// unsupported blanking type → `24/00`.
+    ///
+    /// Every other rewritable medium (DVD-RAM) keeps the type-0 zero-fill.
+    /// A sequential recordable CD (CD-R or CD-RW without a medium-owned blank)
+    /// is `24/00` before the write-protection gate, so a finalized CD-R
+    /// reports `24/00`, not `07/27`.
     fn prepare_blank(&mut self, ctx: CommandContext, cdb: &[u8]) -> Result<(), Completion> {
-        if cdb.len() < 6 {
+        if cdb.len() < 12 {
             return Err(Completion::Check(INVALID_FIELD));
         }
-        // MMC-6 Table 229: byte 1 bit 5 = Immed, bits 2-0 = Blanking Type.
-        if cdb[1] & 0x07 != 0 {
+        // MMC-6 Table 229: byte 1 bit 5 = Immed, bits 2-0 = Blanking Type; the
+        // other byte-1 bits are reserved.
+        if cdb[1] & 0xD8 != 0 {
             return Err(Completion::Check(INVALID_FIELD));
         }
+        let blanking = cdb[1] & 0x07;
+        let immediate = cdb[1] & 0x20 != 0;
         check_direction(ctx, Direction::None)?;
         if matches!(ctx.declared_host_bytes(), Some(declared) if declared != 0) {
             return Err(Completion::Check(INVALID_FIELD));
         }
         let attrs = self.attrs().ok_or(Completion::Check(MEDIUM_NOT_PRESENT))?;
+        // Probe before the write-protection gate: a finalized CD-RW refuses
+        // WRITE but still accepts BLANK.
+        if self.medium.as_ref().is_some_and(|m| m.blank_supported()) {
+            return self.begin_media(
+                MmcOp::Blank {
+                    blanking,
+                    immediate,
+                },
+                0,
+            );
+        }
+        // A sequential recordable CD has no zero-fill representation; reject it
+        // before the write-protection gate so a finalized CD-R is 24/00.
+        if sequential_cd(attrs) {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
+        // The zero-fill path only implements blank-all; reject another type
+        // before the write-protection check (baseline ordering).
+        if blanking != 0 {
+            return Err(Completion::Check(INVALID_FIELD));
+        }
         if !attrs.write_accessible() {
             return Err(Completion::Check(WRITE_PROTECTED));
         }
-        // Only a writable medium can be blanked; a write-once CD-R has no
-        // blanking semantics and must not be zero-filled.
+        // Only a writable medium can be zero-filled; any other write-once
+        // medium has no blanking semantics.
         if matches!(
             attrs.write_mode,
             MmcWriteMode::ReadOnly | MmcWriteMode::WriteOnce
@@ -1021,7 +1074,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         self.arm_zero_fill(attrs.sectors, attrs.block_len)?;
         self.query = Query::Format(FormatCmd {
             params: false,
-            immediate: cdb[1] & 0x20 != 0,
+            immediate,
         });
         Ok(())
     }
@@ -1372,7 +1425,7 @@ impl<M: MmcMedium> MmcDrive<M> {
                     };
                     return PollStep::Complete(Completion::Check(sense));
                 };
-                let recordable_cdr = attrs.write_mode == MmcWriteMode::WriteOnce;
+                let recordable_cdr = sequential_cd(attrs);
                 self.poll_encoded(fb, data, |out| {
                     encode_track_info(info, recordable_cdr, out);
                     true
@@ -1542,7 +1595,7 @@ impl<M: MmcMedium> MmcDrive<M> {
                         match validated {
                             Ok(params) => {
                                 if let Some(params) = params {
-                                    // A CD-R recorder applies the requested
+                                    // A sequential CD recorder applies the requested
                                     // test mode to itself and to the medium.
                                     self.test_write = params.test_write;
                                     if let Some(medium) = self.medium.as_mut() {
@@ -1867,18 +1920,18 @@ impl<M: MmcMedium> SpcProfile for MmcDrive<M> {
             // geometry; READ CAPACITY must not fabricate LBA 0.
             return None;
         }
-        // An unfinalized write-once disc keeps the medium extent: the geometry
+        // An unfinalized sequential CD keeps the medium extent: the geometry
         // already fixes the future lead-out, so a reserved-only or partially
         // burned track must not shrink the block device when the host
         // re-probes mid-burn. A finalized disc reports the recorded extent,
-        // and a write-once disc without a lead-out falls back to the medium
+        // and a sequential CD without a lead-out falls back to the medium
         // geometry. A blank rewritable/read-only disc keeps the standard
         // one-block view.
         let last = self.medium.as_ref().map_or_else(
             || attrs.sectors.saturating_sub(1),
             |medium| {
                 let info = medium.disc_info();
-                if attrs.write_mode == MmcWriteMode::WriteOnce {
+                if sequential_cd(attrs) {
                     if info.status == DiscStatus::Finalized {
                         info.last_session_lba
                     } else {
@@ -2156,9 +2209,10 @@ const TIMEOUT_PROTECT_PAGE: [u8; 10] = [0x1D, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00
 /// narrow capability set.
 #[cfg(all(test, feature = "dvdram"))]
 const CDROM_PROFILES: [u16; 1] = [0x08];
-/// Profiles the default Hyper-Multi drive supports, in descending order; the
-/// non-current ones are still listed.
-const HYPER_MULTI_PROFILES: [u16; 3] = [0x12, 0x09, 0x08];
+/// Profiles the default Hyper-Multi drive supports, ordered by descending
+/// profile code per MMC-6 (DVD-RAM, CD-RW, CD-R, CD-ROM); a non-current
+/// profile is still listed.
+const HYPER_MULTI_PROFILES: [u16; 4] = [0x12, 0x0A, 0x09, 0x08];
 /// Profiles the narrower DVD-RAM recorder view supports; the non-current one
 /// is still listed.
 const DVDRAM_PROFILES: [u16; 2] = [0x12, 0x08];
@@ -2195,18 +2249,18 @@ const ALL_PAGE_ORDER: [u8; 9] = [0x01, 0x05, 0x08, 0x0D, 0x0E, 0x1A, 0x1D, 0x2A,
 
 /// Write Parameters page 0x05 for the mounted medium.
 ///
-/// A CD-R recorder advertises the mode it actually records with: Track-at-Once
-/// (Write Type 1), data track mode 4 and 2048-byte Mode 1 data blocks (Data
-/// Block Type 8). `test_write` is the current Test Write bit (byte 2 bit 4),
-/// which the host sets for `wodim -dummy`; it is only meaningful on a
-/// write-once CD. Read-only and rewritable media keep the default zero page
-/// and therefore never claim TAO or Test Write.
+/// A sequential recordable CD (CD-R or CD-RW) advertises the mode it actually
+/// records with: Track-at-Once (Write Type 1), data track mode 4 and
+/// 2048-byte Mode 1 data blocks (Data Block Type 8). `test_write` is the
+/// current Test Write bit (byte 2 bit 4), which the host sets for
+/// `wodim -dummy`. Read-only and other rewritable media keep the default zero
+/// page and therefore never claim TAO or Test Write.
 fn write_params_page(attrs: Option<MmcAttrs>, test_write: bool) -> [u8; WRITE_PARAMS_LEN] {
     let mut page = [0u8; WRITE_PARAMS_LEN];
     page[0] = 0x05;
     page[1] = 0x32;
     if let Some(attrs) = attrs {
-        if attrs.write_mode == MmcWriteMode::WriteOnce {
+        if sequential_cd(attrs) {
             page[2] = 0x01 | if test_write { 0x10 } else { 0 }; // Test Write | TAO
             page[3] = 0x04; // Track Mode: data
             page[4] = 0x08; // Data Block Type: Mode 1, 2048 bytes
@@ -2535,9 +2589,9 @@ fn disc_msf(lba: Option<i64>) -> [u8; 4] {
 /// Encode READ DISC INFORMATION (MMC-6 Table 365).
 ///
 /// Byte 2 carries erasable (bit 4), state of last session (bits 3-2) and disc
-/// status (bits 1-0). The Erasable bit is only set for rewritable media; a
-/// write-once CD-R reports `0`. CD media encode the lead-in and lead-out
-/// addresses as MSF; other media keep the LBA form.
+/// status (bits 1-0). The Erasable bit is only set for rewritable media: a
+/// write-once CD-R reports `0`, a CD-RW reports `1`. CD media encode the
+/// lead-in and lead-out addresses as MSF; other media keep the LBA form.
 fn encode_disc_info(info: DiscInfo, attrs: MmcAttrs, out: &mut [u8]) {
     let mut buf = [0u8; DISC_INFO_LEN];
     buf[0..2].copy_from_slice(&((DISC_INFO_LEN - 2) as u16).to_be_bytes());
@@ -2684,10 +2738,11 @@ struct WriteParams {
 ///
 /// The list must carry a mode header whose block-descriptor length is zero
 /// (MM drives have no block descriptors), followed by complete mode pages. On
-/// a CD-R the Write Parameters page must describe the supported recording
-/// mode: Track-at-Once with 2048-byte Mode 1 blocks. Test Write is accepted and
-/// returned so the caller can apply it. Every other medium accepts and ignores
-/// page 0x05. A list without page 0x05 is a no-op.
+/// a sequential recordable CD (CD-R or CD-RW) the Write Parameters page must
+/// describe the supported recording mode: Track-at-Once with 2048-byte Mode 1
+/// blocks. Test Write is accepted and returned so the caller can apply it.
+/// Every other medium accepts and ignores page 0x05. A list without page 0x05
+/// is a no-op.
 fn validate_mode_select(
     ten: bool,
     data: &[u8],
@@ -2705,7 +2760,7 @@ fn validate_mode_select(
     if block_descriptors != 0 {
         return Err(INVALID_FIELD);
     }
-    let cdr_recorder = attrs.is_some_and(|attrs| attrs.write_mode == MmcWriteMode::WriteOnce);
+    let cdr_recorder = attrs.is_some_and(sequential_cd);
     let mut params = None;
     let mut at = header;
     while at < data.len() {
@@ -2798,7 +2853,7 @@ mod tests {
     use crate::core::{Effect, InterruptReason as Irq, TargetId};
     use crate::mmc::attrs::{Session, Track};
     #[cfg(feature = "cdr-bundle")]
-    use crate::mmc::cdr_bundle::{CdrBundleMedium, CdrCapacity};
+    use crate::mmc::cdr_bundle::{CdrBundleMedium, CdrCapacity, CdrDiscState, DiscKind};
     use crate::mmc::flat::FlatCdMedium;
     use std::cell::Cell;
 
@@ -3074,29 +3129,31 @@ mod tests {
         let profile = dev.spc_profile().expect("profile");
         let mut buf = [0u8; 128];
         let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
-        assert_eq!(n, 108);
-        assert_eq!(&buf[0..4], &104u32.to_be_bytes());
+        assert_eq!(n, 112);
+        assert_eq!(&buf[0..4], &108u32.to_be_bytes());
         assert_eq!(&buf[6..8], &0x0008u16.to_be_bytes());
-        // Profile List: the Hyper-Multi drive supports [0x12, 0x09, 0x08];
-        // only the mounted CD-ROM profile is Current.
+        // Profile List: the Hyper-Multi drive supports [0x12, 0x0A, 0x09,
+        // 0x08]; only the mounted CD-ROM profile is Current.
         assert_eq!(&buf[8..10], &[0x00, 0x00]);
         assert_eq!(buf[10], 0x03);
-        assert_eq!(buf[11], 12);
+        assert_eq!(buf[11], 16);
         assert_eq!(&buf[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(buf[15], 0);
-        assert_eq!(&buf[16..18], &0x0009u16.to_be_bytes());
+        assert_eq!(&buf[16..18], &0x000Au16.to_be_bytes());
         assert_eq!(buf[19], 0);
-        assert_eq!(&buf[20..22], &0x0008u16.to_be_bytes());
-        assert_eq!(buf[23], 0x01);
+        assert_eq!(&buf[20..22], &0x0009u16.to_be_bytes());
+        assert_eq!(buf[23], 0);
+        assert_eq!(&buf[24..26], &0x0008u16.to_be_bytes());
+        assert_eq!(buf[27], 0x01);
         // Core, Removable Medium, Random Readable, MultiRead, CD Read,
         // Random Writable + Defect Management (Current=0 on a read-only disc).
-        assert_eq!(&buf[24..26], &[0x00, 0x01]);
-        assert_eq!(&buf[36..38], &[0x00, 0x03]);
-        assert_eq!(&buf[44..46], &[0x00, 0x10]);
-        assert_eq!(&buf[48..52], &2048u32.to_be_bytes());
-        assert_eq!(buf[53], 0x01);
-        assert_eq!(&buf[56..58], &[0x00, 0x1D]);
-        assert_eq!(&buf[60..62], &[0x00, 0x1E]);
+        assert_eq!(&buf[28..30], &[0x00, 0x01]);
+        assert_eq!(&buf[40..42], &[0x00, 0x03]);
+        assert_eq!(&buf[48..50], &[0x00, 0x10]);
+        assert_eq!(&buf[52..56], &2048u32.to_be_bytes());
+        assert_eq!(buf[57], 0x01);
+        assert_eq!(&buf[60..62], &[0x00, 0x1D]);
+        assert_eq!(&buf[64..66], &[0x00, 0x1E]);
         let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
         assert_eq!(buf[at20 + 2] & 1, 0);
 
@@ -3305,7 +3362,7 @@ mod tests {
             dev.prepare(&permit, ctx(Direction::None, 0), &cdb),
             Err(Completion::Check(WRITE_PROTECTED))
         );
-        let blank = [BLANK, 0x01, 0, 0, 0, 0];
+        let blank = [BLANK, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::None, 0), &blank),
             Err(Completion::Check(INVALID_FIELD))
@@ -3327,7 +3384,7 @@ mod tests {
         dev.interrupt(&permit, Irq::Reset, KnownEffects::NONE)
             .expect("interrupt");
 
-        let blank = [BLANK, 0, 0, 0, 0, 0];
+        let blank = [BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             dev.prepare(&permit, ctx(Direction::None, 0), &blank),
             Ok(())
@@ -3385,7 +3442,11 @@ mod tests {
         }
 
         fn write_once(sectors: u64) -> Self {
-            Self::new(MmcWriteMode::WriteOnce, sectors)
+            let mut medium = Self::new(MmcWriteMode::WriteOnce, sectors);
+            // The sequential-CD predicate is profile-based; a write-once
+            // fixture is a CD-R, not a stamped CD.
+            medium.attrs.profile = 0x0009;
+            medium
         }
 
         fn snap(&self) -> (u32, u32, u32) {
@@ -3862,7 +3923,11 @@ mod tests {
         // BLANK on the same zero-sector medium.
         let mut dev = MmcDrive::new(SpyMedium::rewritable(0));
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0, 0, 0, 0, 0]),
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Ok(())
         );
         assert!(matches!(
@@ -4047,7 +4112,11 @@ mod tests {
         let mut data = [0u8; 4096];
         // Blanking type 0, IMMED=0.
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0, 0, 0, 0, 0]),
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Ok(())
         );
         match dev.poll(&permit, Feedback::begin(), &mut data) {
@@ -4079,14 +4148,22 @@ mod tests {
         // Any other blanking type is rejected before the medium.
         let mut dev = MmcDrive::new(SpyMedium::rewritable(2));
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0x01, 0, 0, 0, 0]),
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Err(Completion::Check(INVALID_FIELD))
         );
 
         // Read-only media cannot be blanked.
         let mut dev = MmcDrive::new(SpyMedium::read_only(2));
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0, 0, 0, 0, 0]),
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Err(Completion::Check(WRITE_PROTECTED))
         );
     }
@@ -4097,7 +4174,11 @@ mod tests {
         let permit = permit();
         // IMMED is CDB byte 1 bit 5 (MMC-6 Table 229).
         assert_eq!(
-            dev.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0x20, 0, 0, 0, 0]),
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Ok(())
         );
         let mut data = [0u8; 4096];
@@ -4389,13 +4470,18 @@ mod tests {
             &0x0000u16.to_be_bytes(),
             "no current profile"
         );
-        assert_eq!(absent[11], 12, "recorder, CD-R and CD-ROM stay listed");
+        assert_eq!(
+            absent[11], 16,
+            "recorder, CD-RW, CD-R and CD-ROM stay listed"
+        );
         assert_eq!(&absent[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(absent[15], 0);
-        assert_eq!(&absent[16..18], &0x0009u16.to_be_bytes());
+        assert_eq!(&absent[16..18], &0x000Au16.to_be_bytes());
         assert_eq!(absent[19], 0);
-        assert_eq!(&absent[20..22], &0x0008u16.to_be_bytes());
+        assert_eq!(&absent[20..22], &0x0009u16.to_be_bytes());
         assert_eq!(absent[23], 0);
+        assert_eq!(&absent[24..26], &0x0008u16.to_be_bytes());
+        assert_eq!(absent[27], 0);
         // RT=10b and RT=01b also answer from the absent default.
         assert!(profile.get_configuration(2, 0x0050, None).is_some());
         assert!(profile.get_configuration(1, 0x0010, None).is_some());
@@ -4465,7 +4551,7 @@ mod tests {
         assert_eq!(profile.mode_sense(false, 0x3F, false, 0, None), Some(198));
         // GC/GESN answer explicitly with the zero-sector view instead of
         // delegating to `Spc` (which would reject for an unrelated reason).
-        assert_eq!(profile.get_configuration(0, 0, None), Some(108));
+        assert_eq!(profile.get_configuration(0, 0, None), Some(112));
         assert_eq!(profile.event_status(0x10, None), Some(8));
 
         let mut cdb = [0u8; 10];
@@ -4512,14 +4598,16 @@ mod tests {
         let n = profile
             .get_configuration(0, 0, Some(&mut buf))
             .expect("GC on an empty drive");
-        assert_eq!(n, 108);
+        assert_eq!(n, 112);
         assert_eq!(&buf[6..8], &0u16.to_be_bytes(), "no current profile");
         assert_eq!(&buf[12..14], &0x12u16.to_be_bytes());
         assert_eq!(buf[15], 0);
-        assert_eq!(&buf[16..18], &0x09u16.to_be_bytes());
+        assert_eq!(&buf[16..18], &0x0Au16.to_be_bytes());
         assert_eq!(buf[19], 0);
-        assert_eq!(&buf[20..22], &0x08u16.to_be_bytes());
+        assert_eq!(&buf[20..22], &0x09u16.to_be_bytes());
         assert_eq!(buf[23], 0);
+        assert_eq!(&buf[24..26], &0x08u16.to_be_bytes());
+        assert_eq!(buf[27], 0);
         let at20 = feature_at(&buf, n, 0x0020).expect("Random Writable listed");
         assert_eq!(buf[at20 + 2] & 1, 0);
         assert!(buf[at20 + 4..at20 + 16].iter().all(|b| *b == 0));
@@ -4886,14 +4974,17 @@ mod tests {
             .expect("configuration");
         assert_eq!(&buf[0..4], &((total - 4) as u32).to_be_bytes());
         assert_eq!(&buf[6..8], &0x0012u16.to_be_bytes());
-        // Three profile-list entries: DVD-RAM (current), CD-R, CD-ROM.
-        assert_eq!(buf[11], 12);
+        // Four profile-list entries, descending: DVD-RAM (current), CD-RW,
+        // CD-R, CD-ROM.
+        assert_eq!(buf[11], 16);
         assert_eq!(&buf[12..14], &0x0012u16.to_be_bytes());
         assert_eq!(buf[15], 0x01);
-        assert_eq!(&buf[16..18], &0x0009u16.to_be_bytes());
+        assert_eq!(&buf[16..18], &0x000Au16.to_be_bytes());
         assert_eq!(buf[19], 0x00);
-        assert_eq!(&buf[20..22], &0x0008u16.to_be_bytes());
-        assert_eq!(buf[23], 0x01, "CD-ROM is read-compatible with DVD-RAM");
+        assert_eq!(&buf[20..22], &0x0009u16.to_be_bytes());
+        assert_eq!(buf[23], 0x00);
+        assert_eq!(&buf[24..26], &0x0008u16.to_be_bytes());
+        assert_eq!(buf[27], 0x01, "CD-ROM is read-compatible with DVD-RAM");
 
         let mut at = 8usize;
         let mut codes = [0u16; 10];
@@ -4909,22 +5000,22 @@ mod tests {
         assert!(codes[..n].contains(&0x0021), "Incremental Streaming");
         assert!(codes[..n].contains(&0x002D), "CD Track at Once");
         // Descriptor arithmetic: profile list (2), core, removable, readable,
-        // multiread, CD read -> Random Writable at 68, Incremental Streaming
-        // at 84, Defect Management at 92, CD Track at Once at 100.
-        assert_eq!(&buf[68..70], &[0x00, 0x20]);
-        assert_eq!(buf[70], 0x05); // version 1, current
-        assert_eq!(buf[71], 0x0C);
-        assert_eq!(&buf[72..76], &3u32.to_be_bytes());
-        assert_eq!(&buf[76..80], &2048u32.to_be_bytes());
-        assert_eq!(&buf[80..82], &16u16.to_be_bytes());
-        assert_eq!(buf[82], 0x00); // PP
-        assert_eq!(&buf[84..86], &[0x00, 0x21]);
-        assert_eq!(buf[86], 0x0C, "Incremental Streaming not current");
-        assert_eq!(&buf[92..94], &[0x00, 0x24]);
-        assert_eq!(buf[94], 0x05);
-        assert_eq!(buf[95], 0x04);
-        assert_eq!(&buf[100..102], &[0x00, 0x2D]);
-        assert_eq!(buf[102], 0x08, "CD Track at Once not current");
+        // multiread, CD read -> Random Writable at 72, Incremental Streaming
+        // at 88, Defect Management at 96, CD Track at Once at 104.
+        assert_eq!(&buf[72..74], &[0x00, 0x20]);
+        assert_eq!(buf[74], 0x05); // version 1, current
+        assert_eq!(buf[75], 0x0C);
+        assert_eq!(&buf[76..80], &3u32.to_be_bytes());
+        assert_eq!(&buf[80..84], &2048u32.to_be_bytes());
+        assert_eq!(&buf[84..86], &16u16.to_be_bytes());
+        assert_eq!(buf[86], 0x00); // PP
+        assert_eq!(&buf[88..90], &[0x00, 0x21]);
+        assert_eq!(buf[90], 0x0C, "Incremental Streaming not current");
+        assert_eq!(&buf[96..98], &[0x00, 0x24]);
+        assert_eq!(buf[98], 0x05);
+        assert_eq!(buf[99], 0x04);
+        assert_eq!(&buf[104..106], &[0x00, 0x2D]);
+        assert_eq!(buf[106], 0x08, "CD Track at Once not current");
     }
 
     #[test]
@@ -5383,6 +5474,121 @@ mod tests {
         commit_medium(&mut medium);
         run_control_medium(&mut medium, MmcOp::Close { function: 2 });
         MmcDrive::new(medium)
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    fn cdrw_drive() -> MmcDrive<CdrBundleMedium> {
+        MmcDrive::new(CdrBundleMedium::blank_disc(
+            DiscKind::Cdrw,
+            CdrCapacity::Cdr74,
+        ))
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_blank_and_read_header_are_rejected() {
+        let mut dev = cdr_drive();
+        let permit = permit();
+        // A write-once CD-R has no blank state.
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        // READ HEADER (0x44) is packet-writing vocabulary that MMC-6 no longer
+        // defines; it stays ILLEGAL REQUEST / INVALID FIELD IN CDB.
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::ToHost, 0),
+                &[0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+
+        // The BLANK CDB is the full 12-byte form; a short CDB and reserved
+        // byte-1 bits are rejected even on an erasable CD-RW.
+        let mut cdrw = cdrw_drive();
+        assert_eq!(
+            cdrw.prepare(&permit, ctx(Direction::None, 0), &[BLANK, 0, 0, 0, 0, 0]),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+        let mut reserved = [BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        reserved[1] = 0xD8;
+        assert_eq!(
+            cdrw.prepare(&permit, ctx(Direction::None, 0), &reserved),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdrw_advertises_the_erasable_profile_as_current() {
+        let dev = cdrw_drive();
+        let profile = dev.spc_profile().expect("profile");
+        let mut buf = [0u8; 128];
+        let n = profile.get_configuration(0, 0, Some(&mut buf)).expect("GC");
+        assert_eq!(&buf[6..8], &0x000Au16.to_be_bytes(), "current profile");
+        // Profile list order [0x12, 0x0A, 0x09, 0x08]: CD-RW is the second
+        // entry and the mounted profile.
+        assert_eq!(&buf[16..18], &0x000Au16.to_be_bytes());
+        assert_eq!(buf[19], 1, "CD-RW is Current");
+        assert!(
+            feature_at(&buf, n, 0x0021).is_some(),
+            "incremental streaming stays Current"
+        );
+        assert!(feature_at(&buf, n, 0x002D).is_some(), "TAO stays Current");
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn blank_on_a_cdrw_bundle_resets_the_disc_without_zero_filling() {
+        let mut medium = CdrBundleMedium::blank_disc(DiscKind::Cdrw, CdrCapacity::Cdr74);
+        write_medium_block(&mut medium, 0);
+        commit_medium(&mut medium);
+        run_control_medium(&mut medium, MmcOp::Close { function: 2 });
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        let mut dev = MmcDrive::new(medium);
+        let permit = permit();
+        let mut data = [0u8; 4096];
+        assert_eq!(
+            dev.prepare(
+                &permit,
+                ctx(Direction::None, 0),
+                &[BLANK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            Ok(())
+        );
+        let mut feedback = Feedback::begin();
+        loop {
+            match dev.poll(&permit, feedback, &mut data) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::None);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Write { resource, buf, .. }) => {
+                    assert_ne!(resource, 0, "BLANK must not zero-fill the medium");
+                    assert!(resource == 1 || resource == 2, "only a TOC slot is written");
+                    feedback = Feedback::io_done(IoReceipt::test(buf.len(), None, Effect::Known));
+                }
+                PollStep::Io(StorageOp::Sync { .. }) => {
+                    feedback = Feedback::io_done(IoReceipt::test(0, None, Effect::Known));
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("unexpected BLANK step: {other:?}"),
+            }
+        }
+        let medium = dev.medium().expect("medium");
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.disc_info().status, DiscStatus::Empty);
+        assert_eq!(medium.attrs().profile, 0x000A);
+        assert_eq!(medium.kind(), DiscKind::Cdrw);
     }
 
     #[cfg(feature = "cdr-bundle")]

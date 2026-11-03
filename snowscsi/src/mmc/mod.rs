@@ -21,8 +21,8 @@
 //! independent read-only medium (a new
 //! medium is a new `MmcMedium` impl, never a `MmcDrive` match); and
 //! `DvdRamMedium` is the feature-gated rewritable DVD-RAM medium;
-//! `cdr_bundle::CdrBundleMedium` is the feature-gated sequential write-once
-//! CD-R medium.
+//! `cdr_bundle::CdrBundleMedium` is the feature-gated sequential CD-R/CD-RW
+//! medium.
 
 pub mod attrs;
 #[cfg(feature = "cdr-bundle")]
@@ -41,7 +41,8 @@ pub use self::attrs::{
 };
 #[cfg(feature = "cdr-bundle")]
 pub use self::cdr_bundle::{
-    CdrBundleMedium, CdrBundleState, CdrCapacity, CdrDiscState, Recovery, TocError, TocHeader,
+    CdrBundleMedium, CdrBundleState, CdrCapacity, CdrDiscState, DiscKind, Recovery, TocError,
+    TocHeader,
 };
 pub use self::drive::{MmcCaps, MmcDrive};
 #[cfg(feature = "dvdram")]

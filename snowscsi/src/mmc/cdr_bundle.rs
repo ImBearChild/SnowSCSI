@@ -1,6 +1,9 @@
-//! Sequential write-once CD-R medium.
+//! Sequential recordable CD medium (CD-R and CD-RW).
 //!
-//! The medium models a CD-R whose payload lives in the application's storage.
+//! The medium models a CD-R or CD-RW whose payload lives in the application's
+//! storage. Both kinds use the same Track-at-Once recording path and the same
+//! alternating TOC slots; only erasability differs (Orange Book: write-once
+//! dye versus a phase-change layer that BLANK can return to the blank state).
 //! The storage resource contract is:
 //!
 //! - `0` is the aggregate flush (`Sync { resource: 0 }` must flush every
@@ -68,7 +71,8 @@ const MEDIUM_LEADIN: i64 = -11077;
 const MAX_TRACKS: usize = 99;
 /// Fixed session-table capacity.
 const MAX_SESSIONS: usize = 16;
-/// Features that are Current for a CD-R.
+/// Features that are Current for a recordable CD (CD-R and CD-RW alike): the
+/// Track-at-Once set.
 const CDR_FEATURES: &[u16] = &[0x0010, 0x001D, 0x001E, 0x0021, 0x002D];
 
 /// ILLEGAL REQUEST / INVALID ADDRESS FOR WRITE.
@@ -78,7 +82,7 @@ const SESSION_FIXATION_INCOMPLETE_TRACK: Sense = Sense::new(0x05, 0x72, 0x03);
 /// ILLEGAL REQUEST / EMPTY OR PARTIALLY WRITTEN RESERVED TRACK.
 const EMPTY_OR_PARTIALLY_WRITTEN_RESERVED_TRACK: Sense = Sense::new(0x05, 0x72, 0x04);
 
-/// Standard CD-R capacities, expressed as the disc's lead-out start LBA.
+/// Standard recordable CD capacities, expressed as the disc's lead-out start LBA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CdrCapacity {
     /// 74-minute disc.
@@ -114,6 +118,20 @@ impl CdrCapacity {
         };
         minutes * 60 * 75 - 151
     }
+}
+
+/// Recordable CD media kind.
+///
+/// Both kinds share the Track-at-Once path and the persistent TOC layout. The
+/// Orange Book difference is erasability: a CD-R records a write-once dye, so
+/// written blocks can never be erased, while a CD-RW records a phase-change
+/// layer that BLANK returns to the blank state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscKind {
+    /// Write-once CD-R (profile `0x09`).
+    Cdr,
+    /// Erasable CD-RW (profile `0x0A`).
+    Cdrw,
 }
 
 /// Disc-level state of a sequential medium.
@@ -254,9 +272,10 @@ struct SaveState {
     rollback: Option<ReserveRollback>,
 }
 
-/// Sequential CD-R medium with a persistent TOC.
+/// Sequential recordable CD medium (CD-R/CD-RW) with a persistent TOC.
 pub struct CdrBundleMedium {
     capacity: u64,
+    kind: DiscKind,
     disc: CdrDiscState,
     tracks: Vec<TrackEntry, MAX_TRACKS>,
     sessions: Vec<SessionEntry, MAX_SESSIONS>,
@@ -290,29 +309,49 @@ pub struct CdrBundleMedium {
 }
 
 impl CdrBundleMedium {
-    /// Build a blank medium with a standard capacity and the default TOC slot.
+    /// Build a blank CD-R with a standard capacity and the default TOC slot.
     #[must_use]
     pub fn blank(capacity: CdrCapacity) -> Self {
         Self::with_capacity(capacity.sectors())
     }
 
-    /// Build a blank medium with an explicit sector count and the default TOC
+    /// Build a blank medium of `kind` with a standard capacity and the default
+    /// TOC slot.
+    #[must_use]
+    pub fn blank_disc(kind: DiscKind, capacity: CdrCapacity) -> Self {
+        Self::build(capacity.sectors(), kind, TOC_SLOT_DEFAULT)
+            .expect("default TOC slot size is valid")
+    }
+
+    /// Build a blank CD-R with an explicit sector count and the default TOC
     /// slot size ([`TOC_SLOT_DEFAULT`]).
     #[must_use]
     pub fn with_capacity(sectors: u64) -> Self {
-        Self::build(sectors, TOC_SLOT_DEFAULT).expect("default TOC slot size is valid")
+        Self::build(sectors, DiscKind::Cdr, TOC_SLOT_DEFAULT)
+            .expect("default TOC slot size is valid")
     }
 
-    /// Build a blank medium with an explicit sector count and slot size.
+    /// Build a blank CD-R with an explicit sector count and slot size.
     ///
     /// `slot_size` must be within [`TOC_SLOT_MIN`]..=[`TOC_SLOT_MAX`]; it is
     /// never silently disabled. A medium constructed this way starts with slot
     /// 0 as current and saves its first TOC there with sequence 1.
     pub fn with_capacity_and_slot(sectors: u64, slot_size: u32) -> Result<Self, TocError> {
-        Self::build(sectors, slot_size)
+        Self::build(sectors, DiscKind::Cdr, slot_size)
     }
 
-    fn build(sectors: u64, slot_size: u32) -> Result<Self, TocError> {
+    /// Build a blank medium of `kind` with an explicit sector count and slot
+    /// size.
+    ///
+    /// `slot_size` must be within [`TOC_SLOT_MIN`]..=[`TOC_SLOT_MAX`]; it is
+    /// never silently disabled. A medium constructed this way starts with slot
+    /// 0 as current and saves its first TOC there with sequence 1. The kind is
+    /// persisted in the TOC body, so a later [`Self::open`] restores it.
+    pub fn with_disc(sectors: u64, kind: DiscKind, slot_size: u32) -> Result<Self, TocError> {
+        Self::build(sectors, kind, slot_size)
+    }
+
+    fn build(sectors: u64, kind: DiscKind, slot_size: u32) -> Result<Self, TocError> {
         if slot_size < TOC_SLOT_MIN {
             return Err(TocError::BadSlotSize);
         }
@@ -321,6 +360,7 @@ impl CdrBundleMedium {
         }
         Ok(Self {
             capacity: sectors,
+            kind,
             disc: CdrDiscState::Blank,
             tracks: Vec::new(),
             sessions: Vec::new(),
@@ -372,7 +412,7 @@ impl CdrBundleMedium {
     }
 
     fn from_parsed(parsed: toc::ParsedToc, recovery: Recovery) -> Result<Self, TocError> {
-        let mut medium = Self::build(parsed.capacity, parsed.header.slot_size)?;
+        let mut medium = Self::build(parsed.capacity, parsed.kind, parsed.header.slot_size)?;
         medium.disc = parsed.disc;
         medium.tracks = parsed.tracks;
         medium.sessions = parsed.sessions;
@@ -395,6 +435,12 @@ impl CdrBundleMedium {
     #[must_use]
     pub const fn capacity_sectors(&self) -> u64 {
         self.capacity
+    }
+
+    /// Recordable media kind (CD-R or CD-RW).
+    #[must_use]
+    pub const fn kind(&self) -> DiscKind {
+        self.kind
     }
 
     /// Start address of the disc lead-in.
@@ -496,6 +542,21 @@ impl CdrBundleMedium {
             self.disc = CdrDiscState::Appendable;
         }
         changed
+    }
+
+    /// Erase the disc back to the blank state, keeping capacity/kind/slot.
+    ///
+    /// Only the in-memory TOC state changes; the caller persists it. Track
+    /// payload files are left untouched: the resource contract truncates a
+    /// reused `track_<n>.bin` on its first write at offset 0, so BLANK never
+    /// removes or zero-fills a track file itself.
+    fn reset_to_blank(&mut self) {
+        self.tracks.clear();
+        self.sessions.clear();
+        self.open_track = None;
+        self.disc = CdrDiscState::Blank;
+        self.implicit_created = false;
+        self.save = None;
     }
 
     /// Keep the written prefix of every track and protect the disc.
@@ -975,6 +1036,7 @@ impl CdrBundleMedium {
             self.capacity,
             self.medium_leadin,
             self.disc,
+            self.kind,
         );
         if TOC_HEADER_LEN
             .checked_add(body_len)
@@ -988,6 +1050,7 @@ impl CdrBundleMedium {
             self.capacity,
             self.medium_leadin,
             self.disc,
+            self.kind,
         );
         let seq = match self.toc_seq.checked_add(1) {
             Some(seq) => seq,
@@ -1056,6 +1119,7 @@ impl CdrBundleMedium {
             self.capacity,
             self.medium_leadin,
             self.disc,
+            self.kind,
         );
         if TOC_HEADER_LEN
             .checked_add(body_len)
@@ -1069,6 +1133,7 @@ impl CdrBundleMedium {
             self.capacity,
             self.medium_leadin,
             self.disc,
+            self.kind,
         );
         let seq = self.toc_seq.checked_add(1).ok_or(TocError::Invalid)?;
         let slot = if self.saved {
@@ -1155,6 +1220,7 @@ impl CdrBundleMedium {
                 self.capacity,
                 self.medium_leadin,
                 self.disc,
+                self.kind,
                 body_at,
                 &mut out[..take],
             );
@@ -1452,15 +1518,19 @@ impl MmcMedium for CdrBundleMedium {
     type State = CdrBundleState;
 
     fn attrs(&self) -> MmcAttrs {
+        let (write_mode, profile) = match self.kind {
+            DiscKind::Cdr => (MmcWriteMode::WriteOnce, 0x0009),
+            DiscKind::Cdrw => (MmcWriteMode::Rewritable, 0x000A),
+        };
         MmcAttrs {
-            write_mode: MmcWriteMode::WriteOnce,
+            write_mode,
             block_len: BLOCK_LEN,
             sectors: self.capacity,
             tracks: self.tracks.len() as u16,
             sessions: self.sessions.len() as u16,
             write_protected: self.write_protected(),
             needs_recovery: false,
-            profile: 0x0009,
+            profile,
             current_features: CDR_FEATURES,
         }
     }
@@ -1603,7 +1673,28 @@ impl MmcMedium for CdrBundleMedium {
                     return Err(completion);
                 }
             }
-            // FORMAT UNIT/BLANK is not erasable on a write-once medium; the
+            MmcOp::Blank { blanking, .. } => {
+                // Precedence is fixed: a write-once CD-R has no blank state
+                // (24/00), a recovery latch wins over erasability (07/27), and
+                // only then does the blanking type matter (24/00 for anything
+                // but all/minimal). The drive does not duplicate these checks
+                // on the medium-owned path.
+                if self.kind == DiscKind::Cdr {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                if self.read_only {
+                    return Err(Completion::Check(WRITE_PROTECTED));
+                }
+                if blanking > 1 {
+                    return Err(Completion::Check(INVALID_FIELD));
+                }
+                self.reset_to_blank();
+                self.needs_save = true;
+                // No data sync: only the TOC state changed. IMMED is accepted
+                // because the medium completes synchronously.
+                self.start_save(false, None)?;
+            }
+            // FORMAT UNIT is not erasable on a sequential CD medium, and the
             // descriptor commands are encoded by the drive.
             MmcOp::Format { .. } | MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
                 return Err(Completion::Check(INVALID_FIELD))
@@ -1925,7 +2016,7 @@ impl MmcMedium for CdrBundleMedium {
             sessions,
             last_session_lba,
             writable: false,
-            erasable: false,
+            erasable: self.kind == DiscKind::Cdrw,
             first_track: 1,
             first_track_last_session: last_session.map_or(1, |session| session.first_track),
             last_track_last_session: last_session.map_or(1, |session| session.last_track),
@@ -1959,12 +2050,20 @@ impl MmcMedium for CdrBundleMedium {
             writing_power: 5,
             reference_speed: 0,
             unrestricted: true,
-            disc_type: 0,
+            disc_type: match self.kind {
+                DiscKind::Cdr => 0,
+                DiscKind::Cdrw => 1,
+            },
             disc_sub_type: 0,
             a1: None,
             a2: None,
             a3: None,
         })
+    }
+
+    /// A CD-RW has BLANK semantics; a CD-R does not.
+    fn blank_supported(&self) -> bool {
+        self.kind == DiscKind::Cdrw
     }
 }
 
@@ -2485,6 +2584,179 @@ mod tests {
         assert_eq!(
             reopened.atip(),
             CdrBundleMedium::blank(CdrCapacity::Cdr90).atip()
+        );
+    }
+
+    #[test]
+    fn disc_kind_round_trips_and_old_cdr_bodies_still_load() {
+        let mut medium = CdrBundleMedium::blank_disc(DiscKind::Cdrw, CdrCapacity::Cdr80);
+        assert_eq!(medium.kind(), DiscKind::Cdrw);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+
+        let slot = store.slot(0);
+        let header = TocHeader::parse(&slot).expect("header");
+        let body_end = TOC_HEADER_LEN + header.body_len as usize;
+        let text = std::str::from_utf8(&slot[TOC_HEADER_LEN..body_end]).expect("body");
+        assert!(text.contains("disc_type = cdrw\n"), "body:\n{text}");
+
+        let reopened = CdrBundleMedium::open(&slot, 0, Recovery::Delete).expect("reopen");
+        assert_eq!(reopened.kind(), DiscKind::Cdrw);
+
+        // A slot written before the kind existed names the CD-R default and
+        // must keep loading as a CD-R.
+        let old = open_body(VALID_BODY).expect("legacy cdr body");
+        assert_eq!(old.kind(), DiscKind::Cdr);
+
+        // An unknown disc type is still rejected.
+        let unknown = VALID_BODY.replace("disc_type = cdr", "disc_type = dvd");
+        assert!(open_body(&unknown).is_err());
+    }
+
+    #[test]
+    fn disc_kind_drives_attrs_disc_info_and_atip() {
+        let cdr = CdrBundleMedium::blank(CdrCapacity::Cdr80);
+        let cdrw = CdrBundleMedium::blank_disc(DiscKind::Cdrw, CdrCapacity::Cdr80);
+
+        assert_eq!(cdr.attrs().write_mode, MmcWriteMode::WriteOnce);
+        assert_eq!(cdr.attrs().profile, 0x0009);
+        assert!(!cdr.attrs().write_protected);
+        assert!(!cdr.disc_info().erasable);
+        assert_eq!(cdr.disc_info().disc_type, 0xFF);
+        assert!(!cdr.blank_supported());
+        let atip = cdr.atip().expect("CD-R ATIP");
+        assert_eq!(atip.disc_type, 0);
+        assert_eq!(atip.disc_sub_type, 0);
+
+        assert_eq!(cdrw.attrs().write_mode, MmcWriteMode::Rewritable);
+        assert_eq!(cdrw.attrs().profile, 0x000A);
+        assert!(!cdrw.attrs().write_protected);
+        assert!(cdrw.disc_info().erasable);
+        assert_eq!(cdrw.disc_info().disc_type, 0xFF);
+        assert!(cdrw.blank_supported());
+        let atip = cdrw.atip().expect("CD-RW ATIP");
+        assert_eq!(atip.disc_type, 1);
+        assert_eq!(atip.disc_sub_type, 0);
+
+        // Both kinds keep the Track-at-Once current-feature set.
+        for medium in [&cdr, &cdrw] {
+            assert_eq!(medium.attrs().current_features, CDR_FEATURES);
+            assert_eq!(medium.capacity_sectors(), CdrCapacity::Cdr80.sectors());
+        }
+    }
+
+    #[test]
+    fn blank_all_resets_a_finalized_cdrw_and_allows_a_new_burn() {
+        let mut medium = CdrBundleMedium::blank_disc(DiscKind::Cdrw, CdrCapacity::Cdr74);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(close_track(&mut medium, &mut store, 1), Completion::Good);
+        assert_eq!(close_track(&mut medium, &mut store, 2), Completion::Good);
+        assert_eq!(medium.disc_state(), CdrDiscState::Finalized);
+        assert!(medium.attrs().write_protected);
+        assert_eq!(
+            medium.begin(MmcOp::Write { lba: 0, blocks: 1 }),
+            Err(Completion::Check(WRITE_PROTECTED))
+        );
+
+        store.writes.clear();
+        store.syncs.clear();
+        assert_eq!(
+            run_control(
+                &mut medium,
+                &mut store,
+                MmcOp::Blank {
+                    blanking: 0,
+                    immediate: false,
+                },
+                4096,
+            ),
+            Completion::Good
+        );
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().tracks, 0);
+        assert_eq!(medium.attrs().sessions, 0);
+        assert!(!medium.attrs().write_protected);
+        assert_eq!(medium.capacity_sectors(), CdrCapacity::Cdr74.sectors());
+        assert_eq!(medium.kind(), DiscKind::Cdrw);
+        // BLANK only writes/syncs a TOC slot, never a track resource.
+        assert!(store
+            .writes
+            .iter()
+            .all(|(resource, _, _)| matches!(*resource, TOC_RESOURCE_0 | TOC_RESOURCE_1)));
+        assert!(store
+            .syncs
+            .iter()
+            .all(|resource| matches!(*resource, TOC_RESOURCE_0 | TOC_RESOURCE_1)));
+
+        let saved = store.slot(medium.current_slot());
+        let reopened = CdrBundleMedium::open_at(medium.current_slot(), &saved, 0, Recovery::Delete)
+            .expect("blanked TOC");
+        assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
+        assert_eq!(reopened.kind(), DiscKind::Cdrw);
+        assert_eq!(reopened.disc_info().status, DiscStatus::Empty);
+
+        // The erased disc is writable again and finalizes like a fresh one.
+        let mut next = reopened;
+        let mut store = StoreMock::default();
+        write_one(&mut next, &mut store, 0);
+        assert_eq!(close_track(&mut next, &mut store, 1), Completion::Good);
+        assert_eq!(close_track(&mut next, &mut store, 2), Completion::Good);
+        assert_eq!(next.disc_state(), CdrDiscState::Finalized);
+    }
+
+    #[test]
+    fn minimal_blank_is_accepted_and_other_blanks_are_rejected() {
+        let mut medium = CdrBundleMedium::blank_disc(DiscKind::Cdrw, CdrCapacity::Cdr80);
+        let mut store = StoreMock::default();
+        write_one(&mut medium, &mut store, 0);
+        assert_eq!(
+            run_control(
+                &mut medium,
+                &mut store,
+                MmcOp::Blank {
+                    blanking: 1,
+                    immediate: true,
+                },
+                4096,
+            ),
+            Completion::Good
+        );
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+
+        // Only all/minimal blank are defined for a CD-RW.
+        assert_eq!(
+            medium.begin(MmcOp::Blank {
+                blanking: 2,
+                immediate: false,
+            }),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+
+        // A write-once CD-R has no blank state.
+        let mut cdr = CdrBundleMedium::blank(CdrCapacity::Cdr80);
+        assert_eq!(
+            cdr.begin(MmcOp::Blank {
+                blanking: 0,
+                immediate: false,
+            }),
+            Err(Completion::Check(INVALID_FIELD))
+        );
+    }
+
+    #[test]
+    fn blank_on_a_read_only_recovery_is_write_protected() {
+        let body = VALID_BODY.replace("disc_type = cdr", "disc_type = cdrw");
+        let mut frozen =
+            CdrBundleMedium::open(&slot_from_body(&body), 0, Recovery::ReadOnly).expect("frozen");
+        assert_eq!(frozen.kind(), DiscKind::Cdrw);
+        assert_eq!(
+            frozen.begin(MmcOp::Blank {
+                blanking: 0,
+                immediate: false,
+            }),
+            Err(Completion::Check(WRITE_PROTECTED))
         );
     }
 
@@ -3676,6 +3948,7 @@ end = 1
             100_000,
             MEDIUM_LEADIN,
             CdrDiscState::Appendable,
+            DiscKind::Cdr,
         );
         let mut body = std::vec![0u8; len];
         assert_eq!(
@@ -3685,6 +3958,7 @@ end = 1
                 100_000,
                 MEDIUM_LEADIN,
                 CdrDiscState::Appendable,
+                DiscKind::Cdr,
                 0,
                 &mut body
             ),
@@ -4159,6 +4433,7 @@ end = 1
             100_000,
             MEDIUM_LEADIN,
             CdrDiscState::Appendable,
+            DiscKind::Cdr,
         );
         let mut body = std::vec![0u8; len];
         assert_eq!(
@@ -4168,6 +4443,7 @@ end = 1
                 100_000,
                 MEDIUM_LEADIN,
                 CdrDiscState::Appendable,
+                DiscKind::Cdr,
                 0,
                 &mut body
             ),

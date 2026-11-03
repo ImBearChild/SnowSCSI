@@ -380,7 +380,7 @@ impl MmcMedium for DvdRamMedium {
             MmcOp::Close { .. } => return Err(Completion::Good),
             // Track reservation is sequential-media vocabulary.
             MmcOp::ReserveTrack { .. } => return Err(Completion::Check(INVALID_FIELD)),
-            MmcOp::TrackInfo { .. } | MmcOp::DiscInfo => {
+            MmcOp::TrackInfo { .. } | MmcOp::DiscInfo | MmcOp::Blank { .. } => {
                 return Err(Completion::Check(INVALID_FIELD))
             }
         };

@@ -35,7 +35,7 @@ use snowscsi::core::{
 };
 #[cfg(feature = "cdr-bundle")]
 use snowscsi::mmc::cdr_bundle::{
-    max_tracks_for_slot, toc_file, track_file, CdrBundleMedium, Recovery, TocHeader,
+    max_tracks_for_slot, toc_file, track_file, CdrBundleMedium, DiscKind, Recovery, TocHeader,
     TOC_HEADER_LEN, TOC_SLOT_DEFAULT,
 };
 #[cfg(feature = "dvdram")]
@@ -497,12 +497,14 @@ impl BundleStore {
     /// The caller reads only the 256-byte headers first, because the body
     /// length lives in the header; the newer valid slot is then read in full
     /// and parsed with its physical index (`open_at`). A stored TOC owns the
-    /// disc capacity: `capacity_sectors` is only a hint for a new blank bundle.
-    /// A missing slot is not an error, but an unreadable or malformed slot is
-    /// unless the other slot is usable.
+    /// disc capacity and kind: `capacity_sectors`/`kind` are only hints for a
+    /// new blank bundle, and `kind = None` means the default CD-R and never
+    /// warns on reopen. A missing slot is not an error, but an unreadable or
+    /// malformed slot is unless the other slot is usable.
     pub fn open_medium(
         &mut self,
         capacity_sectors: u64,
+        kind: Option<DiscKind>,
         recovery: Recovery,
     ) -> Result<CdrBundleMedium, String> {
         let states: [SlotState; 2] = std::array::from_fn(|slot: usize| {
@@ -569,8 +571,17 @@ impl BundleStore {
                              medium= hint {capacity_sectors}"
                         );
                     }
+                    if let Some(hint) = kind {
+                        if hint != medium.kind() {
+                            log::warn!(
+                                "bundle: stored disc kind {:?} wins over the medium= hint {hint:?}",
+                                medium.kind()
+                            );
+                        }
+                    }
                     self.max_tracks = max_tracks_for_slot(medium.slot_size());
-                    // The stored disc owns the geometry from here on.
+                    // The stored disc owns the geometry and media kind from
+                    // here on.
                     self.capacity_sectors = stored;
                     // Only a clean restore reconciles: a skipped slot may be
                     // the only place a track is referenced, so a transient
@@ -593,24 +604,25 @@ impl BundleStore {
             }
         }
         if let Some(e) = open_error {
-            return Err(format!("no usable CD-R TOC ({e})"));
+            return Err(format!("no usable recordable-CD TOC ({e})"));
         }
         if !corrupt.is_empty() {
             return Err(format!(
-                "no usable CD-R TOC ({}); refusing to start blank over a corrupt slot",
+                "no usable recordable-CD TOC ({}); refusing to start blank over a corrupt slot",
                 corrupt.join(", ")
             ));
         }
         if recovery == Recovery::ReadOnly {
             return Err(
-                "read-only recovery requires an existing CD-R TOC; refusing to create a blank disc"
+                "read-only recovery requires an existing recordable-CD TOC; refusing to create a blank disc"
                     .to_string(),
             );
         }
         let slot = self.slot.unwrap_or(TOC_SLOT_DEFAULT);
-        log::warn!("bundle: no TOC slot found; starting a new blank CD-R (slot {slot})");
-        let medium = CdrBundleMedium::with_capacity_and_slot(capacity_sectors, slot)
-            .map_err(|e| format!("invalid CD-R TOC slot size {slot}: {e}"))?;
+        let disc_kind = kind.unwrap_or(DiscKind::Cdr);
+        log::warn!("bundle: no TOC slot found; starting a new blank {disc_kind:?} (slot {slot})");
+        let medium = CdrBundleMedium::with_disc(capacity_sectors, disc_kind, slot)
+            .map_err(|e| format!("invalid CD-R/CD-RW TOC slot size {slot}: {e}"))?;
         self.max_tracks = max_tracks_for_slot(medium.slot_size());
         // There is no TOC to reconcile against, so a leftover track file may
         // hold the only copy of recorded data: report it, never wipe the
@@ -631,16 +643,17 @@ impl BundleStore {
 }
 
 impl OwnedPlane {
-    /// Restore (or create) the CD-R medium behind this plane.
+    /// Restore (or create) the CD-R/CD-RW medium behind this plane.
     #[cfg(feature = "cdr-bundle")]
     pub fn open_cdr_medium(
         &mut self,
         capacity_sectors: u64,
+        kind: Option<DiscKind>,
         recovery: Recovery,
     ) -> Result<CdrBundleMedium, String> {
         match self {
-            Self::CdrBundle(store) => store.open_medium(capacity_sectors, recovery),
-            _ => Err("not a CD-R bundle plane".to_string()),
+            Self::CdrBundle(store) => store.open_medium(capacity_sectors, kind, recovery),
+            _ => Err("not a CD-R/CD-RW bundle plane".to_string()),
         }
     }
 
@@ -826,8 +839,8 @@ pub(crate) fn ram_write(bytes: &mut [u8], off: u64, buf: &[u8]) -> Result<(), St
 
 /// The media member of a CLI pair: a block slot has no medium, an MMC slot
 /// carries one of the supported media.
-// The CD-R medium's fixed track/session tables are large, but the CLI builds
-// one pair per LUN (same rationale as `OwnedPlane`).
+// The recordable-CD medium's fixed track/session tables are large, but the CLI
+// builds one pair per LUN (same rationale as `OwnedPlane`).
 #[allow(clippy::large_enum_variant)]
 pub enum CliPairMedium {
     /// Block slot (`NoMedium`).
@@ -839,9 +852,10 @@ pub enum CliPairMedium {
 /// The one pair type of the CLI target.
 pub type CliPair = Pair<CliPairMedium, CliBacking>;
 
-/// MMC medium enum: a flat read-only CD or a blank DVD-RAM.
-// The CD-R medium's fixed track/session tables are large, but the CLI builds
-// one per LUN (same rationale as `OwnedPlane`).
+/// MMC medium enum: a flat read-only CD, a blank DVD-RAM, or a persistent
+/// recordable-CD bundle.
+// The recordable-CD medium's fixed track/session tables are large, but the CLI
+// builds one per LUN (same rationale as `OwnedPlane`).
 #[allow(clippy::large_enum_variant)]
 pub enum CliMedium {
     /// Read-only CD data medium.
@@ -849,7 +863,7 @@ pub enum CliMedium {
     /// Rewritable DVD-RAM medium.
     #[cfg(feature = "dvdram")]
     DvdRam(DvdRamMedium),
-    /// Sequential write-once CD-R with a persistent TOC.
+    /// Sequential recordable CD (CD-R/CD-RW) with a persistent TOC.
     #[cfg(feature = "cdr-bundle")]
     CdrBundle(CdrBundleMedium),
 }
@@ -982,10 +996,23 @@ impl MmcMedium for CliMedium {
             Self::Flat(m) => m.atip(),
             #[cfg(feature = "dvdram")]
             Self::DvdRam(m) => m.atip(),
-            // Only the CD-R has a pre-groove; without this forward the CLI
-            // would lose the medium's ATIP and answer format 4 with 24/00.
+            // Only a recordable CD (CD-R/CD-RW) has a pre-groove; without
+            // this forward the CLI would lose the medium's ATIP and answer
+            // format 4 with 24/00.
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(m) => m.atip(),
+        }
+    }
+
+    fn blank_supported(&self) -> bool {
+        match self {
+            Self::Flat(m) => m.blank_supported(),
+            #[cfg(feature = "dvdram")]
+            Self::DvdRam(m) => m.blank_supported(),
+            // Without this forward the CLI would route BLANK to the generic
+            // zero-fill path instead of the CD-RW's TOC reset.
+            #[cfg(feature = "cdr-bundle")]
+            Self::CdrBundle(m) => m.blank_supported(),
         }
     }
 
@@ -995,7 +1022,7 @@ impl MmcMedium for CliMedium {
             #[cfg(feature = "dvdram")]
             Self::DvdRam(m) => m.set_test_write(on),
             // Without this forward the CLI accepts MODE SELECT Test Write but
-            // the CD-R medium keeps recording.
+            // the recordable-CD medium keeps recording.
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(m) => m.set_test_write(on),
         }
@@ -1393,7 +1420,7 @@ impl Storage for CliStorage {
             .and_then(Option::as_ref)
             .is_some_and(OwnedPlane::is_cdr_bundle);
         if is_bundle {
-            log::info!("LUN {lun}: CD-R bundle plane released after the eject");
+            log::info!("LUN {lun}: recordable-CD bundle plane released after the eject");
             self.pending = None;
             self.planes[lun] = None;
         }
@@ -1672,6 +1699,11 @@ mod tests {
     }
 
     #[cfg(feature = "cdr-bundle")]
+    fn bundle_plane_disc(dir: &std::path::Path, capacity_sectors: u64) -> OwnedPlane {
+        bundle_plane_with(dir, capacity_sectors)
+    }
+
+    #[cfg(feature = "cdr-bundle")]
     fn io_req(resource: u16, offset: u64, len: u32, dir: snowscsi::core::Direction) -> IoReq {
         IoReq {
             resource,
@@ -1798,6 +1830,66 @@ mod tests {
         );
     }
 
+    /// Issue BLANK (all) through a real `MmcDrive<CliMedium>` over a bundle
+    /// directory, then reopen the directory and return the restored medium.
+    #[cfg(feature = "cdr-bundle")]
+    fn cli_blank(dir_name: &str, kind: Option<DiscKind>) -> (Completion, CdrBundleMedium) {
+        use snowscsi::core::storage::{BlockingHost, BlockingStorage};
+        use snowscsi::core::{cons, Cons, Here, Nil, StaticTarget, Target};
+
+        type BlankTarget = Target<Cons<LuImpl<Spc<MmcDrive<CliMedium>>, u32>, Nil>>;
+
+        let dir = temp_dir(dir_name);
+        let mut plane = bundle_plane(&dir);
+        let medium = plane
+            .open_cdr_medium(359_849, kind, Recovery::Delete)
+            .expect("bundle");
+        let mut target = BlankTarget::new(cons(
+            LuImpl::new(Spc::new(MmcDrive::new(CliMedium::CdrBundle(medium))), 1u32),
+            Nil,
+        ));
+        let mut work = [0u8; 4096];
+        let mut scratch = [0u8; 4096];
+        let completion = {
+            let mut storage = BlockingStorage::new(PlaneStorage(&mut plane));
+            let mut host = BlockingHost::new(NoHost);
+            target
+                .drive_static_host::<Here>(
+                    &mut storage,
+                    &mut host,
+                    command_ctx(snowscsi::core::Direction::None, 0),
+                    &[0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    &mut work,
+                    &mut scratch,
+                )
+                .expect("BLANK reaches the target")
+        };
+        drop(target);
+        let reopened = plane
+            .open_cdr_medium(0, None, Recovery::Delete)
+            .expect("reopen after BLANK");
+        let _ = std::fs::remove_dir_all(&dir);
+        (completion, reopened)
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cli_medium_forwards_blank_supported() {
+        use snowscsi::mmc::CdrDiscState;
+
+        let (completion, medium) = cli_blank("cli_cdrw_blank", Some(DiscKind::Cdrw));
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(medium.kind(), DiscKind::Cdrw);
+        assert_eq!(medium.disc_state(), CdrDiscState::Blank);
+        assert_eq!(medium.attrs().profile, 0x000A);
+
+        // A write-once CD-R has no blank state; BLANK is 24/00.
+        let (completion, medium) = cli_blank("cli_cdr_blank", Some(DiscKind::Cdr));
+        assert_eq!(completion, Completion::Check(snowscsi::core::INVALID_FIELD));
+        assert_eq!(medium.kind(), DiscKind::Cdr);
+        assert_eq!(medium.attrs().profile, 0x0009);
+    }
+
     /// READ TOC format 4 must reach the medium through the CLI enum: without
     /// the `atip()` forward, the CLI would answer `24/00` on a CD-R.
     #[cfg(feature = "cdr-bundle")]
@@ -1812,7 +1904,11 @@ mod tests {
         let dir = temp_dir("cli_cdr_atip");
         let mut plane = bundle_plane(&dir);
         let medium = plane
-            .open_cdr_medium(CdrCapacity::Cdr80.sectors(), Recovery::Delete)
+            .open_cdr_medium(
+                CdrCapacity::Cdr80.sectors(),
+                Some(DiscKind::Cdr),
+                Recovery::Delete,
+            )
             .expect("fresh bundle");
         let cli = CliMedium::CdrBundle(medium);
         let atip = cli.atip().expect("the enum forwards the CD-R ATIP");
@@ -1891,7 +1987,11 @@ mod tests {
         let dir = temp_dir("cli_cdr_dummy");
         let mut plane = bundle_plane(&dir);
         let medium = plane
-            .open_cdr_medium(CdrCapacity::Cdr80.sectors(), Recovery::Delete)
+            .open_cdr_medium(
+                CdrCapacity::Cdr80.sectors(),
+                Some(DiscKind::Cdr),
+                Recovery::Delete,
+            )
             .expect("fresh bundle");
         let mut target = DummyTarget::new(cons(
             LuImpl::new(Spc::new(MmcDrive::new(CliMedium::CdrBundle(medium))), 1u32),
@@ -1982,7 +2082,11 @@ mod tests {
         );
 
         let reopened = plane
-            .open_cdr_medium(CdrCapacity::Cdr80.sectors(), Recovery::Delete)
+            .open_cdr_medium(
+                CdrCapacity::Cdr80.sectors(),
+                Some(DiscKind::Cdr),
+                Recovery::Delete,
+            )
             .expect("reopen the simulated disc");
         assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
         assert_eq!(reopened.toc_seq(), 0);
@@ -2126,6 +2230,10 @@ mod tests {
 
         fn atip(&self) -> Option<AtipInfo> {
             self.0.atip()
+        }
+
+        fn blank_supported(&self) -> bool {
+            self.0.blank_supported()
         }
 
         fn set_test_write(&mut self, on: bool) {
@@ -2331,7 +2439,7 @@ mod tests {
         let mut plane = bundle_plane(&dir);
 
         let medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh bundle");
         assert_eq!(medium.toc_seq(), 0);
 
@@ -2340,7 +2448,7 @@ mod tests {
         drive_close_session(&mut plane, medium);
 
         let reopened = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("reopen bundle");
         assert_eq!(reopened.toc_seq(), 1);
         assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
@@ -2356,13 +2464,61 @@ mod tests {
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
+    fn cdr_bundle_kind_hint_and_stored_kind() {
+        use snowscsi::mmc::CdrDiscState;
+
+        // A fresh directory uses the hint: a CD-RW preset creates a CD-RW.
+        let dir = temp_dir("cdr_kind_cdrw");
+        let mut plane = bundle_plane_disc(&dir, 359_849);
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdrw), Recovery::Delete)
+            .expect("fresh CD-RW bundle");
+        assert_eq!(medium.kind(), DiscKind::Cdrw);
+        assert_eq!(medium.attrs().profile, 0x000A);
+        drive_close_session(&mut plane, medium);
+
+        // Opening without `medium=` (kind = None) must simply restore the
+        // stored kind and never warn.
+        let restored = plane
+            .open_cdr_medium(359_849, None, Recovery::Delete)
+            .expect("reopen CD-RW bundle without a kind hint");
+        assert_eq!(restored.kind(), DiscKind::Cdrw);
+
+        // An explicit conflicting CD-R hint also loses to the stored TOC (the
+        // mismatch is logged like a capacity mismatch).
+        let reopened = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .expect("reopen CD-RW bundle");
+        assert_eq!(reopened.kind(), DiscKind::Cdrw);
+        assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
+        assert_eq!(reopened.attrs().profile, 0x000A);
+
+        // The reverse: a stored CD-R TOC wins over `medium=cdrw80`-style hint.
+        let cdr_dir = temp_dir("cdr_kind_stored_cdr");
+        let mut cdr_plane = bundle_plane(&cdr_dir);
+        let cdr = cdr_plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .expect("fresh CD-R bundle");
+        drive_close_session(&mut cdr_plane, cdr);
+        let reopened = cdr_plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdrw), Recovery::Delete)
+            .expect("reopen CD-R bundle");
+        assert_eq!(reopened.kind(), DiscKind::Cdr);
+        assert_eq!(reopened.attrs().profile, 0x0009);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cdr_dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
     fn cdr_bundle_open_removes_orphan_tracks_on_delete_only() {
         let dir = temp_dir("cdr_orphans");
         // The default 64 KiB slot persists up to 99 track ids, so track 100 is
         // above the configured bound.
         let mut plane = bundle_plane(&dir);
         let mut medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh bundle");
         drive_write_track(&mut plane, &mut medium, 0);
         drive_sync_cache(&mut plane, &mut medium);
@@ -2395,7 +2551,7 @@ mod tests {
         // A read-only open is a recovery view: it must not delete anything.
         let mut readonly_plane = bundle_plane(&dir);
         let readonly = readonly_plane
-            .open_cdr_medium(0, Recovery::ReadOnly)
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::ReadOnly)
             .expect("read-only restore");
         assert_eq!(readonly.track_numbers().collect::<Vec<_>>(), vec![1]);
         for name in &orphan_names {
@@ -2406,7 +2562,9 @@ mod tests {
 
         // A delete open reconciles the directory against the restored TOC.
         let mut plane = bundle_plane(&dir);
-        let medium = plane.open_cdr_medium(0, Recovery::Delete).expect("reopen");
+        let medium = plane
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::Delete)
+            .expect("reopen");
         assert_eq!(medium.track_numbers().collect::<Vec<_>>(), vec![1]);
         assert!(
             dir.join("track_1.bin").is_file(),
@@ -2427,7 +2585,7 @@ mod tests {
         drop(plane);
         let mut plane = bundle_plane(&dir);
         plane
-            .open_cdr_medium(0, Recovery::Delete)
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("reopen again");
         assert!(dir.join("track_1.bin").is_file());
 
@@ -2445,7 +2603,7 @@ mod tests {
         // may be the only copy of recorded data: warn and keep them.
         let mut plane = bundle_plane(&dir);
         let medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("blank start");
         assert_eq!(medium.toc_seq(), 0);
         assert!(
@@ -2467,7 +2625,7 @@ mod tests {
         let dir = temp_dir("cdr_orphan_corrupt");
         let mut plane = bundle_plane(&dir);
         let mut medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh bundle");
         drive_write_track(&mut plane, &mut medium, 0);
         drive_sync_cache(&mut plane, &mut medium);
@@ -2481,7 +2639,7 @@ mod tests {
 
         let mut plane = bundle_plane(&dir);
         let medium = plane
-            .open_cdr_medium(0, Recovery::Delete)
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("uses slot 0");
         assert_eq!(medium.track_numbers().collect::<Vec<_>>(), vec![1]);
         assert!(
@@ -2499,13 +2657,13 @@ mod tests {
         let mut plane = bundle_plane_with(&dir, 332_849); // cdr74
 
         let medium = plane
-            .open_cdr_medium(332_849, Recovery::Delete)
+            .open_cdr_medium(332_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh cdr74");
         drive_close_session(&mut plane, medium);
 
         // A default cdr80 hint must not reject the stored cdr74 capacity.
         let reopened = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("stored capacity wins");
         assert_eq!(reopened.capacity_sectors(), 332_849);
         assert_eq!(FlatData::capacity(&plane), 332_849 * 2048);
@@ -2518,13 +2676,15 @@ mod tests {
     fn cdr_bundle_one_valid_one_corrupt_slot() {
         let dir = temp_dir("cdr_one_valid");
         let mut plane = bundle_plane(&dir);
-        let medium = plane.open_cdr_medium(359_849, Recovery::Delete).unwrap();
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .unwrap();
         drive_close_session(&mut plane, medium);
         // Slot 0 is valid; make slot 1 look like a corrupt header.
         std::fs::write(dir.join("toc.1"), [0x5Au8; 256]).unwrap();
 
         let reopened = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("the valid slot is used");
         assert_eq!(reopened.toc_seq(), 1);
         assert_eq!(reopened.current_slot(), 0);
@@ -2539,7 +2699,7 @@ mod tests {
         std::fs::write(dir.join("toc.0"), [0x5Au8; 256]).unwrap();
         let mut plane = bundle_plane(&dir);
 
-        let err = match plane.open_cdr_medium(359_849, Recovery::Delete) {
+        let err = match plane.open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete) {
             Ok(_) => panic!("a corrupt slot must not become blank"),
             Err(e) => e,
         };
@@ -2556,7 +2716,7 @@ mod tests {
         let dir = temp_dir("cdr_missing");
         let mut plane = bundle_plane(&dir);
         let medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("blank start");
         assert_eq!(medium.toc_seq(), 0);
         assert!(!dir.join("toc.0").is_file());
@@ -2569,7 +2729,9 @@ mod tests {
     fn cdr_bundle_readonly_recovery_needs_a_toc() {
         let dir = temp_dir("cdr_readonly");
         let mut plane = bundle_plane(&dir);
-        assert!(plane.open_cdr_medium(359_849, Recovery::ReadOnly).is_err());
+        assert!(plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::ReadOnly)
+            .is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2579,7 +2741,9 @@ mod tests {
     fn cdr_bundle_corrupt_body_is_an_error() {
         let dir = temp_dir("cdr_bad_body");
         let mut plane = bundle_plane(&dir);
-        let medium = plane.open_cdr_medium(359_849, Recovery::Delete).unwrap();
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .unwrap();
         drive_close_session(&mut plane, medium);
 
         // The header still parses; the body checksum no longer matches.
@@ -2589,7 +2753,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut plane = bundle_plane(&dir);
-        assert!(plane.open_cdr_medium(359_849, Recovery::Delete).is_err());
+        assert!(plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .is_err());
         assert_eq!(
             std::fs::read(&path).unwrap(),
             bytes,
@@ -2605,7 +2771,9 @@ mod tests {
         let dir = temp_dir("cdr_slot");
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
         let mut plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, Some(8192)));
-        let medium = plane.open_cdr_medium(359_849, Recovery::Delete).unwrap();
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .unwrap();
         assert_eq!(medium.slot_size(), 8192);
         drive_close_session(&mut plane, medium);
 
@@ -2613,7 +2781,7 @@ mod tests {
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
         let mut plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, Some(32 * 1024)));
         let reopened = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("stored slot wins");
         assert_eq!(reopened.slot_size(), 8192);
 
@@ -2628,9 +2796,13 @@ mod tests {
         let dir = temp_dir("cdr_copied");
         let mut plane = bundle_plane(&dir);
         // Two saves alternate the slots: slot 0 seq 1, slot 1 seq 2.
-        let medium = plane.open_cdr_medium(359_849, Recovery::Delete).unwrap();
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .unwrap();
         drive_close_session(&mut plane, medium);
-        let medium = plane.open_cdr_medium(359_849, Recovery::Delete).unwrap();
+        let medium = plane
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
+            .unwrap();
         drive_close_session(&mut plane, medium);
         assert!(dir.join("toc.0").is_file() && dir.join("toc.1").is_file());
         // Copy the older slot over the newer one: its header still claims
@@ -2638,7 +2810,7 @@ mod tests {
         std::fs::copy(dir.join("toc.0"), dir.join("toc.1")).unwrap();
 
         let reopened = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("the physical slot wins");
         assert_eq!(reopened.current_slot(), 0);
         assert_eq!(reopened.disc_state(), CdrDiscState::Blank);
@@ -2655,7 +2827,7 @@ mod tests {
         let dir = temp_dir("cdr_snapshot");
         let mut plane = bundle_plane(&dir);
         let mut medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh bundle");
         drive_write_track(&mut plane, &mut medium, 0);
         assert!(
@@ -2689,7 +2861,7 @@ mod tests {
 
         let mut reopened_plane = bundle_plane(&dir);
         let mut reopened = reopened_plane
-            .open_cdr_medium(0, Recovery::Delete)
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("reopen the snapshot");
         assert_eq!(reopened.current_slot(), 0);
         assert_eq!(reopened.toc_seq(), 1);
@@ -2729,7 +2901,7 @@ mod tests {
 
         let mut latest_plane = bundle_plane(&dir);
         let latest = latest_plane
-            .open_cdr_medium(0, Recovery::Delete)
+            .open_cdr_medium(0, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("reopen the newer slot");
         assert_eq!(latest.current_slot(), 1);
         assert_eq!(latest.toc_seq(), 2);
@@ -2746,11 +2918,11 @@ mod tests {
         let source = temp_dir("cdr_snapshot_clean_src");
         let mut plane = bundle_plane(&source);
         let medium = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("fresh bundle");
         drive_close_session(&mut plane, medium);
         let clean = plane
-            .open_cdr_medium(359_849, Recovery::Delete)
+            .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("saved bundle");
         assert!(!clean.eject_needs_save());
 

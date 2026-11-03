@@ -336,6 +336,7 @@ impl MmcMedium for FlatCdMedium {
             MmcOp::Close { .. } => return Err(Completion::Good),
             // Drive-owned descriptor/format operations never reach the medium.
             MmcOp::Format { .. }
+            | MmcOp::Blank { .. }
             | MmcOp::ReserveTrack { .. }
             | MmcOp::TrackInfo { .. }
             | MmcOp::DiscInfo => return Err(Completion::Check(INVALID_FIELD)),

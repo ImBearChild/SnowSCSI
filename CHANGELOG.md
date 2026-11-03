@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is added; `MmcAttrs` gains `profile`/`current_features`; `DiscInfo` gains the
   recordable-media fields. The default Hyper-Multi drive now lists the CD-R
   profile (`0x09`) in its profile list.
+- **mmc**: `MmcOp` gains `Blank { blanking, immediate }` (exhaustive matches
+  must handle it) and `MmcMedium` gains a defaulted `blank_supported`. The
+  default Hyper-Multi drive now also lists the CD-RW profile (`0x0A`).
+- **mmc**: the `cdr-bundle` TOC body gains `disc_type = cdrw` (the existing
+  `disc_type = cdr` still loads unchanged); `CdrBundleMedium` gains
+  `with_disc`/`blank_disc`/`kind` and `DiscKind`, and the CLI `medium=` option
+  accepts `cdrw74|cdrw80|cdrw90|cdrw99`.
 - **mmc**: `TocError` gains `WriteProtected`; exhaustive matches must handle it.
 - **mmc**: the `cdr-bundle` capacity presets now report the real media lead-out
   (`minutes * 60 * 75 - 151`: 74 → 332 849, 80 → 359 849, 90 → 404 849,
@@ -37,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mmc**: CD-RW media for the persistent `cdr-bundle` — `DiscKind` is stored
+  in the TOC (`disc_type = cdr`/`cdrw`, the old body still loads), the medium
+  reports `MmcWriteMode::Rewritable` + profile `0x0A`, DISC INFORMATION sets
+  the Erasable bit, ATIP reports disc type 1, and GET CONFIGURATION lists
+  `0x0A` as Current. BLANK all/minimal resets an (even finalized) CD-RW to
+  Blank and saves a fresh TOC slot without zero-filling or touching track
+  payload, so the next TAO burn starts at LBA 0; a CD-R answers `24/00` and a
+  read-only recovery answers `07/27`. READ HEADER (`0x44`) stays unimplemented
+  (MMC-6 no longer defines it; it is packet-writing vocabulary). Recordable-CD
+  behavior is selected by profile (`0x09`/`0x0A`), so CD-RW also gets the TAO
+  Write Parameters page, Test Write, recordable track encoding, and ATIP
+  extent capacity; FORMAT UNIT is `24/00` on both kinds.
 - **mmc**: a blank write-once CD reports its ATIP extent in READ CAPACITY,
   so the host sizes the block device before the first session; READ TOC
   formats 0-2 stay `24h/00` until a session completes (format 4 is independent

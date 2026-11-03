@@ -76,8 +76,8 @@ Feature maps:
 - **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
-  `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (sequential CD-R medium
-  with an alternating persistent TOC), `async-io` (→`usb` +
+  `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (sequential CD-R/CD-RW
+  medium with an alternating persistent TOC), `async-io` (→`usb` +
   `snowscsi-common/async-io`), `embassy`
   (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
   `defmt` forwards to `embedded-io/defmt` and
@@ -106,10 +106,15 @@ Feature maps:
 `snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
 
-### CD-R storage resource contract
+### CD-R/CD-RW storage resource contract
 
-The `cdr-bundle` medium (`CdrBundleMedium`) addresses the application's
-storage with these resource ids:
+The `cdr-bundle` medium (`CdrBundleMedium`) models either a write-once CD-R or
+an erasable CD-RW; both use the same Track-at-Once path and persistent TOC, and
+the media kind (`disc_type = cdr` or `disc_type = cdrw` in the TOC body) is
+stored so a reopen restores it. `BLANK` (all or minimal) on a CD-RW resets the
+in-memory track/session state to Blank and saves a fresh TOC slot; it never
+zero-fills or removes a track file. The application's storage is addressed with
+these resource ids:
 
 - `0` — aggregate flush. `Sync { resource: 0 }` must flush every track
   resource.
@@ -142,8 +147,10 @@ The CLI application maps that contract onto a host directory with
   `open_at` with the physical index, so a copied slot is rejected. A missing
   slot is a blank start, but an unreadable/malformed slot is an error unless
   the other slot is valid. A stored TOC always wins over `medium=`: the CLI
-  passes capacity `0` on reopen and warns when the hint differs, so `medium=`
-  and `slot=` only describe a new blank bundle. A missing directory is created
+  passes the preset as a hint and warns when the stored capacity or disc kind
+  differs, so `medium=` and `slot=` only describe a new blank bundle (a fresh
+  directory with no TOC uses the hint, default CD-R; a restored one uses the
+  stored kind). A missing directory is created
   with a warning for `recovery=delete`; `recovery=readonly` requires an
   existing TOC and never creates one. A resource `Sync` fsyncs the addressed
   track or TOC slot, and the aggregate `Sync { resource: 0 }` fsyncs every
@@ -279,12 +286,13 @@ Design notes:
   (`iso9660-no-std`) prefers the Joliet SVD, so only external tools exercise
   the PVD tree.
 
-### Manual CD-R bundle check
+### Manual CD-R/CD-RW bundle check
 
-`--cdrom bundle=<dir>` serves a persistent CD-R. The medium model, the
-recorder-control commands and the alternating TOC slots are covered in-process
-(`cdr_cdrkit_tao_trace` follows the exact `wodim -tao` sequence), but a manual
-burn catches host/driver interaction the harness cannot.
+`--cdrom bundle=<dir>` serves a persistent CD-R (or, with `medium=cdrwNN`, an
+erasable CD-RW). The medium model, the recorder-control commands and the
+alternating TOC slots are covered in-process (`cdr_cdrkit_tao_trace` follows
+the exact `wodim -tao` sequence), but a manual burn catches host/driver
+interaction the harness cannot.
 
 Serve the disc over USB (FunctionFS; `<udc>` is a controller name, `auto`
 picks one, `dummy` auto-loads `dummy_hcd`):
@@ -304,7 +312,9 @@ cargo run -p snowscsi-cli -- serve --iscsi auto \
 ```
 
 `medium=`/`slot=` only describe a **new blank** bundle; once a TOC exists the
-stored geometry wins.
+stored geometry and media kind win. `medium=cdr74|cdr80|cdr90|cdr99` creates a
+write-once CD-R; `medium=cdrw74|cdrw80|cdrw90|cdrw99` creates an erasable
+CD-RW with the same capacity presets.
 
 Burn with cdrkit in Track-at-Once:
 
@@ -324,6 +334,20 @@ ejecting: on eject the server snapshots the current TOC into an alternating
 slot, so the disc restarts Appendable (a host that never issued CLOSE may leave
 a partially recorded track).
 
+A CD-RW additionally supports BLANK: Blanking Type 0 (blank all) and 1 (minimal
+blank) both return the disc to Blank synchronously and save a fresh TOC slot;
+IMMED is accepted because the medium completes before GOOD. After a blank the
+next TAO burn starts again at LBA 0, and a finalized CD-RW becomes blank again.
+The precedence is fixed: a write-once CD-R answers `24/00`, a read-only
+recovery latch answers `07/27`, and an unsupported blanking type `24/00`.
+FORMAT UNIT is `24/00` on both kinds (only BLANK changes a CD-RW); BLANK never
+zero-fills the medium or deletes a track file: a reused `track_<n>.bin` is
+truncated by its first new write at offset 0, so old payload cannot leak into
+the new disc. The drive advertises profile `0x0A` (CD-RW) as Current and
+`0x09` (CD-R) stays in the supported list. READ HEADER (`0x44`) is deliberately
+not implemented: MMC-6 no longer defines it for this command set (it belongs to
+packet writing, which the bundle does not model), so it stays `24/00`.
+
 Read the disc back:
 
 ```bash
@@ -333,8 +357,8 @@ blkid /dev/sr0                # ISO9660 signature / label
 mount -o ro /dev/sr0 /mnt     # or mount the raw device
 ```
 
-A blank CD-R reports its ATIP extent in READ CAPACITY, so the block device
-is sized for the full disc before the first session and keeps that size
+A blank CD-R or CD-RW reports its ATIP extent in READ CAPACITY, so the block
+device is sized for the full disc before the first session and keeps that size
 until the disc is finalized. READ TOC formats 0-2 stay `24h/00` while no
 complete session exists, which keeps the kernel's last-session probe at LBA 0;
 format 4 (ATIP) is independent of session state. The finalize also reports a medium-change
@@ -348,7 +372,9 @@ optional S4 values) with binary, not BCD, M/S/F bytes. The descriptor's
 lead-out is the same address READ DISC INFORMATION reports as the last
 possible lead-out while the disc is blank or appendable (a finalized disc
 reports `FF`), and READ CAPACITY reports that extent minus one while the
-disc is not finalized; a finalized disc reports the last recorded LBA.
+disc is not finalized; a finalized disc reports the last recorded LBA. The
+ATIP descriptor's disc-type bit distinguishes the media: `0` for CD-R, `1` for
+CD-RW (sub-type `0` for both).
 
 The bundle directory holds the durable state:
 
@@ -369,9 +395,10 @@ reopen never deletes anything.
 
 Troubleshooting:
 
-- **Profile** — GET CONFIGURATION must report current profile `0x09` (CD-R),
-  with `0x21` (Incremental Streaming) and `0x2D` (CD Track at Once) Current;
-  `0x20` (Random Writable) and `0x24` (Defect Management) are not.
+- **Profile** — GET CONFIGURATION must report current profile `0x09` (CD-R)
+  or `0x0A` (CD-RW), with `0x21` (Incremental Streaming) and `0x2D` (CD Track
+  at Once) Current; `0x20` (Random Writable) and `0x24` (Defect Management)
+  are not.
 - **`Cannot init drive`** at burn startup — MODE SELECT page 0x05 was
   rejected. It must request Write Type 1 (Track-at-Once), Track Mode 4
   (data) and Data Block Type 8 (Mode 1 / 2048-byte blocks); SAO, packet and
@@ -385,8 +412,9 @@ Troubleshooting:
   one.
 - **`recovery=readonly`** — restores the written prefix as complete tracks,
   finalizes the disc and rejects later writes (`WRITE PROTECTED`).
-- **Geometry presets** — `medium=cdr74|cdr80|cdr90|cdr99` and `slot=<bytes>`
-  (4 KiB..64 KiB) only apply to a new blank bundle; the number of track
+- **Geometry presets** — `medium=cdr74|cdr80|cdr90|cdr99` (write-once CD-R) or
+  `medium=cdrw74|cdrw80|cdrw90|cdrw99` (erasable CD-RW), and `slot=<bytes>`
+  (4 KiB..64 KiB), only apply to a new blank bundle; the number of track
   files is bounded by `max_tracks_for_slot(slot)`. The presets are the real
   media lead-out addresses (`minutes * 60 * 75 - 151`, so 74 → 332 849,
   80 → 359 849, 90 → 404 849, 99 → 445 349 sectors). The 90- and 99-minute

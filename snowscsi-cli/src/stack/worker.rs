@@ -518,7 +518,7 @@ impl Storage for WorkerStore {
             .and_then(Option::as_ref)
             .is_some_and(|plane| plane.bundle);
         if is_bundle {
-            log::info!("LUN {lun}: CD-R bundle plane released after the eject");
+            log::info!("LUN {lun}: recordable-CD bundle plane released after the eject");
             self.planes[lun] = None;
         }
     }
