@@ -440,6 +440,10 @@ struct CreateFlatArgs {
     /// Logical sector size (512 or 2048; default 512).
     #[arg(long, value_name = "512|2048", default_value = "512")]
     sector: u32,
+    /// Overwrite an existing `SNOWBUNDLE` manifest. Chunk files are left in
+    /// place (only the manifest is rewritten), so their data is not migrated.
+    #[arg(long)]
+    force: bool,
     /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
     /// `xor` (obfuscation only). Without this flag the manifest is plaintext.
     #[cfg(feature = "cipher")]
@@ -472,6 +476,10 @@ struct CreateCdrArgs {
     /// TOC slot size in bytes (accepts K/M/G suffixes; default 64 KiB).
     #[arg(long, value_name = "BYTES")]
     slot: Option<String>,
+    /// Overwrite an existing `SNOWBUNDLE` manifest and initial TOC. Leftover
+    /// `track_*.bin` data is still refused (it would be lost).
+    #[arg(long)]
+    force: bool,
     /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
     /// `xor` (obfuscation only). The CD-R TOC stays plaintext; track payloads
     /// are encrypted per resource. Serve it with `--password-file` (or
@@ -685,7 +693,7 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // Password handling happens after `--print-config` (which must not
     // prompt) and before any plane is built. A password is only needed when an
     // encrypted LUN has no `key=` file.
-    let password = match read_serve_password(&args, &specs) {
+    let mut password = match read_serve_password(&args, &specs) {
         Ok(password) => password,
         Err(msg) => {
             eprintln!("snowscsi: {msg}");
@@ -696,24 +704,28 @@ fn run_serve(args: ServeArgs) -> ExitCode {
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
-        return run_serve_iscsi(args, &specs, &config, password.as_deref());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let selector = args.usb.as_deref().unwrap_or("auto");
-        return run_serve_usb(
-            &args,
-            &specs,
-            &config,
-            selector,
-            removable_lun,
-            password.as_deref(),
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("snowscsi: --usb is only supported on Linux");
-        ExitCode::FAILURE
+        run_serve_iscsi(args, &specs, &config, &mut password)
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            let selector = args.usb.as_deref().unwrap_or("auto");
+            run_serve_usb(
+                &args,
+                &specs,
+                &config,
+                selector,
+                removable_lun,
+                &mut password,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(bytes) = password.as_mut() {
+                crate::wipe(bytes);
+            }
+            eprintln!("snowscsi: --usb is only supported on Linux");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -742,6 +754,17 @@ fn read_serve_password(args: &ServeArgs, specs: &[DeviceSpec]) -> Result<Option<
         None if needs_password => read_password_prompt().map(Some),
         None => Ok(None),
     }
+}
+
+/// Best-effort overwrite of secret bytes.
+///
+/// This is **not** `zeroize`: the compiler is only discouraged from eliding
+/// the store, copies made elsewhere are untouched, and the operating system may
+/// have swapped or logged the memory. It exists so a password/key buffer does
+/// not stay in a live stack frame for the rest of the process.
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    core::hint::black_box(bytes);
 }
 
 /// Maximum accepted password length (bytes, after one trailing newline).
@@ -1110,11 +1133,16 @@ fn run_serve_iscsi(
     args: ServeArgs,
     specs: &[DeviceSpec],
     config: &ServeConfig,
-    password: Option<&[u8]>,
+    password: &mut Option<Vec<u8>>,
 ) -> ExitCode {
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(specs, &mut planes, &mut slots, password).is_err() {
+    let built = build_core_slots(specs, &mut planes, &mut slots, password.as_deref()).is_ok();
+    // Best effort (not zeroize): every plane/cipher has copied what it needs.
+    if let Some(bytes) = password.as_mut() {
+        crate::wipe(bytes);
+    }
+    if !built {
         return ExitCode::FAILURE;
     }
     let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
@@ -2983,11 +3011,16 @@ fn run_serve_usb(
     config: &ServeConfig,
     selector: &str,
     removable_lun: Option<usize>,
-    password: Option<&[u8]>,
+    password: &mut Option<Vec<u8>>,
 ) -> ExitCode {
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(specs, &mut planes, &mut slots, password).is_err() {
+    let built = build_core_slots(specs, &mut planes, &mut slots, password.as_deref()).is_ok();
+    // Best effort (not zeroize): the planes/ciphers have copied what they need.
+    if let Some(bytes) = password.as_mut() {
+        crate::wipe(bytes);
+    }
+    if !built {
         return ExitCode::FAILURE;
     }
 
@@ -3731,8 +3764,10 @@ fn create_bundle_cipher(
     }
     if let Some(path) = password_file {
         // One readable line is all the manifest needs; the password itself is
-        // not used (the host supplies it when it serves the bundle).
-        read_password_file(path)?;
+        // not used (the host supplies it when it serves the bundle). Wipe the
+        // read buffer best effort.
+        let mut password = read_password_file(path)?;
+        crate::wipe(&mut password);
     }
     let alg = crate::cipher::parse_alg(name)?;
     crate::cipher::build_meta(alg, iterations, key_file).map(Some)
@@ -3780,12 +3815,12 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
     }
     let dir = Path::new(&args.dir);
     let existed = dir.exists();
-    if existed {
+    if existed && !args.force {
         if let Some(name) = first_chunk_file(dir) {
             eprintln!(
                 "snowscsi: bundle-create: {} already contains chunk {name}; a flat bundle \
                  requires an empty directory or a manifest-only directory (move the chunks \
-                 away or use a new directory)",
+                 away, use --force to rewrite only the manifest, or use a new directory)",
                 args.dir
             );
             return ExitCode::FAILURE;
@@ -3816,6 +3851,20 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
     };
     #[cfg(not(feature = "cipher"))]
     let cipher = None;
+    if existed && args.force {
+        // `--force` rewrites only the manifest (the legacy header too):
+        // existing chunk data stays untouched and is interpreted with the new
+        // geometry.
+        for existing in [MANIFEST_NAME, "BUNDLE"] {
+            if let Err(e) = remove_if_present(&dir.join(existing)) {
+                eprintln!(
+                    "snowscsi: bundle-create: cannot remove the existing {}/{existing}: {e}",
+                    args.dir
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
             "snowscsi: bundle-create: failed to create directory {}: {e}",
@@ -3870,6 +3919,16 @@ fn first_chunk_file(dir: &Path) -> Option<String> {
     None
 }
 
+/// Remove `path` when it exists; a missing file is success.
+#[cfg(feature = "bundle")]
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The first canonical track file (`track_<n>.bin`) in `dir`, if any.
 #[cfg(feature = "cdr-bundle")]
 fn first_track_file(dir: &Path) -> Option<String> {
@@ -3921,18 +3980,22 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     let dir = Path::new(&args.dir);
     let existed = dir.exists();
     if existed {
-        for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
-            if dir.join(existing).exists() {
-                eprintln!(
-                    "snowscsi: bundle-create: {} already contains {existing}; refusing to \
-                     overwrite (use a new directory)",
-                    args.dir
-                );
-                return ExitCode::FAILURE;
+        if !args.force {
+            for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
+                if dir.join(existing).exists() {
+                    eprintln!(
+                        "snowscsi: bundle-create: {} already contains {existing}; refusing to \
+                         overwrite (use --force to rewrite the manifest and initial TOC, or a \
+                         new directory)",
+                        args.dir
+                    );
+                    return ExitCode::FAILURE;
+                }
             }
         }
         // Leftover track data cannot be reconciled without a TOC, so refuse
         // before writing a manifest that would make it look authoritative.
+        // `--force` never bypasses this: it would silently lose recorded data.
         if let Some(name) = first_track_file(dir) {
             eprintln!(
                 "snowscsi: bundle-create: {} already contains track data ({name}); a \
@@ -3968,6 +4031,19 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
              (--medium cdrw* is not supported with --cipher)"
         );
         return ExitCode::FAILURE;
+    }
+    if existed && args.force {
+        // Rewrite the manifest and the initial TOC; both slots are removed so
+        // an older `toc.1` cannot win the newest-slot probe.
+        for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
+            if let Err(e) = remove_if_present(&dir.join(existing)) {
+                eprintln!(
+                    "snowscsi: bundle-create: cannot remove the existing {}/{existing}: {e}",
+                    args.dir
+                );
+                return ExitCode::FAILURE;
+            }
+        }
     }
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
@@ -4337,12 +4413,17 @@ fn crypt_in_place_input(path: &str) -> Result<(), String> {
 
 /// Reject everything that is not a regular file and return its length.
 ///
-/// `metadata` follows symlinks, so a symlink to a regular file is accepted
-/// out of place while a directory, block device or a symlink resolving to one
-/// is refused.
+/// `symlink_metadata` does **not** follow symlinks: a symlink to a regular
+/// file is refused (out of place and in place alike), as is a directory or a
+/// block device.
 #[cfg(feature = "cipher")]
 fn crypt_input_len(path: &str) -> Result<u64, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "'{path}' is a symbolic link; crypt accepts regular files only"
+        ));
+    }
     if !meta.is_file() {
         return Err(format!("'{path}' is not a regular file"));
     }
@@ -4512,7 +4593,13 @@ fn crypt_cipher(
         }
     };
     let key = crate::cipher::derive_key(meta, password.as_deref(), args.key_file.as_deref())?;
-    crate::cipher::CliCipher::from_meta(meta, &key)
+    let cipher = crate::cipher::CliCipher::from_meta(meta, &key);
+    // Best effort (not zeroize): the cipher has copied the key schedule, so
+    // the password buffer can be wiped before the payload starts streaming.
+    if let Some(mut password) = password {
+        crate::wipe(&mut password);
+    }
+    cipher
 }
 
 /// Build the manifest block for a new encrypted image.
@@ -4830,6 +4917,13 @@ fn run_bundle_info(args: BundleInfoArgs) -> ExitCode {
         };
         let bytes = match read_capped(&sidecar, MAX_MANIFEST + 1) {
             Ok(bytes) => bytes,
+            // A regular file without a sidecar is simply not a bundle (exit
+            // 2), not an I/O failure. The path itself was already checked.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("not a bundle");
+                println!("found = none");
+                return ExitCode::from(2);
+            }
             Err(e) => {
                 eprintln!("snowscsi: bundle-info: {sidecar}: {e}");
                 return ExitCode::FAILURE;
@@ -4866,16 +4960,13 @@ fn run_bundle_info(args: BundleInfoArgs) -> ExitCode {
         Identified::Cdr { meta, toc } => {
             print_bundle_meta(&meta);
             if let Some(toc) = toc {
-                #[cfg(feature = "cdr-bundle")]
-                {
-                    println!("seq = {}", toc.seq);
-                    println!("slot_size = {}", toc.slot_size);
-                    println!("max_tracks = {}", toc.max_tracks);
-                }
-                #[cfg(not(feature = "cdr-bundle"))]
-                {
-                    println!("seq = {}", toc.seq);
-                }
+                println!("seq = {}", toc.seq);
+                println!("slot_size = {}", toc.slot_size);
+                println!("max_tracks = {}", toc.max_tracks);
+                println!("capacity = {}", toc.capacity_sectors);
+                println!("sessions = {}", toc.sessions);
+                println!("tracks = {}", toc.tracks);
+                println!("profile = 0x{:04x}", toc.profile);
             } else {
                 println!("toc = missing");
             }
@@ -5761,6 +5852,56 @@ mod tests {
 
     #[cfg(feature = "bundle")]
     #[test]
+    fn flat_bundle_create_force_allows_leftover_chunks() {
+        let dir = temp_dir("flat_force_chunk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("000000.img"), b"leftover").unwrap();
+        let args = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+            force: true,
+            ..CreateFlatArgs::default()
+        };
+        assert_eq!(create_flat_bundle(args), ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read(dir.join("000000.img")).unwrap(),
+            b"leftover",
+            "--force rewrites only the manifest, not the chunk data"
+        );
+        assert!(dir.join("SNOWBUNDLE").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn flat_bundle_create_force_overwrites_the_manifest() {
+        let dir = temp_dir("flat_force_manifest");
+        let first = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+            ..CreateFlatArgs::default()
+        };
+        assert_eq!(create_flat_bundle(first), ExitCode::SUCCESS);
+        let again = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "16M".to_string(),
+            chunk: None,
+            sector: 512,
+            force: true,
+            ..CreateFlatArgs::default()
+        };
+        assert_eq!(create_flat_bundle(again), ExitCode::SUCCESS);
+        let manifest = std::fs::read_to_string(dir.join("SNOWBUNDLE")).unwrap();
+        assert!(manifest.contains("virtual_size = 16777216"), "{manifest}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
     fn flat_bundle_create_validates_before_mkdir() {
         let dir = temp_dir("flat_bad_geometry");
         let args = CreateFlatArgs {
@@ -5898,6 +6039,103 @@ mod tests {
                 path: dir.display().to_string()
             }),
             ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_create_force_rewrites_manifest_and_toc() {
+        let dir = temp_dir("cdr_force");
+        let first = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: Some("cdr74".to_string()),
+            slot: None,
+            ..CreateCdrArgs::default()
+        };
+        assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
+        let toc_before = std::fs::read(dir.join("toc.0")).ok();
+        let again = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: Some("cdr90".to_string()),
+            slot: None,
+            force: true,
+            ..CreateCdrArgs::default()
+        };
+        assert_eq!(create_cdr_bundle(again), ExitCode::SUCCESS);
+        // The old `toc.1` never survives as the newest slot.
+        assert!(!dir.join("toc.1").exists());
+        let toc_after = std::fs::read(dir.join("toc.0")).expect("initial TOC");
+        assert_ne!(toc_before.as_deref(), Some(toc_after.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_create_force_still_refuses_leftover_tracks() {
+        let dir = temp_dir("cdr_force_track");
+        let first = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+            ..CreateCdrArgs::default()
+        };
+        assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
+        std::fs::write(dir.join("track_1.bin"), b"recorded").unwrap();
+        let again = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+            force: true,
+            ..CreateCdrArgs::default()
+        };
+        assert_eq!(create_cdr_bundle(again), ExitCode::FAILURE);
+        assert_eq!(
+            std::fs::read(dir.join("track_1.bin")).unwrap(),
+            b"recorded",
+            "recorded data must survive the refusal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn bundle_info_reports_missing_for_a_corrupt_toc_body() {
+        let dir = temp_dir("info_cdr_corrupt");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+            ..CreateCdrArgs::default()
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let _ = std::fs::remove_file(dir.join("toc.1"));
+        // A valid header over a body whose checksum no longer matches.
+        let mut toc = std::fs::read(dir.join("toc.0")).unwrap();
+        toc[256] ^= 0xFF;
+        std::fs::write(dir.join("toc.0"), &toc).unwrap();
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: dir.display().to_string()
+            }),
+            ExitCode::SUCCESS,
+            "a corrupt body is a missing TOC, not an identification failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn bundle_info_exits_two_for_a_regular_file_without_a_sidecar() {
+        let dir = temp_dir("info_no_sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plain.img");
+        std::fs::write(&file, b"not a bundle").unwrap();
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: file.display().to_string()
+            }),
+            ExitCode::from(2)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6961,6 +7199,57 @@ mod tests {
         let _ = std::fs::remove_file(&key);
     }
 
+    #[cfg(all(feature = "cipher", feature = "bundle"))]
+    #[test]
+    fn encrypted_flat_bundle_round_trips_and_stores_ciphertext() {
+        use snowscsi::common::seekable_storage::{FlatData, WritableFlatData};
+
+        let dir = temp_dir("flat_cipher_e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        let password = dir.join("password.txt");
+        std::fs::write(&password, b"hunter2\n").unwrap();
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: Some("1M".to_string()),
+            sector: 512,
+            cipher: Some("chacha12".to_string()),
+            iterations: Some(1_000),
+            password_file: Some(password.display().to_string()),
+            ..CreateFlatArgs::default()
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+
+        let specs = spec::parse_all(&[format!("bundle={},cipher", dir.display())], &[]).unwrap();
+        let plain: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+
+        let mut plane = open_plane_for(&specs[0], Some(b"hunter2")).expect("encrypted flat plane");
+        assert!(matches!(plane, OwnedPlane::Cipher(_)));
+        WritableFlatData::write_at(&mut plane, 0, &plain).unwrap();
+        let mut out = vec![0u8; plain.len()];
+        FlatData::read_at(&mut plane, 0, &mut out).unwrap();
+        assert_eq!(out, plain);
+        drop(plane);
+
+        let raw = std::fs::read(dir.join("000000.img")).expect("first chunk");
+        assert_ne!(
+            &raw[..plain.len()],
+            &plain[..],
+            "the chunk file must hold ciphertext, not plaintext"
+        );
+
+        // Drop and reopen through the same spec path: the manifest-derived
+        // key/nonce domain must reproduce the plaintext.
+        let mut reopened =
+            open_plane_for(&specs[0], Some(b"hunter2")).expect("reopened encrypted flat plane");
+        let mut out = vec![0u8; plain.len()];
+        FlatData::read_at(&mut reopened, 0, &mut out).unwrap();
+        assert_eq!(out, plain);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "cipher")]
     #[test]
     fn cipher_plane_rejects_a_missing_sidecar_and_a_bad_key() {
@@ -7081,6 +7370,50 @@ mod tests {
         assert!(read_serve_password(&args, &specs).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(unix, feature = "cipher"))]
+    #[test]
+    fn crypt_rejects_a_symlink_input_out_of_place_and_in_place() {
+        let dir = temp_dir("crypt_symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.img");
+        std::fs::write(&target, b"plaintext").unwrap();
+        let link = dir.join("link.img");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key = cipher_key_file("symlink");
+
+        let input = link.display().to_string();
+        let err = crypt_run(CryptArgs {
+            decrypt: false,
+            cipher: Some("xor".to_string()),
+            password_file: None,
+            key_file: Some(key.display().to_string()),
+            iterations: None,
+            in_place: false,
+            force: false,
+            input: input.clone(),
+            output: Some(dir.join("out.img").display().to_string()),
+        })
+        .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+
+        let err = crypt_run(CryptArgs {
+            decrypt: false,
+            cipher: Some("xor".to_string()),
+            password_file: None,
+            key_file: Some(key.display().to_string()),
+            iterations: None,
+            in_place: true,
+            force: false,
+            input,
+            output: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
     }
 
     #[cfg(feature = "cipher")]

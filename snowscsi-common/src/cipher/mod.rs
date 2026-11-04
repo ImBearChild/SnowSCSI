@@ -728,6 +728,28 @@ mod tests {
         }
     }
 
+    /// Pins the on-disk bytes to an externally computed constant instead of
+    /// [`encrypt_ref`] (which reuses the same XOR path and would bless a
+    /// wrong offset or a missing encryption step). The constant is
+    /// `pattern_byte(7 + i) ^ i` for `i = 0..16`.
+    #[test]
+    fn plane_write_matches_a_hard_coded_ciphertext() {
+        let expected = [
+            0xcfu8, 0x43, 0xc3, 0x47, 0xff, 0x7b, 0xfb, 0x77, 0xff, 0x63, 0xe3, 0x67, 0xef, 0x6b,
+            0xeb, 0x17,
+        ];
+        let plain: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let mut ram = [0u8; 64];
+        {
+            // SCRATCH 5 forces three staging chunks for 16 bytes at offset 7.
+            let mut plane = CipherPlane::<_, _, 5>::new(RamBackend::new(&mut ram), PatternCipher);
+            plane.write_at(7, &plain).unwrap();
+        }
+        assert_eq!(&ram[7..23], &expected[..]);
+        assert!(ram[..7].iter().all(|&b| b == 0));
+        assert!(ram[23..].iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn plane_fill_at_encrypts_and_crosses_scratch() {
         let mut ram = [0x11u8; 64];

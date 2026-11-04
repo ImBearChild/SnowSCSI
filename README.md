@@ -94,6 +94,11 @@ cipher description), and create an encrypted flat or CD-R bundle with
 snowscsi crypt --cipher chacha20 --password-file pw image.img image.enc
 ```
 
+The cipher is **at-rest protection, not a security boundary**: it does not
+protect a running machine or a compromised host, and there is no integrity
+authentication (a wrong password or tampered bytes produce garbage, not an
+error). See `HACKING.md` for the explicit threat model.
+
 ## Embedded example
 
 [`examples/esp32s3-pocket-dongle`](examples/esp32s3-pocket-dongle) is a

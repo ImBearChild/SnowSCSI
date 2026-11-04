@@ -929,6 +929,16 @@ fn bundle_info_reports_a_bundle() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("not a bundle"), "info output:\n{text}");
     let _ = std::fs::remove_dir_all(&plain);
+
+    // A regular file without a sidecar is not a bundle (exit 2), not a read
+    // error (exit 1).
+    let regular = std::env::temp_dir().join(format!("snowscsi_fileinfo_{}", std::process::id()));
+    std::fs::write(&regular, b"plain image").unwrap();
+    let out = run(&["bundle-info", &regular.to_string_lossy()]);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not a bundle"), "info output:\n{text}");
+    let _ = std::fs::remove_file(&regular);
 }
 
 /// `--block img=<file>,ro` opens the plane read-only: on a read-only file the
@@ -1509,6 +1519,13 @@ fn encrypted_cdr_bundle_info_and_print_config() {
         text.contains("slot_size = "),
         "missing TOC summary:\n{text}"
     );
+    assert!(
+        text.contains("capacity = 359849"),
+        "missing capacity summary:\n{text}"
+    );
+    assert!(text.contains("sessions = "), "info:\n{text}");
+    assert!(text.contains("tracks = "), "info:\n{text}");
+    assert!(text.contains("profile = 0x0009"), "info:\n{text}");
 
     // `--print-config` identifies the bundle but never derives the key; it
     // therefore works with or without a password file and never prompts.

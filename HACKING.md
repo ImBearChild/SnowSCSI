@@ -129,10 +129,14 @@ A directory-chunked flat bundle is created once with
 ```bash
 snowscsi bundle-create flat --dir <dir> --size <n> [--chunk <n>] [--sector 512|2048]
     [--cipher <alg>] [--iterations <n>] [--key-file <k>] [--password-file <f>]
+    [--force]
 ```
 
 which writes the canonical `SNOWBUNDLE` (`kind = flat`) through a checked
-create (no `--force`: an existing manifest or legacy `BUNDLE` is refused).
+create. Without `--force`, an existing `SNOWBUNDLE` or legacy `BUNDLE` is
+refused; with `--force`, an existing `SNOWBUNDLE`/legacy `BUNDLE` is
+overwritten and the chunk files are left untouched (the new geometry is
+**not** migrated to them).
 Geometry is validated before the directory is created, and `bundle-create`
 removes a directory it created if the manifest write then fails. The flat
 manifest write itself is **not** atomic yet (single create/truncate + sync);
@@ -145,7 +149,31 @@ read-only flat CD (the MMC role always opens a flat bundle read-only).
 chunk files on the first host write. `bundle-info <dir>` prints the parsed
 kind, geometry, cipher description and CRC presence. An image file with a
 `<file>.SNOWBUNDLE` sidecar is inspected by passing the image path (or the
-sidecar path itself) to `bundle-info`.
+sidecar path itself) to `bundle-info`; a regular file without a sidecar prints
+`not a bundle` and exits 2. For `kind = cdr`, `bundle-info` also reports the
+newest valid TOC slot's capacity, sessions, tracks and profile (a header with a
+corrupt body simply reports `toc = missing`).
+
+### `SNOWBUNDLE` manifest fields
+
+The manifest is a strict, canonical text file (fixed order, single spaces
+around `=`, `\n` line endings, at most 512 bytes). `bundle-create` and
+`serve` share the parser; the parser validates the format only, never the
+medium geometry (that belongs to the caller installing the medium).
+
+| Field | Value / meaning |
+|---|---|
+| `magic` | Always `snow_bundle`. |
+| `version` | Always `1`. |
+| `kind` | `image`, `flat` or `cdr`. |
+| geometry (`kind = image`) | `size = <u64>` bytes. |
+| geometry (`kind = flat`) | `virtual_size`, `chunk_size`, `sector_size` (`512`/`2048`). |
+| geometry (`kind = cdr`) | none; the plaintext TOC owns capacity/session/track geometry. |
+| cipher block (optional) | `cipher` (`chacha8`/`chacha12`/`chacha20`/`aes-ctr`/`xor`), `kdf` (`pbkdf2-hmac-sha256`/`none`), `iterations` + `salt` (PBKDF2 only), `nonce` (8 bytes as 16 hex digits). |
+| `crc` (optional on read, always written) | `crc = <8 lowercase hex>`: CRC-32 over every preceding byte, newlines included. It detects accidental damage only. |
+
+`kind = cdr` keeps the TOC (`toc.0`/`toc.1`) **outside** the manifest and
+plaintext, so a summary is available without the key.
 
 ### Encrypted images and bundles
 
@@ -197,6 +225,10 @@ prompts on stdin.
   are **not** preserved), and writes the sidecar **first**, then replaces the
   image through a temp; a crash leaves recoverable plaintext plus a stale
   sidecar (remove it).
+- Passwords and raw derived-key buffers are overwritten **best effort** once
+  the cipher/planes have copied what they need. This is not `zeroize`: copies
+  made by the allocator or runtime, the OS page cache and swap are out of
+  scope.
 - Every run holds an exclusive `<canonical target>.lock` file (`create_new`)
   next to the target for its whole duration; the lock is removed on every
   ordinary exit path. Contention is a hard error. A crash/SIGKILL can leave the
@@ -245,6 +277,31 @@ capacity, session and track geometry are readable without a key. A manifest
 without a cipher block, missing key material, or a wrong-length key file is a
 hard error, never a plaintext fallback.
 
+**Threat model — what this protects and what it does not.** The cipher is
+at-rest protection for the bytes on a removed image, card or disc. It is not a
+security boundary against a live machine or a determined offline attacker:
+
+- **Card theft vs whole-machine compromise.** A stolen card/disc/image that
+  was never unlocked is protected only as far as the password/key is unknown.
+  Once the key or password is present on the machine (or the bundle is served),
+  an attacker with the same access can read the plaintext.
+- **Weak passwords.** PBKDF2 slows guessing but cannot rescue a low-entropy
+  password; the iteration count is in the manifest and the salt is per
+  manifest, so all manifests can be attacked independently. Use a strong
+  password or a raw key file.
+- **`kdf = none` key-file sensitivity.** The key is the only secret and is
+  stored outside the bundle. Anyone who copies `key.bin` can decrypt every
+  bundle that used it; a leaked key and a leaked image are equivalent.
+- **Swapped sidecar and writable corruption.** The manifest/TOC is not
+  authenticated and the cipher is malleable. A swapped sidecar changes the
+  parameters (wrong plaintext, never a clean error), and anyone who can write
+  the medium can flip ciphertext bits or rewrite `toc.0`/`toc.1`; neither is
+  detected.
+- **No integrity.** There is no MAC/AEAD tag: a wrong password, swapped
+  sidecar, truncated file and deliberate modification all decrypt to garbage
+  with exit status 0. Keep the source and verify the result before deleting
+  anything.
+
 Encrypted recordable bundles require a **write-once CD-R**. A CD-RW can be
 blanked and then re-record track 1 at resource 17 offset 0 under the same
 `(key, nonce)`, which would repeat the keystream. For v1,
@@ -256,6 +313,31 @@ never a silent plaintext fallback).
 snowscsi bundle-create cdr --dir ./cdr --cipher chacha12 --password-file pw
 snowscsi serve --cdrom bundle=./cdr --password-file pw --iscsi 127.0.0.1:3260
 ```
+
+### P4 embedded cipher wiring
+
+`examples/esp32p4-touch-lcd-35` serves the SD card through
+`common::cipher::AsyncCipherPlane` and its own hardware AES-256-CTR backend.
+The host-side rules carry over unchanged, but the platform path adds:
+
+- **DMA double buffers.** TX and RX are two statically allocated DMA buffers
+  (`AES_BUF` = 2 KiB each). The driver cannot encrypt in place, so the plaintext
+  (or ciphertext) is copied into TX and DMA writes the result into RX before it
+  is copied to the caller's bank; the two buffers travel as an `Option` pair so
+  a DMA error returns them instead of panicking.
+- **Busy-wait with a bound.** Completion is a poll loop on the peripheral
+  status register, not an interrupt. It has a 100 ms deadline and checks the
+  RX byte count; a timeout drops the transfer, poisons the primitive and turns
+  every later operation into a backend error, so a stuck engine cannot hang
+  the executor forever.
+- **INC_32 counter cap.** The P4 AES CTR mode only carries the low 32 counter
+  bits inside the peripheral. `ctr_xor_aligned` therefore caps every hardware
+  run at the next 32-bit boundary and advances the full 128-bit counter in
+  software, which keeps the `nonce || BE64(block)` layout identical to the
+  CLI/library `AesCtr`.
+
+See [`examples/esp32p4-touch-lcd-35/README.md`](examples/esp32p4-touch-lcd-35/README.md#encryption-hardware-aes-256-ctr)
+for the pin map, key/nonce injection and measured throughput.
 
 ### CD-R/CD-RW storage resource contract
 
@@ -520,6 +602,18 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The default workspace run uses `std` only. The feature-gated manifests,
+ciphers and CD-R medium need explicit runs:
+
+```bash
+# common seams: manifests, cipher planes and PBKDF2
+cargo test -p snowscsi-common --features 'bundle,cipher,cipher-kdf,async-io'
+# SCSI core + CD-R bundle + cipher resources
+cargo test -p snowscsi --features 'scsi,cdrom,iscsi,usb,dvdram,bundle,cdr-bundle,cipher,cipher-kdf,async-io'
+# CLI verbs (bundle-create/info, crypt, encrypted serve planes)
+cargo test -p snowscsi-cli --features 'std,scsi,iscsi,cdrom,livefs,usb,bundle,cdr-bundle,cipher,log,dvdram,tokio'
+```
+
 ### External Tool Tests
 
 Beyond the cargo suites, `tools/ext-test/` cross-validates the `snowscsi`
@@ -737,9 +831,12 @@ Troubleshooting:
   TOC; create the bundle with `bundle-create cdr` first. A TOC-less
   `kind = cdr` directory is rejected (`no recordable-CD TOC …`) and is never
   opened as a blank disc.
-- **`bundle-create cdr` failures** — it refuses to overwrite an existing
-  `SNOWBUNDLE`, legacy `BUNDLE`, or `toc.0`/`toc.1`, and refuses a directory
-  that already contains canonical `track_<n>.bin` data. The manifest is
+- **`bundle-create cdr` failures** — without `--force` it refuses to overwrite
+  an existing `SNOWBUNDLE`, legacy `BUNDLE`, or `toc.0`/`toc.1`. `--force`
+  removes those files and writes a fresh manifest plus the initial TOC (both
+  slots are cleared, so an old `toc.1` cannot win the newest-slot probe), but
+  it still refuses a directory that already contains canonical
+  `track_<n>.bin` data (recorded tracks cannot be migrated). The manifest is
   written before the initial TOC; the TOC is written through a fsynced
   temporary file renamed into place (a failed write removes the temporary).
   If the TOC write still fails the error says the manifest was already
@@ -821,7 +918,8 @@ Notes:
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` — rustdoc must stay
    warning-free (broken intra-doc links, links to private items, stale
    paths)
-6. `cargo clippy -p snowscsi --features 'scsi,cdrom,iscsi,usb,dvdram,async-io,embassy' --
+6. `cargo clippy -p snowscsi --features
+   'scsi,cdrom,iscsi,usb,dvdram,bundle,cdr-bundle,cipher,cipher-kdf,async-io,embassy' --
    -D warnings` — the feature-gated modules are not compiled by the
    workspace-wide pass (dependencies of `snowscsi-tests` are only
    *compiled*, never linted), so lint them explicitly

@@ -376,8 +376,9 @@ def _wait_for(predicate, timeout=15.0):
 class _UsbCdrServer:
     """A `serve --usb dummy --cdrom <spec>` subprocess and its block device."""
 
-    def __init__(self, spec):
+    def __init__(self, spec, *extra_args):
         self.spec = spec
+        self.extra_args = list(extra_args)
         self.proc = None
         self.device = None
         self._log_file = None
@@ -406,6 +407,7 @@ class _UsbCdrServer:
             "dummy",
             "--cdrom",
             self.spec,
+            *self.extra_args,
         ]
         self.proc = subprocess.Popen(
             argv, stdout=subprocess.DEVNULL, stderr=self._log_file, text=True
@@ -805,6 +807,82 @@ class CdrBundleEjectTest(_SelfServedMixin, unittest.TestCase):
         final = _toc_slots(self.bundle)
         self.assertTrue(final, "finalize did not persist a TOC slot")
         self.assertIn("disc_state = finalized", _newest_slot(final)["body"])
+
+
+@unittest.skipUnless(
+    _usb_dummy_ready() and have_tool("wodim") and have_tool("isoinfo"),
+    "requires root, wodim, isoinfo and a free dummy_hcd UDC to burn an "
+    "encrypted CD-R bundle served by `snowscsi serve --usb dummy`",
+)
+class CdrBundleCipherBurnTest(_IsoReadBack, unittest.TestCase):
+    """Burn an ISO through an encrypted CD-R bundle and verify both views.
+
+    The host sees plaintext through the emulated drive, while the on-disk
+    ``track_1.bin`` must be ciphertext (no ISO ``CD001`` PVD signature at
+    ``0x8001``) and ``toc.0`` must stay a plaintext TOC.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="snowscsi-cdr-cipher-burn-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bundle = os.path.join(self.tmp, "bundle")
+        self.password = os.path.join(self.tmp, "pw")
+        with open(self.password, "w", encoding="utf-8") as handle:
+            handle.write("secret\n")
+        help_text = sh(find_binary(), "bundle-create", "cdr", "--help").stdout
+        if "--cipher" not in help_text:
+            self.skipTest("binary built without the cipher feature")
+        created = sh(
+            find_binary(),
+            "bundle-create",
+            "cdr",
+            "--dir",
+            self.bundle,
+            "--medium",
+            "cdr80",
+            "--cipher",
+            "chacha12",
+            "--password-file",
+            self.password,
+            check=False,
+            timeout=300,
+        )
+        if created.returncode != 0:
+            if "requires the `cdr-bundle` feature" in created.stderr:
+                self.skipTest("binary built without the cdr-bundle feature")
+            self.fail(
+                "encrypted bundle-create failed:\n"
+                f"{created.stdout}\n{created.stderr}"
+            )
+        made, self.iso, self.text, self.payload = _make_iso(self.tmp, "cipher", LABEL)
+        if made.returncode != 0:
+            self.skipTest(f"mkisofs failed: {made.stderr}")
+        self.server = _UsbCdrServer(
+            f"bundle={self.bundle},cipher", "--password-file", self.password
+        )
+        self.device = self.server.start()
+        self.addCleanup(self.server.stop)
+
+    def test_burn_and_read_back_are_plaintext_but_storage_is_not(self):
+        sh("wodim", "-v", "-tao", f"dev={self.device}", self.iso, timeout=300)
+        self.verify_iso(self.device, LABEL, self.text, self.payload)
+
+        track = os.path.join(self.bundle, "track_1.bin")
+        self.assertTrue(os.path.isfile(track), "the burn must create track_1.bin")
+        with open(track, "rb") as handle:
+            raw = handle.read()
+        self.assertGreater(len(raw), 0x8006, "track_1.bin is too short for a PVD")
+        self.assertNotEqual(
+            raw[0x8001:0x8006],
+            b"CD001",
+            "track_1.bin must not contain the plaintext ISO PVD signature",
+        )
+        with open(os.path.join(self.bundle, "toc.0"), "rb") as handle:
+            self.assertIn(
+                TOC_MAGIC.encode("ascii"),
+                handle.read(),
+                "the TOC must stay plaintext",
+            )
 
 
 class CdrBundleCipherCreateTest(unittest.TestCase):

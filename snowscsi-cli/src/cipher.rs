@@ -108,6 +108,12 @@ pub fn derive_key(
 ) -> Result<CipherKey, String> {
     match meta.kdf {
         KdfKind::Pbkdf2HmacSha256 => {
+            if key_path.is_some() {
+                return Err(format!(
+                    "{} manifest uses PBKDF2; key= is only valid with kdf = none",
+                    cipher_meta_name(meta)
+                ));
+            }
             let password = password.ok_or_else(|| {
                 format!(
                     "{} manifest uses PBKDF2; pass --password-file <path>",
@@ -121,10 +127,16 @@ pub fn derive_key(
                 .salt
                 .ok_or_else(|| "manifest cipher block is missing `salt`".to_string())?;
             let mut key = [0u8; 32];
-            SoftKdf
-                .derive(password, &salt, iterations, &mut key)
-                .map_err(|e| format!("PBKDF2 key derivation failed: {e}"))?;
-            CipherKey::from_bytes(&key).map_err(|e| e.to_string())
+            let result = (|| {
+                SoftKdf
+                    .derive(password, &salt, iterations, &mut key)
+                    .map_err(|e| format!("PBKDF2 key derivation failed: {e}"))?;
+                CipherKey::from_bytes(&key).map_err(|e| e.to_string())
+            })();
+            // Best effort (not zeroize): the raw derivation buffer must not
+            // linger after the key schedule has copied it.
+            crate::wipe(&mut key);
+            result
         }
         KdfKind::None => {
             let path = key_path.ok_or_else(|| {
@@ -159,7 +171,10 @@ pub fn read_key_file(path: &str) -> Result<CipherKey, String> {
     let mut bytes = [0u8; 32];
     file.read_exact(&mut bytes)
         .map_err(|e| format!("cannot read key file '{path}': {e}"))?;
-    CipherKey::from_bytes(&bytes).map_err(|e| format!("key file '{path}': {e}"))
+    let key = CipherKey::from_bytes(&bytes).map_err(|e| format!("key file '{path}': {e}"));
+    // Best effort (not zeroize): wipe the raw file buffer.
+    crate::wipe(&mut bytes);
+    key
 }
 
 /// Parse a manifest-spelling cipher algorithm name.
@@ -377,6 +392,21 @@ mod tests {
         assert_eq!(a.as_bytes(), b.as_bytes());
         let other = derive_key(&meta, Some(b"other"), None).unwrap();
         assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    #[test]
+    fn derive_key_pbkdf2_rejects_a_key_file() {
+        let meta = CipherMeta {
+            cipher: CipherAlg::ChaCha12,
+            kdf: KdfKind::Pbkdf2HmacSha256,
+            iterations: Some(1_000),
+            salt: Some([0x11; 16]),
+            nonce: [0x22; 8],
+        };
+        let path = temp_file("pbkdf2_keyfile", &[0x7Au8; 32]);
+        let err = derive_key(&meta, Some(b"secret"), Some(path.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("key= is only valid with kdf = none"), "{err}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -26,10 +26,10 @@ const SIGMA: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
 /// Original DJB ChaCha with `ROUNDS` rounds.
 ///
-/// Use [`ChaCha8`], [`ChaCha12`] or [`ChaCha20`]; the generic parameter exists
-/// so a policy layer can pick the round count. `ROUNDS` must be even and
-/// non-zero, otherwise [`ChaCha::new`] returns
-/// [`CipherError::BadParameters`].
+/// The round count is restricted to the three deployed variants: [`ChaCha8`],
+/// [`ChaCha12`] and [`ChaCha20`]. Any other value makes [`ChaCha::new`] return
+/// [`CipherError::BadParameters`], so a manifest or policy cannot silently
+/// select an unreviewed (or accidentally odd) round count.
 pub struct ChaCha<const ROUNDS: usize> {
     key: [u8; 32],
     nonce: [u8; 8],
@@ -47,11 +47,11 @@ impl<const ROUNDS: usize> ChaCha<ROUNDS> {
     ///
     /// # Errors
     ///
-    /// [`CipherError::BadParameters`] when `ROUNDS` is zero or odd. The
-    /// nonce is not validated: any 64-bit value is a legal nonce, but a
+    /// [`CipherError::BadParameters`] unless `ROUNDS` is `8`, `12` or `20`.
+    /// The nonce is not validated: any 64-bit value is a legal nonce, but a
     /// caller must never reuse one with the same key.
     pub fn new(key: &CipherKey, nonce: [u8; 8]) -> Result<Self, CipherError> {
-        if ROUNDS == 0 || (ROUNDS & 1) != 0 {
+        if !matches!(ROUNDS, 8 | 12 | 20) {
             return Err(CipherError::BadParameters);
         }
         Ok(Self {
@@ -284,14 +284,22 @@ mod tests {
     #[test]
     fn invalid_round_counts_are_rejected() {
         let key = CipherKey::from_bytes(&[0u8; 32]).unwrap();
-        assert_eq!(
-            ChaCha::<0>::new(&key, [0u8; 8]).err(),
-            Some(CipherError::BadParameters)
-        );
-        assert_eq!(
-            ChaCha::<7>::new(&key, [0u8; 8]).err(),
-            Some(CipherError::BadParameters)
-        );
+        for rounds in [0usize, 4, 6, 7, 10, 16, 24] {
+            let rejected = match rounds {
+                0 => ChaCha::<0>::new(&key, [0u8; 8]).err(),
+                4 => ChaCha::<4>::new(&key, [0u8; 8]).err(),
+                6 => ChaCha::<6>::new(&key, [0u8; 8]).err(),
+                7 => ChaCha::<7>::new(&key, [0u8; 8]).err(),
+                10 => ChaCha::<10>::new(&key, [0u8; 8]).err(),
+                16 => ChaCha::<16>::new(&key, [0u8; 8]).err(),
+                24 => ChaCha::<24>::new(&key, [0u8; 8]).err(),
+                _ => unreachable!(),
+            };
+            assert_eq!(rejected, Some(CipherError::BadParameters), "{rounds}");
+        }
+        assert!(ChaCha::<8>::new(&key, [0u8; 8]).is_ok());
+        assert!(ChaCha::<12>::new(&key, [0u8; 8]).is_ok());
+        assert!(ChaCha::<20>::new(&key, [0u8; 8]).is_ok());
     }
 
     /// Pins the 64-bit counter split (words 12/13) and the nonce word order

@@ -715,6 +715,8 @@ impl CdrStore {
             BlockingStorage::new(store),
             cipher,
             nonce,
+            // `BundleStore` accepts only `resource > 16` (track 1 = 17), so
+            // resource 16 is never transformed and stays a contract fault.
             snowscsi::mmc::cdr_bundle::TRACK_RESOURCE_BASE + 1,
         )))
     }

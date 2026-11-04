@@ -351,9 +351,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **docs**: the README lists the persistent CD-R bundle (`--cdrom bundle=<dir>`,
   feature `cdr-bundle`) in its project status and full-feature example, and
   points at `HACKING.md` for the directory/durability contract.
+- **cli**: `bundle-create flat|cdr --force` overwrites an existing manifest
+  (and, for `cdr`, the initial TOC) without migrating chunk/track data. Flat
+  `--force` accepts a directory that already contains chunks; CD-R `--force`
+  still refuses leftover `track_<n>.bin` data. `bundle-info` on a regular file
+  without a sidecar now prints `not a bundle` and exits 2, and a CD-R
+  `bundle-info` reports the newest TOC slot's capacity, sessions, tracks and
+  profile from a fully validated slot (a corrupt body reports
+  `toc = missing`).
+- **docs**: `HACKING.md` gains a `SNOWBUNDLE` field table, the at-rest threat
+  model (card theft vs whole-machine, weak passwords, `kdf = none` key files,
+  swapped sidecars/writable corruption, no integrity), the ESP32-P4 DMA/CTR
+  wiring notes, and the feature-gated test commands. The README states that
+  encryption is at-rest protection, not a security boundary.
 
 ### Fixed
 
+- **cli**: `derive_key` rejects `key=<path>` for a PBKDF2 manifest with an
+  explicit “`key=` is only valid with `kdf = none`” error instead of ignoring
+  it. `crypt` refuses a symlink input both out of place and in place
+  (`symlink_metadata`), matching its “regular file only” contract. Passwords
+  and raw derived-key buffers are overwritten best effort (not `zeroize`) after
+  the planes/cipher are built.
+- **common**: `ChaCha::new` accepts only the deployed round counts `8`, `12`
+  and `20`; any other value is `CipherError::BadParameters`.
+- **common**: the cipher-plane write path is pinned by a hard-coded ciphertext
+  test that does not reuse `encrypt_ref`.
 - **core**: the `defmt` backend rejected the unit-attention log line: it used
   an implicit format-string capture with a spec (`{opcode:02x}`) and `{:?}` on
   a type that did not implement `defmt::Format`. `UaClass` now derives it, and

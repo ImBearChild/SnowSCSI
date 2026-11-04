@@ -637,6 +637,34 @@ fn crypt_rejects_aliased_paths() {
 
 #[cfg(unix)]
 #[test]
+fn out_of_place_refuses_a_symlink_input() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new("symlink_in");
+    let input = dir.write("in.img", &pseudo_random(4096, 0x5151_2222));
+    let pw = password_file(&dir);
+    let sym = dir.str("sym.img");
+    symlink(&input, &sym).unwrap();
+    let out = dir.str("out.enc");
+
+    run_fail(
+        &[
+            "crypt",
+            "--cipher",
+            "xor",
+            "--password-file",
+            &pw,
+            &sym,
+            &out,
+        ],
+        "symbolic link",
+    );
+    assert!(!Path::new(&out).exists(), "no output for a symlink input");
+    assert_no_temps(&dir.0);
+}
+
+#[cfg(unix)]
+#[test]
 fn in_place_refuses_symlink_and_hard_link() {
     use std::os::unix::fs::symlink;
 
