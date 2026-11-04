@@ -257,9 +257,9 @@ fn print_config_reports_the_async_wire() {
     );
 }
 
-/// The `bundle=` CD-R backing is discoverable from both surfaces: `serve
-/// --help` documents it, and `--print-config` names it without building (or
-/// creating) the directory.
+/// The `bundle=` backing is discoverable from both surfaces: `serve --help`
+/// documents it, and `--print-config` names it (validating `bundle=` inputs
+/// but not starting a transport).
 #[cfg(feature = "cdr-bundle")]
 #[test]
 fn cdr_bundle_help_and_print_config_mention_the_backing() {
@@ -269,13 +269,20 @@ fn cdr_bundle_help_and_print_config_mention_the_backing() {
     assert!(help.contains("bundle=<dir>"), "help text:\n{help}");
     assert!(help.contains("toc.0"), "help text:\n{help}");
     assert!(help.contains("track_<n>.bin"), "help text:\n{help}");
+    assert!(help.contains("bundle-create"), "help text:\n{help}");
 
+    let dir = std::env::temp_dir().join(format!("snowscsi_helpcfg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    assert!(run(&["bundle-create", "cdr", "--dir", &path])
+        .status
+        .success());
     let out = run(&[
         "serve",
         "--block",
         "ram=1M",
         "--cdrom",
-        "bundle=/tmp/disc,medium=cdr80",
+        &format!("bundle={path}"),
         "--usb",
         "--print-config",
     ]);
@@ -289,6 +296,7 @@ fn cdr_bundle_help_and_print_config_mention_the_backing() {
         stdout.trim_end().ends_with("lun=2 backing=ram,bundle"),
         "print-config line:\n{stdout}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -723,9 +731,10 @@ fn serve_starts_with_cdrom_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An `imgdir=` backing is block-only: `--cdrom imgdir=<dir>` is rejected.
+/// The removed `imgdir=` backing is rejected (the flat bundle spelling is
+/// `bundle=`) and the error names the flag it came from.
 #[test]
-fn serve_rejects_imgdir_cdrom() {
+fn serve_rejects_removed_imgdir() {
     let out = run(&["serve", "--cdrom", "imgdir=/tmp", "--iscsi", "127.0.0.1:0"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -735,35 +744,51 @@ fn serve_rejects_imgdir_cdrom() {
     );
 }
 
-/// A fresh `--block imgdir=<dir>` without `size=` is rejected: creating a new
-/// bundle needs a virtual size.
+/// `serve` never creates a bundle: a `--block bundle=<dir>` without a
+/// `SNOWBUNDLE` manifest is rejected with a create hint, and a missing
+/// directory is not created.
 #[cfg(feature = "bundle")]
 #[test]
-fn serve_rejects_bundle_without_size() {
-    let dir = std::env::temp_dir().join(format!("snowscsi_bundlesz_{}", std::process::id()));
+fn serve_rejects_bundle_without_manifest() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_bundleno_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.to_string_lossy().to_string();
 
     let out = run(&[
         "serve",
         "--block",
-        &format!("imgdir={path}"),
+        &format!("bundle={}", dir.display()),
         "--iscsi",
         "127.0.0.1:0",
     ]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("size=") || err.contains("virtual_size"),
-        "expected a missing-size error, got: {err}"
+        err.contains("SNOWBUNDLE") && err.contains("bundle-create"),
+        "expected a missing-manifest error, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+
+    let missing = std::env::temp_dir().join(format!("snowscsi_bundlemiss_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let out = run(&[
+        "serve",
+        "--block",
+        &format!("bundle={}", missing.display()),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        !missing.exists(),
+        "serve must not create a bundle directory"
+    );
+    let _ = std::fs::remove_dir_all(&missing);
 }
 
-/// `serve --block imgdir=<dir>,size=8M` creates a directory-chunked disk,
-/// announces 'listening' and exits 0 after SIGINT; the SNOWBUNDLE manifest and
-/// the first chunk appear on disk.
+/// `bundle-create flat` writes the manifest, then `serve --block bundle=`
+/// opens a directory-chunked disk, announces 'listening' and exits 0 after
+/// SIGINT. Chunks only materialize on the first host write.
 #[cfg(all(unix, feature = "bundle"))]
 #[test]
 fn serve_starts_with_bundle_disk() {
@@ -775,11 +800,28 @@ fn serve_starts_with_bundle_disk() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.to_string_lossy().to_string();
 
+    let created = run(&[
+        "bundle-create",
+        "flat",
+        "--dir",
+        &path,
+        "--size",
+        "8M",
+        "--sector",
+        "512",
+    ]);
+    assert!(
+        created.status.success(),
+        "bundle-create failed:\n{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(dir.join("SNOWBUNDLE").is_file());
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_snowscsi"))
         .args([
             "serve",
             "--block",
-            &format!("imgdir={path},size=8M"),
+            &format!("bundle={path}"),
             "--iscsi",
             "127.0.0.1:0",
         ])
@@ -825,9 +867,7 @@ fn serve_starts_with_bundle_disk() {
     let status = child.wait().expect("wait for snowscsi");
     assert!(status.success(), "snowscsi should exit 0 after SIGINT");
 
-    // The directory was created (host-owned) and the SNOWBUNDLE manifest
-    // written by the serve run. Chunks only materialize on first write (no
-    // initiator traffic in this smoke), so only the manifest is asserted.
+    // `bundle-create` wrote the manifest; `serve` only opened it.
     let header = std::fs::read(dir.join("SNOWBUNDLE")).unwrap_or_default();
     let header = String::from_utf8_lossy(&header);
     assert!(
@@ -848,6 +888,47 @@ fn serve_starts_with_bundle_disk() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `bundle-info` reports a created flat bundle and exits 2 for a plain
+/// directory carrying no manifest.
+#[cfg(feature = "bundle")]
+#[test]
+fn bundle_info_reports_a_bundle() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_bundleinfo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    let created = run(&[
+        "bundle-create",
+        "flat",
+        "--dir",
+        &path,
+        "--size",
+        "8M",
+        "--chunk",
+        "1M",
+    ]);
+    assert!(created.status.success());
+
+    let out = run(&["bundle-info", &path]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("kind = flat"), "info output:\n{text}");
+    assert!(text.contains("virtual_size = 8388608"), "info:\n{text}");
+    assert!(text.contains("chunk_size = 1048576"), "info:\n{text}");
+    assert!(text.contains("sector_size = 512"), "info:\n{text}");
+    assert!(text.contains("crc = present"), "info:\n{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let plain = std::env::temp_dir().join(format!("snowscsi_plaininfo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(&plain).unwrap();
+    let out = run(&["bundle-info", &plain.to_string_lossy()]);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not a bundle"), "info output:\n{text}");
+    let _ = std::fs::remove_dir_all(&plain);
 }
 
 /// `--block img=<file>,ro` opens the plane read-only: on a read-only file the
@@ -873,7 +954,7 @@ fn serve_starts_with_read_only_img() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// `--block imgdir=<dir>,ro` opens the plane read-only so it works on a
+/// `--block bundle=<dir>,ro` opens the plane read-only so it works on a
 /// read-only directory (simulated here). Skipped when running as root.
 #[cfg(all(unix, feature = "bundle"))]
 #[test]
@@ -888,9 +969,18 @@ fn serve_starts_with_read_only_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.to_string_lossy().to_string();
 
-    // Materialize the bundle + header with a writable run.
-    let rw = format!("imgdir={path},size=8M");
-    run_serve_until_ready_then_sigint(&["serve", "--block", &rw, "--iscsi", "127.0.0.1:0"]);
+    // Materialize the bundle + manifest with `bundle-create`.
+    let created = run(&[
+        "bundle-create",
+        "flat",
+        "--dir",
+        &path,
+        "--size",
+        "8M",
+        "--sector",
+        "512",
+    ]);
+    assert!(created.status.success());
     assert!(dir.join("SNOWBUNDLE").is_file());
 
     // Simulate read-only media.
@@ -901,8 +991,62 @@ fn serve_starts_with_read_only_bundle() {
     .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let ro = format!("imgdir={path},ro");
+    let ro = format!("bundle={path},ro");
     run_serve_until_ready_then_sigint(&["serve", "--block", &ro, "--iscsi", "127.0.0.1:0"]);
+
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--cdrom bundle=<flat>` is optical media, so it opens read-only even
+/// without `ro`: a 0444 chunk and a 0555 directory must still serve.
+/// Skipped when running as root.
+#[cfg(all(unix, feature = "bundle", feature = "cdrom"))]
+#[test]
+fn serve_starts_with_read_only_flat_cdrom_bundle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !can_simulate_read_only() {
+        eprintln!("skipping: cannot simulate read-only media (running as root)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("snowscsi_ro_cdbundle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+
+    let created = run(&[
+        "bundle-create",
+        "flat",
+        "--dir",
+        &path,
+        "--size",
+        "8M",
+        "--chunk",
+        "1M",
+        "--sector",
+        "2048",
+    ]);
+    assert!(
+        created.status.success(),
+        "bundle-create flat failed:\n{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    // A read-only chunk proves the optical plane never opens it for writing.
+    std::fs::write(dir.join("000000.img"), [0u8; 4096]).unwrap();
+
+    for name in ["SNOWBUNDLE", "000000.img"] {
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // No `ro`: `--cdrom` implies it for a flat bundle.
+    run_serve_until_ready_then_sigint(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path}"),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
 
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1297,13 +1441,81 @@ fn serve_starts_with_cdr_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.to_string_lossy().to_string();
 
+    let created = run(&["bundle-create", "cdr", "--dir", &path, "--medium", "cdr74"]);
+    assert!(
+        created.status.success(),
+        "bundle-create cdr failed:\n{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(dir.join("SNOWBUNDLE").is_file());
+    assert!(dir.join("toc.0").is_file());
+
     run_serve_until_ready_then_sigint(&[
         "serve",
         "--cdrom",
-        &format!("bundle={path},medium=cdr74"),
+        &format!("bundle={path}"),
         "--iscsi",
         "127.0.0.1:0",
     ]);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `kind = cdr` directory without any TOC slot is not a blank disc: serve
+/// fails with a create hint and writes no TOC.
+#[cfg(feature = "cdr-bundle")]
+#[test]
+fn serve_rejects_a_toc_less_cdr_bundle() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_notoc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+
+    let created = run(&["bundle-create", "cdr", "--dir", &path]);
+    assert!(created.status.success());
+    std::fs::remove_file(dir.join("toc.0")).unwrap();
+    let _ = std::fs::remove_file(dir.join("toc.1"));
+
+    let out = run(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path}"),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no recordable-CD TOC") && err.contains("bundle-create cdr"),
+        "expected a TOC-less error, got: {err}"
+    );
+    assert!(!dir.join("toc.0").exists(), "serve must not write a TOC");
+    assert!(!dir.join("toc.1").exists(), "serve must not write a TOC");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `kind = cdr` bundle is MMC-only: `--block` reports the kind and points at
+/// `--cdrom` even when `ro` (or `profile=cd`) is also present.
+#[cfg(feature = "cdr-bundle")]
+#[test]
+fn serve_reports_a_cdr_bundle_under_block() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cdrblock_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    assert!(run(&["bundle-create", "cdr", "--dir", &path])
+        .status
+        .success());
+
+    for spec in [
+        format!("bundle={path},ro"),
+        format!("bundle={path},profile=cd"),
+    ] {
+        let out = run(&["serve", "--block", &spec, "--iscsi", "127.0.0.1:0"]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("kind 'cdr'") && err.contains("--cdrom"),
+            "expected the kind/suggestion, got: {err}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

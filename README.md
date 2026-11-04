@@ -68,8 +68,13 @@ sudo snowscsi serve --usb --cdrom img=out.iso
 # a live ISO9660 view of a directory, as a USB CD-ROM
 sudo snowscsi serve --usb --cdrom live=./src_dir
 
-# a persistent CD-R bundle (burn with wodim/cdrecord; survives restarts)
-sudo snowscsi serve --usb --cdrom bundle=./cdr,medium=cdr80
+# create a flat directory-chunked disk, then serve it as a USB block device
+snowscsi bundle-create flat --dir ./disk --size 64M --chunk 1M
+sudo snowscsi serve --usb --block bundle=./disk
+
+# a persistent CD-R bundle (create once, then burn with wodim/cdrecord)
+snowscsi bundle-create cdr --dir ./cdr --medium cdr80
+sudo snowscsi serve --usb --cdrom bundle=./cdr
 ```
 
 `--iscsi` and `--usb` are mutually exclusive; exactly one transport is
@@ -147,7 +152,8 @@ Both transports drive any `impl ScsiDevice` through
 - [x] USB Mass Storage transport (`serve --usb`, FunctionFS gadget on Linux): verified end-to-end against the real kernel (`dummy_hcd` + `usb-storage`, ext4 format/mount/fsck)
 - [x] ISO9660 image generation (`mkisofs`): cross-validated by `file`, `isoinfo`, `7z`, `bsdtar`
 - [x] Writable DVD-RAM (`--cdrom dvdram=`, feature `dvdram`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
-- [x] Persistent CD-R/CD-RW bundle (`--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once or erasable disc for Track-at-Once burning (`wodim`/`cdrecord`), with CD-RW BLANK (`blank=fast`/`blank=all`), multi-session append, CD-DA audio (data/audio/mixed-mode tracks), the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, and TOC snapshotting on eject. The TAO path is exercised by an in-process cdrkit trace plus the external burn/mount/blank/eject test and the manual `wodim` recipe in `HACKING.md`. See the [CD-R/CD-RW storage resource contract](HACKING.md#cd-rcd-rw-storage-resource-contract) for the directory layout and durability rules.
+- [x] Flat directory-chunked bundles (`snowscsi bundle-create flat`, served with `--block bundle=<dir>` / `--cdrom bundle=<dir>`): a canonical `SNOWBUNDLE` manifest, on-demand chunk files, optional read-only media, and `snowscsi bundle-info` to inspect a directory or image sidecar. `serve` never creates the directory or manifest (chunk files appear on the first host write), and `--cdrom` always opens a flat bundle read-only. Bundle directories are canonicalized, so aliases count as one writer.
+- [x] Persistent CD-R/CD-RW bundle (`snowscsi bundle-create cdr`, served with `--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once or erasable disc for Track-at-Once burning (`wodim`/`cdrecord`), with CD-RW BLANK (`blank=fast`/`blank=all`), multi-session append, CD-DA audio (data/audio/mixed-mode tracks), the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, and TOC snapshotting on eject. `bundle-create cdr` writes the manifest and initial TOC; `serve` never creates either, but does create track files and write TOC snapshots while serving. The TAO path is exercised by an in-process cdrkit trace plus the external burn/mount/blank/eject test and the manual `wodim` recipe in `HACKING.md`. See the [CD-R/CD-RW storage resource contract](HACKING.md#cd-rcd-rw-storage-resource-contract) for the directory layout and durability rules.
 - [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`)
 
 ## Project structure
@@ -159,7 +165,7 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 ├── snowscsi-iso9660/               # ISO9660/Joliet live-generation algorithms
 ├── snowscsi/                       # SCSI core + iSCSI + USB MSC + CD-ROM + DVD-RAM
 │   └── src/{scsi, cdrom, iscsi, usb}
-├── snowscsi-cli/                   # `snowscsi` binary (serve + mkisofs)
+├── snowscsi-cli/                   # `snowscsi` binary (serve + mkisofs + bundle-create/info)
 ├── snowscsi-tests/                 # non-published test harness (integration + whitebox)
 ├── tools/                          # NOT a cargo member: ext-test/ + USB helpers
 ├── examples/esp32s3-pocket-dongle/ # ESP32-S3 firmware: SD card as a DVD-RAM USB drive

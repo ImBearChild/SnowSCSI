@@ -2,8 +2,9 @@
 """Black-box burn/read-back check for CD-R/CD-RW bundles served by the CLI.
 
 Most cases do **not** start a server: they expect an already-served optical
-device (for example `snowscsi serve --usb dummy --cdrom
-bundle=/tmp/cdr,medium=cdr80`) and a blank CD-R bundle behind it. Point
+device (for example `snowscsi bundle-create cdr --dir /tmp/cdr --medium cdr80`
+followed by `snowscsi serve --usb dummy --cdrom bundle=/tmp/cdr`) and a blank
+CD-R bundle behind it. Point
 `SNOWSCSI_CDR_DEV` at the host block device that server exposes:
 
     SNOWSCSI_CDR_DEV=/dev/sr0 python3 tools/ext-test/test_cdr_bundle.py
@@ -470,6 +471,17 @@ class _SelfServedMixin:
         self.tmp = tempfile.mkdtemp(prefix="snowscsi-cdr-self-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bundle = os.path.join(self.tmp, "bundle")
+        # `serve` never creates a bundle directory or manifest: create them
+        # (and the initial TOC) up front.
+        sh(
+            find_binary(),
+            "bundle-create",
+            "cdr",
+            "--dir",
+            self.bundle,
+            "--medium",
+            "cdr80",
+        )
         self.server = None
 
     def start_server(self, spec):
@@ -603,7 +615,8 @@ class CdrBundleAudioBurnTest(unittest.TestCase):
 @unittest.skipUnless(
     _cdrw_device_ready() and have_tool("wodim") and have_tool("isoinfo"),
     "set SNOWSCSI_CDRW_DEV to a blank, erasable /dev/srX served by "
-    "`snowscsi serve --cdrom bundle=…,medium=cdrw80` and install wodim + isoinfo",
+    "`snowscsi bundle-create cdr --medium cdrw80` plus `snowscsi serve --cdrom "
+    "bundle=…` and install wodim + isoinfo",
 )
 class CdrBundleCdrwTest(_IsoReadBack, unittest.TestCase):
     """Blank a CD-RW (fast and all) between three Track-at-Once burns."""
@@ -653,7 +666,7 @@ class CdrBundlePersistenceTest(_SelfServedMixin, _IsoReadBack, unittest.TestCase
         self.assertEqual(made.returncode, 0, made.stderr)
 
     def test_restart_keeps_mount_and_newest_toc(self):
-        dev = self.start_server(f"bundle={self.bundle},medium=cdr80")
+        dev = self.start_server(f"bundle={self.bundle}")
         sh("wodim", "-v", "-tao", f"dev={dev}", self.iso, timeout=300)
         self.verify_iso(dev, self.LABEL, self.text, self.payload)
         self.verify_mount(dev, self.text, self.payload)
@@ -670,8 +683,8 @@ class CdrBundlePersistenceTest(_SelfServedMixin, _IsoReadBack, unittest.TestCase
         self.assertIn("disc_state = finalized", newest["body"], newest["body"])
         self.assertEqual(newest["seq"], max(h["seq"] for h in before.values()))
 
-        # Reopen the same directory: the stored TOC (not the medium= hint)
-        # must restore the disc.
+        # Reopen the same directory: the stored TOC (not a CLI hint) must
+        # restore the disc.
         dev = self.start_server(f"bundle={self.bundle}")
         self.verify_iso(dev, self.LABEL, self.text, self.payload)
         self.verify_mount(dev, self.text, self.payload)
@@ -717,7 +730,7 @@ class CdrBundleEjectTest(_SelfServedMixin, unittest.TestCase):
             handle.write(b"\x5a" * 2048)
 
     def test_eject_snapshot_restores_appendable_disc(self):
-        dev = self.start_server(f"bundle={self.bundle},medium=cdr80")
+        dev = self.start_server(f"bundle={self.bundle}")
         _consume_unit_attention(dev)
         # WRITE(10) one 2048-byte block at LBA 0.
         _sg_raw(

@@ -17,7 +17,7 @@ the `snowscsi` binary lives in `snowscsi-cli`.
 | — iSCSI | `snowscsi::iscsi` | iSCSI PDU codec, connection, target state machine driving `core::Target`, TCP transport |
 | — USB MSC | `snowscsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, `BotSession` driving `core::Target` |
 | — DVD-RAM | `snowscsi::dvdram` (feature `dvdram`) | Blank, host-formatted random-writable DVD-RAM media (`cdrom::dvdram::DvdRamMedia`) |
-| **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory |
+| **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory; `snowscsi bundle-create` writes a `SNOWBUNDLE` directory manifest (flat or recordable CD + initial TOC) and `snowscsi bundle-info` reports one |
 | **Tests** | `snowscsi-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
 | **Tools** | `tools/` (not a workspace member) | External Python black-box tests (`ext-test/`) + USB passthrough helper |
 
@@ -43,7 +43,7 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 │       └── dvdram.rs            # feature "dvdram": blank, host-formatted DVD-RAM media
 ├── snowscsi-cli/                 # crate: `snowscsi` binary (src/main.rs)
 │   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/bundle/cdr-bundle/log/tokio/defmt
-│   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs subcommands
+│   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs + bundle-create/info
 ├── tests/                         # crate: snowscsi-tests (integration tests)
 │   ├── Cargo.toml
 │   ├── build.rs                  # probes libiscsi (cfg has_libiscsi), compiles c/iscsi_access.c
@@ -102,8 +102,8 @@ Feature maps:
   Linux-only `usb-gadget`/`bytes` deps under
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowscsi-cli`** — `full` (default) pulls `std` +
-  `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`bundle`/`cdr-bundle`/`log`/
-  `tokio` plus
+  `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`bundle`/`cdr-bundle`
+  (→`bundle` in this crate)/`log`/`tokio` plus
   std-only deps (clap/ctrlc/env_logger). Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
@@ -116,6 +116,30 @@ Feature maps:
 
 `snowscsi`'s `no_std` surface is feature-gated; without `std` it stays
 `no_std`-clean so embedded consumers can pull in only `scsi`/`usb`/`iscsi`.
+
+### Flat bundle directories
+
+A directory-chunked flat bundle is created once with
+
+```bash
+snowscsi bundle-create flat --dir <dir> --size <n> [--chunk <n>] [--sector 512|2048]
+```
+
+which writes the canonical `SNOWBUNDLE` (`kind = flat`) through a checked
+create (no `--force`: an existing manifest or legacy `BUNDLE` is refused).
+Geometry is validated before the directory is created, and `bundle-create`
+removes a directory it created if the manifest write then fails. The flat
+manifest write itself is **not** atomic yet (single create/truncate + sync);
+`bundle-create` is the only creator. `bundle-create` never writes chunk data.
+Chunk files are created on demand by the first host write. `--block
+bundle=<dir>` serves it as a writable or read-only block disk (`ro` opens every
+chunk read-only), and `--cdrom bundle=<dir>` presents the same manifest as a
+read-only flat CD (the MMC role always opens a flat bundle read-only).
+`serve` never creates the directory or manifest; it does create and write
+chunk files on the first host write. `bundle-info <dir>` prints the parsed
+kind, geometry, cipher description and CRC presence. An image file with a
+`<file>.SNOWBUNDLE` sidecar is inspected by passing the image path (or the
+sidecar path itself) to `bundle-info`.
 
 ### CD-R/CD-RW storage resource contract
 
@@ -142,13 +166,17 @@ SESSION and SYNCHRONIZE CACHE sync the aggregate data (`Sync { resource: 0 }`)
 before writing and syncing the TOC slot. The medium never deletes track files;
 the application reconciles orphans with `CdrBundleMedium::track_numbers`.
 Serve at most one writer per bundle directory: the alternating TOC slots and
-the orphan cleanup assume a single serving process.
+the orphan cleanup assume a single serving process. Before serving, the CLI
+canonicalizes every `bundle=` directory, so `dir`, `dir/` and a symlink alias
+count as the same writer and are rejected as duplicate LUNs.
 
 The CLI application maps that contract onto a host directory with
-`--cdrom bundle=<dir>` (`cdr-bundle` feature):
+`--cdrom bundle=<dir>` (`cdr-bundle` feature). `snowscsi bundle-create cdr`
+creates the manifest and initial TOC; `serve` opens them and never creates
+either, but serving does create/write `track_<n>.bin` and TOC snapshots:
 
 - **CLI bundle backing** — `OwnedPlane::CdrBundle` owns an
-  `FsPlaneAdapter<StdFsBackend>` plus the preset's sector count, and its
+  `FsPlaneAdapter<StdFsBackend>` plus the restored medium, and its
   `exec(resource, …)` routes `1`/`2` to `toc.0`/`toc.1` and `16 + n`
   (`1 <= n <= max_tracks_for_slot(slot_size)`) to `track_<n>.bin`. Track reads
   return the readable prefix and zero-fill only the suffix (a missing file is
@@ -157,18 +185,20 @@ The CLI application maps that contract onto a host directory with
   (256-byte header of both slots, then the newer valid slot in full) and uses
   `open_at` with the physical index, so a copied slot is rejected. A missing
   slot is a blank start, but an unreadable/malformed slot is an error unless
-  the other slot is valid. A stored TOC always wins over `medium=`: the CLI
-  passes the preset as a hint and warns when the stored capacity or disc kind
-  differs, so `medium=` and `slot=` only describe a new blank bundle (a fresh
-  directory with no TOC uses the hint, default CD-R; a restored one uses the
-  stored kind). A missing directory is created
-  with a warning for `recovery=delete`; `recovery=readonly` requires an
-  existing TOC and never creates one. A resource `Sync` fsyncs the addressed
+  the other slot is valid. The stored TOC always owns capacity and disc kind:
+  `serve` passes no capacity/kind hints, and `bundle-create cdr --medium`/
+  `--slot` only describe the TOC it writes for a new disc (default CD-R, 64 KiB
+  slot). `serve` never creates the directory, manifest or TOC; a missing
+  directory, manifest, or a `kind = cdr` directory with no TOC slot is an error
+  with a `bundle-create` hint, and a recordable bundle is writable-only (`ro` is
+  rejected). Serving does create track files and write TOC snapshots. A
+  resource `Sync`
+  fsyncs the addressed
   track or TOC slot, and the aggregate `Sync { resource: 0 }` fsyncs every
   dirty track and TOC file before `SYNCHRONIZE CACHE`/`CLOSE` reports GOOD.
-  Orphan `track_<n>.bin` files are removed when a bundle is reopened with
-  `recovery=delete` (never with `recovery=readonly`); stale tails are ignored
-  because the TOC bounds every read. On host eject the serve paths that own the
+  Orphan `track_<n>.bin` files are removed when a bundle is reopened with the
+  default `Recovery::Delete` (never with `Recovery::ReadOnly`); stale tails are
+  ignored because the TOC bounds every read. On host eject the serve paths that own the
   storage handle snapshot the ejected medium before its plane is dropped: USB inline
   (`CliStorage`) and USB `--banks dual` (`WorkerStore`) first flush the bundle's
   track data, then render the next alternating slot (`CdrBundleMedium::toc_image`
@@ -439,21 +469,24 @@ Design notes:
 
 ### Manual CD-R/CD-RW bundle check
 
-`--cdrom bundle=<dir>` serves a persistent CD-R (or, with `medium=cdrwNN`, an
-erasable CD-RW). The medium model covers CD-RW BLANK, multi-session append,
-CD-DA audio (data/audio/mixed-mode) and the blocking-iSCSI eject snapshot; the
-recorder-control commands and alternating TOC slots are covered in-process
-(`cdr_cdrkit_tao_trace` follows the exact `wodim -tao` sequence) and by
-`tools/ext-test/test_cdr_bundle.py` (burn/read-back, read-only mount,
-CD-RW blank/reburn, restart and opt-in eject snapshot), but a manual burn
+`bundle-create cdr --dir <dir>` writes the `SNOWBUNDLE` manifest and the first
+TOC slot, then `--cdrom bundle=<dir>` serves a persistent CD-R (or, with
+`--medium cdrwNN`, an erasable CD-RW). The medium model covers CD-RW BLANK,
+multi-session append, CD-DA audio (data/audio/mixed-mode) and the blocking-iSCSI
+eject snapshot; the recorder-control commands and alternating TOC slots are
+covered in-process (`cdr_cdrkit_tao_trace` follows the exact `wodim -tao`
+sequence) and by `tools/ext-test/test_cdr_bundle.py` (burn/read-back, read-only
+mount, CD-RW blank/reburn, restart and opt-in eject snapshot), but a manual burn
 catches host/driver interaction the harness cannot.
 
-Serve the disc over USB (FunctionFS; `<udc>` is a controller name, `auto`
-picks one, `dummy` auto-loads `dummy_hcd`):
+Create the disc, then serve it over USB (FunctionFS; `<udc>` is a controller
+name, `auto` picks one, `dummy` auto-loads `dummy_hcd`):
 
 ```bash
+cargo run -p snowscsi-cli -- bundle-create cdr --dir /tmp/cdr --medium cdr80
+
 cargo run -p snowscsi-cli -- serve --usb <udc> \
-    --cdrom bundle=/tmp/cdr,medium=cdr80
+    --cdrom bundle=/tmp/cdr
 ```
 
 or over iSCSI (`auto` binds the loopback portal and logs in through
@@ -462,13 +495,16 @@ login):
 
 ```bash
 cargo run -p snowscsi-cli -- serve --iscsi auto \
-    --cdrom bundle=/tmp/cdr,medium=cdr80
+    --cdrom bundle=/tmp/cdr
 ```
 
-`medium=`/`slot=` only describe a **new blank** bundle; once a TOC exists the
-stored geometry and media kind win. `medium=cdr74|cdr80|cdr90|cdr99` creates a
-write-once CD-R; `medium=cdrw74|cdrw80|cdrw90|cdrw99` creates an erasable
-CD-RW with the same capacity presets.
+`--medium`/`--slot` on `bundle-create cdr` only describe the disc being
+created; a stored TOC always wins on reopen. `--medium cdr74|cdr80|cdr90|cdr99`
+creates a write-once CD-R; `--medium cdrw74|cdrw80|cdrw90|cdrw99` creates an
+erasable CD-RW with the same capacity presets. `serve` never creates a bundle:
+a missing directory, `SNOWBUNDLE`, or TOC is an error, and a recordable bundle
+is writable-only. Serving does create `track_<n>.bin` files and write TOC
+snapshots as the host records.
 
 Burn with cdrkit in Track-at-Once:
 
@@ -545,18 +581,21 @@ The bundle directory holds the durable state:
 
 | Path | Content |
 |------|---------|
+| `SNOWBUNDLE` | Canonical manifest (`kind = cdr`); written by `bundle-create cdr` |
 | `toc.0`, `toc.1` | Alternating TOC slots; the newer valid one wins |
 | `track_1.bin`, … | Track payload (`16 + n` storage resource; 2048 bytes per block for data, 2352 for audio) |
 
 Stop the server and start it again on the same directory to prove the TOC is
 re-read (`open_at` checks each slot against its physical index, so a copied
-slot is rejected). A `recovery=delete` reopen removes orphan `track_<n>.bin`
-files only when the TOC was restored from a readable slot with no skipped
-candidate; a file is kept only in its canonical `track_file(n)` spelling when
-the TOC references it and the slot can persist it. An unreadable slot disables
-cleanup, and a TOC-less directory is never wiped (leftover track files are
-counted and reported). `toc.0`/`toc.1` are never touched. A `recovery=readonly`
-reopen never deletes anything.
+slot is rejected). The CLI reopens every bundle with `Recovery::Delete`, which
+removes orphan `track_<n>.bin` files only when the TOC was restored from a
+readable slot with no skipped candidate; a file is kept only in its canonical
+`track_file(n)` spelling when the TOC references it and the slot can persist
+it. An unreadable slot disables cleanup. A direct library open of a TOC-less
+directory never wipes it (leftover track files are counted and reported), but
+the CLI rejects that directory before serving. `toc.0`/`toc.1` are
+never touched. (`Recovery::ReadOnly` remains available to library callers and
+never deletes anything.)
 
 Troubleshooting:
 
@@ -578,14 +617,21 @@ Troubleshooting:
   no spindle to retune; SEND OPC tables are consumed and discarded.
 - **TOC corrupt or missing** — the two slots alternate, so a torn save leaves
   the other valid slot usable. An unreadable/malformed slot is an error
-  unless the other is valid. A missing directory starts a blank disc with a
-  warning; `recovery=readonly` requires an existing TOC and never creates
-  one.
-- **`recovery=readonly`** — restores the written prefix as complete tracks,
-  finalizes the disc and rejects later writes (`WRITE PROTECTED`).
-- **Geometry presets** — `medium=cdr74|cdr80|cdr90|cdr99` (write-once CD-R) or
-  `medium=cdrw74|cdrw80|cdrw90|cdrw99` (erasable CD-RW), and `slot=<bytes>`
-  (4 KiB..64 KiB), only apply to a new blank bundle; the number of track
+  unless the other is valid. `serve` never creates a missing directory or
+  TOC; create the bundle with `bundle-create cdr` first. A TOC-less
+  `kind = cdr` directory is rejected (`no recordable-CD TOC …`) and is never
+  opened as a blank disc.
+- **`bundle-create cdr` failures** — it refuses to overwrite an existing
+  `SNOWBUNDLE`, legacy `BUNDLE`, or `toc.0`/`toc.1`, and refuses a directory
+  that already contains canonical `track_<n>.bin` data. The manifest is
+  written before the initial TOC; the TOC is written through a fsynced
+  temporary file renamed into place (a failed write removes the temporary).
+  If the TOC write still fails the error says the manifest was already
+  written, so remove the directory before retrying.
+- **Geometry presets** — `bundle-create cdr --medium
+  cdr74|cdr80|cdr90|cdr99` (write-once CD-R) or `cdrw74|cdrw80|cdrw90|cdrw99`
+  (erasable CD-RW), and `--slot <bytes>` (4 KiB..64 KiB), only describe the
+  TOC written for a new bundle; the number of track
   files is bounded by `max_tracks_for_slot(slot)`. The presets are the real
   media lead-out addresses (`minutes * 60 * 75 - 151`, so 74 → 332 849,
   80 → 359 849, 90 → 404 849, 99 → 445 349 sectors). The 90- and 99-minute

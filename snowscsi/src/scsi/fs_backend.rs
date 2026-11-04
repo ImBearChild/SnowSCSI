@@ -67,10 +67,13 @@ impl FsStorage for StdFsBackend {
             .create(opts.create)
             .truncate(opts.truncate);
         let file = oopts.open(&full).map_err(|e| {
-            crate::warn!("std fs open {:?} failed: {}", full, e);
-            match e.kind() {
-                std::io::ErrorKind::NotFound => FsError::NotFound,
-                other => FsError::Io(map_io_err(other)),
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // Manifest/TOC/chunk probes routinely test for a missing file.
+                crate::debug!("std fs open {:?} not found", full);
+                FsError::NotFound
+            } else {
+                crate::warn!("std fs open {:?} failed: {}", full, e);
+                FsError::Io(map_io_err(e.kind()))
             }
         })?;
         Ok(StdFile::new(file))

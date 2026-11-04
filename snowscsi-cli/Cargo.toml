@@ -34,7 +34,8 @@ usb = ["snowscsi/usb"]
 bundle = ["snowscsi/bundle"]
 # Persistent CD-R bundle backing (`--cdrom bundle=<dir>`): the library's
 # sequential write-once medium with its alternating `toc.0`/`toc.1` slots.
-cdr-bundle = ["snowscsi/cdr-bundle"]
+# `bundle` supplies the canonical `SNOWBUNDLE` manifest and identification.
+cdr-bundle = ["snowscsi/cdr-bundle", "bundle"]
 log = ["snowscsi/log", "dep:log"]
 defmt = ["snowscsi/defmt"]
 # Tokio binding for the runtime-agnostic async seams (`--wire async`). The

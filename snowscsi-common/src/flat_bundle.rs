@@ -578,7 +578,11 @@ impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
 }
 
 /// Validate bundle geometry.
-fn validate_geometry(
+///
+/// Used by `FlatBundle` construction and by the CLI before it creates a
+/// bundle directory, so invalid `--size`/`--chunk`/`--sector` values fail
+/// without leaving an empty directory behind.
+pub fn validate_geometry(
     chunk_size: u64,
     virtual_size: u64,
     sector_size: u32,

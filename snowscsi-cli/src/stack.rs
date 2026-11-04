@@ -161,29 +161,36 @@ fn sync_file_or_missing(fs: &mut FsPlaneAdapter<StdFsBackend>, path: &str) -> Re
 /// renamed over the real slot. Within the temp file the header/body order is
 /// irrelevant because the file is not visible until the rename, which makes
 /// the slot switch atomic. The directory is fsynced best effort so the rename
-/// is durable. The plane is dropped right after an eject, so this uses
-/// `std::fs` uniformly on the serve paths that own the store.
+/// is durable, and a failed write/rename removes the temporary file. Used by
+/// the serve paths that own the store (the plane may be dropped right after an
+/// eject) and by `bundle-create cdr` for the initial slot.
 #[cfg(feature = "cdr-bundle")]
-fn write_toc_snapshot(dir: &str, slot: u8, image: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_toc_snapshot(dir: &str, slot: u8, image: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let name = toc_file(slot);
     let path = std::path::Path::new(dir).join(name);
     let tmp = std::path::Path::new(dir).join(format!("{name}.tmp"));
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(image)?;
-        file.sync_all()?;
+    let write = (|| {
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)?;
+            file.write_all(image)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, &path)?;
-    if let Ok(dir) = std::fs::File::open(dir) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    write
 }
 
 /// Snapshot a CD-R bundle pair before an eject drops its plane.
@@ -657,8 +664,20 @@ impl OwnedPlane {
         }
     }
 
+    /// Logical sector size of a flat bundle plane, when this plane is one.
+    ///
+    /// The manifest owns the geometry, so the CLI block-device builders take
+    /// the sector size from here instead of the spec's `sector=` default.
+    pub fn sector_size(&self) -> Option<u32> {
+        match self {
+            #[cfg(feature = "bundle")]
+            Self::Bundle(bundle) => Some(bundle.sector_size()),
+            _ => None,
+        }
+    }
+
     /// Whether this plane should be addressed as a writable plane.
-    fn is_writable(&self) -> bool {
+    pub(crate) fn is_writable(&self) -> bool {
         match self {
             Self::BlockRw(_) => true,
             Self::Ram { writable, .. } => *writable,

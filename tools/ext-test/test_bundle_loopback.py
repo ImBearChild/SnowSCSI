@@ -3,14 +3,18 @@
 
 Same initiator stack as `test_iscsi_loopback.py` (`iscsiadm` + `iscsi_tcp`,
 manual login through `harness.IscsiSession`), but the served LUN is a
-**directory-chunked FlatBundle** (`--block imgdir=<dir>,size=32M`) instead of
-a RAM disk. On top of the usual login/format/mount/write/read/fsck checklist
-it asserts the FlatBundle side effects:
+**directory-chunked FlatBundle** (`--block bundle=<dir>`) instead of a RAM
+disk. The directory is created up front by `snowscsi bundle-create flat`; the
+manifest exists before serving, while `serve` creates chunk files on demand
+(it never creates the directory or manifest). On top of the usual
+login/format/mount/write/read/fsck checklist it asserts the FlatBundle side
+effects:
 
-- the `SNOWBUNDLE` manifest is written when the server creates the disk;
+- the `SNOWBUNDLE` manifest written by `bundle-create` is still canonical;
 - chunk files materialize on demand (`000000.img` after the first write and
   more chunks once the whole device has been written);
-- the directory is re-openable (the same `imgdir=` spec reloads geometry).
+- the directory is re-openable (`--block bundle=<dir>` reloads the geometry
+  from the manifest).
 
 The device is detected by the `/sys/class/block` snapshot diff in
 `harness.wait_new_sd`, so a stale device from a previous run can never be
@@ -28,6 +32,7 @@ import zlib
 from harness import (
     IscsiSession,
     ServerHandle,
+    find_binary,
     full_disk_test,
     have_tool,
     is_root,
@@ -65,9 +70,21 @@ class _BundleScenario:
 
     def setUp(self):
         self.bundle_dir = tempfile.mkdtemp(prefix="snowscsi-bundle-")
+        # `serve` never creates a bundle: write the manifest first.
+        sh(
+            find_binary(),
+            "bundle-create",
+            "flat",
+            "--dir",
+            self.bundle_dir,
+            "--size",
+            SIZE,
+            "--chunk",
+            CHUNK,
+        )
         self.server = ServerHandle(
             "--block",
-            f"imgdir={self.bundle_dir},size={SIZE},chunk={CHUNK}",
+            f"bundle={self.bundle_dir}",
             *self.EXTRA,
         )
         self.server.__enter__()
@@ -113,7 +130,7 @@ class _BundleScenario:
             raise
 
     def _login_format_mount_write_read_fsck_chunks(self):
-        # The server created the disk: the SNOWBUNDLE manifest exists up front.
+        # `bundle-create` wrote the manifest up front; `serve` only opened it.
         header = os.path.join(self.bundle_dir, "SNOWBUNDLE")
         self.assertTrue(os.path.isfile(header), "SNOWBUNDLE manifest missing")
         with open(header, encoding="utf-8") as f:
@@ -169,7 +186,7 @@ class _BundleScenario:
         # Restart the server on the same bundle directory (no size=/chunk=
         # needed: the SNOWBUNDLE manifest carries the geometry).
         self.server = ServerHandle(
-            "--block", f"imgdir={self.bundle_dir}", *self.EXTRA
+            "--block", f"bundle={self.bundle_dir}", *self.EXTRA
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)

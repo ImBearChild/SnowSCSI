@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ⚠️ Breaking changes
 
+- **cli**: `serve` no longer creates a bundle directory, manifest or TOC.
+  `imgdir=` is removed; `bundle=<dir>` is the single bundle backing for both
+  `--block` and `--cdrom`, and the directory's canonical `SNOWBUNDLE` `kind`
+  selects a flat chunked disk (`kind = flat`) or a recordable CD
+  (`kind = cdr`). A missing directory, manifest, or `kind = cdr` directory
+  without a TOC is an error. The old serve-time creation knobs `chunk=`,
+  `medium=`, `slot=` and `recovery=` are removed (they belong to
+  `bundle-create`), `sector=`/`size=` are rejected with `bundle=`, `ro` is
+  rejected with `--cdrom dvdram=`, and `ro` is accepted only for a flat bundle
+  (a CD-R bundle is writable-only). New `snowscsi bundle-create flat|cdr`
+  (the only creator of the directory manifest and initial CD-R TOC; it writes
+  no chunk/track data) and `snowscsi bundle-info` verbs replace the implicit
+  setup. `serve` still creates chunk/track files and writes TOC snapshots
+  while it serves. Bundle directories are canonicalized, so `dir`, `dir/` and
+  a symlink alias are rejected as duplicate writers.
 - **common**: a flat bundle is identified by a canonical `SNOWBUNDLE`
   manifest (`magic = snow_bundle`, `version`, `kind = flat`, geometry); the
   old `BUNDLE`/`snow_flat_bnd` header is refused instead of being
@@ -36,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default Hyper-Multi drive now also lists the CD-RW profile (`0x0A`).
 - **mmc**: the `cdr-bundle` TOC body gains `disc_type = cdrw` (the existing
   `disc_type = cdr` still loads unchanged); `CdrBundleMedium` gains
-  `with_disc`/`blank_disc`/`kind` and `DiscKind`, and the CLI `medium=` option
-  accepts `cdrw74|cdrw80|cdrw90|cdrw99`.
+  `with_disc`/`blank_disc`/`kind` and `DiscKind`, and the CLI
+  `bundle-create cdr --medium` option accepts `cdrw74|cdrw80|cdrw90|cdrw99`.
 - **mmc**: `TocError` gains `WriteProtected`; exhaustive matches must handle it.
 - **mmc**: the `cdr-bundle` capacity presets now report the real media lead-out
   (`minutes * 60 * 75 - 151`: 74 → 332 849, 80 → 359 849, 90 → 404 849,
@@ -63,6 +78,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **core**: `CipherStore` decorates a `Storage` with per-resource stream-cipher
   domains (CD-R track resources encrypted, TOC resources plaintext) and
   forwards `AsyncWake`.
+- **cli**: `bundle-create flat --dir <dir> --size <n> [--chunk <n>]
+  [--sector 512|2048]` writes a canonical `kind = flat` manifest (checked
+  create: an existing `SNOWBUNDLE` or legacy `BUNDLE`, or a non-empty chunk
+  set, is refused; geometry is validated before the directory is created and
+  a directory it created is removed on failure);
+  `bundle-create cdr --dir <dir> [--medium …] [--slot <bytes>]` writes
+  `kind = cdr` plus the initial TOC slot (manifest first, then an atomically
+  renamed and fsynced `toc.<slot>`; temporary files are removed on failure),
+  refusing an existing manifest/TOC or leftover `track_<n>.bin` data, and
+  `bundle-info <path>` prints the
+  kind/geometry, cipher/kdf/iterations (when present), CRC presence and the
+  CD-R TOC header summary (`toc = missing` when absent), exiting 2 for a
+  non-bundle. The flat manifest write itself is not atomic yet; `bundle-create`
+  is its only creator.
 - **bundle**: `snowscsi::bundle::{identify_dir, identify_manifest}` classify a
   directory or sidecar as `image`/`flat`/`cdr` from the canonical manifest and
   summarize the plaintext CD-R TOC header.
@@ -235,16 +264,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: `--block img=<file>,removable` USB card-reader demo (one removable
   slot, `profile=block`, `img=` only, not with `--banks dual`): eject drops
   the plane and a background watcher installs a stable replacement file.
-- **cli**: `--cdrom bundle=<dir>[,medium=cdr74|cdr80|cdr90|cdr99][,slot=<bytes>]
-  [,recovery=delete|readonly]` (`cdr-bundle` feature) serves a persistent CD-R
+- **cli**: `bundle-create cdr --dir <dir> [--medium cdr74|cdr80|cdr90|cdr99|
+  cdrw74|cdrw80|cdrw90|cdrw99] [--slot <bytes>]` (`cdr-bundle` feature)
+  writes a `kind = cdr` `SNOWBUNDLE` and its initial TOC slot; `serve --cdrom
+  bundle=<dir>` then serves a persistent CD-R
   whose alternating TOC slots and track payloads live in the directory as
   `toc.0`/`toc.1` and `track_<n>.bin`. The LUN is restored from the newer valid
   TOC slot with `open_at`, so a copied/restored slot is rejected and
-  `current_slot` matches the file it came from. A **stored TOC wins** over the
-  `medium=` hint (the CLI passes capacity `0` on reopen and warns on a
-  mismatch); `medium=`/`slot=` only describe a new blank bundle. A missing
-  directory still starts a blank disc with a warning, but `recovery=readonly`
-  requires an existing TOC, and an unreadable/malformed slot is an error rather
+  `current_slot` matches the file it came from. The **stored TOC owns** the
+  capacity and disc kind (`serve` passes no hints); `--medium`/`--slot` only
+  describe the TOC `bundle-create` writes. `serve` never creates the directory,
+  manifest or TOC, so a missing one (including a `kind = cdr` directory with no
+  TOC slot) is an error, while serving does create track files and write TOC
+  snapshots. An unreadable/malformed
+  slot is an error rather
   than a silent overwrite. Track reads return the readable prefix followed by
   zeros (a missing track file is empty), and the first write at offset `0`
   truncates a reused track id. A resource `Sync` fsyncs that track or TOC slot,
@@ -261,12 +294,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left Appendable (not finalized), and a host that never issued CLOSE may leave
   a partially recorded track. The same resource mapping covers `--banks dual`,
   so a bundle LUN can run on the worker path.
-- **cli**: a `recovery=delete` CD-R bundle open reconciles the directory
+- **cli**: the default `Recovery::Delete` bundle open reconciles the directory
   against the restored TOC: a `track_<n>.bin` is kept only when its canonical
   `track_file(n)` spelling is referenced by the TOC and `n` fits the slot, so
   unreferenced files, ids above `max_tracks_for_slot`, and non-canonical
   spellings are removed (one summary log line; a failed removal only warns).
-  `toc.0`/`toc.1` are never touched, and a `recovery=readonly` open deletes
+  `toc.0`/`toc.1` are never touched, and a `Recovery::ReadOnly` open (library
+  callers only; the CLI always uses `Delete`) deletes
   nothing. Cleanup runs only when the newest readable slot is restored with no
   skipped/unreadable candidate; a TOC-less directory is never wiped (leftover
   track files are counted and reported). The scan restarts at the first entry
@@ -288,8 +322,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saved TOC slots through `open_at`. `HACKING.md` gains a manual CD-R bundle
   burn/read-back recipe with its troubleshooting notes.
 - **tests**: READ CAPACITY of a blank, reserved-only, partially burned and
-  finalized write-once disc, plus the `recovery=delete`/`recovery=readonly`
-  orphan-track reconciliation of the CLI bundle directory.
+  finalized write-once disc, plus the `Recovery::Delete`/`Recovery::ReadOnly`
+  orphan-track reconciliation (the CLI always reopens with `Delete`).
 - **cli**: `--print-config` reports the resolved backing per LUN after the
   existing fields (`… backing=ram,bundle`); a smoke test pins the `bundle=`
   help text and the backing token.

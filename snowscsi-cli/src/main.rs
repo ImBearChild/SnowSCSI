@@ -6,28 +6,35 @@
 //! - `serve`: run the iSCSI target (serial accept loop)
 //! - `mkisofs`: generate an ISO9660/Joliet image from a host directory
 //!   (the live-generation algorithm, dumped sector-by-sector to a file)
+//! - `bundle-create`: create a flat or recordable-CD bundle directory
+//!   (the **only** creator of its `SNOWBUNDLE` manifest and initial CD-R TOC;
+//!   it writes no chunk/track data)
+//! - `bundle-info`: report what a bundle directory or image sidecar describes
 //!
 //! Devices are declared with two repeatable flags sharing one grammar
 //! (`<backing>[=<value>][,<option>...]`): `--block` and `--cdrom`.
 //!
 //! - `--block` drives `BlockDevice`: `img=<file>[,ro][,removable]`,
-//!   `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]` (directory-chunked
-//!   disk, `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
+//!   `bundle=<dir>` (directory-chunked flat disk from its `SNOWBUNDLE`
+//!   manifest; `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
 //!   `removable` (USB only, `img=` only) is the card-reader demo.
 //! - `--cdrom` drives the core `MmcDrive` profile (full MMC): `img=<iso>`,
 //!   `live=<dir>` (live ISO9660 over a directory),
 //!   `dvdram=<path|ram:<size>>[,size=…]` (blank random-writable DVD-RAM;
 //!   `size=` creates a new zeroed file — the host formats it, the device
-//!   never writes file-system structures), `bundle=<dir>[,medium=…][,slot=…]
-//!   [,recovery=…]` (a persistent CD-R or erasable CD-RW bundle:
-//!   `toc.0`/`toc.1` plus `track_<n>.bin` in the directory, reopened from its
-//!   newest valid TOC slot; requires the `cdr-bundle` feature), or `empty` (an
-//!   enumerated drive with no medium; the application installs the first one).
-//!   Bundles are written only in Track-at-Once: `wodim -tao` (also `-audio`
-//!   for CD-DA and `-multi` for another session) and, on a CD-RW,
-//!   `wodim blank=fast|all`. SAO/DAO is not implemented.
+//!   never writes file-system structures), `bundle=<dir>` (a flat ISO or a
+//!   persistent CD-R/CD-RW bundle; the manifest's `kind` selects the backing,
+//!   and a recordable bundle's `toc.0`/`toc.1` plus `track_<n>.bin` live in
+//!   the directory), or `empty` (an enumerated drive with no medium; the
+//!   application installs the first one). Recordable bundles are written only
+//!   in Track-at-Once: `wodim -tao` (also `-audio` for CD-DA and `-multi` for
+//!   another session) and, on a CD-RW, `wodim blank=fast|all`. SAO/DAO is not
+//!   implemented.
 //!
+//! `serve` never creates the bundle directory or manifest: `snowscsi
+//! bundle-create flat …` or `snowscsi bundle-create cdr …` must create them
+//! first (serving does create chunk/track files and write TOC snapshots).
 //! All backing keys are explicit — there is no bare-value or suffix
 //! auto-typing. Unknown or duplicate options are rejected. LUN numbering is
 //! all `--block` devices first, then all `--cdrom` devices (the two planes
@@ -56,13 +63,20 @@ use std::time::Duration;
 
 use clap::{Args, Parser};
 use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
+#[cfg(feature = "bundle")]
+use snowscsi::bundle::{identify_dir, identify_manifest, Identified};
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::media::LiveData;
-use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "cdr-bundle")]
-use snowscsi::common::fs_plane::FsPlaneAdapter;
+use snowscsi::common::bundle::MANIFEST_NAME;
+#[cfg(any(feature = "bundle", feature = "cdr-bundle"))]
+use snowscsi::common::bundle::{BundleKind, BundleMeta};
 #[cfg(feature = "bundle")]
-use snowscsi::common::fs_storage::OpenOptions;
+use snowscsi::common::bundle::{CipherAlg, KdfKind, MAX_MANIFEST, SIDECAR_SUFFIX};
+#[cfg(feature = "bundle")]
+use snowscsi::common::flat_bundle::{validate_geometry, FlatBundle};
+#[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
+use snowscsi::common::fs_plane::FsPlaneAdapter;
 use snowscsi::common::seekable_storage::FlatData;
 #[cfg(feature = "tokio")]
 use snowscsi::common::seekable_storage::StorageError;
@@ -82,17 +96,21 @@ use snowscsi::iscsi::target::TargetError;
 #[cfg(feature = "tokio")]
 use snowscsi::iscsi::transport::serve_conn_async;
 use snowscsi::iscsi::transport::{serve_with_release, DEFAULT_READ_TIMEOUT};
+#[cfg(feature = "cdr-bundle")]
+use snowscsi::mmc::cdr_bundle::{
+    toc_file, CdrBundleMedium, CdrCapacity, DiscKind, TOC_SLOT_DEFAULT, TOC_SLOT_MAX, TOC_SLOT_MIN,
+};
 #[cfg(feature = "dvdram")]
 use snowscsi::mmc::DvdRamMedium;
 use snowscsi::mmc::{FlatCdMedium, MmcDrive};
 use snowscsi::scsi::backend::FileBackend;
-use snowscsi::scsi::fs_backend::{FsStorage, StdFsBackend};
+use snowscsi::scsi::fs_backend::StdFsBackend;
 use snowscsi::{MIN_DATA_AREA, MIN_DATA_LEN};
 use spec::{Backing, DeviceRole, DeviceSpec};
 #[cfg(feature = "tokio")]
 use stack::tokio_conn::TokioConn;
 use stack::worker::WorkerStore;
-#[cfg(feature = "cdr-bundle")]
+#[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
 use stack::BundleStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 #[cfg(feature = "tokio")]
@@ -148,6 +166,10 @@ enum Cli {
     Serve(ServeArgs),
     /// Generate an ISO9660/Joliet image from a directory
     Mkisofs(MkisofsArgs),
+    /// Report the manifest (and CD-R TOC, when present) of a bundle
+    BundleInfo(BundleInfoArgs),
+    /// Create a flat or recordable-CD bundle directory
+    BundleCreate(BundleCreateArgs),
 }
 
 /// Host transport execution model.
@@ -190,23 +212,27 @@ impl Banks {
 #[command(group = clap::ArgGroup::new("transport").required(true).multiple(false))]
 struct ServeArgs {
     /// Block device (`BlockDevice`): `img=<file>[,ro][,removable]`,
-    /// `ram=<size>`, `imgdir=<dir>[,chunk=…][,size=…][,sector=…][,ro]`
-    /// (directory-chunked disk), or `img=<file>,profile=cd` (read-only optical
-    /// profile). `removable` is a USB card-reader demo: `--block
-    /// img=<file>,removable` reports RMB and lets the host eject the card;
-    /// replacing the file installs a new card at the same LUN. Repeatable;
-    /// `--block` LUNs come first in declaration order.
+    /// `ram=<size>`, `bundle=<dir>` (a directory-chunked flat disk described
+    /// by its `SNOWBUNDLE` manifest; create it with `snowscsi bundle-create
+    /// flat`), or `img=<file>,profile=cd` / `bundle=<dir>,profile=cd`
+    /// (read-only optical profile). `removable` is a USB card-reader demo:
+    /// `--block img=<file>,removable` reports RMB and lets the host eject the
+    /// card; replacing the file installs a new card at the same LUN.
+    /// Repeatable; `--block` LUNs come first in declaration order.
     #[arg(long = "block", value_name = "SPEC")]
     block: Vec<String>,
 
     /// CD-ROM device (core `MmcDrive`, full MMC): `img=<iso>`, `live=<dir>`
     /// (live ISO9660 over a directory), `dvdram=<path|ram:<size>>[,size=…]`
-    /// (random-writable DVD-RAM), `bundle=<dir>[,medium=cdr74|cdr80|cdr90|
-    /// cdr99|cdrw74|cdrw80|cdrw90|cdrw99][,slot=<bytes>][,recovery=delete|
-    /// readonly]` (a persistent CD-R or erasable CD-RW bundle whose
-    /// `toc.0`/`toc.1` and `track_<n>.bin` live in the directory; requires the
-    /// `cdr-bundle` feature), or `empty` (an enumerated drive with no
-    /// medium). A bundle is written only in Track-at-Once: `wodim -tao`
+    /// (random-writable DVD-RAM), `bundle=<dir>` (a directory carrying a
+    /// `SNOWBUNDLE` manifest: `kind = flat` serves a flat ISO, `kind = cdr`
+    /// serves a persistent CD-R/CD-RW whose `toc.0`/`toc.1` and
+    /// `track_<n>.bin` live in the directory), or `empty` (an enumerated
+    /// drive with no medium). `serve` never creates the bundle directory,
+    /// manifest or TOC: create it with `snowscsi bundle-create flat` or
+    /// `snowscsi bundle-create cdr` first (serving does create chunk/track
+    /// files and write TOC snapshots).
+    /// A recordable bundle is written only in Track-at-Once: `wodim -tao`
     /// (also `-audio` for CD-DA and `-multi` for another session) and, on a
     /// CD-RW, `wodim blank=fast|all`; SAO/DAO is not implemented. Repeatable;
     /// these LUNs follow the `--block` LUNs.
@@ -293,7 +319,8 @@ struct ServeArgs {
     #[arg(long = "banks", value_name = "MODE", default_value = "single")]
     banks: Banks,
 
-    /// Print the resolved configuration as one line and exit 0.
+    /// Print the resolved configuration as one line and exit 0 (`bundle=`
+    /// directories are validated, but no transport is started).
     #[arg(long = "print-config")]
     print_config: bool,
 
@@ -330,10 +357,68 @@ struct MkisofsArgs {
     verbose: u8,
 }
 
+/// Arguments for `snowscsi bundle-info`: classify a bundle directory or a
+/// single-file image's `<path>.SNOWBUNDLE` sidecar.
+#[derive(Args, Debug)]
+struct BundleInfoArgs {
+    /// Bundle directory, or image file whose `<path>.SNOWBUNDLE` is read.
+    #[arg(value_name = "PATH")]
+    path: String,
+}
+
+/// Arguments for `snowscsi bundle-create`.
+#[derive(Args, Debug)]
+struct BundleCreateArgs {
+    #[command(subcommand)]
+    kind: BundleCreateKind,
+}
+
+/// The two bundle families `bundle-create` can write.
+#[derive(clap::Subcommand, Debug)]
+enum BundleCreateKind {
+    /// Create a directory-chunked flat bundle (`kind = flat`)
+    Flat(CreateFlatArgs),
+    /// Create a recordable CD bundle (`kind = cdr`) with its initial TOC
+    Cdr(CreateCdrArgs),
+}
+
+/// Arguments for `bundle-create flat`.
+#[derive(Args, Debug)]
+struct CreateFlatArgs {
+    /// Bundle directory (created when missing).
+    #[arg(long, value_name = "DIR")]
+    dir: String,
+    /// Logical device size (accepts K/M/G suffixes).
+    #[arg(long, value_name = "SIZE")]
+    size: String,
+    /// Chunk file size (accepts K/M/G suffixes; default 100 MiB).
+    #[arg(long, value_name = "BYTES")]
+    chunk: Option<String>,
+    /// Logical sector size (512 or 2048; default 512).
+    #[arg(long, value_name = "512|2048", default_value = "512")]
+    sector: u32,
+}
+
+/// Arguments for `bundle-create cdr`.
+#[derive(Args, Debug)]
+struct CreateCdrArgs {
+    /// Bundle directory (created when missing).
+    #[arg(long, value_name = "DIR")]
+    dir: String,
+    /// Blank disc preset (default cdr80).
+    #[arg(long, value_name = "MEDIUM")]
+    medium: Option<String>,
+    /// TOC slot size in bytes (accepts K/M/G suffixes; default 64 KiB).
+    #[arg(long, value_name = "BYTES")]
+    slot: Option<String>,
+}
+
 fn main() -> ExitCode {
     match Cli::parse() {
         Cli::Serve(args) => run_serve(args),
         Cli::Mkisofs(args) => run_mkisofs(args),
+        Cli::BundleInfo(args) => run_bundle_info(args),
+        Cli::BundleCreate(args) => run_bundle_create(args),
     }
 }
 
@@ -430,6 +515,9 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if args.print_config {
+        if validate_bundle_specs(&specs).is_err() {
+            return ExitCode::FAILURE;
+        }
         println!(
             "{}",
             config.line(
@@ -572,10 +660,24 @@ fn build_core_slots(
             return Err(());
         };
         let cap = plane.capacity();
+        // A `bundle=` manifest may describe a recordable CD, which is an MMC
+        // medium only. Fail with the actual kind instead of the generic
+        // unsupported-spec fallback.
+        if matches!(&spec.backing, Backing::Bundle { .. })
+            && plane.is_cdr_bundle()
+            && matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd)
+        {
+            eprintln!(
+                "snowscsi: bundle: LUN {lun}: manifest kind is 'cdr'; --block accepts only a \
+                 'flat' bundle (use `--cdrom bundle=<dir>`)"
+            );
+            return Err(());
+        }
         match (spec.role, &spec.backing) {
-            (DeviceRole::BlockDisk, Backing::ImgDir { .. }) => {
-                let mut attrs =
-                    BlockAttrs::new(cap / u64::from(spec.plane.sector), spec.plane.sector);
+            (DeviceRole::BlockDisk, Backing::Bundle { .. }) => {
+                // The manifest owns the geometry, including the sector size.
+                let sector = plane.sector_size().unwrap_or(spec.plane.sector);
+                let mut attrs = BlockAttrs::new(cap / u64::from(sector), sector);
                 if spec.plane.read_only {
                     attrs.write_mode = Writability::ReadOnly;
                 }
@@ -584,17 +686,18 @@ fn build_core_slots(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
                 )));
-                log::debug!("LUN {lun}: bundle block device ({cap} bytes)");
+                log::debug!("LUN {lun}: flat bundle block device ({cap} bytes)");
             }
-            (DeviceRole::BlockCd, Backing::ImgDir { .. }) => {
-                let mut attrs = BlockAttrs::new(cap / u64::from(ISO_SECTOR_SIZE), ISO_SECTOR_SIZE);
+            (DeviceRole::BlockCd, Backing::Bundle { .. }) => {
+                let sector = plane.sector_size().unwrap_or(ISO_SECTOR_SIZE);
+                let mut attrs = BlockAttrs::new(cap / u64::from(sector), sector);
                 attrs.write_mode = Writability::ReadOnly;
                 planes.push(Some(plane));
                 slots.push(CliLu::Block(snowscsi::core::LuImpl::new(
                     Spc::new(CoreBlockDevice::new(attrs)),
                     backing,
                 )));
-                log::debug!("LUN {lun}: bundle CD profile ({cap} bytes)");
+                log::debug!("LUN {lun}: flat bundle CD profile ({cap} bytes)");
             }
             (DeviceRole::BlockDisk, Backing::Img { .. } | Backing::Ram { .. }) => {
                 let mut attrs =
@@ -659,20 +762,17 @@ fn build_core_slots(
                 )));
                 log::debug!("LUN {lun}: DvdRam DVD-RAM ({cap} bytes)");
             }
-            #[cfg(feature = "cdr-bundle")]
-            (
-                DeviceRole::MmcCd,
-                Backing::CdrBundle {
-                    medium,
-                    kind,
-                    recovery,
-                    ..
-                },
-            ) => {
+            #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
+            (DeviceRole::MmcCd, Backing::Bundle { .. }) if plane.is_cdr_bundle() => {
                 // The TOC read needs the filesystem plane, so the medium is
-                // restored here rather than in `build_planes`.
+                // restored here rather than in `build_planes`. The stored TOC
+                // owns capacity and kind; the CLI passes no hints.
                 let mut plane = plane;
-                let medium = match plane.open_cdr_medium(medium.sectors(), *kind, *recovery) {
+                let medium = match plane.open_cdr_medium(
+                    0,
+                    None,
+                    snowscsi::mmc::cdr_bundle::Recovery::Delete,
+                ) {
                     Ok(medium) => medium,
                     Err(e) => {
                         eprintln!("snowscsi: bundle: LUN {lun}: {e}");
@@ -691,6 +791,16 @@ fn build_core_slots(
                 // open track or unsaved transition survives; restarting the
                 // server re-reads the directory.
                 log::debug!("LUN {lun}: recordable CD bundle ({sectors} sectors)");
+            }
+            #[cfg(feature = "bundle")]
+            (DeviceRole::MmcCd, Backing::Bundle { .. }) if !plane.is_cdr_bundle() => {
+                let medium = CliMedium::Flat(FlatCdMedium::new(cap));
+                planes.push(Some(plane));
+                slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
+                    Spc::new(MmcDrive::new(medium)),
+                    backing,
+                )));
+                log::debug!("LUN {lun}: flat bundle CD-ROM ({cap} bytes)");
             }
             _ => {
                 eprintln!("snowscsi: internal: unsupported device spec '{}'", spec.raw);
@@ -896,12 +1006,10 @@ fn backing_names(specs: &[DeviceSpec]) -> String {
         .iter()
         .map(|spec| match &spec.backing {
             Backing::Img { .. } => "img",
-            Backing::ImgDir { .. } => "imgdir",
+            Backing::Bundle { .. } => "bundle",
             Backing::Ram { .. } => "ram",
             Backing::Live { .. } => "live",
             Backing::DvdRam { .. } => "dvdram",
-            #[cfg(feature = "cdr-bundle")]
-            Backing::CdrBundle { .. } => "bundle",
             Backing::Empty => "empty",
         })
         .collect::<Vec<_>>()
@@ -1665,11 +1773,95 @@ fn open_img_plane(path: &str, writable: bool) -> Result<OwnedPlane, ()> {
     })
 }
 
-/// Own every backing resource a LUN specification needs, in LUN order.
+/// Validate `bundle=` directories for `--print-config`.
 ///
-/// Exactly one byte-plane backend per non-Live LUN; `Live` owns its scanner.
-/// RAM slots are consumed from `ram_disks` via a walking split cursor (no
-/// reallocation, disjoint borrows). Each `--block`/`--cdrom` spec pushes at
+/// `--print-config` never builds a plane (and never allocates a RAM disk), but
+/// a bundle's manifest/TOC decides whether `serve` could open it at all, so
+/// this performs the same identification step as `build_planes` for bundle
+/// LUNs only.
+#[cfg(feature = "bundle")]
+fn validate_bundle_specs(specs: &[DeviceSpec]) -> Result<(), ()> {
+    for spec in specs {
+        let Backing::Bundle { dir } = &spec.backing else {
+            continue;
+        };
+        if !Path::new(dir).is_dir() {
+            eprintln!(
+                "snowscsi: bundle: directory not found: {dir} (create it with \
+                 `snowscsi bundle-create ...`)"
+            );
+            return Err(());
+        }
+        let mut fs = StdFsBackend::new(dir);
+        let identified = match identify_dir(&mut fs) {
+            Ok(identified) => identified,
+            Err(e) => {
+                eprintln!("snowscsi: bundle: {dir}: cannot read the SNOWBUNDLE manifest: {e}");
+                return Err(());
+            }
+        };
+        match identified {
+            Identified::NotBundle { found } => {
+                let names = found.as_slice().join(", ");
+                eprintln!(
+                    "snowscsi: bundle: no SNOWBUNDLE manifest in {dir}; create it with \
+                     `snowscsi bundle-create ...` (found: {names})"
+                );
+                return Err(());
+            }
+            Identified::Image { .. } => {
+                eprintln!(
+                    "snowscsi: bundle: {dir} carries a single-file image manifest, not a \
+                     directory bundle"
+                );
+                return Err(());
+            }
+            Identified::Flat { .. } => {}
+            Identified::Cdr { toc, .. } => {
+                #[cfg(feature = "cdr-bundle")]
+                {
+                    if matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd) {
+                        eprintln!(
+                            "snowscsi: bundle: {dir} is a recordable CD (manifest kind 'cdr'); \
+                             --block accepts only a 'flat' bundle (use `--cdrom bundle=<dir>`)"
+                        );
+                        return Err(());
+                    }
+                    if toc.is_none() {
+                        eprintln!(
+                            "snowscsi: bundle: no recordable-CD TOC in {dir}; create it with \
+                             `snowscsi bundle-create cdr`"
+                        );
+                        return Err(());
+                    }
+                    if spec.plane.read_only {
+                        eprintln!(
+                            "snowscsi: bundle: {dir} is a recordable CD (writable-only); `ro` \
+                             is not supported"
+                        );
+                        return Err(());
+                    }
+                }
+                #[cfg(not(feature = "cdr-bundle"))]
+                {
+                    let _ = toc;
+                    eprintln!(
+                        "snowscsi: bundle: {dir} is a recordable CD; serving it requires the \
+                         `cdr-bundle` feature"
+                    );
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "bundle"))]
+fn validate_bundle_specs(_specs: &[DeviceSpec]) -> Result<(), ()> {
+    Ok(())
+}
+
 /// Build one owned plane per LUN, in specification order.
 ///
 /// Every plane owns its bytes — file handles and RAM disks included — so the
@@ -1679,106 +1871,133 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
     if let Some(dir) = spec::duplicate_bundle_dir(specs) {
         eprintln!(
             "snowscsi: bundle directory '{dir}' is served by more than one LUN; \
-             use one directory per recordable-CD bundle"
+             use one directory per bundle"
         );
         return Err(());
+    }
+    // The cheap exact check above misses aliases such as `dir` vs `dir/` or a
+    // symlink. Once the directories exist, canonicalize them so two writers
+    // can never reach the same bundle through different spellings.
+    #[cfg(feature = "bundle")]
+    {
+        let mut seen = std::collections::HashSet::new();
+        for spec in specs {
+            if let Backing::Bundle { dir } = &spec.backing {
+                let canonical = std::fs::canonicalize(dir)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| dir.clone());
+                if !seen.insert(canonical) {
+                    eprintln!(
+                        "snowscsi: bundle directory '{dir}' is served by more than one LUN; \
+                         use one directory per bundle"
+                    );
+                    return Err(());
+                }
+            }
+        }
     }
     let mut planes = Vec::with_capacity(specs.len());
     for spec in specs {
         let plane = match &spec.backing {
             #[cfg(feature = "bundle")]
-            Backing::ImgDir { dir } => {
+            Backing::Bundle { dir } => {
                 if !Path::new(dir).is_dir() {
-                    if spec.plane.read_only {
-                        eprintln!("snowscsi: bundle: read-only directory not found: {dir}");
-                        return Err(());
-                    }
-                    // The FsStorage seam has no mkdir — the host (CLI) owns
-                    // directory creation.
-                    std::fs::create_dir_all(dir).map_err(|e| {
-                        eprintln!("snowscsi: bundle: failed to create directory {dir}: {e}");
-                    })?;
+                    eprintln!(
+                        "snowscsi: bundle: directory not found: {dir} (create it with \
+                         `snowscsi bundle-create ...`)"
+                    );
+                    return Err(());
                 }
                 let mut fs = StdFsBackend::new(dir);
-                let bundle = if spec.plane.read_only {
-                    // Data-plane RO (works on read-only media); never writes a
-                    // header here.
-                    FlatBundle::open_read_only(
-                        fs,
-                        spec.plane.chunk,
-                        spec.plane.size,
-                        Some(spec.plane.sector),
-                    )
-                    .map_err(|e| {
-                        eprintln!("snowscsi: bundle: failed to open read-only {dir}: {e}")
-                    })?
-                } else {
-                    // Headless directory (empty / chunk files only) → create a
-                    // new bundle (writes the SNOWBUNDLE manifest); otherwise
-                    // open + override.
-                    let has_header = fs
-                        .open(
-                            snowscsi::common::bundle::MANIFEST_NAME,
-                            OpenOptions::read_only(),
-                        )
-                        .is_ok();
-                    if !has_header {
-                        let sz = spec.plane.size.ok_or_else(|| {
-                            eprintln!(
-                                "snowscsi: bundle: size= required to create a new bundle in {dir}"
-                            );
-                        })?;
-                        FlatBundle::create(
-                            fs,
-                            spec.plane
-                                .chunk
-                                .unwrap_or(snowscsi::common::flat_bundle::DEFAULT_CHUNK_SIZE),
-                            sz,
-                            spec.plane.sector,
-                        )
-                        .map_err(|e| eprintln!("snowscsi: bundle: failed to create {dir}: {e}"))?
-                    } else {
-                        FlatBundle::open(
-                            fs,
-                            spec.plane.chunk,
-                            spec.plane.size,
-                            Some(spec.plane.sector),
-                        )
-                        .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?
-                    }
-                };
-                OwnedPlane::Bundle(bundle)
-            }
-            #[cfg(not(feature = "bundle"))]
-            Backing::ImgDir { .. } => {
-                eprintln!("snowscsi: imgdir= requires the `bundle` feature");
-                return Err(());
-            }
-            #[cfg(feature = "cdr-bundle")]
-            Backing::CdrBundle {
-                dir,
-                medium,
-                kind: _,
-                slot,
-                recovery,
-            } => {
-                if !Path::new(dir).is_dir() {
-                    if *recovery == snowscsi::mmc::cdr_bundle::Recovery::ReadOnly {
+                let identified = match identify_dir(&mut fs) {
+                    Ok(identified) => identified,
+                    Err(e) => {
                         eprintln!(
-                            "snowscsi: bundle: read-only recovery requires an existing \
-                             directory with a TOC: {dir}"
+                            "snowscsi: bundle: {dir}: cannot read the SNOWBUNDLE manifest: {e}"
                         );
                         return Err(());
                     }
-                    // The FsStorage seam has no mkdir — the host (CLI) owns
-                    // directory creation, exactly as for `imgdir=`.
-                    log::warn!("bundle: {dir} does not exist; creating a new blank recordable CD");
-                    std::fs::create_dir_all(dir).map_err(|e| {
-                        eprintln!("snowscsi: bundle: failed to create directory {dir}: {e}");
-                    })?;
+                };
+                match identified {
+                    Identified::NotBundle { found } => {
+                        let names = found.as_slice().join(", ");
+                        eprintln!(
+                            "snowscsi: bundle: no SNOWBUNDLE manifest in {dir}; create it with \
+                             `snowscsi bundle-create ...` (found: {names})"
+                        );
+                        return Err(());
+                    }
+                    Identified::Flat { .. } => {
+                        // No overrides: the manifest owns the whole geometry.
+                        // A flat bundle under `--cdrom` is optical media and
+                        // must open read-only; `--block` honours an explicit
+                        // `ro`, otherwise it stays writable.
+                        let read_only = spec.plane.read_only || spec.role == DeviceRole::MmcCd;
+                        let bundle = if read_only {
+                            FlatBundle::open_read_only(fs, None, None, None)
+                        } else {
+                            FlatBundle::open(fs, None, None, None)
+                        }
+                        .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?;
+                        OwnedPlane::Bundle(bundle)
+                    }
+                    Identified::Cdr { toc, .. } => {
+                        #[cfg(feature = "cdr-bundle")]
+                        {
+                            // A recordable CD is an MMC medium: report the
+                            // wrong role before any read-only complaint, so
+                            // `--block bundle=<cdr>` (even with `ro` or
+                            // `profile=cd`) suggests the right flag.
+                            if matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd) {
+                                eprintln!(
+                                    "snowscsi: bundle: {dir} is a recordable CD (manifest kind \
+                                     'cdr'); --block accepts only a 'flat' bundle (use `--cdrom \
+                                     bundle=<dir>`)"
+                                );
+                                return Err(());
+                            }
+                            if toc.is_none() {
+                                eprintln!(
+                                    "snowscsi: bundle: no recordable-CD TOC in {dir}; create it \
+                                     with `snowscsi bundle-create cdr`"
+                                );
+                                return Err(());
+                            }
+                            if spec.plane.read_only {
+                                eprintln!(
+                                    "snowscsi: bundle: {dir} is a recordable CD (writable-only); \
+                                     `ro` is not supported"
+                                );
+                                return Err(());
+                            }
+                            let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
+                            // Capacity and disc kind come from the stored TOC;
+                            // no CLI hints are applied.
+                            OwnedPlane::CdrBundle(BundleStore::new(fs, 0, None))
+                        }
+                        #[cfg(not(feature = "cdr-bundle"))]
+                        {
+                            let _ = toc;
+                            eprintln!(
+                                "snowscsi: bundle: {dir} is a recordable CD; serving it requires \
+                                 the `cdr-bundle` feature"
+                            );
+                            return Err(());
+                        }
+                    }
+                    Identified::Image { .. } => {
+                        eprintln!(
+                            "snowscsi: bundle: {dir} carries a single-file image manifest, not a \
+                             directory bundle"
+                        );
+                        return Err(());
+                    }
                 }
-                let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
-                OwnedPlane::CdrBundle(BundleStore::new(fs, medium.sectors(), *slot))
+            }
+            #[cfg(not(feature = "bundle"))]
+            Backing::Bundle { dir } => {
+                eprintln!("snowscsi: bundle= requires the `bundle` feature: {dir}");
+                return Err(());
             }
             Backing::Ram { size } => {
                 let bytes = usize::try_from(*size).map_err(|_| {
@@ -2095,7 +2314,7 @@ fn card_attrs(len: u64, sector: u32, read_only: bool) -> Result<BlockAttrs, &'st
 #[cfg(feature = "cdr-bundle")]
 fn cdr_bundle_dir(specs: &[DeviceSpec], lun: usize) -> Option<&str> {
     match specs.get(lun).map(|spec| &spec.backing) {
-        Some(Backing::CdrBundle { dir, .. }) => Some(dir),
+        Some(Backing::Bundle { dir }) => Some(dir),
         _ => None,
     }
 }
@@ -2869,6 +3088,471 @@ impl<'a> Gadget<'a> for FfsGadget {
     }
 }
 
+/// `snowscsi bundle-create <flat|cdr>` dispatch.
+fn run_bundle_create(args: BundleCreateArgs) -> ExitCode {
+    match args.kind {
+        BundleCreateKind::Flat(args) => create_flat_bundle(args),
+        BundleCreateKind::Cdr(args) => create_cdr_bundle(args),
+    }
+}
+
+/// `snowscsi bundle-create flat` — write a `kind = flat` manifest.
+#[cfg(feature = "bundle")]
+fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
+    let size = match spec::parse_size(&args.size) {
+        Some(size) => size,
+        None => {
+            eprintln!("snowscsi: bundle-create: invalid --size '{}'", args.size);
+            return ExitCode::FAILURE;
+        }
+    };
+    let chunk = match args.chunk.as_deref() {
+        None => snowscsi::common::flat_bundle::DEFAULT_CHUNK_SIZE,
+        Some(raw) => match spec::parse_size(raw) {
+            Some(chunk) => chunk,
+            None => {
+                eprintln!("snowscsi: bundle-create: invalid --chunk '{raw}'");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if args.sector != 512 && args.sector != 2048 {
+        eprintln!(
+            "snowscsi: bundle-create: invalid --sector {} (512 or 2048)",
+            args.sector
+        );
+        return ExitCode::FAILURE;
+    }
+    let dir = Path::new(&args.dir);
+    let existed = dir.exists();
+    if existed {
+        if let Some(name) = first_chunk_file(dir) {
+            eprintln!(
+                "snowscsi: bundle-create: {} already contains chunk {name}; a flat bundle \
+                 requires an empty directory or a manifest-only directory (move the chunks \
+                 away or use a new directory)",
+                args.dir
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    // Validate before creating the directory so a bad `--size` cannot leave an
+    // empty directory behind.
+    if let Err(e) = validate_geometry(chunk, size, args.sector) {
+        eprintln!(
+            "snowscsi: bundle-create: invalid geometry (--size {}, --chunk {chunk}, \
+             --sector {}): {e}",
+            args.size, args.sector
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::create_dir_all(&args.dir) {
+        eprintln!(
+            "snowscsi: bundle-create: failed to create directory {}: {e}",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+    let meta = BundleMeta {
+        kind: BundleKind::Flat {
+            virtual_size: size,
+            chunk_size: chunk,
+            sector_size: args.sector,
+        },
+        cipher: None,
+        has_crc: false,
+    };
+    match FlatBundle::create_with_meta(StdFsBackend::new(&args.dir), &meta) {
+        Ok(_) => {
+            println!(
+                "snowscsi: created flat bundle {} ({} bytes, {} byte chunks, {} byte sectors)",
+                args.dir, size, chunk, args.sector
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&args.dir);
+            }
+            eprintln!("snowscsi: bundle-create: {}: {e}", args.dir);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The first canonical chunk file (`NNNNNN.img`) in `dir`, if any.
+#[cfg(feature = "bundle")]
+fn first_chunk_file(dir: &Path) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(stem) = name.strip_suffix(".img") {
+            if stem.len() == 6 && stem.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(name.into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The first canonical track file (`track_<n>.bin`) in `dir`, if any.
+#[cfg(feature = "cdr-bundle")]
+fn first_track_file(dir: &Path) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(digits) = name
+            .strip_prefix("track_")
+            .and_then(|rest| rest.strip_suffix(".bin"))
+        {
+            if !digits.is_empty() && digits.parse::<u16>().is_ok() {
+                return Some(name.into_owned());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(feature = "bundle"))]
+fn create_flat_bundle(_args: CreateFlatArgs) -> ExitCode {
+    eprintln!("snowscsi: bundle-create flat requires the `bundle` feature");
+    ExitCode::FAILURE
+}
+
+/// `snowscsi bundle-create cdr` — write a `kind = cdr` manifest and the
+/// initial TOC slot so `serve` can open the directory.
+#[cfg(feature = "cdr-bundle")]
+fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
+    let (capacity, kind) = match args.medium.as_deref() {
+        None => (CdrCapacity::Cdr80, DiscKind::Cdr),
+        Some(raw) => match parse_medium(raw) {
+            Ok(preset) => preset,
+            Err(e) => {
+                eprintln!("snowscsi: bundle-create: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let slot = match args.slot.as_deref() {
+        None => TOC_SLOT_DEFAULT,
+        Some(raw) => match parse_slot(raw) {
+            Ok(slot) => slot,
+            Err(e) => {
+                eprintln!("snowscsi: bundle-create: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let dir = Path::new(&args.dir);
+    let existed = dir.exists();
+    if existed {
+        for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
+            if dir.join(existing).exists() {
+                eprintln!(
+                    "snowscsi: bundle-create: {} already contains {existing}; refusing to \
+                     overwrite (use a new directory)",
+                    args.dir
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        // Leftover track data cannot be reconciled without a TOC, so refuse
+        // before writing a manifest that would make it look authoritative.
+        if let Some(name) = first_track_file(dir) {
+            eprintln!(
+                "snowscsi: bundle-create: {} already contains track data ({name}); a \
+                 recordable-CD bundle requires an empty directory (move the track files away \
+                 or use a new directory)",
+                args.dir
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all(&args.dir) {
+        eprintln!(
+            "snowscsi: bundle-create: failed to create directory {}: {e}",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let meta = BundleMeta {
+        kind: BundleKind::Cdr,
+        cipher: None,
+        has_crc: false,
+    };
+    let manifest = match meta.encode() {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            eprintln!("snowscsi: bundle-create: cannot encode the manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = write_manifest_atomic(dir, &manifest) {
+        if !existed {
+            let _ = std::fs::remove_dir_all(&args.dir);
+        }
+        eprintln!(
+            "snowscsi: bundle-create: failed to write {}/SNOWBUNDLE: {e}",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let mut medium = match CdrBundleMedium::with_disc(capacity.sectors(), kind, slot) {
+        Ok(medium) => medium,
+        Err(e) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&args.dir);
+            }
+            eprintln!("snowscsi: bundle-create: cannot build the blank disc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut image = vec![0u8; medium.slot_size() as usize];
+    let slot_index = match medium.toc_image(&mut image) {
+        Ok(slot) => slot,
+        Err(e) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&args.dir);
+            }
+            eprintln!("snowscsi: bundle-create: cannot render the initial TOC: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let name = toc_file(slot_index);
+    if let Err(e) = stack::write_toc_snapshot(&args.dir, slot_index, &image) {
+        if !existed {
+            let _ = std::fs::remove_dir_all(&args.dir);
+        }
+        eprintln!(
+            "snowscsi: bundle-create: manifest written, but writing {}/{name} failed: {e}; \
+             remove the directory to retry",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "snowscsi: created recordable-CD bundle {} ({:?}, {slot} byte TOC slot, {name})",
+        args.dir, kind
+    );
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(feature = "cdr-bundle"))]
+fn create_cdr_bundle(_args: CreateCdrArgs) -> ExitCode {
+    eprintln!("snowscsi: bundle-create cdr requires the `cdr-bundle` feature");
+    ExitCode::FAILURE
+}
+
+/// Write the manifest through a temporary file and rename it into place.
+#[cfg(feature = "cdr-bundle")]
+fn write_manifest_atomic(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let tmp = dir.join(format!("{MANIFEST_NAME}.tmp"));
+    let write = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, dir.join(MANIFEST_NAME))?;
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn parse_medium(raw: &str) -> Result<(CdrCapacity, DiscKind), String> {
+    let invalid = || {
+        format!(
+            "invalid --medium '{raw}' (cdr74, cdr80, cdr90, cdr99, cdrw74, cdrw80, cdrw90, cdrw99)"
+        )
+    };
+    let (prefix, kind) = if let Some(rest) = raw.strip_prefix("cdrw") {
+        (rest, DiscKind::Cdrw)
+    } else if let Some(rest) = raw.strip_prefix("cdr") {
+        (rest, DiscKind::Cdr)
+    } else {
+        return Err(invalid());
+    };
+    let capacity = match prefix {
+        "74" => CdrCapacity::Cdr74,
+        "80" => CdrCapacity::Cdr80,
+        "90" => CdrCapacity::Cdr90,
+        "99" => CdrCapacity::Cdr99,
+        _ => return Err(invalid()),
+    };
+    Ok((capacity, kind))
+}
+
+#[cfg(feature = "cdr-bundle")]
+fn parse_slot(raw: &str) -> Result<u32, String> {
+    let bytes = spec::parse_size(raw).ok_or_else(|| format!("invalid --slot '{raw}'"))?;
+    let bytes = u32::try_from(bytes).map_err(|_| format!("--slot {bytes} is too large"))?;
+    if !(TOC_SLOT_MIN..=TOC_SLOT_MAX).contains(&bytes) {
+        return Err(format!(
+            "--slot {bytes} is outside {TOC_SLOT_MIN}..={TOC_SLOT_MAX}"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// `snowscsi bundle-info <path>` — report the manifest (and CD-R TOC header).
+#[cfg(feature = "bundle")]
+fn run_bundle_info(args: BundleInfoArgs) -> ExitCode {
+    if !Path::new(&args.path).exists() {
+        eprintln!("snowscsi: bundle-info: path not found: {}", args.path);
+        return ExitCode::FAILURE;
+    }
+    let identified = if Path::new(&args.path).is_dir() {
+        let mut fs = StdFsBackend::new(&args.path);
+        match identify_dir(&mut fs) {
+            Ok(identified) => identified,
+            Err(e) => {
+                eprintln!("snowscsi: bundle-info: {}: {e}", args.path);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        // Use an explicit sidecar path as-is; otherwise append the suffix
+        // without replacing the image's extension.
+        let sidecar = if args.path.ends_with(SIDECAR_SUFFIX) {
+            args.path.clone()
+        } else {
+            format!("{}{}", args.path, SIDECAR_SUFFIX)
+        };
+        let bytes = match read_capped(&sidecar, MAX_MANIFEST + 1) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("snowscsi: bundle-info: {sidecar}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match identify_manifest(&bytes) {
+            Ok(identified) => identified,
+            Err(e) => {
+                eprintln!("snowscsi: bundle-info: {sidecar}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    match identified {
+        Identified::NotBundle { found } => {
+            println!("not a bundle");
+            let names = found.as_slice().join(", ");
+            if names.is_empty() {
+                println!("found = none");
+            } else {
+                println!("found = {names}");
+            }
+            ExitCode::from(2)
+        }
+        Identified::Image { meta } => {
+            print_bundle_meta(&meta);
+            ExitCode::SUCCESS
+        }
+        Identified::Flat { meta } => {
+            print_bundle_meta(&meta);
+            ExitCode::SUCCESS
+        }
+        Identified::Cdr { meta, toc } => {
+            print_bundle_meta(&meta);
+            if let Some(toc) = toc {
+                #[cfg(feature = "cdr-bundle")]
+                {
+                    println!("seq = {}", toc.seq);
+                    println!("slot_size = {}", toc.slot_size);
+                    println!("max_tracks = {}", toc.max_tracks);
+                }
+                #[cfg(not(feature = "cdr-bundle"))]
+                {
+                    println!("seq = {}", toc.seq);
+                }
+            } else {
+                println!("toc = missing");
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Read at most `limit` bytes, so a sidecar cannot be slurped whole.
+#[cfg(feature = "bundle")]
+fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(feature = "bundle"))]
+fn run_bundle_info(_args: BundleInfoArgs) -> ExitCode {
+    eprintln!("snowscsi: bundle-info requires the `bundle` feature");
+    ExitCode::FAILURE
+}
+
+#[cfg(feature = "bundle")]
+fn print_bundle_meta(meta: &BundleMeta) {
+    match meta.kind {
+        BundleKind::Image { size } => {
+            println!("kind = image");
+            println!("size = {size}");
+        }
+        BundleKind::Flat {
+            virtual_size,
+            chunk_size,
+            sector_size,
+        } => {
+            println!("kind = flat");
+            println!("virtual_size = {virtual_size}");
+            println!("chunk_size = {chunk_size}");
+            println!("sector_size = {sector_size}");
+        }
+        BundleKind::Cdr => println!("kind = cdr"),
+    }
+    if let Some(cipher) = meta.cipher {
+        println!("cipher = {}", cipher_text(cipher.cipher));
+        println!("kdf = {}", kdf_text(cipher.kdf));
+        if let Some(iterations) = cipher.iterations {
+            println!("iterations = {iterations}");
+        }
+    }
+    println!("crc = {}", if meta.has_crc { "present" } else { "absent" });
+}
+
+#[cfg(feature = "bundle")]
+fn cipher_text(cipher: CipherAlg) -> &'static str {
+    match cipher {
+        CipherAlg::ChaCha8 => "chacha8",
+        CipherAlg::ChaCha12 => "chacha12",
+        CipherAlg::ChaCha20 => "chacha20",
+        CipherAlg::AesCtr => "aes-ctr",
+        CipherAlg::Xor => "xor",
+    }
+}
+
+#[cfg(feature = "bundle")]
+fn kdf_text(kdf: KdfKind) -> &'static str {
+    match kdf {
+        KdfKind::Pbkdf2HmacSha256 => "pbkdf2-hmac-sha256",
+        KdfKind::None => "none",
+    }
+}
+
 /// `snowscsi mkisofs <DIR> <OUT.iso>` — scan a host directory and write a
 /// standalone ISO9660/Joliet image to disk.
 ///
@@ -3360,14 +4044,37 @@ mod tests {
         assert!(args.print_config);
     }
 
-    #[cfg(feature = "cdr-bundle")]
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "snowscsi_cli_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The CLI's `CdrBundleMedium` is large (fixed track/session tables), so a
+    /// debug-build call graph can exceed the default 2 MiB test-thread stack.
+    fn run_with_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack thread")
+            .join()
+            .expect("large-stack thread")
+    }
+
     #[test]
-    fn print_config_accepts_a_cdr_bundle() {
+    fn print_config_accepts_a_bundle() {
         let Cli::Serve(args) = Cli::try_parse_from([
             "snowscsi",
             "serve",
             "--cdrom",
-            "bundle=/tmp/disc,medium=cdr74",
+            "bundle=/tmp/disc",
             "--usb",
             "--print-config",
         ])
@@ -3398,13 +4105,12 @@ mod tests {
         assert!(!pool_capable(&specs, &async_dual));
     }
 
-    #[cfg(feature = "cdr-bundle")]
     #[test]
-    fn cdr_bundle_help_and_print_config_mention_the_backing() {
+    fn bundle_help_and_print_config_mention_the_backing() {
         use clap::CommandFactory;
 
-        // `serve --help` documents the persistent CD-R backing, its medium
-        // presets, and the directory artifacts the CLI owns.
+        // `serve --help` documents the unified bundle backing and the
+        // directory artifacts the CLI owns.
         let mut command = Cli::command();
         let serve = command
             .find_subcommand_mut("serve")
@@ -3417,15 +4123,11 @@ mod tests {
         assert!(help.contains("Track-at-Once"), "help text:\n{help}");
         assert!(help.contains("blank="), "help text:\n{help}");
         assert!(help.contains("-audio"), "help text:\n{help}");
+        assert!(help.contains("bundle-create"), "help text:\n{help}");
 
         // `--print-config` resolves the same backing without touching the
         // filesystem: the token lists every LUN's backing in LUN order.
-        let args = parse_serve(&[
-            "--usb",
-            "--print-config",
-            "--cdrom",
-            "bundle=/tmp/disc,medium=cdr80",
-        ]);
+        let args = parse_serve(&["--usb", "--print-config", "--cdrom", "bundle=/tmp/disc"]);
         let specs = spec::parse_all(&args.block, &args.cdrom).unwrap();
         assert_eq!(backing_names(&specs), "ram,bundle");
         let cfg = resolve_config(&args).unwrap();
@@ -3440,50 +4142,449 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cdr-bundle")]
+    #[cfg(feature = "bundle")]
     #[test]
-    fn build_planes_creates_a_missing_cdr_bundle_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "snowscsi_cli_bundle_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn build_planes_rejects_a_missing_bundle_dir() {
+        let dir = temp_dir("missing_bundle");
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
-        let planes = build_planes(&specs).expect("bundle plane");
-        assert!(dir.is_dir(), "the CLI owns directory creation");
+        assert!(build_planes(&specs).is_err());
+        assert!(!dir.exists(), "serve must never create a bundle directory");
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn build_planes_opens_a_created_flat_bundle() {
+        let dir = temp_dir("flat_bundle");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: Some("1M".to_string()),
+            sector: 512,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
+        let planes = build_planes(&specs).expect("flat bundle plane");
         assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].capacity(), 8 << 20);
+        assert_eq!(planes[0].sector_size(), Some(512));
+        assert!(!planes[0].is_cdr_bundle());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn cdrom_opens_a_flat_bundle_read_only() {
+        let dir = temp_dir("flat_cdrom_ro");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+
+        let cd = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
+        let planes = build_planes(&cd).expect("cdrom flat bundle plane");
+        assert!(
+            !planes[0].is_writable(),
+            "--cdrom bundle=<flat> must open read-only"
+        );
+
+        let block = spec::parse_all(&[format!("bundle={}", dir.display())], &[]).unwrap();
+        let planes = build_planes(&block).expect("block flat bundle plane");
+        assert!(
+            planes[0].is_writable(),
+            "--block bundle=<flat> stays writable"
+        );
+
+        let block_ro = spec::parse_all(&[format!("bundle={},ro", dir.display())], &[]).unwrap();
+        let planes = build_planes(&block_ro).expect("read-only block flat bundle plane");
+        assert!(
+            !planes[0].is_writable(),
+            "`ro` opens the block plane read-only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn bundle_info_reports_a_created_flat_bundle() {
+        let dir = temp_dir("info_flat");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
         assert_eq!(
-            planes[0].capacity(),
-            snowscsi::mmc::CdrCapacity::Cdr80.sectors() * 2048
+            run_bundle_info(BundleInfoArgs {
+                path: dir.display().to_string()
+            }),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn bundle_info_exits_two_for_a_non_bundle() {
+        let dir = temp_dir("info_not_bundle");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("000000.img"), b"chunk").unwrap();
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: dir.display().to_string()
+            }),
+            ExitCode::from(2)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
-    fn build_planes_refuses_to_create_a_readonly_recovery_bundle() {
-        let dir = std::env::temp_dir().join(format!(
-            "snowscsi_cli_bundle_ro_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+    fn build_planes_opens_a_created_cdr_bundle() {
+        let dir = temp_dir("cdr_bundle");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: Some("cdr74".to_string()),
+            slot: None,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        assert!(dir.join("SNOWBUNDLE").is_file());
+        assert!(dir.join("toc.0").is_file());
+
+        let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
+        let planes = build_planes(&specs).expect("cdr bundle plane");
+        assert_eq!(planes.len(), 1);
+        assert!(planes[0].is_cdr_bundle());
+
+        // The stored TOC owns the geometry, so the slot builds end to end.
+        let specs_for_slots = specs.clone();
+        assert!(
+            run_with_large_stack(move || {
+                let mut planes = Vec::new();
+                let mut slots = Vec::new();
+                build_core_slots(&specs_for_slots, &mut planes, &mut slots).is_ok()
+                    && slots.len() == 1
+            }),
+            "a kind=cdr bundle must build an MMC slot"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_is_rejected_under_block() {
+        let dir = temp_dir("cdr_under_block");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let specs = spec::parse_all(&[format!("bundle={}", dir.display())], &[]).unwrap();
+        assert!(
+            run_with_large_stack(move || {
+                let mut planes = Vec::new();
+                let mut slots = Vec::new();
+                build_core_slots(&specs, &mut planes, &mut slots).is_err()
+            }),
+            "a kind=cdr manifest cannot back --block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_rejects_read_only() {
+        let dir = temp_dir("cdr_read_only");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let specs = spec::parse_all(&[], &[format!("bundle={},ro", dir.display())]).unwrap();
+        assert!(build_planes(&specs).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_without_a_toc_is_rejected() {
+        let dir = temp_dir("cdr_no_toc");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        std::fs::remove_file(dir.join("toc.0")).unwrap();
+        let _ = std::fs::remove_file(dir.join("toc.1"));
+
+        let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
+        assert!(
+            build_planes(&specs).is_err(),
+            "a TOC-less recordable bundle must not open"
+        );
+        assert!(!dir.join("toc.0").exists(), "serve must not create a TOC");
+        assert!(!dir.join("toc.1").exists(), "serve must not create a TOC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_create_refuses_leftover_tracks() {
+        let dir = temp_dir("cdr_leftover_track");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("track_1.bin"), b"leftover").unwrap();
+
+        let args = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        };
+        assert_eq!(create_cdr_bundle(args), ExitCode::FAILURE);
+        assert!(
+            dir.join("track_1.bin").is_file(),
+            "the leftover track data must survive the refusal"
+        );
+        assert!(!dir.join("SNOWBUNDLE").exists());
+        assert!(!dir.join("toc.0").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn flat_bundle_create_validates_before_mkdir() {
+        let dir = temp_dir("flat_bad_geometry");
+        let args = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "1".to_string(),
+            chunk: None,
+            sector: 512,
+        };
+        assert_eq!(create_flat_bundle(args), ExitCode::FAILURE);
+        assert!(!dir.exists(), "a bad --size must not create the directory");
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn flat_bundle_create_refuses_leftover_chunks() {
+        let dir = temp_dir("flat_leftover_chunk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("000000.img"), b"leftover").unwrap();
+        let args = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        };
+        assert_eq!(create_flat_bundle(args), ExitCode::FAILURE);
+        assert!(dir.join("000000.img").is_file());
+        assert!(!dir.join("SNOWBUNDLE").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(unix, feature = "bundle"))]
+    #[test]
+    fn build_planes_rejects_bundle_aliases() {
+        let dir = temp_dir("alias_bundle");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+
+        // A trailing slash is the same directory but a different raw string.
+        let slash = format!("{}/", dir.display());
         let specs = spec::parse_all(
+            &[
+                format!("bundle={}", dir.display()),
+                format!("bundle={slash}"),
+            ],
             &[],
-            &[format!("bundle={},recovery=readonly", dir.display())],
         )
         .unwrap();
-        assert!(build_planes(&specs).is_err());
-        assert!(!dir.exists(), "read-only recovery must not create a disc");
+        assert!(
+            build_planes(&specs).is_err(),
+            "slash alias must be rejected"
+        );
 
+        // A symlink is also the same directory after canonicalization.
+        let link = temp_dir("alias_link");
+        let _ = std::fs::remove_dir_all(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let specs = spec::parse_all(
+            &[
+                format!("bundle={}", dir.display()),
+                format!("bundle={}", link.display()),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            build_planes(&specs).is_err(),
+            "symlink alias must be rejected"
+        );
+
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn bundle_info_handles_missing_toc_sidecar_and_missing_path() {
+        let missing = temp_dir("info_missing");
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: missing.display().to_string()
+            }),
+            ExitCode::FAILURE
+        );
+
+        let dir = temp_dir("info_sidecar");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let manifest = std::fs::read(dir.join("SNOWBUNDLE")).unwrap();
+        let image = dir.join("image.iso");
+        std::fs::write(&image, b"image").unwrap();
+        let sidecar = format!("{}{SIDECAR_SUFFIX}", image.display());
+        std::fs::write(&sidecar, &manifest).unwrap();
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: image.display().to_string()
+            }),
+            ExitCode::SUCCESS
+        );
+        // An explicit sidecar path is used as-is, never suffixed twice.
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs { path: sidecar }),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn bundle_info_reports_a_toc_less_cdr_bundle() {
+        let dir = temp_dir("info_cdr_no_toc");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        std::fs::remove_file(dir.join("toc.0")).unwrap();
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: dir.display().to_string()
+            }),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn bundle_create_refuses_to_overwrite() {
+        let dir = temp_dir("overwrite");
+        let flat = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        };
+        assert_eq!(create_flat_bundle(flat), ExitCode::SUCCESS);
+        let again = CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: None,
+            sector: 512,
+        };
+        assert_eq!(create_flat_bundle(again), ExitCode::FAILURE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn cdr_bundle_create_refuses_to_overwrite() {
+        let dir = temp_dir("cdr_overwrite");
+        let first = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        };
+        assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
+        let again = CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+        };
+        assert_eq!(create_cdr_bundle(again), ExitCode::FAILURE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_bundle_verbs_parse() {
+        match Cli::try_parse_from(["snowscsi", "bundle-info", "/tmp/disc"]).unwrap() {
+            Cli::BundleInfo(args) => assert_eq!(args.path, "/tmp/disc"),
+            other => panic!("expected BundleInfo, got {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "snowscsi",
+            "bundle-create",
+            "flat",
+            "--dir",
+            "/tmp/disc",
+            "--size",
+            "8M",
+            "--sector",
+            "2048",
+        ])
+        .unwrap()
+        {
+            Cli::BundleCreate(args) => match args.kind {
+                BundleCreateKind::Flat(flat) => {
+                    assert_eq!(flat.dir, "/tmp/disc");
+                    assert_eq!(flat.size, "8M");
+                    assert_eq!(flat.sector, 2048);
+                }
+                other => panic!("expected Flat, got {other:?}"),
+            },
+            other => panic!("expected BundleCreate, got {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "snowscsi",
+            "bundle-create",
+            "cdr",
+            "--dir",
+            "/tmp/cdr",
+            "--medium",
+            "cdrw80",
+            "--slot",
+            "16K",
+        ])
+        .unwrap()
+        {
+            Cli::BundleCreate(args) => match args.kind {
+                BundleCreateKind::Cdr(cdr) => {
+                    assert_eq!(cdr.dir, "/tmp/cdr");
+                    assert_eq!(cdr.medium.as_deref(), Some("cdrw80"));
+                    assert_eq!(cdr.slot.as_deref(), Some("16K"));
+                }
+                other => panic!("expected Cdr, got {other:?}"),
+            },
+            other => panic!("expected BundleCreate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3757,7 +4858,7 @@ mod tests {
                 assert_eq!(a.work_buf_size.as_deref(), Some("256K"));
                 assert_eq!(a.verbose, 1);
             }
-            Cli::Mkisofs(_) => panic!("expected Serve, got Mkisofs"),
+            other => panic!("expected Serve, got {other:?}"),
         }
     }
 
