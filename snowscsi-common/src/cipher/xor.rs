@@ -77,6 +77,12 @@ impl XorMix {
     }
 }
 
+impl super::NonceCipher for XorMix {
+    fn set_nonce(&mut self, nonce: [u8; 8]) {
+        self.nonce = nonce;
+    }
+}
+
 impl StreamCipher for XorMix {
     fn xor(&mut self, off: u64, buf: &mut [u8]) -> Result<(), CipherError> {
         let mut block = off / 64;

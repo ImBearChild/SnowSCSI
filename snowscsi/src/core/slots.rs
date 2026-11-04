@@ -744,9 +744,9 @@ mod tests {
         let token = store.begin_exec(req(Direction::FromHost, 0, 4));
         assert!(poll_job(&task, &mut cx).is_none());
 
-        let data = [9u8; 4];
+        let mut data = [9u8; 4];
         assert!(matches!(
-            store.poll_exec(token, IoBuf::Write(&data)),
+            store.poll_exec(token, IoBuf::Write(&mut data)),
             Poll::Pending
         ));
         let mut job = expect_job(&task, &mut cx);
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(job.data(), &[9u8; 4]);
         task.complete(job, Ok(4));
 
-        match store.poll_exec(token, IoBuf::Write(&data)) {
+        match store.poll_exec(token, IoBuf::Write(&mut data)) {
             Poll::Ready(receipt) => assert_eq!(receipt.error, None),
             Poll::Pending => panic!("the receipt must be ready"),
         }
@@ -788,15 +788,15 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
 
         let token = store.begin_exec(req(Direction::FromHost, 0, 4));
-        let data = [1u8; 4];
+        let mut data = [1u8; 4];
         assert!(matches!(
-            store.poll_exec(token, IoBuf::Write(&data)),
+            store.poll_exec(token, IoBuf::Write(&mut data)),
             Poll::Pending
         ));
         let job = expect_job(&task, &mut cx);
         task.fail(job, StorageError::OutOfBounds);
 
-        match store.poll_exec(token, IoBuf::Write(&data)) {
+        match store.poll_exec(token, IoBuf::Write(&mut data)) {
             Poll::Ready(receipt) => {
                 assert_eq!(receipt.error, Some(Fault::OutOfBounds));
                 assert_eq!(receipt.effect, Effect::UnknownRemainder);
@@ -914,9 +914,9 @@ mod tests {
 
         // A write now waits for data AND for the buffer.
         let write = store.begin_exec(req(Direction::FromHost, 0, 4));
-        let data = [5u8; 4];
+        let mut data = [5u8; 4];
         assert!(matches!(
-            store.poll_exec(write, IoBuf::Write(&data)),
+            store.poll_exec(write, IoBuf::Write(&mut data)),
             Poll::Pending
         ));
         // The buffer is gone: parking is the only safe answer, otherwise the
@@ -926,13 +926,13 @@ mod tests {
         drop(job);
         assert!(store.poll_wake(&mut cx).is_ready());
         assert!(matches!(
-            store.poll_exec(write, IoBuf::Write(&data)),
+            store.poll_exec(write, IoBuf::Write(&mut data)),
             Poll::Pending
         ));
         let mut job = expect_job(&task, &mut cx);
         assert_eq!(job.data(), &data);
         task.complete(job, Ok(4));
-        match store.poll_exec(write, IoBuf::Write(&data)) {
+        match store.poll_exec(write, IoBuf::Write(&mut data)) {
             Poll::Ready(receipt) => assert_eq!(receipt.error, None),
             Poll::Pending => unreachable!(),
         }

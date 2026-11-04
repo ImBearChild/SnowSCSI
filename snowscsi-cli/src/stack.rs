@@ -2341,8 +2341,12 @@ mod tests {
         let mut plane = bundle_plane(&dir);
 
         // TOC slot 0 (resource 1).
+        let mut hello = *b"hello";
         assert_eq!(
-            plane.exec(io_req(1, 0, 5, Direction::FromHost), IoBuf::Write(b"hello")),
+            plane.exec(
+                io_req(1, 0, 5, Direction::FromHost),
+                IoBuf::Write(&mut hello)
+            ),
             Ok(5)
         );
         let mut toc0 = [0u8; 5];
@@ -2353,8 +2357,12 @@ mod tests {
         assert_eq!(&toc0, b"hello");
 
         // TOC slot 1 (resource 2) is an independent file.
+        let mut world = *b"world";
         assert_eq!(
-            plane.exec(io_req(2, 4, 5, Direction::FromHost), IoBuf::Write(b"world")),
+            plane.exec(
+                io_req(2, 4, 5, Direction::FromHost),
+                IoBuf::Write(&mut world)
+            ),
             Ok(5)
         );
         let mut toc1 = [0u8; 9];
@@ -2366,8 +2374,12 @@ mod tests {
         assert_eq!(&toc1[4..], b"world");
 
         // Track 1 (`16 + 1`).
+        let mut data = *b"data";
         assert_eq!(
-            plane.exec(io_req(17, 0, 4, Direction::FromHost), IoBuf::Write(b"data")),
+            plane.exec(
+                io_req(17, 0, 4, Direction::FromHost),
+                IoBuf::Write(&mut data)
+            ),
             Ok(4)
         );
         let mut track = [0u8; 4];
@@ -2389,15 +2401,20 @@ mod tests {
 
         // A reused track id truncates on its first write, so no stale tail
         // survives.
+        let mut digits = *b"01234567";
         assert_eq!(
             plane.exec(
                 io_req(17, 0, 8, Direction::FromHost),
-                IoBuf::Write(b"01234567")
+                IoBuf::Write(&mut digits)
             ),
             Ok(8)
         );
+        let mut abcd = *b"ABCD";
         assert_eq!(
-            plane.exec(io_req(17, 0, 4, Direction::FromHost), IoBuf::Write(b"ABCD")),
+            plane.exec(
+                io_req(17, 0, 4, Direction::FromHost),
+                IoBuf::Write(&mut abcd)
+            ),
             Ok(4)
         );
         let mut reused = [0xAAu8; 8];
@@ -2452,8 +2469,12 @@ mod tests {
             plane.exec(io_req(0, 0, 1, Direction::ToHost), IoBuf::Read(&mut one)),
             Err(StorageError::Unsupported)
         );
+        let mut zero = [0u8; 1];
         assert_eq!(
-            plane.exec(io_req(0, 0, 1, Direction::FromHost), IoBuf::Write(&[0])),
+            plane.exec(
+                io_req(0, 0, 1, Direction::FromHost),
+                IoBuf::Write(&mut zero)
+            ),
             Err(StorageError::Unsupported)
         );
 

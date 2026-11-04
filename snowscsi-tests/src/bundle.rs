@@ -335,10 +335,10 @@ fn bundle_reopen_persists() {
         StorePlane::BlockRw(&mut bundle).sync().unwrap();
     } // drop closes chunk handles
 
-    // The BUNDLE header was written to the real dir.
-    assert!(dir.join("BUNDLE").is_file());
+    // The SNOWBUNDLE manifest was written to the real dir.
+    assert!(dir.join("SNOWBUNDLE").is_file());
 
-    // Reopen through the header: geometry and data are restored.
+    // Reopen through the manifest: geometry and data are restored.
     let bundle = FlatBundle::open(StdFsBackend::new(&dir_str), None, None, None).unwrap();
     let mut bundle = bundle;
     let mut dev = dev(&mut bundle);

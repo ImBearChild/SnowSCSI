@@ -377,7 +377,10 @@ impl Feedback {
 /// One step of a command or resident long operation.
 ///
 /// Slices are valid only for this poll step; the runner re-borrows a caller
-/// bank on every pending poll and core never stores `&mut [u8]`.
+/// bank on every pending poll and core never stores `&mut [u8]`. A write-side
+/// buffer may be transformed in place by a storage decorator before the
+/// backing sees it, so a device must never re-read or re-submit one after
+/// emitting the step.
 ///
 /// A **long operation** may span several entries with one retained adapter
 /// token: `Io`/`Prefetch` is issued once and polls at most once per entry
@@ -397,7 +400,8 @@ pub enum PollStep<'a> {
     Receive {
         /// Host → device bytes for this step.
         buf: &'a mut [u8],
-        /// Required write of the chunk received in the previous entry.
+        /// Required write of the chunk received in the previous entry. The
+        /// buffer may be transformed in place before the backing sees it.
         write: Option<WriteOp<'a>>,
     },
     /// Send data to the host (read-style commands), optionally submitting the

@@ -1526,7 +1526,7 @@ impl CdrBundleMedium {
                 PollStep::Io(StorageOp::Write {
                     resource: toc_resource(save.slot),
                     offset: u64::from(save.offset),
-                    buf: &data[..chunk],
+                    buf: &mut data[..chunk],
                 })
             }
             SaveStage::Header => {
@@ -1551,7 +1551,7 @@ impl CdrBundleMedium {
                 PollStep::Io(StorageOp::Write {
                     resource: toc_resource(save.slot),
                     offset: u64::from(save.offset),
-                    buf: &data[..chunk],
+                    buf: &mut data[..chunk],
                 })
             }
             SaveStage::SlotSync => {
@@ -2200,7 +2200,7 @@ impl MmcMedium for CdrBundleMedium {
                 PollStep::Io(StorageOp::Write {
                     resource: track_resource(track),
                     offset: at,
-                    buf: &data[..accepted],
+                    buf: &mut data[..accepted],
                 })
             }
             (CdrBundleState::WriteIo, FeedbackKind::IoDone) => {

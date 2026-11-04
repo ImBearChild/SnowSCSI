@@ -2223,7 +2223,7 @@ impl Device for SettleDevice {
             Step::Write(len) => PollStep::Io(StorageOp::Write {
                 resource: 1,
                 offset: 0,
-                buf: &data[..len],
+                buf: &mut data[..len],
             }),
             Step::Read(len) => PollStep::Io(StorageOp::Read {
                 resource: 1,
@@ -2245,7 +2245,7 @@ impl Device for SettleDevice {
                 write: Some(WriteOp::Write {
                     resource: 1,
                     offset: 1,
-                    buf: &data[..write],
+                    buf: &mut data[..write],
                 }),
             },
             Step::Send(len) => PollStep::Send {
@@ -2651,7 +2651,7 @@ impl Device for LongDevice {
             Step::Write(len) => PollStep::Io(StorageOp::Write {
                 resource: 1,
                 offset: 0,
-                buf: &data[..len],
+                buf: &mut data[..len],
             }),
             Step::Sync => PollStep::Io(StorageOp::Sync { resource: 1 }),
             Step::Complete(completion) => {

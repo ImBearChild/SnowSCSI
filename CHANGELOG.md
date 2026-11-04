@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ⚠️ Breaking changes
 
+- **common**: a flat bundle is identified by a canonical `SNOWBUNDLE`
+  manifest (`magic = snow_bundle`, `version`, `kind = flat`, geometry); the
+  old `BUNDLE`/`snow_flat_bnd` header is refused instead of being
+  reinterpreted with new geometry. `BundleError` loses
+  `BadHeader`/`BadMagic`/`MissingMagic` and gains `Manifest`, `WrongKind` and
+  `LegacyHeader`; `snowscsi-common` no longer depends on `ini_core`.
+- **core**: the write-side storage buffers (`IoBuf::Write`,
+  `StorageOp::Write`, `WriteOp::Write`) are now `&mut [u8]` so an in-place
+  storage decorator can transform them before the backing sees them. Adapters
+  that only read the buffer are unaffected; every constructor of those
+  variants needs a mutable buffer.
 - **core**: transport loops return `Result<ServeExit, _>`; `Flow` replaces the
   `&AtomicBool` stop flag on USB; `Target::settle_transport_end` is replaced by
   `link_lost`; `RunEnd::TransportEnded` is removed.
@@ -44,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **common**: `cipher` adds offset-addressed stream-cipher plane decorators
+  (`CipherPlane`/`AsyncCipherPlane`) over the byte-plane seams, with nonced
+  AES-CTR, original DJB ChaCha (8/12/20 rounds) and an obfuscation-only
+  mixer; `cipher-kdf` adds the `Kdf` seam and PBKDF2-HMAC-SHA256.
+  `NonceCipher` exposes `set_nonce` for per-resource domains.
+- **core**: `CipherStore` decorates a `Storage` with per-resource stream-cipher
+  domains (CD-R track resources encrypted, TOC resources plaintext) and
+  forwards `AsyncWake`.
+- **bundle**: `snowscsi::bundle::{identify_dir, identify_manifest}` classify a
+  directory or sidecar as `image`/`flat`/`cdr` from the canonical manifest and
+  summarize the plaintext CD-R TOC header.
 - **core**: `MmcDrive::companion_issues()` and `BlockDevice::companion_issues()`
   count the prefetches issued *together with* a data-in send. `prefetch_issues`
   also counts the serial single-bank read-ahead steps, so it cannot prove that

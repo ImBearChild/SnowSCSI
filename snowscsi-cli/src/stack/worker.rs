@@ -483,7 +483,7 @@ fn worker_loop(
         let len = job.req.len as usize;
         let result = match job.req.dir {
             Direction::ToHost => plane.exec(job.req, IoBuf::Read(&mut buf[..len])),
-            Direction::FromHost => plane.exec(job.req, IoBuf::Write(&buf[..len])),
+            Direction::FromHost => plane.exec(job.req, IoBuf::Write(&mut buf[..len])),
             Direction::None => plane.exec(job.req, IoBuf::None),
         }
         .map(|_| ());
@@ -596,7 +596,7 @@ mod tests {
         }
     }
 
-    fn poll_write(store: &mut WorkerStore, token: IoToken, data: &[u8]) -> StorageReceipt {
+    fn poll_write(store: &mut WorkerStore, token: IoToken, data: &mut [u8]) -> StorageReceipt {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Poll::Ready(r) = store.poll_exec(token, IoBuf::Write(data)) {
@@ -640,12 +640,13 @@ mod tests {
             // and returns Pending, a later poll completes.
             let token = store.begin_exec(write_req(8, 4));
             assert_ne!(token, invalid());
+            let mut data = *b"data";
             assert!(matches!(
-                store.poll_exec(token, IoBuf::Write(b"data")),
+                store.poll_exec(token, IoBuf::Write(&mut data)),
                 Poll::Pending
             ));
             assert_eq!(
-                poll_write(&mut store, token, b"data"),
+                poll_write(&mut store, token, &mut data),
                 StorageReceipt::ok(4)
             );
 
@@ -899,8 +900,9 @@ mod tests {
                 len: 4,
                 dir: Direction::FromHost,
             });
+            let mut data = *b"data";
             assert_eq!(
-                poll_write(&mut store, token, b"data"),
+                poll_write(&mut store, token, &mut data),
                 StorageReceipt::ok(4)
             );
 

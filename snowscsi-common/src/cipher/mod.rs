@@ -88,6 +88,18 @@ pub trait StreamCipher {
     fn xor(&mut self, off: u64, buf: &mut [u8]) -> Result<(), CipherError>;
 }
 
+/// A stream cipher whose nonce can be changed without rebuilding the key.
+///
+/// Resource-addressed media (a CD-R track table, for example) use one key with
+/// a **per-resource nonce domain**: the same key is used for every track, but
+/// each track gets its own nonce so no keystream is reused across resources.
+/// Changing the nonce never touches the key; a caller must still ensure a
+/// `(key, nonce)` pair is never reused for different plaintext.
+pub trait NonceCipher: StreamCipher {
+    /// Replace the nonce; the key is unchanged.
+    fn set_nonce(&mut self, nonce: [u8; 8]);
+}
+
 /// Cipher-layer error (no_std, `core::error::Error`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -555,6 +567,82 @@ mod tests {
             "invalid cipher parameters"
         );
         assert_eq!(CipherError::Backend.to_string(), "cipher backend failed");
+    }
+
+    /// Identity block cipher: CTR exposes the raw counter blocks.
+    struct IdentityBlock;
+
+    impl BlockCipher16 for IdentityBlock {
+        fn encrypt_block(&mut self, _block: &mut [u8; 16]) -> Result<(), CipherError> {
+            Ok(())
+        }
+    }
+
+    impl CtrAccel for IdentityBlock {}
+
+    /// Pins the `NonceCipher` contract for one cipher constructor:
+    /// `set_nonce(n)` is byte-identical to building a fresh cipher with `n`,
+    /// a different nonce changes the keystream, and switching back proves the
+    /// key survived.
+    fn check_nonce_cipher<C, F>(make: F)
+    where
+        C: NonceCipher,
+        F: Fn([u8; 8]) -> C,
+    {
+        let plain: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        let first_nonce = [0x11u8; 8];
+        let second_nonce = [0x22u8; 8];
+
+        let mut original = make(first_nonce);
+        let mut reference = make(first_nonce);
+        let mut other = make(second_nonce);
+
+        let mut first = plain;
+        original.xor(37, &mut first).unwrap();
+        let mut expected_first = plain;
+        reference.xor(37, &mut expected_first).unwrap();
+        assert_eq!(first, expected_first);
+
+        let mut changed = plain;
+        other.xor(37, &mut changed).unwrap();
+        assert_ne!(
+            first, changed,
+            "a different nonce must change the keystream"
+        );
+
+        original.set_nonce(second_nonce);
+        let mut after_set = plain;
+        original.xor(37, &mut after_set).unwrap();
+        assert_eq!(
+            after_set, changed,
+            "set_nonce must match a fresh cipher with that nonce"
+        );
+
+        original.set_nonce(first_nonce);
+        let mut restored = plain;
+        original.xor(37, &mut restored).unwrap();
+        assert_eq!(
+            restored, first,
+            "set_nonce must not change the key (switching back restores the keystream)"
+        );
+    }
+
+    #[test]
+    fn nonce_cipher_chacha_matches_fresh_construction() {
+        let key = CipherKey::from_bytes(&[0x5Au8; 32]).unwrap();
+        check_nonce_cipher(|nonce| ChaCha12::new(&key, nonce).unwrap());
+        check_nonce_cipher(|nonce| ChaCha20::new(&key, nonce).unwrap());
+    }
+
+    #[test]
+    fn nonce_cipher_aes_ctr_matches_fresh_construction() {
+        check_nonce_cipher(|nonce| AesCtr::new(IdentityBlock, nonce));
+    }
+
+    #[test]
+    fn nonce_cipher_xor_mix_matches_fresh_construction() {
+        let key = CipherKey::from_bytes(&[0xA5u8; 32]).unwrap();
+        check_nonce_cipher(|nonce| XorMix::new(&key, nonce));
     }
 
     #[test]

@@ -762,8 +762,8 @@ fn serve_rejects_bundle_without_size() {
 }
 
 /// `serve --block imgdir=<dir>,size=8M` creates a directory-chunked disk,
-/// announces 'listening' and exits 0 after SIGINT; the BUNDLE header and the
-/// first chunk appear on disk.
+/// announces 'listening' and exits 0 after SIGINT; the SNOWBUNDLE manifest and
+/// the first chunk appear on disk.
 #[cfg(all(unix, feature = "bundle"))]
 #[test]
 fn serve_starts_with_bundle_disk() {
@@ -825,22 +825,26 @@ fn serve_starts_with_bundle_disk() {
     let status = child.wait().expect("wait for snowscsi");
     assert!(status.success(), "snowscsi should exit 0 after SIGINT");
 
-    // The directory was created (host-owned) and the BUNDLE header written by
-    // the serve run. Chunks only materialize on first write (no initiator
-    // traffic in this smoke), so only the header is asserted.
-    let header = std::fs::read(dir.join("BUNDLE")).unwrap_or_default();
+    // The directory was created (host-owned) and the SNOWBUNDLE manifest
+    // written by the serve run. Chunks only materialize on first write (no
+    // initiator traffic in this smoke), so only the manifest is asserted.
+    let header = std::fs::read(dir.join("SNOWBUNDLE")).unwrap_or_default();
     let header = String::from_utf8_lossy(&header);
     assert!(
-        header.contains("magic = snow_flat_bnd"),
-        "BUNDLE magic missing: {header}"
+        header.contains("magic = snow_bundle"),
+        "SNOWBUNDLE magic missing: {header}"
+    );
+    assert!(
+        header.contains("kind = flat"),
+        "SNOWBUNDLE kind missing: {header}"
     );
     assert!(
         header.contains("virtual_size = 8388608"),
-        "BUNDLE size missing: {header}"
+        "SNOWBUNDLE size missing: {header}"
     );
     assert!(
         header.contains("sector_size = 512"),
-        "BUNDLE sector missing: {header}"
+        "SNOWBUNDLE sector missing: {header}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -887,10 +891,14 @@ fn serve_starts_with_read_only_bundle() {
     // Materialize the bundle + header with a writable run.
     let rw = format!("imgdir={path},size=8M");
     run_serve_until_ready_then_sigint(&["serve", "--block", &rw, "--iscsi", "127.0.0.1:0"]);
-    assert!(dir.join("BUNDLE").is_file());
+    assert!(dir.join("SNOWBUNDLE").is_file());
 
     // Simulate read-only media.
-    std::fs::set_permissions(dir.join("BUNDLE"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(
+        dir.join("SNOWBUNDLE"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let ro = format!("imgdir={path},ro");

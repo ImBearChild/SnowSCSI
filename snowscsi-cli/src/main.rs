@@ -1714,9 +1714,14 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
                     })?
                 } else {
                     // Headless directory (empty / chunk files only) → create a
-                    // new bundle (writes the BUNDLE header); otherwise open +
-                    // override.
-                    let has_header = fs.open("BUNDLE", OpenOptions::read_only()).is_ok();
+                    // new bundle (writes the SNOWBUNDLE manifest); otherwise
+                    // open + override.
+                    let has_header = fs
+                        .open(
+                            snowscsi::common::bundle::MANIFEST_NAME,
+                            OpenOptions::read_only(),
+                        )
+                        .is_ok();
                     if !has_header {
                         let sz = spec.plane.size.ok_or_else(|| {
                             eprintln!(
@@ -3960,9 +3965,9 @@ mod tests {
                     len: 4,
                     dir: Direction::FromHost,
                 });
-                let data = [7u8; 4];
+                let mut data = [7u8; 4];
                 loop {
-                    match store.poll_exec(write, IoBuf::Write(&data)) {
+                    match store.poll_exec(write, IoBuf::Write(&mut data)) {
                         std::task::Poll::Ready(receipt) => {
                             assert_eq!(receipt.error, None);
                             assert_eq!(receipt.confirmed, 4);

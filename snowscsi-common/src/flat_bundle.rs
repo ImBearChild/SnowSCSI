@@ -6,9 +6,9 @@
 //! allocation, and the FAT32 4 GiB limit is sidestepped per chunk.
 //!
 //! Design notes:
-//! - **`FsStorage` root = the bundle directory.** Chunks and `BUNDLE` are
-//!   opened by relative path (`"000000.img"`, `"BUNDLE"`) from the root, same
-//!   as `LiveData`'s scanner. The bundle holds **no `dir` field**.
+//! - **`FsStorage` root = the bundle directory.** Chunks and the manifest are
+//!   opened by relative path (`"000000.img"`, `"SNOWBUNDLE"`) from the root,
+//!   same as `LiveData`'s scanner. The bundle holds **no `dir` field**.
 //! - The bundle implements [`FlatData`] (read) + [`WritableFlatData`]
 //!   (write+sync) directly — it deliberately does **not** implement
 //!   [`SeekableStorage`](crate::seekable_storage::SeekableStorage) (no embedded-io cursor semantics; addressing is explicit
@@ -26,19 +26,30 @@
 //! # Feature gating
 //!
 //! The core struct + read/write path are compiled unconditionally (and stay
-//! `no_std`-clean). The `BUNDLE` INI header handling ([`FlatBundle::create`],
-//! [`FlatBundle::open`], `parse_bundle_header`) is gated behind the `bundle`
-//! feature (which pulls in `ini_core`).
+//! `no_std`-clean). The manifest handling ([`FlatBundle::create`],
+//! [`FlatBundle::create_with_meta`], [`FlatBundle::open`]) is gated behind the
+//! `bundle` feature. The manifest itself is the shared canonical
+//! [`crate::bundle`] format (`SNOWBUNDLE`, `kind = flat`); an optional cipher
+//! block is preserved but not interpreted here — the cipher decorator owns
+//! it.
 
 use embedded_io::Error as _;
 use embedded_io::ErrorKind as IoErrorKind;
 use heapless::Vec as HeaplessVec;
 
+#[cfg(feature = "bundle")]
+use crate::bundle::{BundleKind, MANIFEST_NAME, MAX_MANIFEST};
+use crate::bundle::{BundleMeta, ManifestError};
 use crate::fs_storage::{FsError, FsStorage, OpenOptions};
 use crate::seekable_storage::{FlatData, StorageError, WritableFlatData};
 
-/// Default chunk size when the `BUNDLE` header is absent (100 MiB).
+/// Default chunk size when the manifest is absent (100 MiB).
 pub const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Header file name used before the `SNOWBUNDLE` format. Only probed to
+/// refuse a silent reinterpretation of an old directory.
+#[cfg(feature = "bundle")]
+const LEGACY_HEADER_NAME: &str = "BUNDLE";
 
 /// Maximum number of simultaneously-open chunk file handles (LRU bound).
 pub const MAX_OPEN_CHUNKS: usize = 8;
@@ -46,20 +57,21 @@ pub const MAX_OPEN_CHUNKS: usize = 8;
 /// Maximum number of addressable chunks (`{:06}.img` → 6 digits).
 const MAX_CHUNKS: u64 = 999_999;
 
-/// `FlatBundle` construction/geometry/header errors.
+/// `FlatBundle` construction/geometry/manifest errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleError {
     /// Underlying filesystem failure.
     Fs(FsError),
-    /// `BUNDLE` header is not valid UTF-8 / INI / numeric field.
-    BadHeader,
-    /// `BUNDLE` header exists but the `magic` value is not `snow_flat_bnd`.
-    BadMagic,
-    /// `BUNDLE` header exists but lacks a `magic` key.
-    MissingMagic,
-    /// `FlatBundle::create` on a directory that already has a `BUNDLE`.
+    /// The `SNOWBUNDLE` manifest is malformed.
+    Manifest(ManifestError),
+    /// The manifest parsed but describes a non-flat bundle.
+    WrongKind,
+    /// `FlatBundle::create` on a directory that already has a manifest.
     AlreadyExists,
-    /// No header and no caller-supplied `virtual_size`.
+    /// The directory carries the legacy `BUNDLE` header from an older format.
+    /// It is refused rather than reinterpreted with new geometry.
+    LegacyHeader,
+    /// No manifest and no caller-supplied `virtual_size`.
     MissingVirtualSize,
     /// Geometry rejected (`chunk_size`/`virtual_size`/`sector_size` alignment,
     /// zero, or chunk-count overflow). See `validate_geometry`.
@@ -70,11 +82,16 @@ impl core::fmt::Display for BundleError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Fs(e) => write!(f, "filesystem error: {e}"),
-            Self::BadHeader => write!(f, "invalid BUNDLE header"),
-            Self::BadMagic => write!(f, "invalid BUNDLE magic"),
-            Self::MissingMagic => write!(f, "BUNDLE header missing magic key"),
-            Self::AlreadyExists => write!(f, "BUNDLE header already exists"),
-            Self::MissingVirtualSize => write!(f, "virtual_size required (no BUNDLE header)"),
+            Self::Manifest(e) => write!(f, "manifest error: {e}"),
+            Self::WrongKind => write!(f, "not a flat bundle"),
+            Self::AlreadyExists => write!(f, "SNOWBUNDLE manifest already exists"),
+            Self::LegacyHeader => write!(
+                f,
+                "legacy BUNDLE header found; recreate the bundle in the current format"
+            ),
+            Self::MissingVirtualSize => {
+                write!(f, "virtual_size required (no SNOWBUNDLE manifest)")
+            }
             Self::InvalidGeometry => write!(f, "invalid bundle geometry"),
         }
     }
@@ -88,6 +105,12 @@ impl From<FsError> for BundleError {
     }
 }
 
+impl From<ManifestError> for BundleError {
+    fn from(e: ManifestError) -> Self {
+        Self::Manifest(e)
+    }
+}
+
 /// One open chunk file handle (LRU slot).
 struct ChunkSlot<F: FsStorage> {
     idx: u64,
@@ -98,7 +121,7 @@ struct ChunkSlot<F: FsStorage> {
 /// Directory-chunked, random-writable block plane over an [`FsStorage`].
 ///
 /// `F`'s root **is** the bundle directory: chunks are
-/// `"{:06}.img"` relative to it, the optional header is `"BUNDLE"`.
+/// `"{:06}.img"` relative to it, the optional manifest is `"SNOWBUNDLE"`.
 pub struct FlatBundle<F: FsStorage> {
     fs: F,
     chunk_size: u64,
@@ -108,13 +131,15 @@ pub struct FlatBundle<F: FsStorage> {
     /// and chunk files are opened read-only. The data plane and the device
     /// policy must agree (read-only media cannot even be opened `r+b`).
     read_only: bool,
+    /// Parsed manifest, or `None` when the plane was built from explicit
+    /// geometry only.
+    meta: Option<BundleMeta>,
     open_chunks: HeaplessVec<ChunkSlot<F>, MAX_OPEN_CHUNKS>,
     tick: u64,
 }
 
 impl<F: FsStorage> FlatBundle<F> {
-    /// Construct a read-write bundle with explicit geometry (no `BUNDLE` header
-    /// I/O).
+    /// Construct a read-write bundle with explicit geometry (no manifest I/O).
     ///
     /// `fs` must be rooted at the bundle directory; the directory must already
     /// exist (the `FsStorage` seam has no `mkdir` — host callers create it).
@@ -157,9 +182,18 @@ impl<F: FsStorage> FlatBundle<F> {
             virtual_size,
             sector_size,
             read_only,
+            meta: None,
             open_chunks: HeaplessVec::new(),
             tick: 0,
         })
+    }
+
+    /// Manifest this bundle was opened/created from, when one was involved.
+    ///
+    /// A bundle constructed with [`Self::new`]/[`Self::new_read_only`] has no
+    /// manifest and returns `None`.
+    pub fn meta(&self) -> Option<&BundleMeta> {
+        self.meta.as_ref()
     }
 
     /// Whether this bundle is read-only (`write_at` → `NotWritable`).
@@ -182,51 +216,92 @@ impl<F: FsStorage> FlatBundle<F> {
         self.sector_size
     }
 
-    /// Create a new bundle: validate geometry, write the `BUNDLE` header, and
-    /// return the bundle. Requires the directory to already exist.
+    /// Create a new flat bundle with the given geometry.
     ///
-    /// Fails with [`BundleError::AlreadyExists`] if a `BUNDLE` header is
-    /// already present (prevents accidental overwrite). Chunk 0 is not
-    /// pre-allocated; the first write creates it.
+    /// Builds a plaintext [`BundleKind::Flat`] manifest and delegates to
+    /// [`Self::create_with_meta`]; see there for the manifest/failure rules.
     #[cfg(feature = "bundle")]
     pub fn create(
-        mut fs: F,
+        fs: F,
         chunk_size: u64,
         virtual_size: u64,
         sector_size: u32,
     ) -> Result<Self, BundleError> {
+        let meta = BundleMeta {
+            kind: BundleKind::Flat {
+                virtual_size,
+                chunk_size,
+                sector_size,
+            },
+            cipher: None,
+            has_crc: false,
+        };
+        Self::create_with_meta(fs, &meta)
+    }
+
+    /// Create a new bundle from an explicit manifest.
+    ///
+    /// Only [`BundleKind::Flat`] is accepted ([`BundleError::WrongKind`]).
+    /// Fails with [`BundleError::AlreadyExists`] if a `SNOWBUNDLE` manifest is
+    /// already present (prevents accidental overwrite). The manifest is
+    /// written with `create_or_truncate`, flushed, closed and the filesystem
+    /// synced. Chunk 0 is not pre-allocated; the first write creates it.
+    #[cfg(feature = "bundle")]
+    pub fn create_with_meta(mut fs: F, meta: &BundleMeta) -> Result<Self, BundleError> {
+        let (chunk_size, virtual_size, sector_size) = match meta.kind {
+            BundleKind::Flat {
+                virtual_size,
+                chunk_size,
+                sector_size,
+            } => (chunk_size, virtual_size, sector_size),
+            _ => return Err(BundleError::WrongKind),
+        };
         validate_geometry(chunk_size, virtual_size, sector_size)?;
-        match fs.open("BUNDLE", OpenOptions::read_only()) {
-            Ok(_) => return Err(BundleError::AlreadyExists),
+        match fs.open(MANIFEST_NAME, OpenOptions::read_only()) {
+            Ok(file) => {
+                fs.close(file);
+                return Err(BundleError::AlreadyExists);
+            }
             Err(FsError::NotFound) => {}
             Err(e) => return Err(BundleError::Fs(e)),
         }
-        let mut hdr = heapless::String::<160>::new();
-        use core::fmt::Write as _;
-        write!(
-            hdr,
-            "magic = snow_flat_bnd\r\nversion = 1\r\nchunk_size = {}\r\nvirtual_size = {}\r\nsector_size = {}\r\n",
-            chunk_size, virtual_size, sector_size
-        )
-        .map_err(|_| BundleError::BadHeader)?;
+        // A legacy directory must not be silently given new geometry: its
+        // chunk files were written with the old header's chunk size.
+        match fs.open(LEGACY_HEADER_NAME, OpenOptions::read_only()) {
+            Ok(file) => {
+                fs.close(file);
+                return Err(BundleError::LegacyHeader);
+            }
+            Err(FsError::NotFound) => {}
+            Err(e) => return Err(BundleError::Fs(e)),
+        }
+        let manifest = meta.encode()?;
         let mut file = fs
-            .open("BUNDLE", OpenOptions::create_or_truncate())
+            .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
             .map_err(BundleError::Fs)?;
-        embedded_io::Write::write_all(&mut file, hdr.as_bytes())
+        embedded_io::Write::write_all(&mut file, &manifest)
             .map_err(|e| BundleError::Fs(FsError::Io(e.kind())))?;
         embedded_io::Write::flush(&mut file).map_err(|e| BundleError::Fs(FsError::Io(e.kind())))?;
         fs.close(file);
         fs.sync().map_err(BundleError::Fs)?;
-        Self::new(fs, chunk_size, virtual_size, sector_size)
+        let mut bundle = Self::build(fs, chunk_size, virtual_size, sector_size, false)?;
+        // `encode` always emits a CRC line, so the stored metadata reflects
+        // what a re-open would parse.
+        let mut stored = *meta;
+        stored.has_crc = true;
+        bundle.meta = Some(stored);
+        Ok(bundle)
     }
 
-    /// Open an existing (or header-less) bundle, merging the `BUNDLE` header
-    /// with caller overrides (caller wins per-field).
+    /// Open an existing (or manifest-less) bundle, merging the `SNOWBUNDLE`
+    /// manifest with caller overrides (caller wins per-field).
     ///
     /// - `chunk_override` / `size_override` / `sector_override`: optional
-    ///   caller values that override the header (or fill in for a missing
-    ///   header).
-    /// - A missing header with no `size_override` yields
+    ///   caller values that override the manifest (or fill in for a missing
+    ///   manifest).
+    /// - A present manifest must be a [`BundleKind::Flat`] bundle, otherwise
+    ///   [`BundleError::WrongKind`].
+    /// - A missing manifest with no `size_override` yields
     ///   [`BundleError::MissingVirtualSize`].
     #[cfg(feature = "bundle")]
     pub fn open(
@@ -259,33 +334,65 @@ impl<F: FsStorage> FlatBundle<F> {
         sector_override: Option<u32>,
         read_only: bool,
     ) -> Result<Self, BundleError> {
-        let mut header = BundleHeader::default();
-        match fs.open("BUNDLE", OpenOptions::read_only()) {
+        let mut meta = None;
+        let mut manifest_geometry = None;
+        match fs.open(MANIFEST_NAME, OpenOptions::read_only()) {
             Ok(mut f) => {
-                let mut data = HeaplessVec::<u8, 2048>::new();
-                let mut tmp = [0u8; 256];
+                let mut data = HeaplessVec::<u8, MAX_MANIFEST>::new();
+                let mut tmp = [0u8; 64];
                 loop {
-                    let n = embedded_io::Read::read(&mut f, &mut tmp)
-                        .map_err(|e| BundleError::Fs(FsError::Io(e.kind())))?;
+                    let n = match embedded_io::Read::read(&mut f, &mut tmp) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            fs.close(f);
+                            return Err(BundleError::Fs(FsError::Io(e.kind())));
+                        }
+                    };
                     if n == 0 {
                         break;
                     }
-                    data.extend_from_slice(&tmp[..n])
-                        .map_err(|_| BundleError::BadHeader)?;
+                    if data.extend_from_slice(&tmp[..n]).is_err() {
+                        fs.close(f);
+                        return Err(BundleError::Manifest(ManifestError::TooLarge));
+                    }
                 }
                 fs.close(f);
-                header = parse_bundle_header(&data)?;
+                let parsed = BundleMeta::parse(&data)?;
+                match parsed.kind {
+                    BundleKind::Flat {
+                        virtual_size,
+                        chunk_size,
+                        sector_size,
+                    } => manifest_geometry = Some((chunk_size, virtual_size, sector_size)),
+                    _ => return Err(BundleError::WrongKind),
+                }
+                meta = Some(parsed);
             }
-            Err(FsError::NotFound) => {}
+            Err(FsError::NotFound) => {
+                // Never reinterpret an old bundle with new geometry: its
+                // chunk files use the legacy header's chunk size.
+                match fs.open(LEGACY_HEADER_NAME, OpenOptions::read_only()) {
+                    Ok(file) => {
+                        fs.close(file);
+                        return Err(BundleError::LegacyHeader);
+                    }
+                    Err(FsError::NotFound) => {}
+                    Err(e) => return Err(BundleError::Fs(e)),
+                }
+            }
             Err(e) => return Err(BundleError::Fs(e)),
         }
-        let chunk_size = chunk_override.unwrap_or(header.chunk_size);
-        let virtual_size = size_override.unwrap_or(header.virtual_size);
-        let sector_size = sector_override.unwrap_or(header.sector_size);
+        let (manifest_chunk, manifest_virtual, manifest_sector) =
+            manifest_geometry.unwrap_or((DEFAULT_CHUNK_SIZE, 0, 512));
+        let chunk_size = chunk_override.unwrap_or(manifest_chunk);
+        let virtual_size = size_override.unwrap_or(manifest_virtual);
+        let sector_size = sector_override.unwrap_or(manifest_sector);
         if virtual_size == 0 {
             return Err(BundleError::MissingVirtualSize);
         }
-        Self::build(fs, chunk_size, virtual_size, sector_size, read_only)
+        let mut bundle = Self::build(fs, chunk_size, virtual_size, sector_size, read_only)?;
+        bundle.meta = meta;
+        Ok(bundle)
     }
 
     /// Relative path of chunk `idx` within the bundle directory.
@@ -497,74 +604,6 @@ fn validate_geometry(
         return Err(BundleError::InvalidGeometry);
     }
     Ok(())
-}
-
-/// Parsed `BUNDLE` header (only used behind the `bundle` feature).
-#[cfg(feature = "bundle")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BundleHeader {
-    version: u32,
-    chunk_size: u64,
-    virtual_size: u64,
-    sector_size: u32,
-}
-
-#[cfg(feature = "bundle")]
-impl Default for BundleHeader {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            chunk_size: DEFAULT_CHUNK_SIZE,
-            virtual_size: 0,
-            sector_size: 512,
-        }
-    }
-}
-
-/// Parse a `BUNDLE` INI header. Comments use `;` (traditional INI, `ini_core`'s
-/// default — no `comment_char` needed); `auto_trim` strips surrounding space.
-///
-/// `magic` is mandatory when the file exists; `virtual_size`/`chunk_size`/
-/// `sector_size` are optional (defaults fill in). Unknown keys are ignored
-/// (forward compatibility).
-#[cfg(feature = "bundle")]
-fn parse_bundle_header(input: &[u8]) -> Result<BundleHeader, BundleError> {
-    let doc = core::str::from_utf8(input).map_err(|_| BundleError::BadHeader)?;
-    let parser = ini_core::Parser::new(doc).auto_trim(true);
-    let mut header = BundleHeader::default();
-    let mut magic_seen = false;
-    for item in parser {
-        match item {
-            // Item::Comment fires only on ';' lines; Item::Error only for a bad
-            // [SECTION line (this format has none).
-            ini_core::Item::Comment(_) => {}
-            ini_core::Item::Property(key, Some(value)) => match key {
-                "magic" => {
-                    magic_seen = true;
-                    if value != "snow_flat_bnd" {
-                        return Err(BundleError::BadMagic);
-                    }
-                }
-                "version" => header.version = value.parse().map_err(|_| BundleError::BadHeader)?,
-                "chunk_size" => {
-                    header.chunk_size = value.parse().map_err(|_| BundleError::BadHeader)?
-                }
-                "virtual_size" => {
-                    header.virtual_size = value.parse().map_err(|_| BundleError::BadHeader)?
-                }
-                "sector_size" => {
-                    header.sector_size = value.parse().map_err(|_| BundleError::BadHeader)?
-                }
-                _ => {} // unknown key: ignore (forward compatible)
-            },
-            ini_core::Item::Property(_, None) => {} // line without '=': ignore
-            _ => {}
-        }
-    }
-    if !magic_seen {
-        return Err(BundleError::MissingMagic);
-    }
-    Ok(header)
 }
 
 #[cfg(test)]
@@ -915,45 +954,126 @@ mod tests {
         // overflow
     }
 
-    // ── header tests (require the `bundle` feature) ─────────────────────
+    // ── manifest tests (require the `bundle` feature) ───────────────────
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn header_parse_comments_and_order() {
-        let input = b"; comment\r\nmagic = snow_flat_bnd\r\nversion = 1\r\nchunk_size = 1048576\r\nvirtual_size = 2097152\r\nsector_size = 512\r\n";
-        let h = parse_bundle_header(input).unwrap();
-        assert_eq!(h.chunk_size, 1 << 20);
-        assert_eq!(h.virtual_size, 2 << 20);
-        assert_eq!(h.sector_size, 512);
-        assert_eq!(h.version, 1);
-    }
-
-    #[cfg(feature = "bundle")]
-    #[test]
-    fn header_missing_magic_rejected() {
-        let input = b"chunk_size = 1048576\r\nvirtual_size = 2097152\r\n";
-        assert_eq!(parse_bundle_header(input), Err(BundleError::MissingMagic));
-        let input2 = b"magic = NOPE\r\n";
-        assert_eq!(parse_bundle_header(input2), Err(BundleError::BadMagic));
-    }
-
-    #[cfg(feature = "bundle")]
-    #[test]
-    fn header_bad_utf8_rejected() {
+    fn create_writes_canonical_manifest() {
+        let (fs, store) = MockFs::new();
+        let b = FlatBundle::create(fs, 1 << 20, 4 << 20, 512).unwrap();
+        let raw = store.borrow()[MANIFEST_NAME].borrow().clone();
+        let meta = BundleMeta::parse(&raw).unwrap();
         assert_eq!(
-            parse_bundle_header(&[0xFF, 0xFE]),
-            Err(BundleError::BadHeader)
+            meta.kind,
+            BundleKind::Flat {
+                virtual_size: 4 << 20,
+                chunk_size: 1 << 20,
+                sector_size: 512,
+            }
+        );
+        assert!(meta.has_crc);
+        assert_eq!(meta.cipher, None);
+        // The stored metadata mirrors what a re-open parses (the encoder
+        // always writes a CRC line).
+        assert_eq!(b.meta().unwrap().kind, meta.kind);
+        assert!(b.meta().unwrap().has_crc);
+        // The writer never enumerates the directory.
+        assert_eq!(store.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn legacy_bundle_is_refused_not_reinterpreted() {
+        let (fs, store) = MockFs::new();
+        store.borrow_mut().insert(
+            "BUNDLE".to_string(),
+            Rc::new(RefCell::new(b"magic = snow_flat_bnd\n".to_vec())),
+        );
+        assert_eq!(
+            FlatBundle::open(fs, None, Some(8 << 20), None).err(),
+            Some(BundleError::LegacyHeader)
+        );
+        let (fs, _store) = MockFs::new();
+        assert!(FlatBundle::create(fs, 1 << 20, 8 << 20, 512).is_ok());
+        let (fs, store) = MockFs::new();
+        store.borrow_mut().insert(
+            "BUNDLE".to_string(),
+            Rc::new(RefCell::new(b"magic = snow_flat_bnd\n".to_vec())),
+        );
+        assert_eq!(
+            FlatBundle::create(fs, 1 << 20, 8 << 20, 512).err(),
+            Some(BundleError::LegacyHeader)
         );
     }
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn create_rejects_existing_header() {
+    fn opens_manifest_without_crc() {
+        let (fs, store) = MockFs::new();
+        let body = "magic = snow_bundle\nversion = 1\nkind = flat\nvirtual_size = 8388608\nchunk_size = 1048576\nsector_size = 512\n";
+        store.borrow_mut().insert(
+            MANIFEST_NAME.to_string(),
+            Rc::new(RefCell::new(body.as_bytes().to_vec())),
+        );
+        let b = FlatBundle::open(fs, None, None, None).unwrap();
+        assert_eq!(b.capacity(), 8 << 20);
+        assert_eq!(b.chunk_size(), 1 << 20);
+        assert!(!b.meta().unwrap().has_crc);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn create_with_meta_preserves_cipher() {
+        let (fs, store) = MockFs::new();
+        let cipher = crate::bundle::CipherMeta {
+            cipher: crate::bundle::CipherAlg::Xor,
+            kdf: crate::bundle::KdfKind::None,
+            iterations: None,
+            salt: None,
+            nonce: [7; 8],
+        };
+        let meta = BundleMeta {
+            kind: BundleKind::Flat {
+                virtual_size: 4 << 20,
+                chunk_size: 1 << 20,
+                sector_size: 512,
+            },
+            cipher: Some(cipher),
+            has_crc: false,
+        };
+        let b = FlatBundle::create_with_meta(fs, &meta).unwrap();
+        let mut stored = meta;
+        stored.has_crc = true;
+        assert_eq!(b.meta(), Some(&stored));
+        let raw = store.borrow()[MANIFEST_NAME].borrow().clone();
+        let parsed = BundleMeta::parse(&raw).unwrap();
+        assert_eq!(parsed.cipher, Some(cipher));
+        assert!(parsed.has_crc);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn create_with_meta_rejects_non_flat_kind() {
+        let (fs, _store) = MockFs::new();
+        let meta = BundleMeta {
+            kind: BundleKind::Image { size: 4096 },
+            cipher: None,
+            has_crc: false,
+        };
+        assert_eq!(
+            FlatBundle::create_with_meta(fs, &meta).err(),
+            Some(BundleError::WrongKind)
+        );
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn create_rejects_existing_manifest() {
         let (mut fs, _store) = MockFs::new();
         let mut f = fs
-            .open("BUNDLE", OpenOptions::create_or_truncate())
+            .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
             .unwrap();
-        embedded_io::Write::write_all(&mut f, b"magic = snow_flat_bnd\r\n").unwrap();
+        embedded_io::Write::write_all(&mut f, b"magic = snow_bundle\n").unwrap();
         fs.close(f);
         assert!(matches!(
             FlatBundle::create(fs, 1 << 20, 4 << 20, 512),
@@ -963,12 +1083,65 @@ mod tests {
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn open_requires_virtual_size_when_no_header() {
+    fn open_requires_virtual_size_when_no_manifest() {
         let (fs, _store) = MockFs::new();
         assert!(matches!(
             FlatBundle::open(fs, None, None, None),
             Err(BundleError::MissingVirtualSize)
         ));
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn open_rejects_wrong_kind() {
+        let (mut fs, _store) = MockFs::new();
+        let meta = BundleMeta {
+            kind: BundleKind::Cdr,
+            cipher: None,
+            has_crc: false,
+        };
+        let bytes = meta.encode().unwrap();
+        let mut f = fs
+            .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
+            .unwrap();
+        embedded_io::Write::write_all(&mut f, &bytes).unwrap();
+        fs.close(f);
+        assert_eq!(
+            FlatBundle::open(fs, None, Some(4096), None).err(),
+            Some(BundleError::WrongKind)
+        );
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn open_rejects_malformed_manifest() {
+        let (mut fs, _store) = MockFs::new();
+        let mut f = fs
+            .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
+            .unwrap();
+        embedded_io::Write::write_all(&mut f, b"magic = NOPE\n").unwrap();
+        fs.close(f);
+        assert_eq!(
+            FlatBundle::open(fs, None, Some(4096), None).err(),
+            Some(BundleError::Manifest(ManifestError::BadMagic))
+        );
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn open_rejects_manifest_larger_than_max() {
+        let (mut fs, _store) = MockFs::new();
+        let mut f = fs
+            .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
+            .unwrap();
+        let mut data = vec![b'a'; MAX_MANIFEST + 1];
+        data[MAX_MANIFEST] = b'\n';
+        embedded_io::Write::write_all(&mut f, &data).unwrap();
+        fs.close(f);
+        assert_eq!(
+            FlatBundle::open(fs, None, Some(4096), None).err(),
+            Some(BundleError::Manifest(ManifestError::TooLarge))
+        );
     }
 
     #[cfg(feature = "bundle")]
@@ -985,6 +1158,7 @@ mod tests {
         let mut out = vec![0u8; 64];
         b2.read_at(0, &mut out).unwrap();
         assert_eq!(out, vec![0x33; 64]);
+        assert!(b2.meta().is_some());
     }
 
     #[cfg(feature = "bundle")]
@@ -998,5 +1172,14 @@ mod tests {
         let b2 = FlatBundle::open(MockFs { store }, Some(1 << 21), None, None).unwrap();
         assert_eq!(b2.chunk_size(), 1 << 21);
         assert_eq!(b2.capacity(), 4 << 20);
+        assert_eq!(b2.sector_size(), 512);
+    }
+
+    #[cfg(feature = "bundle")]
+    #[test]
+    fn explicit_new_has_no_meta() {
+        let (fs, _store) = MockFs::new();
+        let b = mk(fs, 1 << 20, 4 << 20);
+        assert_eq!(b.meta(), None);
     }
 }

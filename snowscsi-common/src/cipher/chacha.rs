@@ -86,6 +86,12 @@ impl<const ROUNDS: usize> ChaCha<ROUNDS> {
     }
 }
 
+impl<const ROUNDS: usize> super::NonceCipher for ChaCha<ROUNDS> {
+    fn set_nonce(&mut self, nonce: [u8; 8]) {
+        self.nonce = nonce;
+    }
+}
+
 impl<const ROUNDS: usize> StreamCipher for ChaCha<ROUNDS> {
     fn xor(&mut self, off: u64, buf: &mut [u8]) -> Result<(), CipherError> {
         let mut block = off / 64;

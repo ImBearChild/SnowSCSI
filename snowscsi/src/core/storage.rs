@@ -55,13 +55,17 @@ pub enum StorageOp<'a> {
         buf: &'a mut [u8],
     },
     /// Backing write from `buf`.
+    ///
+    /// The buffer is mutable because a storage decorator (the cipher plane)
+    /// may transform it in place before delegating to the backing. Device code
+    /// must not re-read or re-submit it after emitting the step.
     Write {
         /// Resource id, local to the current Lu.
         resource: u16,
         /// Byte offset inside the resource.
         offset: u64,
         /// Source buffer.
-        buf: &'a [u8],
+        buf: &'a mut [u8],
     },
     /// Flush/synchronize a resource; no data buffer.
     Sync {
@@ -101,8 +105,8 @@ pub enum WriteOp<'a> {
         resource: u16,
         /// Byte offset inside the resource.
         offset: u64,
-        /// Source buffer.
-        buf: &'a [u8],
+        /// Source buffer (mutable for in-place storage decorators).
+        buf: &'a mut [u8],
     },
 }
 
@@ -139,8 +143,10 @@ pub enum IoBuf<'a> {
     None,
     /// Device reads from the backing into this buffer (`dir == ToHost`).
     Read(&'a mut [u8]),
-    /// Device writes this buffer to the backing (`dir == FromHost`).
-    Write(&'a [u8]),
+    /// Device writes this buffer to the backing (`dir == FromHost`). It is
+    /// mutable because an in-place decorator (such as the cipher store) may
+    /// transform it before the backing sees it.
+    Write(&'a mut [u8]),
 }
 
 /// Opaque storage adapter token.
@@ -241,6 +247,13 @@ pub trait Storage {
     /// poll or `cancel`. `Ready` carries the adapter facts; an unknown token, an
     /// already-`Ready` token or a `buf` that does not match `req` yields
     /// `Fault::Contract`.
+    ///
+    /// The same buffer must be passed on every poll of one operation. A
+    /// decorator may transform a [`IoBuf::Write`] buffer **in place** before
+    /// the backing sees it, so its contents are consumed by the operation:
+    /// device code must not re-read or re-submit a write buffer after
+    /// returning a write step, and the data is undefined after `Pending` and
+    /// after an error.
     fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt>;
 
     /// Stop waiting on `token`; idempotent, and the token is dead afterwards.
@@ -253,6 +266,9 @@ pub trait Storage {
 /// [`IoBuf::None`] here as well.
 pub trait SyncStorage {
     /// Execute one operation to completion.
+    ///
+    /// A decorator may transform a [`IoBuf::Write`] buffer in place; its
+    /// contents are consumed by the call.
     fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt;
 }
 
@@ -1247,7 +1263,7 @@ mod tests {
         )));
         let op = store.begin_exec(sync_req());
         assert!(is_storage_contract(ready(
-            store.poll_exec(op, IoBuf::Write(&[]))
+            store.poll_exec(op, IoBuf::Write(&mut []))
         )));
         assert_eq!(store.inner().count(), 1);
     }
@@ -1259,7 +1275,7 @@ mod tests {
 
         let op = store.begin_exec(read_req(8));
         assert!(is_storage_contract(ready(
-            store.poll_exec(op, IoBuf::Write(&[0u8; 8]))
+            store.poll_exec(op, IoBuf::Write(&mut [0u8; 8]))
         )));
         let op = store.begin_exec(read_req(8));
         assert!(is_storage_contract(ready(
@@ -1297,14 +1313,14 @@ mod tests {
         )));
         let op = store.begin_exec(write_req(8));
         assert!(is_storage_contract(ready(
-            store.poll_exec(op, IoBuf::Write(&recv[..4]))
+            store.poll_exec(op, IoBuf::Write(&mut recv[..4]))
         )));
         let op = store.begin_exec(write_req(8));
         assert!(is_storage_contract(ready(store.poll_exec(op, IoBuf::None))));
 
         let op = store.begin_exec(write_req(8));
         assert_eq!(
-            ready(store.poll_exec(op, IoBuf::Write(&recv))),
+            ready(store.poll_exec(op, IoBuf::Write(&mut recv))),
             StorageReceipt::ok(8)
         );
         assert_eq!(store.inner().last().kind, KIND_WRITE);
@@ -1317,11 +1333,11 @@ mod tests {
         for op in &mut ops {
             *op = store.begin_exec(read_req(4));
         }
-        let buf = [0u8; 4];
+        let mut buf = [0u8; 4];
         for op in ops {
             // Wrong direction: receipt is Contract and the slot is consumed.
             assert!(is_storage_contract(ready(
-                store.poll_exec(op, IoBuf::Write(&buf))
+                store.poll_exec(op, IoBuf::Write(&mut buf))
             )));
         }
         let mut again = [IoToken::invalid(); SLOTS];
@@ -1369,9 +1385,9 @@ mod tests {
             Effect::UnknownRemainder,
         ));
         let op = store.begin_exec(write_req(16));
-        let buf = [0u8; 16];
+        let mut buf = [0u8; 16];
         assert_eq!(
-            ready(store.poll_exec(op, IoBuf::Write(&buf))),
+            ready(store.poll_exec(op, IoBuf::Write(&mut buf))),
             StorageReceipt::failed(Fault::Io, 8, Effect::UnknownRemainder)
         );
     }
@@ -1388,7 +1404,7 @@ mod tests {
         let write = StorageOp::Write {
             resource: 1,
             offset: 2,
-            buf: &[],
+            buf: &mut [],
         };
         assert!(format!("{write:?}").contains("Write"));
         let sync = StorageOp::Sync { resource: 1 };
@@ -1841,8 +1857,8 @@ mod tests {
             len: 4,
             dir: Direction::FromHost,
         });
-        let data = [7u8, 8, 9, 10];
-        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        let mut data = [7u8, 8, 9, 10];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&mut data)));
         assert_eq!(receipt.error, None);
         assert_eq!(receipt.confirmed, 4);
 
@@ -1889,8 +1905,8 @@ mod tests {
             len: 4,
             dir: Direction::FromHost,
         });
-        let data = [2u8; 4];
-        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        let mut data = [2u8; 4];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&mut data)));
         assert_eq!(receipt.error, Some(Fault::NotWritable));
         assert_eq!(receipt.effect, Effect::UnknownRemainder);
         assert_eq!(receipt.confirmed, 0);
@@ -1924,8 +1940,8 @@ mod tests {
             len: 8,
             dir: Direction::FromHost,
         });
-        let data = [0u8; 8];
-        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&data)));
+        let mut data = [0u8; 8];
+        let receipt = ready(storage.poll_exec(write, IoBuf::Write(&mut data)));
         assert_eq!(receipt.error, Some(Fault::OutOfBounds));
         assert_eq!(receipt.effect, Effect::UnknownRemainder);
     }

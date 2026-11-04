@@ -528,7 +528,7 @@ impl MmcMedium for DvdRamMedium {
                         write: Some(crate::core::storage::WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..accepted],
+                            buf: &mut data[..accepted],
                         }),
                     };
                 }
@@ -536,7 +536,7 @@ impl MmcMedium for DvdRamMedium {
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
                     offset: self.next_offset(),
-                    buf: &data[..accepted],
+                    buf: &mut data[..accepted],
                 })
             }
             (DvdRamState::WritePipe, FeedbackKind::HostReceived) => {
@@ -550,10 +550,10 @@ impl MmcMedium for DvdRamMedium {
                 };
                 self.queued_recv = Some((accepted, self.next_in_alt, failed || accepted < chunk));
                 self.phase = DvdRamState::WriteIo;
-                let buf: &[u8] = if pending_alt {
-                    &alt[..pending_len]
+                let buf: &mut [u8] = if pending_alt {
+                    &mut alt[..pending_len]
                 } else {
-                    &data[..pending_len]
+                    &mut data[..pending_len]
                 };
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
@@ -593,10 +593,10 @@ impl MmcMedium for DvdRamMedium {
                 let other_len = if other_alt { alt.len() } else { data.len() };
                 if last {
                     self.phase = DvdRamState::WriteIo;
-                    let buf: &[u8] = if recv_alt {
-                        &alt[..accepted]
+                    let buf: &mut [u8] = if recv_alt {
+                        &mut alt[..accepted]
                     } else {
-                        &data[..accepted]
+                        &mut data[..accepted]
                     };
                     return PollStep::Io(StorageOp::Write {
                         resource: 0,
@@ -617,7 +617,7 @@ impl MmcMedium for DvdRamMedium {
                         write: Some(crate::core::storage::WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &alt[..accepted],
+                            buf: &mut alt[..accepted],
                         }),
                     }
                 } else {
@@ -626,7 +626,7 @@ impl MmcMedium for DvdRamMedium {
                         write: Some(crate::core::storage::WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..accepted],
+                            buf: &mut data[..accepted],
                         }),
                     }
                 }
@@ -654,10 +654,10 @@ impl MmcMedium for DvdRamMedium {
                     let last = self.progress as usize + queued_len >= total;
                     if last {
                         self.phase = DvdRamState::WriteIo;
-                        let buf: &[u8] = if queued_alt {
-                            &alt[..queued_len]
+                        let buf: &mut [u8] = if queued_alt {
+                            &mut alt[..queued_len]
                         } else {
-                            &data[..queued_len]
+                            &mut data[..queued_len]
                         };
                         return PollStep::Io(StorageOp::Write {
                             resource: 0,
@@ -680,7 +680,7 @@ impl MmcMedium for DvdRamMedium {
                             write: Some(crate::core::storage::WriteOp::Write {
                                 resource: 0,
                                 offset: self.next_offset(),
-                                buf: &alt[..queued_len],
+                                buf: &mut alt[..queued_len],
                             }),
                         };
                     }
@@ -689,7 +689,7 @@ impl MmcMedium for DvdRamMedium {
                         write: Some(crate::core::storage::WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..queued_len],
+                            buf: &mut data[..queued_len],
                         }),
                     };
                 }

@@ -131,7 +131,7 @@ fn read<S: Storage>(storage: &mut S, offset: u64, buf: &mut [u8]) -> StorageRece
     )
 }
 
-fn write<S: Storage>(storage: &mut S, offset: u64, buf: &[u8]) -> StorageReceipt {
+fn write<S: Storage>(storage: &mut S, offset: u64, buf: &mut [u8]) -> StorageReceipt {
     exec(
         storage,
         IoReq {
@@ -216,9 +216,9 @@ fn file_storage_round_trips_through_the_blocking_adapter() {
     assert_eq!(read_back, original, "the READ path is byte-exact");
 
     // 2. WRITE a new pattern in the middle.
-    let pattern = vec![0x5Au8; 1024];
+    let mut pattern = vec![0x5Au8; 1024];
     assert_eq!(
-        write(&mut storage, 1024, &pattern),
+        write(&mut storage, 1024, &mut pattern),
         StorageReceipt::ok(pattern.len())
     );
 

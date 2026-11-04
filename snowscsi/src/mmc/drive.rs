@@ -1359,7 +1359,7 @@ impl<M: MmcMedium> MmcDrive<M> {
         PollStep::Io(StorageOp::Write {
             resource: 0,
             offset: done,
-            buf: &data[..chunk],
+            buf: &mut data[..chunk],
         })
     }
 

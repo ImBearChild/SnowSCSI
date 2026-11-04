@@ -67,17 +67,18 @@ snowscsi ──▶ snowscsi-common              │
 
 Feature maps:
 
-- **`snowscsi-common`** — `std` (default), `log`, `defmt`, `async-io`,
-  `cipher`, `cipher-kdf`. The core seams are always compiled (no feature
-  gate). `async-io` adds the asynchronous storage seams (`async fn` in trait,
-  no runtime). `cipher` adds the offset-addressed, length-preserving
-  stream-cipher plane decorators (`cipher::CipherPlane` /
-  `AsyncCipherPlane` over `FlatData`/`WritableFlatData`) and its ciphers; the
-  feature is empty (no runtime dependency) and the ciphers are
-  allocation-free and `no_std`. `cipher-kdf` (→`cipher`) adds the
-  password-to-key derivation seam (`cipher::Kdf`/`cipher::SoftKdf`) and an
-  in-crate PBKDF2-HMAC-SHA256 implementation, also dependency-free and
-  `no_std`. `defmt` forwards to `embedded-io/defmt` so `embedded_io::ErrorKind`
+- **`snowscsi-common`** — `std` (default), `log`, `defmt`, `bundle`,
+  `async-io`, `cipher`, `cipher-kdf`. The core seams are always compiled (no
+  feature gate). `bundle` enables the `FlatBundle` manifest/chunk I/O (the
+  canonical `SNOWBUNDLE` parser itself is always available). `async-io` adds
+  the asynchronous storage seams (`async fn` in trait, no runtime). `cipher`
+  adds the offset-addressed, length-preserving stream-cipher plane decorators
+  (`cipher::CipherPlane` / `AsyncCipherPlane` over
+  `FlatData`/`WritableFlatData`) and its ciphers; the feature is empty (no
+  runtime dependency) and the ciphers are allocation-free and `no_std`.
+  `cipher-kdf` (→`cipher`) adds the password-to-key derivation seam
+  (`cipher::Kdf`/`cipher::SoftKdf`) and an in-crate PBKDF2-HMAC-SHA256
+  implementation, also dependency-free and `no_std`. `defmt` forwards to `embedded-io/defmt` so `embedded_io::ErrorKind`
   implements `defmt::Format`; `std` + `defmt` is rejected at compile time
   (see below).
 - **`snowscsi-iso9660`** — `std` (default).

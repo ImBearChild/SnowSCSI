@@ -3371,7 +3371,7 @@ fn pending_io_buf<'a>(
             }
         }
         Direction::ToHost => bank.get_mut(offset..end).map(IoBuf::Read),
-        Direction::FromHost => bank.get(offset..end).map(IoBuf::Write),
+        Direction::FromHost => bank.get_mut(offset..end).map(IoBuf::Write),
     }
 }
 
@@ -3535,7 +3535,7 @@ mod tests {
                 Script::Write { len } => PollStep::Io(StorageOp::Write {
                     resource: 1,
                     offset: 0,
-                    buf: &data[..len],
+                    buf: &mut data[..len],
                 }),
                 Script::Prefetch { len } => PollStep::Prefetch(PrefetchOp::Read {
                     resource: 1,
@@ -3650,7 +3650,7 @@ mod tests {
             PollStep::Io(StorageOp::Write {
                 resource: 1,
                 offset: 0,
-                buf: &data[..8],
+                buf: &mut data[..8],
             })
         }
 

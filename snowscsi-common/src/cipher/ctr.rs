@@ -121,6 +121,12 @@ impl<C: CtrAccel> AesCtr<C> {
     }
 }
 
+impl<C: CtrAccel> super::NonceCipher for AesCtr<C> {
+    fn set_nonce(&mut self, nonce: [u8; 8]) {
+        self.nonce = nonce;
+    }
+}
+
 impl<C: CtrAccel> StreamCipher for AesCtr<C> {
     fn xor(&mut self, off: u64, buf: &mut [u8]) -> Result<(), CipherError> {
         // Reject an overflowing range before touching `buf`: a wrapped cursor

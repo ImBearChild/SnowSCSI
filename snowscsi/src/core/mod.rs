@@ -46,6 +46,8 @@
 //! `::core::…`; a bare `core::…` in this tree risks resolving ambiguously.
 
 pub mod async_wake;
+#[cfg(feature = "cipher")]
+pub mod cipher_store;
 pub mod collections;
 pub mod device;
 pub mod eject;
@@ -64,6 +66,8 @@ pub mod target;
 pub mod ua;
 
 pub use self::async_wake::{wait, AsyncWake};
+#[cfg(feature = "cipher")]
+pub use self::cipher_store::CipherStore;
 pub use self::collections::{cons, At, Cons, Here, Index, Nil, RuntimeSet, SlotSet, There};
 pub use self::device::{
     Admission, CommandContext, Control, DataPlan, Device, Direction, Feedback, FeedbackKind,

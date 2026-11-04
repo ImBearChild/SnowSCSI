@@ -760,7 +760,7 @@ impl Device for BlockDevice {
                         write: Some(WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..accepted],
+                            buf: &mut data[..accepted],
                         }),
                     };
                 }
@@ -772,7 +772,7 @@ impl Device for BlockDevice {
                 PollStep::Io(StorageOp::Write {
                     resource: 0,
                     offset: self.next_offset(),
-                    buf: &data[..accepted],
+                    buf: &mut data[..accepted],
                 })
             }
             // A missing companion (pool exhaustion) forces the previous write
@@ -788,9 +788,9 @@ impl Device for BlockDevice {
                 let (accepted, failed) = host_facts(fb, next_len);
                 self.effects.host_prefix = self.effects.host_prefix.saturating_add(accepted as u64);
                 let pending_buf = if pending_write.1 {
-                    &alt[..pending_write.0]
+                    &mut alt[..pending_write.0]
                 } else {
-                    &data[..pending_write.0]
+                    &mut data[..pending_write.0]
                 };
                 self.stage = Stage::WriteIo {
                     pending: pending_write,
@@ -856,13 +856,13 @@ impl Device for BlockDevice {
                         PollStep::Io(StorageOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &alt[..accepted],
+                            buf: &mut alt[..accepted],
                         })
                     } else {
                         PollStep::Io(StorageOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..accepted],
+                            buf: &mut data[..accepted],
                         })
                     };
                 }
@@ -881,7 +881,7 @@ impl Device for BlockDevice {
                         write: Some(WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &alt[..accepted],
+                            buf: &mut alt[..accepted],
                         }),
                     }
                 } else {
@@ -890,7 +890,7 @@ impl Device for BlockDevice {
                         write: Some(WriteOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..accepted],
+                            buf: &mut data[..accepted],
                         }),
                     }
                 }
@@ -951,13 +951,13 @@ impl Device for BlockDevice {
                         PollStep::Io(StorageOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &alt[..queued_len],
+                            buf: &mut alt[..queued_len],
                         })
                     } else {
                         PollStep::Io(StorageOp::Write {
                             resource: 0,
                             offset: self.next_offset(),
-                            buf: &data[..queued_len],
+                            buf: &mut data[..queued_len],
                         })
                     };
                 }

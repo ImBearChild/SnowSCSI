@@ -7,7 +7,7 @@ manual login through `harness.IscsiSession`), but the served LUN is a
 a RAM disk. On top of the usual login/format/mount/write/read/fsck checklist
 it asserts the FlatBundle side effects:
 
-- the `BUNDLE` header is written when the server creates the disk;
+- the `SNOWBUNDLE` manifest is written when the server creates the disk;
 - chunk files materialize on demand (`000000.img` after the first write and
   more chunks once the whole device has been written);
 - the directory is re-openable (the same `imgdir=` spec reloads geometry).
@@ -23,6 +23,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import zlib
 
 from harness import (
     IscsiSession,
@@ -86,7 +87,21 @@ class _BundleScenario:
     # ── helpers ─────────────────────────────────────────────────────
 
     def _chunk_names(self):
-        return sorted(n for n in os.listdir(self.bundle_dir) if n != "BUNDLE")
+        return sorted(n for n in os.listdir(self.bundle_dir) if n != "SNOWBUNDLE")
+
+    def _check_manifest(self, content):
+        """The manifest is canonical and its optional CRC covers the body."""
+        lines = content.splitlines(keepends=True)
+        self.assertTrue(lines, "empty manifest")
+        self.assertTrue(lines[-1].startswith("crc = "), "manifest has no CRC line")
+        body = "".join(lines[:-1]).encode("utf-8")
+        expected = int(lines[-1].split("=", 1)[1].strip(), 16)
+        self.assertEqual(
+            zlib.crc32(body) & 0xFFFFFFFF, expected, "manifest CRC mismatch"
+        )
+        self.assertIn("virtual_size =", content)
+        self.assertIn("chunk_size =", content)
+        self.assertIn("sector_size =", content)
 
     # ── tests ───────────────────────────────────────────────────────
 
@@ -98,12 +113,14 @@ class _BundleScenario:
             raise
 
     def _login_format_mount_write_read_fsck_chunks(self):
-        # The server created the disk: the BUNDLE header exists up front.
-        header = os.path.join(self.bundle_dir, "BUNDLE")
-        self.assertTrue(os.path.isfile(header), "BUNDLE header missing")
+        # The server created the disk: the SNOWBUNDLE manifest exists up front.
+        header = os.path.join(self.bundle_dir, "SNOWBUNDLE")
+        self.assertTrue(os.path.isfile(header), "SNOWBUNDLE manifest missing")
         with open(header, encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("magic = snow_flat_bnd", content)
+        self.assertIn("magic = snow_bundle", content)
+        self.assertIn("kind = flat", content)
+        self._check_manifest(content)
 
         dev = self.session.login(expected_bytes=SIZE_BYTES)
         self.assertTrue(os.path.exists(dev), f"device {dev} missing")
@@ -149,10 +166,10 @@ class _BundleScenario:
         self.session.logout()
         self.server.stop()
 
-        # Restart the server on the same bundle directory (no size= needed:
-        # the BUNDLE header already exists).
+        # Restart the server on the same bundle directory (no size=/chunk=
+        # needed: the SNOWBUNDLE manifest carries the geometry).
         self.server = ServerHandle(
-            "--block", f"imgdir={self.bundle_dir},chunk={CHUNK}", *self.EXTRA
+            "--block", f"imgdir={self.bundle_dir}", *self.EXTRA
         )
         self.server.__enter__()
         self.session = IscsiSession(self.server.addr)
