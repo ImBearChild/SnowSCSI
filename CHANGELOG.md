@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-ahead whenever a second caller bank exists (`FlatCdMedium`,
   `DvdRamMedium`, `VendorMedium`, `BlockDevice`). A command that fell back to
   the serial read-ahead no longer stays serial for the rest of the transfer.
+- **mmc**: the persistent `cdr-bundle` medium pre-reads the next recorded
+  segment with the send when the caller offers a second bank
+  (`poll_with_alt`), so a multi-segment track read overlaps storage with the
+  wire. A zero-filled gap, a track boundary or a caller without a second bank
+  keeps the serial path, and both paths deliver identical bytes.
 - **iscsi**: blocking `transport::serve_with_release` adds an eject callback
   that receives a host handback's `take_rt` result before the pair is dropped.
   The CLI uses it for `--wire blocking` (both inline and `--banks dual`), so an

@@ -263,6 +263,19 @@ enum Op {
     SaveToc,
 }
 
+/// One read segment starting at a byte offset inside the admitted read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Segment {
+    /// Recorded bytes: a backing read of `len` bytes at `resource`/`offset`.
+    Recorded {
+        resource: u16,
+        offset: u64,
+        len: usize,
+    },
+    /// Unrecorded bytes: zero-fill `len` bytes, no backing read.
+    Gap { len: usize },
+}
+
 /// Stage of the TOC save state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SaveStage {
@@ -322,6 +335,13 @@ pub struct CdrBundleMedium {
     progress: u32,
     /// Bytes of the current read/write chunk.
     chunk_len: usize,
+    /// The staged read chunk lives in the alternate caller bank (`alt`), so
+    /// the next `Send` must take it from there.
+    chunk_in_alt: bool,
+    /// Bank of the chunk the staged `Send` prefetches for the following step.
+    next_in_alt: bool,
+    /// Bytes of that prefetched chunk.
+    next_len: usize,
     /// The current write command created its track implicitly.
     implicit_created: bool,
     /// Fixed slot size in bytes.
@@ -408,6 +428,9 @@ impl CdrBundleMedium {
             phase: CdrBundleState::Idle,
             progress: 0,
             chunk_len: 0,
+            chunk_in_alt: false,
+            next_in_alt: false,
+            next_len: 0,
             implicit_created: false,
             slot_size,
             toc_seq: 0,
@@ -642,6 +665,9 @@ impl CdrBundleMedium {
         self.phase = CdrBundleState::Idle;
         self.progress = 0;
         self.chunk_len = 0;
+        self.chunk_in_alt = false;
+        self.next_in_alt = false;
+        self.next_len = 0;
         self.implicit_created = false;
         self.save = None;
     }
@@ -1609,27 +1635,27 @@ impl CdrBundleMedium {
         }
     }
 
-    /// Issue the next read segment, or zero-fill an unrecorded one.
-    fn next_read_step<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
-        let total = self.total_bytes();
-        let remaining = total.saturating_sub(self.progress as usize);
-        if remaining == 0 {
-            return self.finish(Completion::Good);
+    /// Pure projection of the read segment at `progress`, bounded by `bank_len`.
+    ///
+    /// `progress` is a byte offset into the admitted read, so the projection is
+    /// the same whether it describes the chunk to read now or the one a
+    /// prefetch should stage. `None` means the request cannot be staged (no
+    /// bytes left, no bank, or a zero-length segment).
+    fn segment_at(&self, progress: usize, bank_len: usize) -> Option<Segment> {
+        let remaining = self.total_bytes().saturating_sub(progress);
+        if remaining == 0 || bank_len == 0 {
+            return None;
         }
-        if data.is_empty() {
-            return self.finish(Completion::Check(INTERNAL_FAILURE));
-        }
-        let max_chunk = data.len();
         let Some(Op::Read { lba, kind, .. }) = self.op else {
-            return self.finish(Completion::Check(INTERNAL_FAILURE));
+            return None;
         };
         let block_bytes = u64::from(sector_len(kind));
         let pos = lba
             .saturating_mul(block_bytes)
-            .saturating_add(u64::from(self.progress));
+            .saturating_add(progress as u64);
         let current_lba = pos / block_bytes;
 
-        let recorded = self
+        if let Some(track) = self
             .tracks
             .iter()
             .find(|track| {
@@ -1637,25 +1663,22 @@ impl CdrBundleMedium {
                     && (track.data_start_lba..track.data_start_lba.saturating_add(track.written))
                         .contains(&current_lba)
             })
-            .copied();
-
-        if let Some(track) = recorded {
+            .copied()
+        {
             let segment_end = track
                 .data_start_lba
                 .saturating_add(track.written)
                 .saturating_mul(block_bytes);
             let available = segment_end.saturating_sub(pos);
-            let chunk = (remaining as u64).min(max_chunk as u64).min(available) as usize;
-            if chunk == 0 {
-                return self.finish(Completion::Check(INTERNAL_FAILURE));
+            let len = (remaining as u64).min(bank_len as u64).min(available) as usize;
+            if len == 0 {
+                return None;
             }
             let offset = pos.saturating_sub(track.data_start_lba.saturating_mul(block_bytes));
-            self.chunk_len = chunk;
-            self.phase = CdrBundleState::ReadIo;
-            return PollStep::Io(StorageOp::Read {
+            return Some(Segment::Recorded {
                 resource: track_resource(track.number),
                 offset,
-                buf: &mut data[..chunk],
+                len,
             });
         }
 
@@ -1666,20 +1689,111 @@ impl CdrBundleMedium {
                 boundary = at;
             }
         }
-        let chunk = (remaining as u64)
-            .min(max_chunk as u64)
+        let len = (remaining as u64)
+            .min(bank_len as u64)
             .min(boundary.saturating_sub(pos)) as usize;
-        if chunk == 0 {
+        if len == 0 {
+            return None;
+        }
+        Some(Segment::Gap { len })
+    }
+
+    /// Issue the next read segment, or zero-fill an unrecorded one.
+    ///
+    /// This is the serial path: it is taken after a plain send (no companion),
+    /// and it either starts a required read or delivers a zero-filled gap.
+    fn next_read_step<'a>(&mut self, data: &'a mut [u8]) -> PollStep<'a> {
+        if self.total_bytes().saturating_sub(self.progress as usize) == 0 {
+            return self.finish(Completion::Good);
+        }
+        let Some(segment) = self.segment_at(self.progress as usize, data.len()) else {
             return self.finish(Completion::Check(INTERNAL_FAILURE));
+        };
+        match segment {
+            Segment::Recorded {
+                resource,
+                offset,
+                len,
+            } => {
+                self.chunk_len = len;
+                self.chunk_in_alt = false;
+                self.phase = CdrBundleState::ReadIo;
+                PollStep::Io(StorageOp::Read {
+                    resource,
+                    offset,
+                    buf: &mut data[..len],
+                })
+            }
+            Segment::Gap { len } => {
+                data[..len].fill(0);
+                self.chunk_len = len;
+                self.chunk_in_alt = false;
+                self.phase = CdrBundleState::Deliver;
+                PollStep::Send {
+                    bytes: &data[..len],
+                    prefetch: None,
+                }
+            }
         }
-        for byte in &mut data[..chunk] {
-            *byte = 0;
+    }
+
+    /// Describe the recorded segment after the staged chunk.
+    ///
+    /// Pure projection: no stage, progress or bank state changes. A gap or a
+    /// second bank too small for one segment yields no companion (the serial
+    /// path handles those).
+    fn peek_prefetch(&self, data_len: usize, alt_len: usize) -> Option<(bool, u16, u64, usize)> {
+        if alt_len == 0 {
+            return None;
         }
-        self.chunk_len = chunk;
-        self.phase = CdrBundleState::Deliver;
-        PollStep::Send {
-            bytes: &data[..chunk],
-            prefetch: None,
+        let next_progress = self.progress as usize + self.chunk_len;
+        let use_alt = !self.chunk_in_alt;
+        let bank_len = if use_alt { alt_len } else { data_len };
+        match self.segment_at(next_progress, bank_len) {
+            Some(Segment::Recorded {
+                resource,
+                offset,
+                len,
+            }) => Some((use_alt, resource, offset, len)),
+            Some(Segment::Gap { .. }) | None => None,
+        }
+    }
+
+    /// Send the staged chunk, with the speculative read of the next segment
+    /// when a second caller bank and a recorded segment both exist.
+    ///
+    /// The only send path of a read, so a command that had to take the serial
+    /// step re-enters the pipeline on its next chunk instead of staying serial
+    /// for the rest of the transfer.
+    fn send_staged_with_prefetch<'a>(
+        &mut self,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
+        let peek = self.peek_prefetch(data.len(), alt.len());
+        self.next_in_alt = peek.is_some_and(|(in_alt, ..)| in_alt);
+        self.next_len = peek.map_or(0, |(_, _, _, len)| len);
+        let len = self.chunk_len;
+        if self.chunk_in_alt {
+            let bytes = &alt[..len];
+            let prefetch = peek.map(|(_, resource, offset, prefetch_len)| {
+                crate::core::storage::PrefetchOp::Read {
+                    resource,
+                    offset,
+                    buf: &mut data[..prefetch_len],
+                }
+            });
+            PollStep::Send { bytes, prefetch }
+        } else {
+            let bytes = &data[..len];
+            let prefetch = peek.map(|(_, resource, offset, prefetch_len)| {
+                crate::core::storage::PrefetchOp::Read {
+                    resource,
+                    offset,
+                    buf: &mut alt[..prefetch_len],
+                }
+            });
+            PollStep::Send { bytes, prefetch }
         }
     }
 
@@ -1766,6 +1880,9 @@ impl MmcMedium for CdrBundleMedium {
         self.phase = CdrBundleState::Idle;
         self.progress = 0;
         self.chunk_len = 0;
+        self.chunk_in_alt = false;
+        self.next_in_alt = false;
+        self.next_len = 0;
         self.implicit_created = false;
         // In Test Write mode the recording commands are simulations: they
         // report GOOD without changing the disc or touching the TOC. A real
@@ -1929,6 +2046,15 @@ impl MmcMedium for CdrBundleMedium {
     }
 
     fn poll<'a>(&mut self, fb: Feedback, data: &'a mut [u8]) -> PollStep<'a> {
+        self.poll_with_alt(fb, data, &mut [])
+    }
+
+    fn poll_with_alt<'a>(
+        &mut self,
+        fb: Feedback,
+        data: &'a mut [u8],
+        alt: &'a mut [u8],
+    ) -> PollStep<'a> {
         let total = self.total_bytes();
         match (self.phase, fb.kind()) {
             (CdrBundleState::Publish, FeedbackKind::Begin) => match self.op {
@@ -1982,10 +2108,33 @@ impl MmcMedium for CdrBundleMedium {
                     return self.finish(Completion::Check(MEDIUM_ERROR));
                 }
                 self.phase = CdrBundleState::Deliver;
-                PollStep::Send {
-                    bytes: &data[..chunk],
-                    prefetch: None,
+                self.send_staged_with_prefetch(data, alt)
+            }
+            (CdrBundleState::Deliver, FeedbackKind::HostSentWithIo) => {
+                let chunk = self.chunk_len;
+                let (accepted, failed) = match fb.host() {
+                    Some(receipt) => (receipt.accepted().min(chunk), receipt.error().is_some()),
+                    None => (0, true),
+                };
+                if failed || accepted < chunk {
+                    return self.finish(Completion::Check(COMMAND_ABORTED));
                 }
+                let Some(io) = fb.io() else {
+                    return self.finish(Completion::Check(INTERNAL_FAILURE));
+                };
+                self.progress = self.progress.saturating_add(chunk as u32);
+                if io.error().is_some() || io.confirmed() != self.next_len {
+                    // The speculative segment is optional: re-read the range
+                    // as a required read; the command outcome is unchanged.
+                    return self.next_read_step(data);
+                }
+                if (self.progress as usize) < total {
+                    self.chunk_in_alt = self.next_in_alt;
+                    self.chunk_len = self.next_len;
+                    self.phase = CdrBundleState::Deliver;
+                    return self.send_staged_with_prefetch(data, alt);
+                }
+                self.finish(Completion::Good)
             }
             (CdrBundleState::Deliver, FeedbackKind::HostSent) => {
                 let chunk = self.chunk_len;
@@ -2614,6 +2763,65 @@ mod tests {
                     feedback = Feedback::host_sent(HostReceipt::test(len, None));
                 }
                 PollStep::Complete(completion) => return (collected, completion),
+                other => panic!("unexpected read step: {other:?}"),
+            }
+        }
+    }
+
+    /// Drive a read with a second caller bank, honouring the prefetch the
+    /// medium attaches to a send. Returns the delivered bytes, the completion
+    /// and the number of companions actually issued.
+    #[allow(clippy::too_many_arguments)]
+    fn run_read_alt<B: Backing>(
+        medium: &mut CdrBundleMedium,
+        mock: &mut B,
+        op: MmcOp,
+        total: usize,
+        bank: usize,
+    ) -> (std::vec::Vec<u8>, Completion, usize) {
+        let mut data = std::vec![0u8; bank];
+        let mut alt = std::vec![0u8; bank];
+        assert_eq!(medium.begin(op), Ok(()));
+        let mut feedback = Feedback::begin();
+        let mut collected = std::vec::Vec::new();
+        let mut companions = 0;
+        loop {
+            match medium.poll_with_alt(feedback, &mut data, &mut alt) {
+                PollStep::Publish(plan) => {
+                    assert_eq!(plan.direction, Direction::ToHost);
+                    assert_eq!(plan.bytes, total as u64);
+                    feedback = Feedback::plan_accepted();
+                }
+                PollStep::Io(StorageOp::Read {
+                    resource,
+                    offset,
+                    buf,
+                }) => {
+                    let len = buf.len();
+                    mock.read_into(resource, offset, buf);
+                    feedback = Feedback::io_done(IoReceipt::test(len, None, Effect::Known));
+                }
+                PollStep::Send { bytes, prefetch } => {
+                    let len = bytes.len();
+                    collected.extend_from_slice(bytes);
+                    match prefetch {
+                        Some(crate::core::storage::PrefetchOp::Read {
+                            resource,
+                            offset,
+                            buf,
+                        }) => {
+                            let prefetch_len = buf.len();
+                            mock.read_into(resource, offset, buf);
+                            companions += 1;
+                            feedback = Feedback::host_sent_with_io(
+                                HostReceipt::test(len, None),
+                                IoReceipt::test(prefetch_len, None, Effect::Known),
+                            );
+                        }
+                        None => feedback = Feedback::host_sent(HostReceipt::test(len, None)),
+                    }
+                }
+                PollStep::Complete(completion) => return (collected, completion, companions),
                 other => panic!("unexpected read step: {other:?}"),
             }
         }
@@ -3678,6 +3886,145 @@ mod tests {
         assert_eq!(data.len(), 451 * 2048);
         assert_eq!(mock.reads, std::vec![(17, 0, 2048), (18, 0, 2048)]);
         assert!(data[2048..450 * 2048].iter().all(|byte| *byte == 0));
+    }
+
+    /// A read longer than the bank keeps the next recorded segment in flight
+    /// with every send when a second caller bank exists.
+    #[test]
+    fn a_two_bank_read_prefetches_the_next_segment() {
+        let mut medium = CdrBundleMedium::with_capacity(64);
+        let mut mock = Mock::default();
+        let payload = std::vec![0x5Au8; 8 * 2048];
+        assert_eq!(
+            run_write(&mut medium, &mut mock, 0, 8, &payload, 2048),
+            Completion::Good
+        );
+
+        let (single, completion) = run_read(&mut medium, &mut mock, 0, 8, 2048);
+        assert_eq!(completion, Completion::Good);
+        let (piped, completion, companions) = run_read_alt(
+            &mut medium,
+            &mut mock,
+            MmcOp::Read { lba: 0, blocks: 8 },
+            8 * 2048,
+            2048,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(piped, single, "the pipeline delivers the same bytes");
+        assert_eq!(companions, 7, "one companion per later segment");
+    }
+
+    /// Partial-sector banks stream and prefetch byte-exactly too.
+    #[test]
+    fn a_two_bank_read_below_one_sector_prefetches_too() {
+        let mut medium = CdrBundleMedium::with_capacity(8);
+        let mut mock = Mock::default();
+        let payload = [0x3Cu8; 2048];
+        assert_eq!(
+            run_write(&mut medium, &mut mock, 0, 1, &payload, 512),
+            Completion::Good
+        );
+
+        let (single, completion) = run_read(&mut medium, &mut mock, 0, 1, 512);
+        assert_eq!(completion, Completion::Good);
+        let (piped, completion, companions) = run_read_alt(
+            &mut medium,
+            &mut mock,
+            MmcOp::Read { lba: 0, blocks: 1 },
+            2048,
+            512,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(piped, single);
+        assert_eq!(companions, 3);
+    }
+
+    /// Unrecorded segments have nothing to read ahead: they are delivered from
+    /// the serial path and the pipeline resumes after them.
+    #[test]
+    fn a_two_bank_read_crosses_zero_segments() {
+        let mut medium = CdrBundleMedium::with_capacity(1024);
+        let mut mock = Mock::default();
+        let payload = std::vec![0x11u8; 2 * 2048];
+        assert_eq!(
+            run_write(&mut medium, &mut mock, 0, 2, &payload, 2048),
+            Completion::Good
+        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+        assert_eq!(
+            run_write(&mut medium, &mut mock, 450, 2, &payload, 2048),
+            Completion::Good
+        );
+        assert_eq!(close_track(&mut medium, &mut mock, 1), Completion::Good);
+
+        let (single, completion) = run_read(&mut medium, &mut mock, 0, 452, 2048);
+        assert_eq!(completion, Completion::Good);
+        let (piped, completion, companions) = run_read_alt(
+            &mut medium,
+            &mut mock,
+            MmcOp::Read {
+                lba: 0,
+                blocks: 452,
+            },
+            452 * 2048,
+            2048,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(piped, single);
+        assert_eq!(piped.len(), 452 * 2048);
+        assert!(
+            piped[2 * 2048..450 * 2048].iter().all(|byte| *byte == 0),
+            "the padding and pre-gap stay zero"
+        );
+        assert_eq!(
+            companions, 2,
+            "one companion per recorded pair, none across the gap"
+        );
+    }
+
+    /// Audio segments prefetch by byte with the 2352-byte sector size.
+    #[test]
+    fn a_two_bank_audio_read_prefetches_at_2352() {
+        let mut medium = CdrBundleMedium::with_capacity(16);
+        let mut mock = Mock::default();
+        let payload = std::vec![0x24u8; 4 * 2352];
+        assert_eq!(
+            run_write_kind(
+                &mut medium,
+                &mut mock,
+                0,
+                4,
+                &payload,
+                2352,
+                SectorKind::Audio2352
+            ),
+            Completion::Good
+        );
+        mock.reads.clear();
+
+        let (data, completion, companions) = run_read_alt(
+            &mut medium,
+            &mut mock,
+            MmcOp::ReadSectors {
+                lba: 0,
+                blocks: 4,
+                kind: SectorKind::Audio2352,
+            },
+            4 * 2352,
+            2352,
+        );
+        assert_eq!(completion, Completion::Good);
+        assert_eq!(data.len(), 4 * 2352);
+        assert_eq!(companions, 3, "one companion per audio sector");
+        assert_eq!(
+            mock.reads,
+            std::vec![
+                (17, 0, 2352),
+                (17, 2352, 2352),
+                (17, 4704, 2352),
+                (17, 7056, 2352),
+            ]
+        );
     }
 
     #[test]
