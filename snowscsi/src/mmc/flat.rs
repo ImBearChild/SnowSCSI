@@ -209,26 +209,6 @@ impl FlatCdMedium {
         })
     }
 
-    /// Send the staged chunk from the bank that holds it.
-    fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
-        // A plain send carries no read-ahead: never let a stale peek leak into
-        // a later combined settlement.
-        self.next_in_alt = false;
-        self.next_len = 0;
-        let len = self.chunk_len;
-        if self.chunk_in_alt {
-            PollStep::Send {
-                bytes: &alt[..len],
-                prefetch: None,
-            }
-        } else {
-            PollStep::Send {
-                bytes: &data[..len],
-                prefetch: None,
-            }
-        }
-    }
-
     /// Describe the speculative read of the chunk after the staged one.
     ///
     /// Pure projection: no stage, progress or bank state changes. A
@@ -251,8 +231,13 @@ impl FlatCdMedium {
         Some((use_alt, len, self.next_offset() + self.chunk_len as u64))
     }
 
-    /// Send the staged chunk together with the speculative read of the next
-    /// one, remembering where that chunk will land.
+    /// Send the staged chunk, with the speculative read of the next one when a
+    /// second caller bank and a following chunk both exist.
+    ///
+    /// This is the only send path, so a command that fell back to the serial
+    /// read-ahead (`alt` empty or too small) re-enters the pipeline on its next
+    /// chunk instead of staying serial for the rest of the transfer. With
+    /// nothing to read ahead the peek is `None` and the send is plain.
     fn send_chunk_with_prefetch<'a>(
         &mut self,
         data: &'a mut [u8],
@@ -431,7 +416,7 @@ impl MmcMedium for FlatCdMedium {
                     return self.read_chunk(data);
                 }
                 self.phase = FlatState::Deliver;
-                self.send_chunk(data, alt)
+                self.send_chunk_with_prefetch(data, alt)
             }
             (FlatState::Deliver, FeedbackKind::HostSent) => {
                 let chunk = self.chunk_len;
@@ -879,5 +864,59 @@ mod tests {
         assert_eq!(prefetches, 3, "three later chunks");
         assert_eq!(alt_prefetches, 2, "alternate bank carries the odd chunks");
         assert!(!m.active());
+    }
+
+    /// A command that fell back to the serial read-ahead re-enters the
+    /// two-bank pipeline on its next chunk instead of staying serial.
+    #[test]
+    fn a_serial_read_ahead_re_enters_the_prefetch_pipeline() {
+        let mut m = medium(1);
+        assert_eq!(m.begin(MmcOp::Read { lba: 0, blocks: 1 }), Ok(()));
+        let mut data = [0u8; 512];
+        let mut alt = [0u8; 512];
+        let alt_start = alt.as_ptr() as usize;
+        let data_start = data.as_ptr() as usize;
+        assert!(matches!(
+            m.poll_with_alt(Feedback::begin(), &mut data, &mut alt),
+            PollStep::Publish(_)
+        ));
+        assert!(matches!(
+            m.poll_with_alt(Feedback::plan_accepted(), &mut data, &mut alt),
+            PollStep::Io(StorageOp::Read { .. })
+        ));
+        // No second bank for this send: the command takes the serial path.
+        assert!(matches!(
+            m.poll_with_alt(io_receipt(512, None), &mut data, &mut []),
+            PollStep::Send { prefetch: None, .. }
+        ));
+        // The serial read-ahead lands in the second bank once it is offered.
+        assert!(matches!(
+            m.poll_with_alt(
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data,
+                &mut alt
+            ),
+            PollStep::Prefetch(crate::core::storage::PrefetchOp::Read { .. })
+        ));
+        // The send that follows carries the next read-ahead: the pipeline is
+        // re-entered rather than staying serial for the rest of the command.
+        match m.poll_with_alt(io_receipt(512, None), &mut data, &mut alt) {
+            PollStep::Send {
+                bytes,
+                prefetch: Some(crate::core::storage::PrefetchOp::Read { buf, .. }),
+            } => {
+                assert_eq!(
+                    bytes.as_ptr() as usize,
+                    alt_start,
+                    "send from the second bank"
+                );
+                assert_eq!(
+                    buf.as_ptr() as usize,
+                    data_start,
+                    "companion into the first"
+                );
+            }
+            other => panic!("expected a companion send, got {other:?}"),
+        }
     }
 }

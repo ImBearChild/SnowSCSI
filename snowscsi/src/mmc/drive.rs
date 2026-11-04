@@ -367,6 +367,12 @@ pub struct MmcDrive<M: MmcMedium> {
     io_issues: u32,
     /// Speculative prefetch operations issued by the medium (probe counter).
     prefetch_issues: u32,
+    /// Prefetches issued *together with* a data-in send (probe counter).
+    ///
+    /// Only these can overlap with the wire transfer; a standalone
+    /// [`PollStep::Prefetch`] is a serial read-ahead, so `prefetch_issues`
+    /// alone cannot prove overlap.
+    companion_issues: u32,
     /// Last SET CD SPEED read speed in kilobytes per second (`0xFFFF` = max).
     read_speed: u16,
     /// Last SET CD SPEED write speed in kilobytes per second (`0xFFFF` = max).
@@ -398,6 +404,7 @@ impl<M: MmcMedium> MmcDrive<M> {
             long: LongOp::Idle,
             io_issues: 0,
             prefetch_issues: 0,
+            companion_issues: 0,
             read_speed: 0,
             write_speed: 0,
             test_write: false,
@@ -455,6 +462,17 @@ impl<M: MmcMedium> MmcDrive<M> {
     #[must_use]
     pub const fn prefetch_issues(&self) -> u32 {
         self.prefetch_issues
+    }
+
+    /// Number of prefetches issued together with a data-in send (probe
+    /// counter, not a business API).
+    ///
+    /// These are the only prefetches that can overlap the wire transfer;
+    /// `prefetch_issues` also counts standalone (serial) read-ahead steps.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn companion_issues(&self) -> u32 {
+        self.companion_issues
     }
 
     /// Last requested SET CD SPEED `(read, write)` values in kilobytes per
@@ -1454,6 +1472,7 @@ impl<M: MmcMedium> MmcDrive<M> {
                         prefetch: Some(_), ..
                     } => {
                         self.prefetch_issues = self.prefetch_issues.saturating_add(1);
+                        self.companion_issues = self.companion_issues.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -4663,6 +4682,88 @@ mod tests {
         assert_eq!(prefetches, 2048 / 16 - 1);
         assert_eq!(dev.io_issues(), 1);
         assert_eq!(dev.prefetch_issues(), 2048 / 16 - 1);
+        assert_eq!(
+            dev.companion_issues(),
+            0,
+            "a single-bank caller never issues a send companion"
+        );
+        assert!(!dev.active());
+    }
+
+    /// With a second caller bank every chunk after the first is prefetched
+    /// *with* the send, and the companion counter separates those from the
+    /// serial read-ahead steps above.
+    #[test]
+    fn read_with_a_second_bank_issues_a_companion_per_chunk() {
+        let mut dev = drive(100);
+        let permit = permit();
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 2048), &read_cdb(0, 1)),
+            Ok(())
+        );
+        let mut data = [0u8; 16];
+        let mut alt = [0u8; 16];
+        let data_range = data.as_ptr_range();
+        let alt_range = alt.as_ptr_range();
+        match dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt) {
+            PollStep::Publish(plan) => assert_eq!(plan.bytes, 2048),
+            other => panic!("expected publish, got {other:?}"),
+        }
+        let mut fb = Feedback::plan_accepted();
+        let mut ios = 0;
+        let mut last_has_companion = None;
+        loop {
+            match dev.poll_with_alt(&permit, fb, &mut data, &mut alt) {
+                PollStep::Io(StorageOp::Read { buf, .. }) => {
+                    assert_eq!(buf.len(), 16);
+                    ios += 1;
+                    fb = Feedback::io_done(IoReceipt::test(16, None, Effect::Known));
+                }
+                PollStep::Prefetch(_) => {
+                    panic!("a second bank must never take the serial read-ahead path")
+                }
+                PollStep::Send { bytes, prefetch } => {
+                    assert_eq!(bytes.len(), 16);
+                    match prefetch {
+                        Some(crate::core::storage::PrefetchOp::Read { buf, .. }) => {
+                            assert_eq!(buf.len(), 16);
+                            // The companion lands in the other bank, never in
+                            // the one on the wire.
+                            let in_data = data_range.contains(&buf.as_ptr());
+                            let in_alt = alt_range.contains(&buf.as_ptr());
+                            assert!(in_data || in_alt, "companion buf is a caller bank");
+                            assert_ne!(
+                                in_alt,
+                                alt_range.contains(&bytes.as_ptr()),
+                                "companion and send must use different banks"
+                            );
+                            last_has_companion = Some(true);
+                            fb = Feedback::host_sent_with_io(
+                                HostReceipt::test(16, None),
+                                IoReceipt::test(16, None, Effect::Known),
+                            );
+                        }
+                        None => {
+                            last_has_companion = Some(false);
+                            fb = Feedback::host_sent(HostReceipt::test(16, None));
+                        }
+                    }
+                }
+                PollStep::Complete(completion) => {
+                    assert_eq!(completion, Completion::Good);
+                    break;
+                }
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(ios, 1, "only the first chunk is a required read");
+        assert_eq!(dev.prefetch_issues(), 2048 / 16 - 1);
+        assert_eq!(dev.companion_issues(), 2048 / 16 - 1);
+        assert_eq!(
+            last_has_companion,
+            Some(false),
+            "the last chunk has nothing to prefetch"
+        );
         assert!(!dev.active());
     }
 

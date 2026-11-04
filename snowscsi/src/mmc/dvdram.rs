@@ -236,26 +236,6 @@ impl DvdRamMedium {
         })
     }
 
-    /// Send the staged read chunk from the bank that holds it.
-    fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
-        // A plain send carries no read-ahead: never let a stale peek leak into
-        // a later combined settlement.
-        self.next_in_alt = false;
-        self.next_len = 0;
-        let len = self.chunk_len;
-        if self.chunk_in_alt {
-            PollStep::Send {
-                bytes: &alt[..len],
-                prefetch: None,
-            }
-        } else {
-            PollStep::Send {
-                bytes: &data[..len],
-                prefetch: None,
-            }
-        }
-    }
-
     /// Describe the speculative read of the chunk after the staged one.
     ///
     /// Pure projection: no stage, progress or bank state changes. A
@@ -278,8 +258,13 @@ impl DvdRamMedium {
         Some((use_alt, len, self.next_offset() + self.chunk_len as u64))
     }
 
-    /// Send the staged chunk together with the speculative read of the next
-    /// one, remembering where that chunk will land.
+    /// Send the staged chunk, with the speculative read of the next one when a
+    /// second caller bank and a following chunk both exist.
+    ///
+    /// This is the only send path, so a command that fell back to the serial
+    /// read-ahead (`alt` empty or too small) re-enters the pipeline on its next
+    /// chunk instead of staying serial for the rest of the transfer. With
+    /// nothing to read ahead the peek is `None` and the send is plain.
     fn send_chunk_with_prefetch<'a>(
         &mut self,
         data: &'a mut [u8],
@@ -484,7 +469,7 @@ impl MmcMedium for DvdRamMedium {
                     return self.read_chunk(data);
                 }
                 self.phase = DvdRamState::Deliver;
-                self.send_chunk(data, alt)
+                self.send_chunk_with_prefetch(data, alt)
             }
             (DvdRamState::Deliver, FeedbackKind::HostSent) => {
                 let chunk = self.chunk_len;

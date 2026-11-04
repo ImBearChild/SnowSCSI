@@ -129,6 +129,9 @@ pub struct BlockDevice {
     delivery: Delivery,
     io_issues: u32,
     prefetch_issues: u32,
+    /// Prefetches issued together with a data-in send: the only ones that can
+    /// overlap the wire transfer.
+    companion_issues: u32,
     /// The staged read chunk lives in the alternate caller bank (`alt`), so the
     /// next `Send` must take it from there.
     chunk_in_alt: bool,
@@ -165,6 +168,7 @@ impl BlockDevice {
             next_len: 0,
             io_issues: 0,
             prefetch_issues: 0,
+            companion_issues: 0,
         }
     }
 
@@ -194,6 +198,14 @@ impl BlockDevice {
     #[must_use]
     pub const fn prefetch_issues(&self) -> u32 {
         self.prefetch_issues
+    }
+
+    /// Number of prefetches issued together with a data-in send (probe
+    /// counter, not a business API).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn companion_issues(&self) -> u32 {
+        self.companion_issues
     }
 
     /// Confirmed effects observed from receipts (not a success flag).
@@ -470,26 +482,6 @@ impl BlockDevice {
         })
     }
 
-    /// Send the staged read chunk from the bank that holds it.
-    fn send_chunk<'a>(&mut self, data: &'a mut [u8], alt: &'a mut [u8]) -> PollStep<'a> {
-        // A plain send carries no read-ahead: never let a stale peek leak into
-        // a later combined settlement.
-        self.next_in_alt = false;
-        self.next_len = 0;
-        let len = self.chunk_len;
-        if self.chunk_in_alt {
-            PollStep::Send {
-                bytes: &alt[..len],
-                prefetch: None,
-            }
-        } else {
-            PollStep::Send {
-                bytes: &data[..len],
-                prefetch: None,
-            }
-        }
-    }
-
     /// Describe the speculative read of the chunk after the staged one.
     ///
     /// Pure projection: no stage, progress or bank state changes. The
@@ -513,8 +505,13 @@ impl BlockDevice {
         Some((use_alt, len, self.offset + next_progress as u64))
     }
 
-    /// Send the staged chunk together with the speculative read of the next
-    /// one, remembering where that chunk will land.
+    /// Send the staged chunk, with the speculative read of the next one when a
+    /// second caller bank and a following chunk both exist.
+    ///
+    /// This is the only send path, so a command that fell back to the serial
+    /// read-ahead (`alt` empty or too small) re-enters the pipeline on its next
+    /// chunk instead of staying serial for the rest of the transfer. With
+    /// nothing to read ahead the peek is `None` and the send is plain.
     fn send_chunk_with_prefetch<'a>(
         &mut self,
         data: &'a mut [u8],
@@ -525,6 +522,7 @@ impl BlockDevice {
         self.next_len = peek.map_or(0, |(_, len, _)| len);
         if peek.is_some() {
             self.prefetch_issues = self.prefetch_issues.saturating_add(1);
+            self.companion_issues = self.companion_issues.saturating_add(1);
         }
         let len = self.chunk_len;
         if self.chunk_in_alt {
@@ -719,7 +717,7 @@ impl Device for BlockDevice {
                     return self.read_chunk(data);
                 }
                 self.stage = Stage::Send;
-                self.send_chunk(data, alt)
+                self.send_chunk_with_prefetch(data, alt)
             }
             // WRITE: one-deep pipeline. The chunk being written is always the
             // bank that is not being received.
@@ -1338,6 +1336,11 @@ mod tests {
             ));
         }
         assert_eq!(dev.prefetch_issues(), 3, "chunks - 1");
+        assert_eq!(
+            dev.companion_issues(),
+            0,
+            "a single-bank caller never issues a send companion"
+        );
         assert_eq!(dev.io_issues(), 1, "only the first chunk is a normal read");
         assert!(matches!(
             dev.poll(
@@ -2177,10 +2180,69 @@ mod tests {
         ));
         assert_eq!(dev.io_issues(), 1, "only the first chunk is a normal read");
         assert_eq!(dev.prefetch_issues(), 3, "chunks - 1");
+        assert_eq!(
+            dev.companion_issues(),
+            3,
+            "each later chunk is prefetched with its send"
+        );
     }
 
     /// A short send ends the command even when its prefetch succeeded, and no
     /// further chunk is sent.
+    /// A command that fell back to the serial read-ahead re-enters the
+    /// two-bank pipeline on its next chunk instead of staying serial.
+    #[test]
+    fn a_serial_read_ahead_re_enters_the_prefetch_pipeline() {
+        let mut dev = BlockDevice::new(BlockAttrs::new(4, 512));
+        let permit = permit();
+        let mut data = [0u8; 512];
+        let mut alt = [0u8; 512];
+        let alt_start = alt.as_ptr() as usize;
+        let data_start = data.as_ptr() as usize;
+        assert_eq!(
+            dev.prepare(&permit, ctx(Direction::ToHost, 2048), &cdb10(READ_10, 0, 4)),
+            Ok(())
+        );
+        dev.poll_with_alt(&permit, Feedback::begin(), &mut data, &mut alt);
+        dev.poll_with_alt(&permit, Feedback::plan_accepted(), &mut data, &mut alt);
+        // No second bank for this send: the command takes the serial path.
+        assert!(matches!(
+            dev.poll_with_alt(&permit, io_receipt(512, None), &mut data, &mut []),
+            PollStep::Send { prefetch: None, .. }
+        ));
+        // The serial read-ahead lands in the second bank once it is offered.
+        assert!(matches!(
+            dev.poll_with_alt(
+                &permit,
+                Feedback::host_sent(HostReceipt::test(512, None)),
+                &mut data,
+                &mut alt
+            ),
+            PollStep::Prefetch(PrefetchOp::Read { .. })
+        ));
+        // The send that follows carries the next read-ahead: the pipeline is
+        // re-entered rather than staying serial for the rest of the command.
+        match dev.poll_with_alt(&permit, io_receipt(512, None), &mut data, &mut alt) {
+            PollStep::Send {
+                bytes,
+                prefetch: Some(PrefetchOp::Read { buf, .. }),
+            } => {
+                assert_eq!(
+                    bytes.as_ptr() as usize,
+                    alt_start,
+                    "send from the second bank"
+                );
+                assert_eq!(
+                    buf.as_ptr() as usize,
+                    data_start,
+                    "companion into the first"
+                );
+            }
+            other => panic!("expected a companion send, got {other:?}"),
+        }
+        assert_eq!(dev.companion_issues(), 1);
+    }
+
     #[test]
     fn short_send_with_a_successful_prefetch_aborts_the_command() {
         let mut dev = BlockDevice::new(BlockAttrs::new(2, 512));

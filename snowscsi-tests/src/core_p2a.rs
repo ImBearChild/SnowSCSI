@@ -777,6 +777,11 @@ fn read_larger_than_the_bank_streams_with_prefetch() {
     );
     assert_eq!(device.prefetch_issues(), 3, "chunks - 1 prefetches");
     assert_eq!(
+        device.companion_issues(),
+        0,
+        "a single-bank caller never issues a send companion"
+    );
+    assert_eq!(
         &host.inner().sent_data[..host.inner().sent_len],
         &storage.inner().data[..2048],
         "the streamed data is byte-exact"

@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **core**: `MmcDrive::companion_issues()` and `BlockDevice::companion_issues()`
+  count the prefetches issued *together with* a data-in send. `prefetch_issues`
+  also counts the serial single-bank read-ahead steps, so it cannot prove that
+  a read overlaps the wire; `companion_issues` can (a single-bank caller always
+  reports zero).
+- **core**: the send after a standalone prefetch now carries the next
+  read-ahead whenever a second caller bank exists (`FlatCdMedium`,
+  `DvdRamMedium`, `VendorMedium`, `BlockDevice`). A command that fell back to
+  the serial read-ahead no longer stays serial for the rest of the transfer.
 - **iscsi**: blocking `transport::serve_with_release` adds an eject callback
   that receives a host handback's `take_rt` result before the pair is dropped.
   The CLI uses it for `--wire blocking` (both inline and `--banks dual`), so an
