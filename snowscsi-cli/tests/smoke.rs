@@ -1519,3 +1519,125 @@ fn serve_reports_a_cdr_bundle_under_block() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--print-config` returns before the password is read, so an encrypted LUN
+/// never prompts (and does not need a sidecar) in that mode.
+#[cfg(feature = "cipher")]
+#[test]
+fn cipher_print_config_does_not_prompt() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_ciphercfg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    std::fs::write(&image, [0u8; 4096]).unwrap();
+    let password = dir.join("pw");
+    std::fs::write(&password, b"secret\n").unwrap();
+
+    let out = run(&[
+        "serve",
+        "--block",
+        &format!("img={},cipher", image.display()),
+        "--password-file",
+        &password.display().to_string(),
+        "--usb",
+        "--print-config",
+    ]);
+    assert!(
+        out.status.success(),
+        "print-config failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("backing=img"),
+        "print-config line:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("password:"),
+        "print-config must not prompt:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cipher-bearing image without its sidecar and one with a wrong-length key
+/// both fail hard instead of serving plaintext.
+#[cfg(feature = "cipher")]
+#[test]
+fn cipher_serve_rejects_missing_sidecar_and_bad_key() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cipherbad_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    std::fs::write(&image, [0u8; 4096]).unwrap();
+    let password = dir.join("pw");
+    std::fs::write(&password, b"secret\n").unwrap();
+
+    let out = run(&[
+        "serve",
+        "--block",
+        &format!("img={},cipher", image.display()),
+        "--password-file",
+        &password.display().to_string(),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot read manifest"), "got: {err}");
+
+    std::fs::write(
+        format!("{}.SNOWBUNDLE", image.display()),
+        b"magic = snow_bundle\nversion = 1\nkind = image\nsize = 4096\ncipher = xor\nkdf = none\nnonce = 0000000000000000\n",
+    )
+    .unwrap();
+    let key = dir.join("key.bin");
+    std::fs::write(&key, [0u8; 31]).unwrap();
+    let out = run(&[
+        "serve",
+        "--block",
+        &format!("img={},cipher,key={}", image.display(), key.display()),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("exactly 32 bytes"), "got: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cipher option is rejected at parse time for the removable-card demo and
+/// for non-file backings.
+#[cfg(feature = "cipher")]
+#[test]
+fn cipher_serve_rejects_removable_and_ram() {
+    let out = run(&[
+        "serve",
+        "--block",
+        "img=/tmp/card.img,removable,cipher",
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("removable is not supported with cipher"),
+        "got: {err}"
+    );
+
+    let out = run(&[
+        "serve",
+        "--block",
+        "ram=1M,cipher",
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("only valid with img= or bundle="),
+        "got: {err}"
+    );
+}

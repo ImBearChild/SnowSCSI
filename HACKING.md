@@ -42,8 +42,8 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 │       ├── usb/                   # feature "usb": bot, gadget, io, target
 │       └── dvdram.rs            # feature "dvdram": blank, host-formatted DVD-RAM media
 ├── snowscsi-cli/                 # crate: `snowscsi` binary (src/main.rs)
-│   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/bundle/cdr-bundle/log/tokio/defmt
-│   └── src/main.rs               # #![forbid(unsafe_code)]; serve + mkisofs + bundle-create/info
+│   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/bundle/cdr-bundle/cipher/log/tokio/defmt
+│   └── src/{main,spec,stack,cipher}.rs  # #![forbid(unsafe_code)]; serve + mkisofs + bundle-create/info
 ├── tests/                         # crate: snowscsi-tests (integration tests)
 │   ├── Cargo.toml
 │   ├── build.rs                  # probes libiscsi (cfg has_libiscsi), compiles c/iscsi_access.c
@@ -103,8 +103,11 @@ Feature maps:
   `[target.'cfg(target_os = "linux")'.dependencies]`.
 - **`snowscsi-cli`** — `full` (default) pulls `std` +
   `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`bundle`/`cdr-bundle`
-  (→`bundle` in this crate)/`log`/`tokio` plus
-  std-only deps (clap/ctrlc/env_logger). Builds against `snowscsi` with
+  (→`bundle` in this crate)/`cipher`/`log`/`tokio` plus
+  std-only deps (clap/ctrlc/env_logger). `cipher` (→`snowscsi/cipher` +
+  `snowscsi/cipher-kdf`) adds the `cipher`/`key=` serve options for `img=` and
+  flat `bundle=` LUNs, the AES-256 CTR backend and `--password-file`; it does
+  not wire CD-R `CipherStore` yet. Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other

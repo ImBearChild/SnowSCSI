@@ -19,6 +19,8 @@ use core::task::Poll;
 
 use snowscsi::block::BlockDevice;
 use snowscsi::cdrom::media::LiveData;
+#[cfg(feature = "cipher")]
+use snowscsi::common::cipher::CipherPlane;
 #[cfg(feature = "bundle")]
 use snowscsi::common::flat_bundle::FlatBundle;
 #[cfg(feature = "cdr-bundle")]
@@ -46,6 +48,9 @@ use snowscsi::mmc::{
 };
 use snowscsi::scsi::backend::FileBackend;
 use snowscsi::scsi::fs_backend::StdFsBackend;
+
+#[cfg(feature = "cipher")]
+use crate::cipher::CliCipher;
 
 #[cfg(feature = "tokio")]
 pub mod tokio_conn;
@@ -82,6 +87,9 @@ pub enum OwnedPlane {
     /// track files (see [`BundleStore`]).
     #[cfg(feature = "cdr-bundle")]
     CdrBundle(BundleStore),
+    /// Encrypting view over another owned plane.
+    #[cfg(feature = "cipher")]
+    Cipher(Box<CipherPlane<OwnedPlane, CliCipher>>),
     /// Live ISO9660 directory scan (read-only).
     Live(LiveData<StdFsBackend>),
 }
@@ -672,6 +680,8 @@ impl OwnedPlane {
         match self {
             #[cfg(feature = "bundle")]
             Self::Bundle(bundle) => Some(bundle.sector_size()),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => plane.inner().sector_size(),
             _ => None,
         }
     }
@@ -685,6 +695,8 @@ impl OwnedPlane {
             Self::Bundle(bundle) => !bundle.is_read_only(),
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(_) => true,
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => plane.inner().is_writable(),
             Self::BlockRo(_) | Self::Live(_) => false,
         }
     }
@@ -692,7 +704,12 @@ impl OwnedPlane {
     /// Whether this plane is the persistent CD-R directory store.
     #[cfg(feature = "cdr-bundle")]
     pub(crate) fn is_cdr_bundle(&self) -> bool {
-        matches!(self, Self::CdrBundle(_))
+        match self {
+            Self::CdrBundle(_) => true,
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => plane.inner().is_cdr_bundle(),
+            _ => false,
+        }
     }
 
     /// Whether this plane is the persistent CD-R directory store.
@@ -775,6 +792,8 @@ impl FlatData for OwnedPlane {
             // offset on the plane.
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(_) => Err(StorageError::Unsupported),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => FlatData::read_at(&mut **plane, off, buf),
             Self::Live(live) => live.read_at(off, buf),
         }
     }
@@ -787,6 +806,8 @@ impl FlatData for OwnedPlane {
             Self::Bundle(bundle) => bundle.capacity(),
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(store) => store.capacity_bytes(),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => FlatData::capacity(&**plane),
             Self::Live(live) => live.capacity(),
         }
     }
@@ -804,6 +825,8 @@ impl WritableFlatData for OwnedPlane {
             Self::Bundle(bundle) => bundle.write_at(off, buf),
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(_) => Err(StorageError::Unsupported),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => WritableFlatData::write_at(&mut **plane, off, buf),
             _ => Err(StorageError::NotWritable),
         }
     }
@@ -815,6 +838,8 @@ impl WritableFlatData for OwnedPlane {
             Self::Bundle(bundle) => bundle.sync(),
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(store) => store.sync().map(|_| ()),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => WritableFlatData::sync(&mut **plane),
             // A read-only plane, or memory that already is the store.
             Self::BlockRo(_) | Self::Live(_) | Self::Ram { .. } => Ok(()),
         }
@@ -840,6 +865,8 @@ impl WritableFlatData for OwnedPlane {
             Self::Bundle(bundle) => bundle.fill_at(off, len, byte),
             #[cfg(feature = "cdr-bundle")]
             Self::CdrBundle(_) => Err(StorageError::Unsupported),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(plane) => WritableFlatData::fill_at(&mut **plane, off, len, byte),
             _ => Err(StorageError::NotWritable),
         }
     }

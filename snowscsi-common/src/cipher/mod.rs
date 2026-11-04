@@ -233,6 +233,16 @@ impl<D, C, const SCRATCH: usize> CipherPlane<D, C, SCRATCH> {
     pub fn into_parts(self) -> (D, C) {
         (self.inner, self.cipher)
     }
+
+    /// Borrow the wrapped plane.
+    pub fn inner(&self) -> &D {
+        &self.inner
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn inner_mut(&mut self) -> &mut D {
+        &mut self.inner
+    }
 }
 
 impl<D: FlatData, C: StreamCipher, const SCRATCH: usize> FlatData for CipherPlane<D, C, SCRATCH> {
@@ -346,6 +356,16 @@ impl<D, C, const SCRATCH: usize> AsyncCipherPlane<D, C, SCRATCH> {
     /// Give back the wrapped plane and the cipher.
     pub fn into_parts(self) -> (D, C) {
         (self.inner, self.cipher)
+    }
+
+    /// Borrow the wrapped plane.
+    pub fn inner(&self) -> &D {
+        &self.inner
+    }
+
+    /// Mutably borrow the wrapped plane.
+    pub fn inner_mut(&mut self) -> &mut D {
+        &mut self.inner
     }
 }
 

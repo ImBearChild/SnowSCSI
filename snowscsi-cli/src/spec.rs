@@ -9,6 +9,7 @@
 //! backing := img=<file> | bundle=<dir> | ram=<size> | live=<dir>
 //!          | dvdram=<path|ram:<size>> | empty
 //! opt     := profile=block|cd | ro | sector=512|2048 | size=<size> | removable
+//!          | cipher[=<manifest|sidecar>] | key=<path>
 //! ```
 //!
 //! `bundle=<dir>` names a directory that must already contain a canonical
@@ -17,6 +18,12 @@
 //! directory, manifest or TOC: `snowscsi bundle-create` is the only creator,
 //! although serving does create chunk/track files and write TOC snapshots.
 //! `snowscsi bundle-info` reports what a directory or sidecar describes.
+//!
+//! `cipher` marks an `img=` or `bundle=` LUN as encrypted; its key material
+//! comes from the manifest (KDF + salt + nonce) and either a password or a
+//! `key=<path>` file. `cipher=<path>` overrides the manifest location (the
+//! default is `<dir>/SNOWBUNDLE` for a bundle and `<file>.SNOWBUNDLE` for an
+//! image). `removable` and the non-file backings cannot carry a cipher.
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
 //! exists, or which `kind` a `bundle=` manifest carries, is decided when the
@@ -82,6 +89,14 @@ pub struct PlaneOpts {
     pub size: Option<u64>,
 }
 
+/// Cipher selection for a device, if any.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CipherSpec {
+    /// Explicit manifest/sidecar path (`cipher=<path>`), or `None` for the
+    /// backing's default location.
+    pub meta: Option<String>,
+}
+
 /// One parsed device, ready to be built.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DeviceSpec {
@@ -94,6 +109,11 @@ pub struct DeviceSpec {
     /// ejects it). Only legal for `--block img=<file>` without
     /// `profile=cd`; the `--usb` demo uses it for a card reader.
     pub removable: bool,
+    /// The LUN is encrypted (`cipher` / `cipher=<path>`).
+    pub cipher: Option<CipherSpec>,
+    /// Raw key file (`key=<path>`); only meaningful with [`Self::cipher`].
+    /// The password is never stored here.
+    pub key: Option<String>,
 }
 
 /// Parse every `--block` then every `--cdrom` value into LUN order.
@@ -192,6 +212,8 @@ pub fn parse_device_spec(input: &str, family: DeviceFamily) -> Result<DeviceSpec
             size,
         },
         removable: opts.removable,
+        cipher: opts.cipher.map(|meta| CipherSpec { meta }),
+        key: opts.key,
     })
 }
 
@@ -301,6 +323,34 @@ fn check_opts(
     backing: &Backing,
     opts: &RawOpts,
 ) -> Result<(), String> {
+    // A build without the cipher layer keeps the spec fields but rejects the
+    // options: the plane decorator and key derivation are compiled out.
+    #[cfg(not(feature = "cipher"))]
+    if opts.cipher.is_some() || opts.key.is_some() {
+        return Err(
+            "cipher/key= requires the `cipher` feature: rebuild with --features cipher".to_string(),
+        );
+    }
+    #[cfg(feature = "cipher")]
+    {
+        if opts.cipher.is_some() && !matches!(backing, Backing::Img { .. } | Backing::Bundle { .. })
+        {
+            return Err("cipher is only valid with img= or bundle=<dir>".to_string());
+        }
+        if opts.cipher.is_some() && opts.removable {
+            // The card-insert path runs after the password is gone, so an
+            // encrypted removable card cannot be re-opened in place.
+            return Err(
+                "removable is not supported with cipher (the password would be gone after \
+                 the card is inserted)"
+                    .to_string(),
+            );
+        }
+        if opts.key.is_some() && opts.cipher.is_none() {
+            return Err("key= requires cipher".to_string());
+        }
+    }
+
     let is_bundle = matches!(backing, Backing::Bundle { .. });
     let is_dvdram_file = matches!(backing, Backing::DvdRam { path: Some(_) });
 
@@ -362,6 +412,10 @@ struct RawOpts {
     size: Option<u64>,
     removable: bool,
     removable_seen: bool,
+    /// `None` = absent, `Some(None)` = bare `cipher`, `Some(Some(path))` =
+    /// `cipher=<path>`.
+    cipher: Option<Option<String>>,
+    key: Option<String>,
 }
 
 fn parse_opts(s: &str) -> Result<RawOpts, String> {
@@ -401,6 +455,27 @@ fn parse_opts(s: &str) -> Result<RawOpts, String> {
             }
             o.removable_seen = true;
             o.removable = true;
+        } else if opt == "cipher" {
+            if o.cipher.is_some() {
+                return Err("duplicate cipher".to_string());
+            }
+            o.cipher = Some(None);
+        } else if let Some(v) = opt.strip_prefix("cipher=") {
+            if o.cipher.is_some() {
+                return Err("duplicate cipher".to_string());
+            }
+            if v.is_empty() {
+                return Err("empty cipher= path".to_string());
+            }
+            o.cipher = Some(Some(v.to_string()));
+        } else if let Some(v) = opt.strip_prefix("key=") {
+            if o.key.is_some() {
+                return Err("duplicate key=".to_string());
+            }
+            if v.is_empty() {
+                return Err("empty key= path".to_string());
+            }
+            o.key = Some(v.to_string());
         } else {
             // The old bundle-creation knobs live on `snowscsi bundle-create`
             // now; name them so a stale command line is actionable.
@@ -866,5 +941,83 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("more than one LUN"), "{err}");
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_grammar_accepts_img_and_bundle() {
+        let img = block("img=disk.img,cipher").unwrap();
+        assert_eq!(img.cipher, Some(CipherSpec { meta: None }));
+        assert_eq!(img.key, None);
+
+        let bundle = block("bundle=tree,cipher=/tmp/m").unwrap();
+        assert_eq!(
+            bundle.cipher,
+            Some(CipherSpec {
+                meta: Some("/tmp/m".to_string())
+            })
+        );
+
+        let keyed = cdrom("img=boot.iso,cipher,key=/tmp/key.bin").unwrap();
+        assert_eq!(keyed.cipher, Some(CipherSpec { meta: None }));
+        assert_eq!(keyed.key.as_deref(), Some("/tmp/key.bin"));
+
+        let cd = cdrom("bundle=tree,cipher").unwrap();
+        assert_eq!(cd.cipher, Some(CipherSpec { meta: None }));
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_grammar_rejects_illegal_backings() {
+        // `ram=` is block-only, the other two are cdrom-only.
+        for (parse, spec) in [
+            (
+                block as fn(&str) -> Result<DeviceSpec, String>,
+                "ram=1M,cipher",
+            ),
+            (cdrom, "live=tree,cipher"),
+            (cdrom, "dvdram=disc.img,cipher"),
+        ] {
+            let err = parse(spec).expect_err("illegal cipher backing must be rejected");
+            assert!(
+                err.contains("only valid with img= or bundle="),
+                "{spec}: {err}"
+            );
+        }
+        // `empty` takes no options at all, so the generic option gate wins.
+        assert!(cdrom("empty,cipher").is_err());
+
+        let err = block("img=card.img,removable,cipher").unwrap_err();
+        assert!(
+            err.contains("removable is not supported with cipher"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_grammar_rejects_key_alone_duplicates_and_empty_paths() {
+        assert!(block("img=x,key=/tmp/k")
+            .unwrap_err()
+            .contains("requires cipher"));
+        assert!(block("img=x,cipher,cipher=/tmp/m").is_err());
+        assert!(block("img=x,cipher=/tmp/a,cipher=/tmp/b").is_err());
+        assert!(block("img=x,cipher,key=/tmp/a,key=/tmp/b").is_err());
+        assert!(block("img=x,cipher=").is_err());
+        assert!(block("img=x,cipher,key=").is_err());
+    }
+
+    #[cfg(not(feature = "cipher"))]
+    #[test]
+    fn cipher_options_require_the_feature() {
+        for spec in ["img=disk.img,cipher", "bundle=tree,cipher=/tmp/m"] {
+            let err = block(spec).expect_err("cipher is compiled out");
+            assert!(
+                err.contains("requires the `cipher` feature"),
+                "{spec}: {err}"
+            );
+        }
+        let err = block("img=disk.img,cipher,key=/tmp/k").expect_err("key is compiled out");
+        assert!(err.contains("requires the `cipher` feature"), "{err}");
     }
 }

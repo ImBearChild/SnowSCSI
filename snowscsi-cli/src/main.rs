@@ -14,7 +14,7 @@
 //! Devices are declared with two repeatable flags sharing one grammar
 //! (`<backing>[=<value>][,<option>...]`): `--block` and `--cdrom`.
 //!
-//! - `--block` drives `BlockDevice`: `img=<file>[,ro][,removable]`,
+//! - `--block` drives `BlockDevice`: `img=<file>[,ro][,removable][,cipher]`,
 //!   `bundle=<dir>` (directory-chunked flat disk from its `SNOWBUNDLE`
 //!   manifest; `bundle` feature), `ram=<size>` (K/M/G suffixes), or a
 //!   `profile=cd` optical variant (read-only PDT 0x05, 2048 B sectors).
@@ -32,6 +32,13 @@
 //!   another session) and, on a CD-RW, `wodim blank=fast|all`. SAO/DAO is not
 //!   implemented.
 //!
+//! `cipher` on an `img=` or flat `bundle=` LUN reads the manifest (the
+//! `<file>.SNOWBUNDLE` sidecar, `<dir>/SNOWBUNDLE`, or an explicit
+//! `cipher=<path>`), derives the key from the global password
+//! (`--password-file`, or stdin **with echo**) or `key=<path>`, and serves the
+//! bytes through the cipher plane. It is never a plaintext fallback: a missing,
+//! malformed or cipher-less manifest is a hard error.
+//!
 //! `serve` never creates the bundle directory or manifest: `snowscsi
 //! bundle-create flat …` or `snowscsi bundle-create cdr …` must create them
 //! first (serving does create chunk/track files and write TOC snapshots).
@@ -45,6 +52,8 @@
 //! loop by a runtime notification, the serve call returns, and every store
 //! plane is `sync()`ed before exit.
 
+#[cfg(feature = "cipher")]
+mod cipher;
 mod spec;
 mod stack;
 
@@ -67,12 +76,14 @@ use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
 use snowscsi::bundle::{identify_dir, identify_manifest, Identified};
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::media::LiveData;
-#[cfg(feature = "cdr-bundle")]
+#[cfg(any(feature = "cdr-bundle", feature = "cipher"))]
 use snowscsi::common::bundle::MANIFEST_NAME;
-#[cfg(any(feature = "bundle", feature = "cdr-bundle"))]
+#[cfg(any(feature = "bundle", feature = "cdr-bundle", feature = "cipher"))]
 use snowscsi::common::bundle::{BundleKind, BundleMeta};
 #[cfg(feature = "bundle")]
-use snowscsi::common::bundle::{CipherAlg, KdfKind, MAX_MANIFEST, SIDECAR_SUFFIX};
+use snowscsi::common::bundle::{CipherAlg, KdfKind};
+#[cfg(any(feature = "bundle", feature = "cipher"))]
+use snowscsi::common::bundle::{MAX_MANIFEST, SIDECAR_SUFFIX};
 #[cfg(feature = "bundle")]
 use snowscsi::common::flat_bundle::{validate_geometry, FlatBundle};
 #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
@@ -218,6 +229,8 @@ struct ServeArgs {
     /// (read-only optical profile). `removable` is a USB card-reader demo:
     /// `--block img=<file>,removable` reports RMB and lets the host eject the
     /// card; replacing the file installs a new card at the same LUN.
+    /// Add `,cipher` (and optionally `,key=<path>`) to serve an encrypted
+    /// image or flat bundle (`--password-file`, or an echoed stdin prompt).
     /// Repeatable; `--block` LUNs come first in declaration order.
     #[arg(long = "block", value_name = "SPEC")]
     block: Vec<String>,
@@ -234,8 +247,9 @@ struct ServeArgs {
     /// files and write TOC snapshots).
     /// A recordable bundle is written only in Track-at-Once: `wodim -tao`
     /// (also `-audio` for CD-DA and `-multi` for another session) and, on a
-    /// CD-RW, `wodim blank=fast|all`; SAO/DAO is not implemented. Repeatable;
-    /// these LUNs follow the `--block` LUNs.
+    /// CD-RW, `wodim blank=fast|all`; SAO/DAO is not implemented. Add
+    /// `,cipher` to an `img=` or flat `bundle=` LUN to serve it encrypted.
+    /// Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
 
@@ -323,6 +337,15 @@ struct ServeArgs {
     /// directories are validated, but no transport is started).
     #[arg(long = "print-config")]
     print_config: bool,
+
+    /// Password for encrypted (`cipher`) LUNs, read from a file (one line,
+    /// at most 1024 bytes). The password is global to every encrypted LUN;
+    /// each manifest supplies its own salt and nonce. Without this flag the
+    /// password is read from stdin: prompted on a terminal (echo enabled —
+    /// there is no termios dependency) or a single line from a pipe. `--help`
+    /// warns that a terminal echo is visible.
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_file: Option<String>,
 
     /// Allocate a separate long-operation buffer (`--banks single` only).
     ///
@@ -529,20 +552,140 @@ fn run_serve(args: ServeArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Password handling happens after `--print-config` (which must not
+    // prompt) and before any plane is built. A password is only needed when an
+    // encrypted LUN has no `key=` file.
+    let password = match read_serve_password(&args, &specs) {
+        Ok(password) => password,
+        Err(msg) => {
+            eprintln!("snowscsi: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Both transports drive the seam-first core `Target`: only one transport
     // is selected at a time.
     if args.usb.is_none() {
-        return run_serve_iscsi(args, &specs, &config);
+        return run_serve_iscsi(args, &specs, &config, password.as_deref());
     }
     #[cfg(target_os = "linux")]
     {
         let selector = args.usb.as_deref().unwrap_or("auto");
-        return run_serve_usb(&args, &specs, &config, selector, removable_lun);
+        return run_serve_usb(
+            &args,
+            &specs,
+            &config,
+            selector,
+            removable_lun,
+            password.as_deref(),
+        );
     }
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("snowscsi: --usb is only supported on Linux");
         ExitCode::FAILURE
+    }
+}
+
+/// Resolve the (single, global) password for encrypted LUNs.
+///
+/// `None` means no encrypted LUN needs one: either there is no `cipher` LUN or
+/// every encrypted LUN supplies `key=<path>`. `--password-file` with no
+/// encrypted LUN is a configuration error rather than a silent no-op.
+fn read_serve_password(args: &ServeArgs, specs: &[DeviceSpec]) -> Result<Option<Vec<u8>>, String> {
+    let any_cipher = specs.iter().any(|spec| spec.cipher.is_some());
+    let needs_password = specs
+        .iter()
+        .any(|spec| spec.cipher.is_some() && spec.key.is_none());
+    match args.password_file.as_deref() {
+        Some(path) => {
+            if !any_cipher {
+                return Err("--password-file was given but no LUN uses cipher".to_string());
+            }
+            if !needs_password {
+                return Err(
+                    "--password-file was given but every encrypted LUN uses key=<path>".to_string(),
+                );
+            }
+            read_password_file(path).map(Some)
+        }
+        None if needs_password => read_password_prompt().map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Maximum accepted password length (bytes, after one trailing newline).
+const MAX_PASSWORD: usize = 1024;
+
+/// Read one password line from `path`.
+fn read_password_file(path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let file = File::open(path).map_err(|e| format!("cannot read password file '{path}': {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PASSWORD as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read password file '{path}': {e}"))?;
+    strip_password_newline(&mut bytes);
+    if bytes.len() > MAX_PASSWORD {
+        return Err(format!(
+            "password file '{path}' is larger than {MAX_PASSWORD} bytes"
+        ));
+    }
+    if bytes.iter().any(|&b| b == b'\n' || b == b'\r') {
+        return Err(format!(
+            "password file '{path}' must contain one line without embedded newlines"
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err(format!("password file '{path}' contains a NUL byte"));
+    }
+    if bytes.is_empty() {
+        return Err(format!("password file '{path}' is empty"));
+    }
+    Ok(bytes)
+}
+
+/// Read one password line from stdin.
+///
+/// On a terminal the prompt echoes (no termios dependency); a pipe is read
+/// without a prompt. The line is capped at [`MAX_PASSWORD`].
+fn read_password_prompt() -> Result<Vec<u8>, String> {
+    use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
+
+    let terminal = std::io::stdin().is_terminal();
+    if terminal {
+        eprint!("password: ");
+        let _ = std::io::stderr().flush();
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_PASSWORD as u64 + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|e| format!("failed to read the password from stdin: {e}"))?;
+    strip_password_newline(&mut bytes);
+    if bytes.len() > MAX_PASSWORD {
+        return Err(format!(
+            "password is larger than {MAX_PASSWORD} bytes (streams: use --password-file for a file)"
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err("password contains a NUL byte".to_string());
+    }
+    if bytes.is_empty() {
+        return Err("empty password".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Drop one trailing `\n` or `\r\n`.
+fn strip_password_newline(bytes: &mut Vec<u8>) {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
     }
 }
 
@@ -639,6 +782,7 @@ fn build_core_slots(
     specs: &[DeviceSpec],
     planes: &mut Vec<Option<OwnedPlane>>,
     slots: &mut Vec<CliLu>,
+    password: Option<&[u8]>,
 ) -> Result<(), ()> {
     if specs.is_empty() {
         eprintln!("snowscsi: --block or --cdrom is required (at least one device)");
@@ -647,7 +791,7 @@ fn build_core_slots(
     for w in spec::check_dual_mount(specs) {
         eprintln!("{w}");
     }
-    let built = build_planes(specs)?;
+    let built = build_planes(specs, password)?;
 
     planes.clear();
     slots.clear();
@@ -815,10 +959,15 @@ fn build_core_slots(
 
 /// `snowscsi serve --iscsi`: bind the portal, build the core target and drive
 /// the session shell until shutdown.
-fn run_serve_iscsi(args: ServeArgs, specs: &[DeviceSpec], config: &ServeConfig) -> ExitCode {
+fn run_serve_iscsi(
+    args: ServeArgs,
+    specs: &[DeviceSpec],
+    config: &ServeConfig,
+    password: Option<&[u8]>,
+) -> ExitCode {
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(specs, &mut planes, &mut slots).is_err() {
+    if build_core_slots(specs, &mut planes, &mut slots, password).is_err() {
         return ExitCode::FAILURE;
     }
     let mut table: Vec<&mut dyn Lu<Pair = CliPair>> = slots
@@ -1040,12 +1189,20 @@ fn pool_capable(specs: &[DeviceSpec], config: &ServeConfig) -> bool {
 /// Whether every built plane can be handed to the asynchronous backend.
 #[cfg(feature = "tokio")]
 fn supports_async(planes: &[Option<OwnedPlane>]) -> bool {
-    planes.iter().all(|plane| {
-        matches!(
-            plane,
-            Some(OwnedPlane::BlockRo(_) | OwnedPlane::BlockRw(_) | OwnedPlane::Ram { .. })
-        )
-    })
+    planes
+        .iter()
+        .all(|plane| plane.as_ref().is_some_and(plane_is_async))
+}
+
+/// Whether one plane has an asynchronous byte backend.
+#[cfg(feature = "tokio")]
+fn plane_is_async(plane: &OwnedPlane) -> bool {
+    match plane {
+        OwnedPlane::BlockRo(_) | OwnedPlane::BlockRw(_) | OwnedPlane::Ram { .. } => true,
+        #[cfg(feature = "cipher")]
+        OwnedPlane::Cipher(plane) => plane_is_async(plane.inner()),
+        _ => false,
+    }
 }
 
 /// One asynchronous byte plane behind a LUN.
@@ -1085,30 +1242,71 @@ fn io_err(e: std::io::Error) -> StorageError {
 #[cfg(feature = "tokio")]
 struct AsyncBackends {
     luns: Vec<Option<AsyncPlane>>,
+    /// One stream cipher per LUN, when the plane was wrapped.
+    #[cfg(feature = "cipher")]
+    ciphers: Vec<Option<crate::cipher::CliCipher>>,
+}
+
+/// Apply (or remove) the LUN's cipher over `buf` at absolute offset `off`.
+#[cfg(all(feature = "tokio", feature = "cipher"))]
+fn apply_cipher(
+    ciphers: &mut [Option<crate::cipher::CliCipher>],
+    lun: usize,
+    off: u64,
+    buf: &mut [u8],
+) -> Result<(), StorageError> {
+    use snowscsi::common::cipher::StreamCipher as _;
+
+    if let Some(cipher) = ciphers.get_mut(lun).and_then(Option::as_mut) {
+        cipher.xor(off, buf).map_err(StorageError::from)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tokio")]
 impl AsyncBackends {
-    /// Take ownership of the built planes.
+    /// Take ownership of the built planes, splitting off any cipher wrapper.
     fn new(planes: Vec<Option<OwnedPlane>>) -> Self {
-        let luns = planes
-            .into_iter()
-            .map(|plane| {
-                plane.map(|plane| match plane {
-                    OwnedPlane::BlockRo(backend) => AsyncPlane::File {
-                        file: tokio::fs::File::from_std(backend.into_file()),
-                        writable: false,
-                    },
-                    OwnedPlane::BlockRw(backend) => AsyncPlane::File {
-                        file: tokio::fs::File::from_std(backend.into_file()),
-                        writable: true,
-                    },
-                    OwnedPlane::Ram { bytes, writable } => AsyncPlane::Mem { bytes, writable },
-                    _ => unreachable!("supports_async rejects planes without an async backend"),
-                })
-            })
-            .collect();
-        Self { luns }
+        let mut luns = Vec::with_capacity(planes.len());
+        #[cfg(feature = "cipher")]
+        let mut ciphers = Vec::with_capacity(planes.len());
+
+        for plane in planes {
+            let Some(plane) = plane else {
+                luns.push(None);
+                #[cfg(feature = "cipher")]
+                ciphers.push(None);
+                continue;
+            };
+            #[cfg(feature = "cipher")]
+            let (plane, cipher) = match plane {
+                OwnedPlane::Cipher(plane) => {
+                    let (inner, cipher) = plane.into_parts();
+                    (inner, Some(cipher))
+                }
+                other => (other, None),
+            };
+            let async_plane = match plane {
+                OwnedPlane::BlockRo(backend) => AsyncPlane::File {
+                    file: tokio::fs::File::from_std(backend.into_file()),
+                    writable: false,
+                },
+                OwnedPlane::BlockRw(backend) => AsyncPlane::File {
+                    file: tokio::fs::File::from_std(backend.into_file()),
+                    writable: true,
+                },
+                OwnedPlane::Ram { bytes, writable } => AsyncPlane::Mem { bytes, writable },
+                _ => unreachable!("supports_async rejects planes without an async backend"),
+            };
+            luns.push(Some(async_plane));
+            #[cfg(feature = "cipher")]
+            ciphers.push(cipher);
+        }
+        Self {
+            luns,
+            #[cfg(feature = "cipher")]
+            ciphers,
+        }
     }
 
     /// Execute one request against `lun`.
@@ -1118,10 +1316,15 @@ impl AsyncBackends {
         req: IoReq,
         buf: &mut [u8],
     ) -> Result<usize, StorageError> {
-        let Some(plane) = self.luns.get_mut(lun).and_then(Option::as_mut) else {
+        let len = req.len as usize;
+        let Self {
+            luns,
+            #[cfg(feature = "cipher")]
+            ciphers,
+        } = self;
+        let Some(plane) = luns.get_mut(lun).and_then(Option::as_mut) else {
             return Err(StorageError::Unsupported);
         };
-        let len = req.len as usize;
         match plane {
             AsyncPlane::File { file, writable } => match req.dir {
                 Direction::ToHost => {
@@ -1129,12 +1332,16 @@ impl AsyncBackends {
                         .await
                         .map_err(io_err)?;
                     file.read_exact(&mut buf[..len]).await.map_err(io_err)?;
+                    #[cfg(feature = "cipher")]
+                    apply_cipher(ciphers, lun, req.offset, &mut buf[..len])?;
                     Ok(len)
                 }
                 Direction::FromHost => {
                     if !*writable {
                         return Err(StorageError::NotWritable);
                     }
+                    #[cfg(feature = "cipher")]
+                    apply_cipher(ciphers, lun, req.offset, &mut buf[..len])?;
                     file.seek(std::io::SeekFrom::Start(req.offset))
                         .await
                         .map_err(io_err)?;
@@ -1148,13 +1355,19 @@ impl AsyncBackends {
             },
             AsyncPlane::Mem { bytes, writable } => match req.dir {
                 Direction::ToHost => {
-                    stack::ram_read(bytes, req.offset, &mut buf[..len]).map(|()| len)
+                    stack::ram_read(bytes, req.offset, &mut buf[..len])?;
+                    #[cfg(feature = "cipher")]
+                    apply_cipher(ciphers, lun, req.offset, &mut buf[..len])?;
+                    Ok(len)
                 }
                 Direction::FromHost => {
                     if !*writable {
                         return Err(StorageError::NotWritable);
                     }
-                    stack::ram_write(bytes, req.offset, &buf[..len]).map(|()| len)
+                    #[cfg(feature = "cipher")]
+                    apply_cipher(ciphers, lun, req.offset, &mut buf[..len])?;
+                    stack::ram_write(bytes, req.offset, &buf[..len])?;
+                    Ok(len)
                 }
                 Direction::None => Ok(0),
             },
@@ -1867,7 +2080,7 @@ fn validate_bundle_specs(_specs: &[DeviceSpec]) -> Result<(), ()> {
 /// Every plane owns its bytes — file handles and RAM disks included — so the
 /// same value can be moved onto a worker thread or an asynchronous backend
 /// task later.
-fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
+fn build_planes(specs: &[DeviceSpec], password: Option<&[u8]>) -> Result<Vec<OwnedPlane>, ()> {
     if let Some(dir) = spec::duplicate_bundle_dir(specs) {
         eprintln!(
             "snowscsi: bundle directory '{dir}' is served by more than one LUN; \
@@ -1898,188 +2111,333 @@ fn build_planes(specs: &[DeviceSpec]) -> Result<Vec<OwnedPlane>, ()> {
     }
     let mut planes = Vec::with_capacity(specs.len());
     for spec in specs {
-        let plane = match &spec.backing {
-            #[cfg(feature = "bundle")]
-            Backing::Bundle { dir } => {
-                if !Path::new(dir).is_dir() {
-                    eprintln!(
-                        "snowscsi: bundle: directory not found: {dir} (create it with \
+        planes.push(open_plane_for(spec, password)?);
+    }
+    Ok(planes)
+}
+
+/// Build one plane for `spec`, wrapping the backing in a cipher when the spec
+/// carries `cipher`.
+fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPlane, ()> {
+    // Validate and build the cipher before touching any backing: a doomed
+    // invocation must not create/open the base plane first.
+    #[cfg(feature = "cipher")]
+    let cipher = prepare_cipher(spec, password)?;
+    #[cfg(not(feature = "cipher"))]
+    if spec.cipher.is_some() {
+        eprintln!("snowscsi: cipher= requires the `cipher` feature");
+        return Err(());
+    }
+    #[cfg(not(feature = "cipher"))]
+    let _ = password;
+
+    let base = match &spec.backing {
+        #[cfg(feature = "bundle")]
+        Backing::Bundle { dir } => {
+            if !Path::new(dir).is_dir() {
+                eprintln!(
+                    "snowscsi: bundle: directory not found: {dir} (create it with \
                          `snowscsi bundle-create ...`)"
+                );
+                return Err(());
+            }
+            let mut fs = StdFsBackend::new(dir);
+            let identified = match identify_dir(&mut fs) {
+                Ok(identified) => identified,
+                Err(e) => {
+                    eprintln!("snowscsi: bundle: {dir}: cannot read the SNOWBUNDLE manifest: {e}");
+                    return Err(());
+                }
+            };
+            match identified {
+                Identified::NotBundle { found } => {
+                    let names = found.as_slice().join(", ");
+                    eprintln!(
+                        "snowscsi: bundle: no SNOWBUNDLE manifest in {dir}; create it with \
+                             `snowscsi bundle-create ...` (found: {names})"
                     );
                     return Err(());
                 }
-                let mut fs = StdFsBackend::new(dir);
-                let identified = match identify_dir(&mut fs) {
-                    Ok(identified) => identified,
-                    Err(e) => {
-                        eprintln!(
-                            "snowscsi: bundle: {dir}: cannot read the SNOWBUNDLE manifest: {e}"
-                        );
-                        return Err(());
+                Identified::Flat { .. } => {
+                    // No overrides: the manifest owns the whole geometry.
+                    // A flat bundle under `--cdrom` is optical media and
+                    // must open read-only; `--block` honours an explicit
+                    // `ro`, otherwise it stays writable.
+                    let read_only = spec.plane.read_only || spec.role == DeviceRole::MmcCd;
+                    let bundle = if read_only {
+                        FlatBundle::open_read_only(fs, None, None, None)
+                    } else {
+                        FlatBundle::open(fs, None, None, None)
                     }
-                };
-                match identified {
-                    Identified::NotBundle { found } => {
-                        let names = found.as_slice().join(", ");
-                        eprintln!(
-                            "snowscsi: bundle: no SNOWBUNDLE manifest in {dir}; create it with \
-                             `snowscsi bundle-create ...` (found: {names})"
-                        );
-                        return Err(());
-                    }
-                    Identified::Flat { .. } => {
-                        // No overrides: the manifest owns the whole geometry.
-                        // A flat bundle under `--cdrom` is optical media and
-                        // must open read-only; `--block` honours an explicit
-                        // `ro`, otherwise it stays writable.
-                        let read_only = spec.plane.read_only || spec.role == DeviceRole::MmcCd;
-                        let bundle = if read_only {
-                            FlatBundle::open_read_only(fs, None, None, None)
-                        } else {
-                            FlatBundle::open(fs, None, None, None)
-                        }
-                        .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?;
-                        OwnedPlane::Bundle(bundle)
-                    }
-                    Identified::Cdr { toc, .. } => {
-                        #[cfg(feature = "cdr-bundle")]
-                        {
-                            // A recordable CD is an MMC medium: report the
-                            // wrong role before any read-only complaint, so
-                            // `--block bundle=<cdr>` (even with `ro` or
-                            // `profile=cd`) suggests the right flag.
-                            if matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd) {
-                                eprintln!(
-                                    "snowscsi: bundle: {dir} is a recordable CD (manifest kind \
+                    .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?;
+                    OwnedPlane::Bundle(bundle)
+                }
+                Identified::Cdr { toc, .. } => {
+                    #[cfg(feature = "cdr-bundle")]
+                    {
+                        // A recordable CD is an MMC medium: report the
+                        // wrong role before any read-only complaint, so
+                        // `--block bundle=<cdr>` (even with `ro` or
+                        // `profile=cd`) suggests the right flag.
+                        if matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd) {
+                            eprintln!(
+                                "snowscsi: bundle: {dir} is a recordable CD (manifest kind \
                                      'cdr'); --block accepts only a 'flat' bundle (use `--cdrom \
                                      bundle=<dir>`)"
-                                );
-                                return Err(());
-                            }
-                            if toc.is_none() {
-                                eprintln!(
-                                    "snowscsi: bundle: no recordable-CD TOC in {dir}; create it \
-                                     with `snowscsi bundle-create cdr`"
-                                );
-                                return Err(());
-                            }
-                            if spec.plane.read_only {
-                                eprintln!(
-                                    "snowscsi: bundle: {dir} is a recordable CD (writable-only); \
-                                     `ro` is not supported"
-                                );
-                                return Err(());
-                            }
-                            let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
-                            // Capacity and disc kind come from the stored TOC;
-                            // no CLI hints are applied.
-                            OwnedPlane::CdrBundle(BundleStore::new(fs, 0, None))
-                        }
-                        #[cfg(not(feature = "cdr-bundle"))]
-                        {
-                            let _ = toc;
-                            eprintln!(
-                                "snowscsi: bundle: {dir} is a recordable CD; serving it requires \
-                                 the `cdr-bundle` feature"
                             );
                             return Err(());
                         }
+                        if toc.is_none() {
+                            eprintln!(
+                                "snowscsi: bundle: no recordable-CD TOC in {dir}; create it \
+                                     with `snowscsi bundle-create cdr`"
+                            );
+                            return Err(());
+                        }
+                        if spec.plane.read_only {
+                            eprintln!(
+                                "snowscsi: bundle: {dir} is a recordable CD (writable-only); \
+                                     `ro` is not supported"
+                            );
+                            return Err(());
+                        }
+                        let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
+                        // Capacity and disc kind come from the stored TOC;
+                        // no CLI hints are applied.
+                        OwnedPlane::CdrBundle(BundleStore::new(fs, 0, None))
                     }
-                    Identified::Image { .. } => {
+                    #[cfg(not(feature = "cdr-bundle"))]
+                    {
+                        let _ = toc;
                         eprintln!(
-                            "snowscsi: bundle: {dir} carries a single-file image manifest, not a \
-                             directory bundle"
+                            "snowscsi: bundle: {dir} is a recordable CD; serving it requires \
+                                 the `cdr-bundle` feature"
                         );
                         return Err(());
                     }
                 }
+                Identified::Image { .. } => {
+                    eprintln!(
+                        "snowscsi: bundle: {dir} carries a single-file image manifest, not a \
+                             directory bundle"
+                    );
+                    return Err(());
+                }
             }
-            #[cfg(not(feature = "bundle"))]
-            Backing::Bundle { dir } => {
-                eprintln!("snowscsi: bundle= requires the `bundle` feature: {dir}");
-                return Err(());
+        }
+        #[cfg(not(feature = "bundle"))]
+        Backing::Bundle { dir } => {
+            eprintln!("snowscsi: bundle= requires the `bundle` feature: {dir}");
+            return Err(());
+        }
+        Backing::Ram { size } => {
+            let bytes = usize::try_from(*size).map_err(|_| {
+                eprintln!("snowscsi: RAM size {size} too large for this platform");
+            })?;
+            OwnedPlane::Ram {
+                bytes: vec![0u8; bytes],
+                writable: !spec.plane.read_only,
             }
-            Backing::Ram { size } => {
-                let bytes = usize::try_from(*size).map_err(|_| {
-                    eprintln!("snowscsi: RAM size {size} too large for this platform");
+        }
+        Backing::Img { path } => {
+            // Read-only is enforced at BOTH layers: the plane is opened
+            // `rb` (so it works on read-only media; never `r+b`), and the
+            // LUN is built with `disk_read_only` (locked write policy).
+            let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
+            open_img_plane(path, writable)?
+        }
+        Backing::Empty => {
+            // One plane per spec keeps LUN/plane alignment; the empty-CDR
+            // arm in `build_core_slots` drops it and pushes `None`.
+            OwnedPlane::Ram {
+                bytes: Vec::new(),
+                writable: false,
+            }
+        }
+        Backing::Live { dir } => {
+            let fs = StdFsBackend::new(dir);
+            let label = Path::new(dir)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("SNOWSCSI");
+            let live = LiveData::new(fs, label).map_err(|e| {
+                eprintln!("snowscsi: failed to scan live directory {dir}: {e}");
+            })?;
+            OwnedPlane::Live(live)
+        }
+        #[cfg(feature = "dvdram")]
+        Backing::DvdRam { path } => match path.as_deref() {
+            Some(path) => {
+                let existed = Path::new(path).exists();
+                if existed && spec.plane.size.is_some() {
+                    eprintln!("snowscsi: dvdram: size= is only valid for a new file: {path}");
+                    return Err(());
+                }
+                if !existed {
+                    let Some(sz) = spec.plane.size else {
+                        eprintln!(
+                            "snowscsi: dvdram: file not found, use size= to create it: {path}"
+                        );
+                        return Err(());
+                    };
+                    create_sparse(path, sz).map_err(|e| {
+                        eprintln!("snowscsi: dvdram: failed to create {path}: {e}");
+                    })?;
+                }
+                let backend = FileBackend::open(path, true).map_err(|e| {
+                    eprintln!("snowscsi: dvdram: failed to open {path}: {e}");
+                })?;
+                OwnedPlane::BlockRw(backend)
+            }
+            None => {
+                let bytes = spec.plane.size.ok_or_else(|| {
+                    eprintln!("snowscsi: dvdram=ram: requires size=");
+                })?;
+                let bytes = usize::try_from(bytes).map_err(|_| {
+                    eprintln!("snowscsi: dvdram=ram: size too large");
                 })?;
                 OwnedPlane::Ram {
                     bytes: vec![0u8; bytes],
-                    writable: !spec.plane.read_only,
+                    writable: true,
                 }
             }
-            Backing::Img { path } => {
-                // Read-only is enforced at BOTH layers: the plane is opened
-                // `rb` (so it works on read-only media; never `r+b`), and the
-                // LUN is built with `disk_read_only` (locked write policy).
-                let writable = spec.role == DeviceRole::BlockDisk && !spec.plane.read_only;
-                open_img_plane(path, writable)?
-            }
-            Backing::Empty => {
-                // One plane per spec keeps LUN/plane alignment; the empty-CDR
-                // arm in `build_core_slots` drops it and pushes `None`.
-                OwnedPlane::Ram {
-                    bytes: Vec::new(),
-                    writable: false,
-                }
-            }
-            Backing::Live { dir } => {
-                let fs = StdFsBackend::new(dir);
-                let label = Path::new(dir)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("SNOWSCSI");
-                let live = LiveData::new(fs, label).map_err(|e| {
-                    eprintln!("snowscsi: failed to scan live directory {dir}: {e}");
-                })?;
-                OwnedPlane::Live(live)
-            }
-            #[cfg(feature = "dvdram")]
-            Backing::DvdRam { path } => match path.as_deref() {
-                Some(path) => {
-                    let existed = Path::new(path).exists();
-                    if existed && spec.plane.size.is_some() {
-                        eprintln!("snowscsi: dvdram: size= is only valid for a new file: {path}");
-                        return Err(());
-                    }
-                    if !existed {
-                        let Some(sz) = spec.plane.size else {
-                            eprintln!(
-                                "snowscsi: dvdram: file not found, use size= to create it: {path}"
-                            );
-                            return Err(());
-                        };
-                        create_sparse(path, sz).map_err(|e| {
-                            eprintln!("snowscsi: dvdram: failed to create {path}: {e}");
-                        })?;
-                    }
-                    let backend = FileBackend::open(path, true).map_err(|e| {
-                        eprintln!("snowscsi: dvdram: failed to open {path}: {e}");
-                    })?;
-                    OwnedPlane::BlockRw(backend)
-                }
-                None => {
-                    let bytes = spec.plane.size.ok_or_else(|| {
-                        eprintln!("snowscsi: dvdram=ram: requires size=");
-                    })?;
-                    let bytes = usize::try_from(bytes).map_err(|_| {
-                        eprintln!("snowscsi: dvdram=ram: size too large");
-                    })?;
-                    OwnedPlane::Ram {
-                        bytes: vec![0u8; bytes],
-                        writable: true,
-                    }
-                }
-            },
-            #[cfg(not(feature = "dvdram"))]
-            Backing::DvdRam { .. } => {
-                eprintln!("snowscsi: dvdram= requires the `dvdram` feature");
-                return Err(());
-            }
-        };
-        planes.push(plane);
+        },
+        #[cfg(not(feature = "dvdram"))]
+        Backing::DvdRam { .. } => {
+            eprintln!("snowscsi: dvdram= requires the `dvdram` feature");
+            return Err(());
+        }
+    };
+    #[cfg(feature = "cipher")]
+    {
+        use snowscsi::common::cipher::CipherPlane;
+        Ok(match cipher {
+            Some(cipher) => OwnedPlane::Cipher(Box::new(CipherPlane::new(base, cipher))),
+            None => base,
+        })
     }
-    Ok(planes)
+    #[cfg(not(feature = "cipher"))]
+    {
+        Ok(base)
+    }
+}
+
+/// Validate the manifest and build the spec's cipher, if any.
+///
+/// Runs before the base plane is opened so a missing/incorrect manifest never
+/// leaves a half-opened backing (or creates a file) behind.
+#[cfg(feature = "cipher")]
+fn prepare_cipher(
+    spec: &DeviceSpec,
+    password: Option<&[u8]>,
+) -> Result<Option<crate::cipher::CliCipher>, ()> {
+    let Some(cipher_spec) = &spec.cipher else {
+        return Ok(None);
+    };
+
+    let (meta, manifest_path) = match load_cipher_meta(spec, cipher_spec) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("snowscsi: cipher: {e}");
+            return Err(());
+        }
+    };
+    let Some(cipher_meta) = meta.cipher else {
+        eprintln!(
+            "snowscsi: cipher: {manifest_path}: the manifest does not describe a cipher \
+             (refusing to serve plaintext)"
+        );
+        return Err(());
+    };
+    if !meta.has_crc {
+        log::warn!("cipher: {manifest_path} has no crc line; cipher parameters are unchecked");
+    }
+    if cipher_meta.cipher == CipherAlg::Xor {
+        log::warn!("cipher: xor is obfuscation, not encryption");
+    }
+    let key = match crate::cipher::derive_key(&cipher_meta, password, spec.key.as_deref()) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("snowscsi: cipher: {e}");
+            return Err(());
+        }
+    };
+    let cipher = match crate::cipher::CliCipher::from_meta(&cipher_meta, &key) {
+        Ok(cipher) => cipher,
+        Err(e) => {
+            eprintln!("snowscsi: cipher: {e}");
+            return Err(());
+        }
+    };
+    log::debug!(
+        "using cipher {} ({manifest_path})",
+        crate::cipher::cipher_meta_name(&cipher_meta)
+    );
+    Ok(Some(cipher))
+}
+
+/// Read and validate the manifest that describes a cipher-bearing LUN.
+#[cfg(feature = "cipher")]
+fn load_cipher_meta(
+    spec: &DeviceSpec,
+    cipher_spec: &spec::CipherSpec,
+) -> Result<(BundleMeta, String), String> {
+    match &spec.backing {
+        Backing::Img { path } => {
+            let sidecar = cipher_spec
+                .meta
+                .clone()
+                .unwrap_or_else(|| format!("{path}{SIDECAR_SUFFIX}"));
+            let bytes = read_capped(&sidecar, MAX_MANIFEST + 1)
+                .map_err(|e| format!("cannot read manifest '{sidecar}': {e}"))?;
+            let meta = BundleMeta::parse(&bytes)
+                .map_err(|e| format!("invalid manifest '{sidecar}': {e}"))?;
+            let image_size = std::fs::metadata(path)
+                .map_err(|e| format!("cannot stat image '{path}': {e}"))?
+                .len();
+            match meta.kind {
+                BundleKind::Image { size } if size == image_size => {}
+                BundleKind::Image { size } => {
+                    return Err(format!(
+                        "manifest '{sidecar}' declares image size {size}, but '{path}' is \
+                         {image_size} bytes"
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "manifest '{sidecar}' is not a single-file image manifest"
+                    ))
+                }
+            }
+            Ok((meta, sidecar))
+        }
+        Backing::Bundle { dir } => {
+            let manifest = cipher_spec
+                .meta
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME));
+            let bytes = read_capped(&manifest, MAX_MANIFEST + 1)
+                .map_err(|e| format!("cannot read manifest '{manifest}': {e}"))?;
+            let meta = BundleMeta::parse(&bytes)
+                .map_err(|e| format!("invalid manifest '{manifest}': {e}"))?;
+            match meta.kind {
+                BundleKind::Flat { .. } => {}
+                BundleKind::Cdr => {
+                    return Err(
+                        "CD-R cipher support not wired yet; refusing to serve plaintext"
+                            .to_string(),
+                    )
+                }
+                BundleKind::Image { .. } => {
+                    return Err(format!(
+                        "manifest '{manifest}' is an image manifest, not a directory bundle"
+                    ))
+                }
+            }
+            Ok((meta, manifest))
+        }
+        _ => Err("cipher is only valid with img= or bundle=<dir>".to_string()),
+    }
 }
 
 fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
@@ -2364,6 +2722,13 @@ fn build_card_insert(
     spec: &DeviceSpec,
     path: &str,
 ) -> Result<(CliLu, OwnedPlane), String> {
+    if spec.cipher.is_some() {
+        // Parse already rejects it; this keeps the insert path from silently
+        // installing a plaintext card at an encrypted slot.
+        return Err(format!(
+            "LUN {lun}: cipher is not supported with removable media"
+        ));
+    }
     let plane = open_img_plane(path, !spec.plane.read_only)
         .map_err(|_| format!("could not open new card '{path}'"))?;
     let attrs = card_attrs(plane.capacity(), spec.plane.sector, spec.plane.read_only)?;
@@ -2383,10 +2748,11 @@ fn run_serve_usb(
     config: &ServeConfig,
     selector: &str,
     removable_lun: Option<usize>,
+    password: Option<&[u8]>,
 ) -> ExitCode {
     let mut planes: Vec<Option<OwnedPlane>> = Vec::new();
     let mut slots: Vec<CliLu> = Vec::new();
-    if build_core_slots(specs, &mut planes, &mut slots).is_err() {
+    if build_core_slots(specs, &mut planes, &mut slots, password).is_err() {
         return ExitCode::FAILURE;
     }
 
@@ -3489,7 +3855,7 @@ fn run_bundle_info(args: BundleInfoArgs) -> ExitCode {
 }
 
 /// Read at most `limit` bytes, so a sidecar cannot be slurped whole.
-#[cfg(feature = "bundle")]
+#[cfg(any(feature = "bundle", feature = "cipher"))]
 fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
@@ -4147,7 +4513,7 @@ mod tests {
     fn build_planes_rejects_a_missing_bundle_dir() {
         let dir = temp_dir("missing_bundle");
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
-        assert!(build_planes(&specs).is_err());
+        assert!(build_planes(&specs, None).is_err());
         assert!(!dir.exists(), "serve must never create a bundle directory");
     }
 
@@ -4163,7 +4529,7 @@ mod tests {
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
-        let planes = build_planes(&specs).expect("flat bundle plane");
+        let planes = build_planes(&specs, None).expect("flat bundle plane");
         assert_eq!(planes.len(), 1);
         assert_eq!(planes[0].capacity(), 8 << 20);
         assert_eq!(planes[0].sector_size(), Some(512));
@@ -4184,21 +4550,21 @@ mod tests {
         assert_eq!(created, ExitCode::SUCCESS);
 
         let cd = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
-        let planes = build_planes(&cd).expect("cdrom flat bundle plane");
+        let planes = build_planes(&cd, None).expect("cdrom flat bundle plane");
         assert!(
             !planes[0].is_writable(),
             "--cdrom bundle=<flat> must open read-only"
         );
 
         let block = spec::parse_all(&[format!("bundle={}", dir.display())], &[]).unwrap();
-        let planes = build_planes(&block).expect("block flat bundle plane");
+        let planes = build_planes(&block, None).expect("block flat bundle plane");
         assert!(
             planes[0].is_writable(),
             "--block bundle=<flat> stays writable"
         );
 
         let block_ro = spec::parse_all(&[format!("bundle={},ro", dir.display())], &[]).unwrap();
-        let planes = build_planes(&block_ro).expect("read-only block flat bundle plane");
+        let planes = build_planes(&block_ro, None).expect("read-only block flat bundle plane");
         assert!(
             !planes[0].is_writable(),
             "`ro` opens the block plane read-only"
@@ -4255,7 +4621,7 @@ mod tests {
         assert!(dir.join("toc.0").is_file());
 
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
-        let planes = build_planes(&specs).expect("cdr bundle plane");
+        let planes = build_planes(&specs, None).expect("cdr bundle plane");
         assert_eq!(planes.len(), 1);
         assert!(planes[0].is_cdr_bundle());
 
@@ -4265,7 +4631,7 @@ mod tests {
             run_with_large_stack(move || {
                 let mut planes = Vec::new();
                 let mut slots = Vec::new();
-                build_core_slots(&specs_for_slots, &mut planes, &mut slots).is_ok()
+                build_core_slots(&specs_for_slots, &mut planes, &mut slots, None).is_ok()
                     && slots.len() == 1
             }),
             "a kind=cdr bundle must build an MMC slot"
@@ -4288,7 +4654,7 @@ mod tests {
             run_with_large_stack(move || {
                 let mut planes = Vec::new();
                 let mut slots = Vec::new();
-                build_core_slots(&specs, &mut planes, &mut slots).is_err()
+                build_core_slots(&specs, &mut planes, &mut slots, None).is_err()
             }),
             "a kind=cdr manifest cannot back --block"
         );
@@ -4306,7 +4672,7 @@ mod tests {
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let specs = spec::parse_all(&[], &[format!("bundle={},ro", dir.display())]).unwrap();
-        assert!(build_planes(&specs).is_err());
+        assert!(build_planes(&specs, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4325,7 +4691,7 @@ mod tests {
 
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
         assert!(
-            build_planes(&specs).is_err(),
+            build_planes(&specs, None).is_err(),
             "a TOC-less recordable bundle must not open"
         );
         assert!(!dir.join("toc.0").exists(), "serve must not create a TOC");
@@ -4410,7 +4776,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            build_planes(&specs).is_err(),
+            build_planes(&specs, None).is_err(),
             "slash alias must be rejected"
         );
 
@@ -4427,7 +4793,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            build_planes(&specs).is_err(),
+            build_planes(&specs, None).is_err(),
             "symlink alias must be rejected"
         );
 
@@ -5034,6 +5400,385 @@ mod tests {
             verbose: 0,
         };
         assert_eq!(run_mkisofs(args), ExitCode::FAILURE);
+    }
+
+    // ── Cipher-bearing planes ───────────────────────────────────────────
+
+    #[cfg(feature = "cipher")]
+    fn cipher_key_file(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "snowscsi_cli_key_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, [0x11u8; 32]).expect("write key file");
+        path
+    }
+
+    #[cfg(feature = "cipher")]
+    fn cipher_meta(
+        alg: snowscsi::common::bundle::CipherAlg,
+    ) -> snowscsi::common::bundle::CipherMeta {
+        snowscsi::common::bundle::CipherMeta {
+            cipher: alg,
+            kdf: snowscsi::common::bundle::KdfKind::None,
+            iterations: None,
+            salt: None,
+            nonce: [0x5Au8; 8],
+        }
+    }
+
+    #[cfg(feature = "cipher")]
+    fn write_image_manifest(path: &Path, cipher: snowscsi::common::bundle::CipherMeta) {
+        let meta = BundleMeta {
+            kind: BundleKind::Image {
+                size: std::fs::metadata(path).unwrap().len(),
+            },
+            cipher: Some(cipher),
+            has_crc: false,
+        };
+        std::fs::write(
+            format!("{}{SIDECAR_SUFFIX}", path.display()),
+            meta.encode().unwrap(),
+        )
+        .expect("write sidecar");
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_plane_round_trips_over_an_image() {
+        use snowscsi::common::seekable_storage::WritableFlatData;
+
+        let image = temp_dir("cipher_image");
+        std::fs::create_dir_all(&image).unwrap();
+        let image = image.join("disk.img");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        write_image_manifest(
+            &image,
+            cipher_meta(snowscsi::common::bundle::CipherAlg::ChaCha20),
+        );
+        let key = cipher_key_file("image");
+        let key_arg = key.display().to_string();
+        let specs = spec::parse_all(
+            &[format!("img={},cipher,key={key_arg}", image.display())],
+            &[],
+        )
+        .unwrap();
+        let mut plane = open_plane_for(&specs[0], None).expect("cipher plane");
+        assert!(matches!(plane, OwnedPlane::Cipher(_)));
+        assert!(plane.is_writable());
+        assert_eq!(plane.capacity(), 4096);
+        assert_eq!(plane.sector_size(), None);
+
+        let plain = [0xA5u8; 16];
+        WritableFlatData::write_at(&mut plane, 512, &plain).unwrap();
+        let mut out = [0u8; 16];
+        FlatData::read_at(&mut plane, 512, &mut out).unwrap();
+        assert_eq!(out, plain);
+
+        // The file on disk holds ciphertext, not the plaintext.
+        let raw = std::fs::read(&image).unwrap();
+        assert_ne!(&raw[512..528], &plain);
+
+        // A read-only spec still decrypts but refuses writes.
+        let ro = spec::parse_all(
+            &[format!("img={},cipher,key={key_arg},ro", image.display())],
+            &[],
+        )
+        .unwrap();
+        let mut plane = open_plane_for(&ro[0], None).expect("read-only cipher plane");
+        assert!(!plane.is_writable());
+        let mut out = [0u8; 16];
+        FlatData::read_at(&mut plane, 512, &mut out).unwrap();
+        assert_eq!(out, plain);
+        assert_eq!(
+            WritableFlatData::write_at(&mut plane, 512, &plain),
+            Err(snowscsi::common::seekable_storage::StorageError::NotWritable)
+        );
+
+        let _ = std::fs::remove_file(&image);
+        let _ = std::fs::remove_file(format!("{}{SIDECAR_SUFFIX}", image.display()));
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "bundle"))]
+    #[test]
+    fn cipher_plane_delegates_the_flat_bundle_sector_size() {
+        let dir = temp_dir("cipher_bundle");
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: dir.display().to_string(),
+            size: "8M".to_string(),
+            chunk: Some("1M".to_string()),
+            sector: 2048,
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let meta = BundleMeta {
+            kind: BundleKind::Flat {
+                virtual_size: 8 << 20,
+                chunk_size: 1 << 20,
+                sector_size: 2048,
+            },
+            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            has_crc: false,
+        };
+        std::fs::write(dir.join(MANIFEST_NAME), meta.encode().unwrap()).unwrap();
+        let key = cipher_key_file("bundle");
+        let specs = spec::parse_all(
+            &[format!(
+                "bundle={},cipher,key={}",
+                dir.display(),
+                key.display()
+            )],
+            &[],
+        )
+        .unwrap();
+        let plane = open_plane_for(&specs[0], None).expect("cipher bundle plane");
+        assert!(plane.is_writable());
+        assert_eq!(plane.sector_size(), Some(2048));
+        assert_eq!(plane.capacity(), 8 << 20);
+        assert!(!plane.is_cdr_bundle());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_plane_rejects_a_missing_sidecar_and_a_bad_key() {
+        let dir = temp_dir("cipher_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("disk.img");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let key = cipher_key_file("missing");
+
+        // No sidecar: never fall back to plaintext.
+        let specs = spec::parse_all(
+            &[format!(
+                "img={},cipher,key={}",
+                image.display(),
+                key.display()
+            )],
+            &[],
+        )
+        .unwrap();
+        assert!(build_planes(&specs, None).is_err());
+
+        // A wrong-length key file is an error, not a truncated key.
+        write_image_manifest(
+            &image,
+            cipher_meta(snowscsi::common::bundle::CipherAlg::Xor),
+        );
+        std::fs::write(&key, [0u8; 31]).unwrap();
+        assert!(build_planes(&specs, None).is_err());
+
+        // A manifest without a cipher block is never served plaintext.
+        let plain = BundleMeta {
+            kind: BundleKind::Image { size: 4096 },
+            cipher: None,
+            has_crc: false,
+        };
+        std::fs::write(
+            format!("{}{SIDECAR_SUFFIX}", image.display()),
+            plain.encode().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        assert!(build_planes(&specs, None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_print_config_does_not_read_a_password() {
+        let dir = temp_dir("cipher_print");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("disk.img");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let password = dir.join("password.txt");
+        std::fs::write(&password, b"hunter2\n").unwrap();
+
+        let Cli::Serve(args) = Cli::try_parse_from([
+            "snowscsi",
+            "serve",
+            "--block",
+            &format!("img={},cipher", image.display()),
+            "--password-file",
+            &password.display().to_string(),
+            "--usb",
+            "--print-config",
+        ])
+        .expect("parse serve") else {
+            panic!("expected serve");
+        };
+        // The early return happens before any prompt: no TTY is required.
+        assert_eq!(run_serve(args), ExitCode::SUCCESS);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn password_file_is_capped_and_stripped() {
+        let dir = temp_dir("cipher_password");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pw");
+        std::fs::write(&path, b"secret\r\n").unwrap();
+        assert_eq!(
+            read_password_file(&path.display().to_string()).unwrap(),
+            b"secret"
+        );
+
+        std::fs::write(&path, b"\n").unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+        std::fs::write(&path, b"a\0b").unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+        // More than one line is rejected instead of silently becoming a
+        // password with an embedded newline.
+        std::fs::write(&path, b"first\nsecond\n").unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+        std::fs::write(&path, b"secret\n\n").unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+        std::fs::write(&path, vec![b'x'; MAX_PASSWORD + 2]).unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+
+        // `--password-file` without an encrypted LUN is a configuration error.
+        let specs = spec::parse_all(&["ram=1M".to_string()], &[]).unwrap();
+        let args = parse_serve(&["--usb", "--password-file", "/tmp/unused"]);
+        assert!(read_serve_password(&args, &specs).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "tokio", feature = "cipher"))]
+    #[test]
+    fn supports_async_recurses_through_cipher_wrappers() {
+        use snowscsi::common::cipher::CipherPlane;
+
+        run_with_large_stack(|| {
+            let key = snowscsi::common::cipher::CipherKey::from_bytes(&[0x33u8; 32]).unwrap();
+            let meta = cipher_meta(snowscsi::common::bundle::CipherAlg::Xor);
+            let wrap = |plane| {
+                OwnedPlane::Cipher(Box::new(CipherPlane::new(
+                    plane,
+                    cipher::CliCipher::from_meta(&meta, &key).unwrap(),
+                )))
+            };
+
+            let ram = wrap(OwnedPlane::Ram {
+                bytes: vec![0u8; 1024],
+                writable: true,
+            });
+            assert!(supports_async(&[Some(ram)]));
+
+            let dir = temp_dir("cipher_async_file");
+            std::fs::create_dir_all(&dir).unwrap();
+            let image = dir.join("disk.img");
+            std::fs::write(&image, vec![0u8; 4096]).unwrap();
+            let file = FileBackend::open(&image.display().to_string(), true).unwrap();
+            assert!(supports_async(&[Some(wrap(OwnedPlane::BlockRw(file)))]));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let dir = temp_dir("cipher_async_live");
+            std::fs::create_dir_all(&dir).unwrap();
+            let live = snowscsi::cdrom::media::LiveData::new(
+                StdFsBackend::new(&dir.display().to_string()),
+                "LIVE",
+            )
+            .unwrap();
+            assert!(!supports_async(&[Some(wrap(OwnedPlane::Live(live)))]));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            #[cfg(feature = "bundle")]
+            {
+                let dir = temp_dir("cipher_async_bundle");
+                let created = create_flat_bundle(CreateFlatArgs {
+                    dir: dir.display().to_string(),
+                    size: "8M".to_string(),
+                    chunk: Some("1M".to_string()),
+                    sector: 512,
+                });
+                assert_eq!(created, ExitCode::SUCCESS);
+                let bundle = FlatBundle::open(
+                    StdFsBackend::new(&dir.display().to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(!supports_async(&[Some(wrap(OwnedPlane::Bundle(bundle)))]));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tokio", feature = "cipher"))]
+    #[test]
+    fn async_backend_applies_and_removes_the_cipher() {
+        use snowscsi::common::cipher::CipherPlane;
+
+        let key = snowscsi::common::cipher::CipherKey::from_bytes(&[0x44u8; 32]).unwrap();
+        let meta = cipher_meta(snowscsi::common::bundle::CipherAlg::AesCtr);
+        let cipher = cipher::CliCipher::from_meta(&meta, &key).unwrap();
+        let plane = OwnedPlane::Cipher(Box::new(CipherPlane::new(
+            OwnedPlane::Ram {
+                bytes: vec![0u8; 1024],
+                writable: true,
+            },
+            cipher,
+        )));
+        let mut backends = AsyncBackends::new(vec![Some(plane)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let plain = [0x5Au8; 32];
+            let mut data = plain;
+            assert_eq!(
+                backends
+                    .exec(
+                        0,
+                        IoReq {
+                            resource: 0,
+                            offset: 100,
+                            len: 32,
+                            dir: Direction::FromHost,
+                        },
+                        &mut data,
+                    )
+                    .await,
+                Ok(32)
+            );
+            // The RAM plane holds ciphertext.
+            match backends.luns[0].as_ref().unwrap() {
+                AsyncPlane::Mem { bytes, .. } => assert_ne!(&bytes[100..132], &plain),
+                AsyncPlane::File { .. } => panic!("expected a RAM plane"),
+            }
+
+            let mut out = [0u8; 32];
+            assert_eq!(
+                backends
+                    .exec(
+                        0,
+                        IoReq {
+                            resource: 0,
+                            offset: 100,
+                            len: 32,
+                            dir: Direction::ToHost,
+                        },
+                        &mut out,
+                    )
+                    .await,
+                Ok(32)
+            );
+            assert_eq!(out, plain);
+        });
     }
     /// The async storage path end to end: a `SlotPool` in one Tokio task
     /// (`!Send`, no thread) driving [`AsyncBackends`] through the same

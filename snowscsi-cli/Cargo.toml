@@ -23,7 +23,7 @@ doc = false
 [features]
 default = ["full"]
 full = ["std", "scsi", "iscsi", "dvdram", "cdrom", "livefs", "usb", "bundle", "cdr-bundle",
-        "log", "tokio", "dep:clap", "dep:ctrlc", "dep:env_logger"]
+        "cipher", "log", "tokio", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 std = ["snowscsi/std", "dep:clap", "dep:ctrlc", "dep:env_logger"]
 scsi = ["snowscsi/scsi"]
 dvdram = ["snowscsi/dvdram"]
@@ -36,6 +36,10 @@ bundle = ["snowscsi/bundle"]
 # sequential write-once medium with its alternating `toc.0`/`toc.1` slots.
 # `bundle` supplies the canonical `SNOWBUNDLE` manifest and identification.
 cdr-bundle = ["snowscsi/cdr-bundle", "bundle"]
+# Cipher-bearing image and flat-bundle LUNs (`serve ... ,cipher`). Pulls the
+# library cipher plane + KDF seams and the AES backend used by `aes-ctr`; the
+# CLI owns key derivation, password reading and the async cipher path.
+cipher = ["std", "scsi", "snowscsi/cipher", "snowscsi/cipher-kdf", "dep:aes", "dep:getrandom"]
 log = ["snowscsi/log", "dep:log"]
 defmt = ["snowscsi/defmt"]
 # Tokio binding for the runtime-agnostic async seams (`--wire async`). The
@@ -51,6 +55,8 @@ env_logger = { version = "0.11", optional = true }
 log = { workspace = true, optional = true }
 embedded-io.workspace = true
 heapless.workspace = true
+aes = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "signal", "time", "macros", "fs"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
