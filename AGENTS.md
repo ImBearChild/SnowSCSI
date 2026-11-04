@@ -110,6 +110,15 @@ git checkout legacy
   `cargo build -p snowscsi --no-default-features`,
   `cargo build -p snowscsi-iso9660 --no-default-features`,
   `cargo build -p snowscsi-common --no-default-features`.
+  The `defmt` backend is a **separate** gate (it is a different format-string
+  grammar, not just a backend swap): run
+  `cargo build -p snowscsi --no-default-features --features 'scsi,cdrom,usb,dvdram,defmt'`
+  for every change that touches a log call. One literal is forwarded to both
+  `log` and `defmt`, so a message must stay in the portable subset: positional
+  arguments only (no `{name}` captures) and `{}`/`{:?}` (`{:?}` needs
+  `defmt::Format`, add it with `#[cfg_attr(feature = "defmt", derive(defmt::Format))]`);
+  integer type/hint specs like `{=u8:02x}` break `log` and `{:02x}` is not a
+  defmt hint.
   `cargo test -p snowscsi --no-default-features --features scsi` is green
   (verified 2026-10-31; the previous std-prelude gap is closed).
 - **Transport layer**: `Conn` = blanket `embedded_io::Read + Write`; `AsyncConn`

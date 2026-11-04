@@ -10,6 +10,7 @@ use super::errors::Sense;
 
 /// The fixed unit-attention classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UaClass {
     /// Power-on or equivalent reset of the target epoch.
     PowerOn,

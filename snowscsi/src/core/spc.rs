@@ -267,9 +267,13 @@ impl<D: Device> Spc<D> {
         // data (GOOD) and consumes it, but only after its own CDB checks pass.
         if opcode != INQUIRY && opcode != REPORT_LUNS && opcode != REQUEST_SENSE {
             if let Some(pending) = self.ua.next() {
+                // One literal is forwarded to both `log` and `defmt`, so this
+                // stays in the portable subset: no implicit captures and no
+                // format spec that the two backends disagree on.
                 crate::info!(
-                    "reporting unit attention {:?} for opcode {opcode:02x}",
-                    pending.class
+                    "reporting unit attention {:?} for opcode {}",
+                    pending.class,
+                    opcode
                 );
                 return Err(Completion::Check(pending.sense));
             }

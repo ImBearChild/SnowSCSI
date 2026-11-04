@@ -275,6 +275,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature `cdr-bundle`) in its project status and full-feature example, and
   points at `HACKING.md` for the directory/durability contract.
 
+### Fixed
+
+- **core**: the `defmt` backend rejected the unit-attention log line: it used
+  an implicit format-string capture with a spec (`{opcode:02x}`) and `{:?}` on
+  a type that did not implement `defmt::Format`. `UaClass` now derives it, and
+  the message stays in the subset `log` and `defmt` both accept (positional
+  arguments, `{}`/`{:?}` only). The pre-commit list in `HACKING.md` already
+  covered this build; it now also runs as part of review.
+
 ### Documentation
 
 - **docs/tests**: `tools/ext-test/test_cdr_bundle.py` now covers a read-only
