@@ -70,6 +70,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli**: `snowscsi crypt` encrypts/decrypts a single regular image file and
+  its `<file>.SNOWBUNDLE` sidecar (`chacha8`/`chacha12`/`chacha20`/`aes-ctr`/
+  `xor`, PBKDF2-HMAC-SHA256 or a raw 32-byte key, `--in-place`, `--force`, a
+  streaming 1 MiB path, fsynced temp+rename commits, and a `kind = image`
+  size check before any plaintext is written). Path alias/hard-link/symlink
+  checks run before I/O; out-of-place encryption refuses an already-encrypted
+  input; `--in-place` refuses symlinks and multi-hard-link inputs and preserves
+  the file's permissions; `--force` cannot be combined with `--in-place` and a
+  forced decryption removes a stale `<out>.SNOWBUNDLE`. Runs take an exclusive
+  `<target>.lock`, temps are random-suffixed and mode `0600` on Unix, and the
+  byte count is checked against the pre-read size. **There is no payload
+  authentication**: a wrong password or tampered ciphertext exits 0 and writes
+  garbage, so keep the input and verify the result before deleting anything.
+  `bundle-create flat|cdr` gains
+  `--cipher`/`--iterations`/`--key-file`/`--password-file`, and `serve`
+  exposes encrypted `img=` and flat `bundle=` LUNs through the cipher plane;
+  a `kind = cdr` bundle with a cipher is still a hard error (the TOC stays
+  plaintext and track `CipherStore` is not wired yet).
 - **common**: `cipher` adds offset-addressed stream-cipher plane decorators
   (`CipherPlane`/`AsyncCipherPlane`) over the byte-plane seams, with nonced
   AES-CTR, original DJB ChaCha (8/12/20 rounds) and an obfuscation-only

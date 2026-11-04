@@ -162,6 +162,89 @@ pub fn read_key_file(path: &str) -> Result<CipherKey, String> {
     CipherKey::from_bytes(&bytes).map_err(|e| format!("key file '{path}': {e}"))
 }
 
+/// Parse a manifest-spelling cipher algorithm name.
+pub fn parse_alg(name: &str) -> Result<CipherAlg, String> {
+    match name {
+        "chacha8" => Ok(CipherAlg::ChaCha8),
+        "chacha12" => Ok(CipherAlg::ChaCha12),
+        "chacha20" => Ok(CipherAlg::ChaCha20),
+        "aes-ctr" => Ok(CipherAlg::AesCtr),
+        "xor" => Ok(CipherAlg::Xor),
+        other => Err(format!(
+            "unknown cipher '{other}' (expected chacha8, chacha12, chacha20, aes-ctr, or xor)"
+        )),
+    }
+}
+
+/// Fill `buf` from the operating system's random source.
+///
+/// There is deliberately no fallback: a failure to read randomness is a hard
+/// error, never a zero nonce/salt.
+fn random_bytes(buf: &mut [u8]) -> Result<(), String> {
+    getrandom::fill(buf).map_err(|e| format!("cannot read random bytes: {e}"))
+}
+
+/// Generate a fresh 8-byte nonce.
+pub fn random_nonce() -> Result<[u8; 8], String> {
+    let mut nonce = [0u8; 8];
+    random_bytes(&mut nonce)?;
+    Ok(nonce)
+}
+
+/// Generate a fresh 16-byte PBKDF2 salt.
+pub fn random_salt() -> Result<[u8; 16], String> {
+    let mut salt = [0u8; 16];
+    random_bytes(&mut salt)?;
+    Ok(salt)
+}
+
+/// Build the cipher block a new manifest should carry.
+///
+/// `key_file` selects `kdf = none` (the key is supplied directly, so there is
+/// no password, iteration count or salt) and must name an exact 32-byte file.
+/// Without it the block uses PBKDF2-HMAC-SHA256 with `iterations` (default
+/// 600 000, within the manifest's `1 000..=2 000 000` window) and a fresh
+/// random salt. Every block gets a fresh random nonce.
+pub fn build_meta(
+    alg: CipherAlg,
+    iterations: Option<u32>,
+    key_file: Option<&str>,
+) -> Result<CipherMeta, String> {
+    let nonce = random_nonce()?;
+    match key_file {
+        Some(path) => {
+            if iterations.is_some() {
+                return Err("--key-file and --iterations are mutually exclusive".to_string());
+            }
+            // Validate the key material now; the key itself is never stored.
+            read_key_file(path)?;
+            Ok(CipherMeta {
+                cipher: alg,
+                kdf: KdfKind::None,
+                iterations: None,
+                salt: None,
+                nonce,
+            })
+        }
+        None => {
+            let iterations = iterations.unwrap_or(600_000);
+            if !(1_000..=2_000_000).contains(&iterations) {
+                return Err(format!(
+                    "invalid PBKDF2 iteration count {iterations} (1000..=2000000)"
+                ));
+            }
+            let salt = random_salt()?;
+            Ok(CipherMeta {
+                cipher: alg,
+                kdf: KdfKind::Pbkdf2HmacSha256,
+                iterations: Some(iterations),
+                salt: Some(salt),
+                nonce,
+            })
+        }
+    }
+}
+
 /// Manifest spelling of the cipher algorithm, for messages.
 pub fn cipher_meta_name(meta: &CipherMeta) -> &'static str {
     match meta.cipher {
@@ -325,5 +408,85 @@ mod tests {
     fn cipher_meta_name_matches_the_manifest_spelling() {
         assert_eq!(cipher_meta_name(&meta(CipherAlg::ChaCha8)), "chacha8");
         assert_eq!(cipher_meta_name(&meta(CipherAlg::AesCtr)), "aes-ctr");
+    }
+
+    #[test]
+    fn parse_alg_accepts_every_manifest_spelling() {
+        for (name, alg) in [
+            ("chacha8", CipherAlg::ChaCha8),
+            ("chacha12", CipherAlg::ChaCha12),
+            ("chacha20", CipherAlg::ChaCha20),
+            ("aes-ctr", CipherAlg::AesCtr),
+            ("xor", CipherAlg::Xor),
+        ] {
+            assert_eq!(parse_alg(name), Ok(alg));
+        }
+        for name in ["", "ChaCha20", "rot13", "aes"] {
+            assert!(parse_alg(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn build_meta_defaults_to_pbkdf2_with_a_random_salt_and_nonce() {
+        let meta = build_meta(CipherAlg::ChaCha12, None, None).unwrap();
+        assert_eq!(meta.cipher, CipherAlg::ChaCha12);
+        assert_eq!(meta.kdf, KdfKind::Pbkdf2HmacSha256);
+        assert_eq!(meta.iterations, Some(600_000));
+        assert!(meta.salt.is_some());
+        assert_ne!(meta.nonce, [0u8; 8]);
+
+        let other = build_meta(CipherAlg::ChaCha12, Some(1_000), None).unwrap();
+        assert_eq!(other.iterations, Some(1_000));
+        assert_ne!(meta.salt, other.salt, "each block gets a fresh salt");
+        assert_ne!(meta.nonce, other.nonce, "each block gets a fresh nonce");
+    }
+
+    #[test]
+    fn build_meta_enforces_the_iteration_window() {
+        assert!(build_meta(CipherAlg::Xor, Some(999), None).is_err());
+        assert!(build_meta(CipherAlg::Xor, Some(2_000_001), None).is_err());
+        assert!(build_meta(CipherAlg::Xor, Some(1_000), None).is_ok());
+        assert!(build_meta(CipherAlg::Xor, Some(2_000_000), None).is_ok());
+    }
+
+    #[test]
+    fn build_meta_key_file_selects_an_unsalted_none_kdf() {
+        let path = temp_file("build_meta_key", &[0x7Au8; 32]);
+        let meta = build_meta(CipherAlg::AesCtr, None, Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(meta.kdf, KdfKind::None);
+        assert_eq!(meta.iterations, None);
+        assert_eq!(meta.salt, None);
+        assert_ne!(meta.nonce, [0u8; 8]);
+
+        // The key file is validated now, not when the manifest is used.
+        let short = temp_file("build_meta_short", &[0u8; 31]);
+        assert!(build_meta(CipherAlg::AesCtr, None, Some(short.to_str().unwrap())).is_err());
+        assert!(
+            build_meta(CipherAlg::AesCtr, Some(1_000), Some(path.to_str().unwrap())).is_err(),
+            "key-file and iterations are mutually exclusive"
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(short);
+    }
+
+    #[test]
+    fn build_meta_round_trips_through_the_manifest_encoder() {
+        for (alg, key_file) in [
+            (CipherAlg::ChaCha20, None),
+            (CipherAlg::AesCtr, None),
+            (CipherAlg::Xor, None),
+        ] {
+            let meta = build_meta(alg, Some(1_000), key_file).unwrap();
+            let bundle = snowscsi::common::bundle::BundleMeta {
+                kind: snowscsi::common::bundle::BundleKind::Image { size: 65_537 },
+                cipher: Some(meta),
+                has_crc: true,
+            };
+            let encoded = bundle.encode().unwrap();
+            let parsed = snowscsi::common::bundle::BundleMeta::parse(&encoded).unwrap();
+            assert_eq!(parsed.cipher, Some(meta));
+            assert!(parsed.has_crc);
+        }
     }
 }

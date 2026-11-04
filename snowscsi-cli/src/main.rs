@@ -10,6 +10,8 @@
 //!   (the **only** creator of its `SNOWBUNDLE` manifest and initial CD-R TOC;
 //!   it writes no chunk/track data)
 //! - `bundle-info`: report what a bundle directory or image sidecar describes
+//! - `crypt`: encrypt or decrypt one regular image file and its
+//!   `<file>.SNOWBUNDLE` sidecar
 //!
 //! Devices are declared with two repeatable flags sharing one grammar
 //! (`<backing>[=<value>][,<option>...]`): `--block` and `--cdrom`.
@@ -61,6 +63,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+#[cfg(feature = "cipher")]
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use std::process::ExitCode;
@@ -76,12 +80,16 @@ use snowscsi::block::{BlockAttrs, BlockDevice as CoreBlockDevice};
 use snowscsi::bundle::{identify_dir, identify_manifest, Identified};
 #[cfg(feature = "dvdram")]
 use snowscsi::cdrom::media::LiveData;
+#[cfg(any(feature = "bundle", feature = "cipher"))]
+use snowscsi::common::bundle::CipherAlg;
+#[cfg(feature = "cipher")]
+use snowscsi::common::bundle::CipherMeta;
+#[cfg(any(feature = "bundle", feature = "cipher"))]
+use snowscsi::common::bundle::KdfKind;
 #[cfg(any(feature = "cdr-bundle", feature = "cipher"))]
 use snowscsi::common::bundle::MANIFEST_NAME;
 #[cfg(any(feature = "bundle", feature = "cdr-bundle", feature = "cipher"))]
 use snowscsi::common::bundle::{BundleKind, BundleMeta};
-#[cfg(feature = "bundle")]
-use snowscsi::common::bundle::{CipherAlg, KdfKind};
 #[cfg(any(feature = "bundle", feature = "cipher"))]
 use snowscsi::common::bundle::{MAX_MANIFEST, SIDECAR_SUFFIX};
 #[cfg(feature = "bundle")]
@@ -181,6 +189,9 @@ enum Cli {
     BundleInfo(BundleInfoArgs),
     /// Create a flat or recordable-CD bundle directory
     BundleCreate(BundleCreateArgs),
+    /// Encrypt or decrypt a single image file and its `SNOWBUNDLE` sidecar
+    #[cfg(feature = "cipher")]
+    Crypt(CryptArgs),
 }
 
 /// Host transport execution model.
@@ -406,7 +417,7 @@ enum BundleCreateKind {
 }
 
 /// Arguments for `bundle-create flat`.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 struct CreateFlatArgs {
     /// Bundle directory (created when missing).
     #[arg(long, value_name = "DIR")]
@@ -420,10 +431,28 @@ struct CreateFlatArgs {
     /// Logical sector size (512 or 2048; default 512).
     #[arg(long, value_name = "512|2048", default_value = "512")]
     sector: u32,
+    /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
+    /// `xor` (obfuscation only). Without this flag the manifest is plaintext.
+    #[cfg(feature = "cipher")]
+    #[arg(long, value_name = "ALG")]
+    cipher: Option<String>,
+    /// PBKDF2-HMAC-SHA256 iteration count (1000..=2000000; default 600000).
+    #[cfg(feature = "cipher")]
+    #[arg(long, value_name = "N")]
+    iterations: Option<u32>,
+    /// Raw 32-byte key file; selects `kdf = none` (no password or salt).
+    #[cfg(feature = "cipher")]
+    #[arg(long = "key-file", value_name = "PATH")]
+    key_file: Option<String>,
+    /// Validate this password file (one line) for the encrypted manifest; the
+    /// password itself is never stored in the bundle.
+    #[cfg(feature = "cipher")]
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_file: Option<String>,
 }
 
 /// Arguments for `bundle-create cdr`.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 struct CreateCdrArgs {
     /// Bundle directory (created when missing).
     #[arg(long, value_name = "DIR")]
@@ -434,6 +463,95 @@ struct CreateCdrArgs {
     /// TOC slot size in bytes (accepts K/M/G suffixes; default 64 KiB).
     #[arg(long, value_name = "BYTES")]
     slot: Option<String>,
+    /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
+    /// `xor` (obfuscation only). The CD-R TOC stays plaintext; track payload
+    /// encryption is not wired yet, so serving such a bundle is an error.
+    #[cfg(feature = "cipher")]
+    #[arg(long, value_name = "ALG")]
+    cipher: Option<String>,
+    /// PBKDF2-HMAC-SHA256 iteration count (1000..=2000000; default 600000).
+    #[cfg(feature = "cipher")]
+    #[arg(long, value_name = "N")]
+    iterations: Option<u32>,
+    /// Raw 32-byte key file; selects `kdf = none` (no password or salt).
+    #[cfg(feature = "cipher")]
+    #[arg(long = "key-file", value_name = "PATH")]
+    key_file: Option<String>,
+    /// Validate this password file (one line) for the encrypted manifest; the
+    /// password itself is never stored in the bundle.
+    #[cfg(feature = "cipher")]
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_file: Option<String>,
+}
+
+/// Arguments for `snowscsi crypt`.
+///
+/// Encryption writes `<out>` plus `<out>.SNOWBUNDLE`; `--in-place` writes the
+/// sidecar first and then replaces `<in>`. Decryption reads `<in>.SNOWBUNDLE`,
+/// validates its image size, and writes plaintext to `<out>` (never a
+/// sidecar). The two files are separate fsynced renames, so a crash between
+/// them can leave a ciphertext image with a missing or stale sidecar; that is
+/// recoverable because the sidecar carries the only copy of the cipher
+/// parameters (remove it and re-encrypt from the plaintext source).
+///
+/// There is **no payload authentication**: a wrong password or a tampered
+/// ciphertext still exits 0 and writes garbage plaintext. Keep the input until
+/// the result is verified.
+#[cfg(feature = "cipher")]
+#[derive(Args, Debug)]
+#[command(
+    after_help = "SECURITY: there is no payload authentication. A wrong password or a tampered \
+ciphertext produces garbage output with exit status 0. Keep the input and verify the result before \
+deleting anything. Crypt operations take an exclusive `<target>.lock` file next to the target; a \
+crash can leave a stale lock (remove it if no process is running). Temporary files are created with \
+mode 0600 where the platform supports it; SIGKILL can leave one behind. --force overwrites an \
+existing output (and removes a stale <out>.SNOWBUNDLE after decryption)."
+)]
+struct CryptArgs {
+    /// Decrypt `<in>` using its required `<in>.SNOWBUNDLE` sidecar. The
+    /// manifest, not a flag, selects the cipher; its `kind = image` size must
+    /// match `<in>` before any plaintext is written. There is no payload
+    /// authentication: a wrong password or tampered ciphertext still exits 0
+    /// and writes garbage.
+    #[arg(long)]
+    decrypt: bool,
+    /// Cipher for encryption (`chacha8`, `chacha12`, `chacha20`, `aes-ctr`,
+    /// or `xor`). Required unless `--decrypt` is given. `xor` is obfuscation
+    /// only and is reported as such.
+    #[arg(long, value_name = "ALG")]
+    cipher: Option<String>,
+    /// Read one password line from this file (default: prompt on stdin; with
+    /// echo on a terminal). Encryption confirms the password twice unless a
+    /// key file or this flag is used. Only used when the manifest's `kdf` is
+    /// PBKDF2; `kdf = none` requires `--key-file`.
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_file: Option<String>,
+    /// Use a raw 32-byte key file instead of a password (`kdf = none`). This
+    /// is required (never prompted for) when the manifest's `kdf` is `none`.
+    #[arg(long = "key-file", value_name = "PATH")]
+    key_file: Option<String>,
+    /// PBKDF2-HMAC-SHA256 iteration count (1000..=2000000; default 600000).
+    /// Mutually exclusive with `--key-file` and rejected with `--decrypt`.
+    #[arg(long, value_name = "N")]
+    iterations: Option<u32>,
+    /// Encrypt `<in>` in place: write `<in>.SNOWBUNDLE` first, then replace
+    /// `<in>` atomically. Refused when the sidecar already exists, when the
+    /// input is a symlink, or when it has multiple hard links. The input's
+    /// permissions are copied to the replacement; owner, xattrs and ACLs are
+    /// not preserved. Cannot be combined with `--force`.
+    #[arg(long = "in-place")]
+    in_place: bool,
+    /// Overwrite an existing `<out>` or `<out>.SNOWBUNDLE`. After a forced
+    /// decryption a stale `<out>.SNOWBUNDLE` is removed. Cannot be combined
+    /// with `--in-place`.
+    #[arg(long)]
+    force: bool,
+    /// Input image file (must be a regular file).
+    #[arg(value_name = "IN")]
+    input: String,
+    /// Output image file (required unless `--in-place`).
+    #[arg(value_name = "OUT")]
+    output: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -442,6 +560,8 @@ fn main() -> ExitCode {
         Cli::Mkisofs(args) => run_mkisofs(args),
         Cli::BundleInfo(args) => run_bundle_info(args),
         Cli::BundleCreate(args) => run_bundle_create(args),
+        #[cfg(feature = "cipher")]
+        Cli::Crypt(args) => run_crypt(args),
     }
 }
 
@@ -623,7 +743,9 @@ fn read_password_file(path: &str) -> Result<Vec<u8>, String> {
 
     let file = File::open(path).map_err(|e| format!("cannot read password file '{path}': {e}"))?;
     let mut bytes = Vec::new();
-    file.take(MAX_PASSWORD as u64 + 1)
+    // Read two extra bytes so a maximum-length password followed by CRLF is
+    // accepted while a line one byte too long is still detected.
+    file.take(MAX_PASSWORD as u64 + 2)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read password file '{path}': {e}"))?;
     strip_password_newline(&mut bytes);
@@ -661,7 +783,7 @@ fn read_password_prompt() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
-        .take(MAX_PASSWORD as u64 + 1)
+        .take(MAX_PASSWORD as u64 + 2)
         .read_until(b'\n', &mut bytes)
         .map_err(|e| format!("failed to read the password from stdin: {e}"))?;
     strip_password_newline(&mut bytes);
@@ -669,6 +791,9 @@ fn read_password_prompt() -> Result<Vec<u8>, String> {
         return Err(format!(
             "password is larger than {MAX_PASSWORD} bytes (streams: use --password-file for a file)"
         ));
+    }
+    if bytes.iter().any(|&b| b == b'\n' || b == b'\r') {
+        return Err("password contains an embedded newline".to_string());
     }
     if bytes.contains(&0) {
         return Err("password contains a NUL byte".to_string());
@@ -3456,9 +3581,63 @@ impl<'a> Gadget<'a> for FfsGadget {
 
 /// `snowscsi bundle-create <flat|cdr>` dispatch.
 fn run_bundle_create(args: BundleCreateArgs) -> ExitCode {
+    init_logging(0);
     match args.kind {
         BundleCreateKind::Flat(args) => create_flat_bundle(args),
         BundleCreateKind::Cdr(args) => create_cdr_bundle(args),
+    }
+}
+
+/// Resolve `bundle-create`'s optional cipher flags.
+///
+/// Without `--cipher` every other cipher flag is rejected (a plaintext
+/// manifest carries no cipher block). With it, `--key-file` selects
+/// `kdf = none` and `--password-file` is only validated: the password is never
+/// needed to write the manifest and is never stored.
+#[cfg(all(feature = "cipher", feature = "bundle"))]
+fn create_bundle_cipher(
+    cipher: Option<&str>,
+    iterations: Option<u32>,
+    key_file: Option<&str>,
+    password_file: Option<&str>,
+) -> Result<Option<CipherMeta>, String> {
+    let Some(name) = cipher else {
+        for (flag, present) in [
+            ("--iterations", iterations.is_some()),
+            ("--key-file", key_file.is_some()),
+            ("--password-file", password_file.is_some()),
+        ] {
+            if present {
+                return Err(format!("{flag} requires --cipher"));
+            }
+        }
+        return Ok(None);
+    };
+    if key_file.is_some() && password_file.is_some() {
+        return Err("--key-file and --password-file are mutually exclusive".to_string());
+    }
+    if key_file.is_some() && iterations.is_some() {
+        return Err("--key-file and --iterations are mutually exclusive".to_string());
+    }
+    if let Some(path) = password_file {
+        // One readable line is all the manifest needs; the password itself is
+        // not used (the host supplies it when it serves the bundle).
+        read_password_file(path)?;
+    }
+    let alg = crate::cipher::parse_alg(name)?;
+    crate::cipher::build_meta(alg, iterations, key_file).map(Some)
+}
+
+/// Short success suffix: the cipher name, or `plaintext`.
+#[cfg(all(feature = "cipher", feature = "bundle"))]
+fn cipher_summary(cipher: Option<&CipherMeta>) -> String {
+    match cipher {
+        Some(meta) if meta.cipher == CipherAlg::Xor => {
+            log::warn!("xor is obfuscation, not encryption");
+            "obfuscated with xor".to_string()
+        }
+        Some(meta) => format!("encrypted with {}", crate::cipher::cipher_meta_name(meta)),
+        None => "plaintext".to_string(),
     }
 }
 
@@ -3512,6 +3691,21 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    #[cfg(feature = "cipher")]
+    let cipher = match create_bundle_cipher(
+        args.cipher.as_deref(),
+        args.iterations,
+        args.key_file.as_deref(),
+        args.password_file.as_deref(),
+    ) {
+        Ok(cipher) => cipher,
+        Err(e) => {
+            eprintln!("snowscsi: bundle-create: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(feature = "cipher"))]
+    let cipher = None;
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
             "snowscsi: bundle-create: failed to create directory {}: {e}",
@@ -3525,13 +3719,18 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
             chunk_size: chunk,
             sector_size: args.sector,
         },
-        cipher: None,
+        cipher,
         has_crc: false,
     };
+    #[cfg(feature = "cipher")]
+    let security = cipher_summary(meta.cipher.as_ref());
+    #[cfg(not(feature = "cipher"))]
+    let security = "plaintext";
     match FlatBundle::create_with_meta(StdFsBackend::new(&args.dir), &meta) {
         Ok(_) => {
             println!(
-                "snowscsi: created flat bundle {} ({} bytes, {} byte chunks, {} byte sectors)",
+                "snowscsi: created flat bundle {} ({} bytes, {} byte chunks, {} byte sectors, \
+                 {security})",
                 args.dir, size, chunk, args.sector
             );
             ExitCode::SUCCESS
@@ -3634,6 +3833,21 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    #[cfg(feature = "cipher")]
+    let cipher = match create_bundle_cipher(
+        args.cipher.as_deref(),
+        args.iterations,
+        args.key_file.as_deref(),
+        args.password_file.as_deref(),
+    ) {
+        Ok(cipher) => cipher,
+        Err(e) => {
+            eprintln!("snowscsi: bundle-create: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(feature = "cipher"))]
+    let cipher = None;
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
             "snowscsi: bundle-create: failed to create directory {}: {e}",
@@ -3644,9 +3858,13 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
 
     let meta = BundleMeta {
         kind: BundleKind::Cdr,
-        cipher: None,
+        cipher,
         has_crc: false,
     };
+    #[cfg(feature = "cipher")]
+    let security = cipher_summary(meta.cipher.as_ref());
+    #[cfg(not(feature = "cipher"))]
+    let security = "plaintext";
     let manifest = match meta.encode() {
         Ok(manifest) => manifest,
         Err(e) => {
@@ -3699,7 +3917,8 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!(
-        "snowscsi: created recordable-CD bundle {} ({:?}, {slot} byte TOC slot, {name})",
+        "snowscsi: created recordable-CD bundle {} ({:?}, {slot} byte TOC slot, {name}, \
+         {security})",
         args.dir, kind
     );
     ExitCode::SUCCESS
@@ -3772,6 +3991,696 @@ fn parse_slot(raw: &str) -> Result<u32, String> {
         ));
     }
     Ok(bytes)
+}
+
+/// `snowscsi crypt` — encrypt or decrypt one image file and its sidecar.
+#[cfg(feature = "cipher")]
+fn run_crypt(args: CryptArgs) -> ExitCode {
+    init_logging(0);
+    match crypt_run(args) {
+        Ok(line) => {
+            println!("snowscsi: {line}");
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("snowscsi: crypt: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Stream chunk size for `crypt` (one MiB; no whole-file allocation).
+#[cfg(feature = "cipher")]
+const CRYPT_CHUNK: usize = 1024 * 1024;
+
+/// `<path>.SNOWBUNDLE` (literal suffix, never `with_extension`).
+#[cfg(feature = "cipher")]
+fn crypt_sidecar(path: &str) -> String {
+    format!("{path}{SIDECAR_SUFFIX}")
+}
+
+/// `crypt`'s temporary path (`<path>.tmp.<random>`).
+///
+/// The suffix is random (not the PID) and the file is created with `create_new`
+/// so two concurrent runs can never share a temp. Unix temps are mode `0600`.
+#[cfg(feature = "cipher")]
+fn crypt_tmp(path: &str) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix)
+        .map_err(|e| format!("cannot read random bytes for a temporary name: {e}"))?;
+    let mut hex = String::with_capacity(16);
+    for byte in suffix {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(format!("{path}.tmp.{hex}"))
+}
+
+/// Create a fresh `0600` temp next to `path` (`create_new`, so it is ours).
+#[cfg(feature = "cipher")]
+fn crypt_create_temp(path: &str) -> Result<(File, String), String> {
+    let tmp = crypt_tmp(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&tmp)
+        .map_err(|e| format!("cannot create temporary file '{tmp}': {e}"))?;
+    Ok((file, tmp))
+}
+
+/// Identity of a crypt path, resolved before any payload I/O.
+#[cfg(feature = "cipher")]
+struct CryptPathIdentity {
+    /// Canonical target when it exists; otherwise the canonical parent plus the
+    /// file name (so `./`, `.`/`..` and symlinked directories still compare).
+    resolved: PathBuf,
+    /// `(dev, ino)` when the path exists, so hard links compare equal even
+    /// though their canonical paths differ.
+    #[cfg(unix)]
+    file_id: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "cipher")]
+fn crypt_path_identity(path: &str) -> Result<CryptPathIdentity, String> {
+    let raw = Path::new(path);
+    let resolved = match std::fs::canonicalize(raw) {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = raw
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let parent = std::fs::canonicalize(parent)
+                .map_err(|e| format!("cannot resolve the directory of '{path}': {e}"))?;
+            let name = raw
+                .file_name()
+                .ok_or_else(|| format!("'{path}' has no file name"))?;
+            parent.join(name)
+        }
+        Err(e) => return Err(format!("cannot resolve '{path}': {e}")),
+    };
+    #[cfg(unix)]
+    let file_id = std::fs::metadata(raw).ok().map(|meta| {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.dev(), meta.ino())
+    });
+    Ok(CryptPathIdentity {
+        resolved,
+        #[cfg(unix)]
+        file_id,
+    })
+}
+
+#[cfg(feature = "cipher")]
+fn crypt_same_file(a: &CryptPathIdentity, b: &CryptPathIdentity) -> bool {
+    if a.resolved == b.resolved {
+        return true;
+    }
+    #[cfg(unix)]
+    if let (Some(a), Some(b)) = (a.file_id, b.file_id) {
+        if a == b {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reject any pair of crypt paths that resolves to the same file.
+///
+/// This runs before the lock, the cipher or any payload I/O, and is what stops
+/// `out == in` through `./`, `.`/`..`, a symlink or a hard link, as well as an
+/// output that is exactly `<in>.SNOWBUNDLE`.
+#[cfg(feature = "cipher")]
+fn crypt_reject_aliases(entries: &[(&str, &str)]) -> Result<(), String> {
+    let mut ids = Vec::with_capacity(entries.len());
+    for &(label, path) in entries {
+        ids.push((label, path, crypt_path_identity(path)?));
+    }
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let (label_a, path_a, id_a) = &ids[i];
+            let (label_b, path_b, id_b) = &ids[j];
+            if crypt_same_file(id_a, id_b) {
+                return Err(format!(
+                    "{label_a} '{path_a}' and {label_b} '{path_b}' refer to the same file; \
+                     they must differ"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Exclusive, existence-based lock for one crypt target.
+///
+/// The lock is `<canonical target>.lock`; it is removed by [`Drop`] on every
+/// ordinary exit path. A SIGKILL/crash can leave it behind, in which case the
+/// operator must remove the file once no crypt process is running.
+#[cfg(feature = "cipher")]
+struct CryptLock {
+    path: PathBuf,
+}
+
+#[cfg(feature = "cipher")]
+impl Drop for CryptLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(feature = "cipher")]
+fn crypt_lock(target: &str) -> Result<CryptLock, String> {
+    let identity = crypt_path_identity(target)?;
+    let mut lock_name = identity.resolved.into_os_string();
+    lock_name.push(".lock");
+    let path = PathBuf::from(lock_name);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{}", std::process::id());
+            Ok(CryptLock { path })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "another crypt operation is already using '{target}' (lock file '{}' exists); \
+             if no crypt process is running, remove that stale lock file and retry",
+            path.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot create the lock file '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Refuse an in-place target that is a symlink or has multiple hard links.
+///
+/// A symlink would encrypt the target while replacing the link name; a hard
+/// link would silently change the other name's contents too. Both are safe
+/// out of place (the caller decides what to replace).
+#[cfg(feature = "cipher")]
+fn crypt_in_place_input(path: &str) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing --in-place on '{path}': it is a symbolic link (encrypt out of place instead)"
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("'{path}' is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(format!(
+                "refusing --in-place on '{path}': it has {} hard links (encrypt out of place instead)",
+                meta.nlink()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject everything that is not a regular file and return its length.
+///
+/// `metadata` follows symlinks, so a symlink to a regular file is accepted
+/// out of place while a directory, block device or a symlink resolving to one
+/// is refused.
+#[cfg(feature = "cipher")]
+fn crypt_input_len(path: &str) -> Result<u64, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("'{path}' is not a regular file"));
+    }
+    Ok(meta.len())
+}
+
+/// Flush the containing directory after a rename (best effort).
+#[cfg(feature = "cipher")]
+fn crypt_sync_parent(path: &str) {
+    let Some(parent) = Path::new(path).parent() else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Write `bytes` to `path` through a random `0600` temp, fsync it, then rename.
+#[cfg(feature = "cipher")]
+fn crypt_write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let (mut file, tmp) = crypt_create_temp(path)?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|e| format!("cannot write '{tmp}': {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("cannot sync '{tmp}': {e}"))?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("cannot rename '{tmp}' to '{path}': {e}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    } else {
+        crypt_sync_parent(path);
+    }
+    result
+}
+
+/// Stream `input` through `cipher` into `output`, deleting `output` on failure.
+///
+/// The cipher is length-preserving and symmetric: encryption and decryption
+/// are the same call. One [`CRYPT_CHUNK`] buffer is reused for the whole file.
+/// `output` must be a fresh temp created by the caller; this function creates
+/// it with `create_new` and mode `0600` on Unix.
+#[cfg(feature = "cipher")]
+fn crypt_file(
+    input: &str,
+    output: &str,
+    mut cipher: crate::cipher::CliCipher,
+) -> Result<u64, String> {
+    use snowscsi::common::cipher::StreamCipher as _;
+    use std::io::{Read as _, Write as _};
+
+    let result = (|| {
+        let mut src =
+            File::open(input).map_err(|e| format!("cannot open '{input}' for reading: {e}"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut dst = options
+            .open(output)
+            .map_err(|e| format!("cannot create '{output}': {e}"))?;
+        let mut buf = vec![0u8; CRYPT_CHUNK];
+        let mut offset = 0u64;
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| format!("cannot read '{input}': {e}"))?;
+            if n == 0 {
+                break;
+            }
+            cipher
+                .xor(offset, &mut buf[..n])
+                .map_err(|e| format!("cipher failed at offset {offset}: {e}"))?;
+            dst.write_all(&buf[..n])
+                .map_err(|e| format!("cannot write '{output}': {e}"))?;
+            offset += n as u64;
+        }
+        dst.flush()
+            .map_err(|e| format!("cannot flush '{output}': {e}"))?;
+        dst.sync_all()
+            .map_err(|e| format!("cannot sync '{output}': {e}"))?;
+        Ok(offset)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(output);
+    }
+    result
+}
+
+/// Log that `xor` is obfuscation, never encryption.
+#[cfg(feature = "cipher")]
+fn crypt_warn_xor(alg: CipherAlg) {
+    if alg == CipherAlg::Xor {
+        log::warn!("crypt: xor is obfuscation, not encryption");
+    }
+}
+
+/// Success verb for `crypt`; `xor` is never called encryption.
+#[cfg(feature = "cipher")]
+fn crypt_verb(alg: CipherAlg) -> &'static str {
+    if alg == CipherAlg::Xor {
+        "obfuscated with xor"
+    } else {
+        "encrypted"
+    }
+}
+
+/// Read the password/key material and build the manifest's stream cipher.
+#[cfg(feature = "cipher")]
+fn crypt_cipher(
+    meta: &CipherMeta,
+    args: &CryptArgs,
+    confirm: bool,
+) -> Result<crate::cipher::CliCipher, String> {
+    let password = match meta.kdf {
+        KdfKind::None => {
+            if args.password_file.is_some() {
+                return Err(
+                    "the manifest uses kdf = none; pass --key-file <path> instead of \
+                     --password-file"
+                        .to_string(),
+                );
+            }
+            if args.key_file.is_none() {
+                return Err(
+                    "the manifest uses kdf = none; pass --key-file <path> (a password is \
+                     never prompted for this manifest)"
+                        .to_string(),
+                );
+            }
+            None
+        }
+        KdfKind::Pbkdf2HmacSha256 => {
+            if args.key_file.is_some() {
+                return Err(
+                    "the manifest uses PBKDF2; pass --password-file <path> (or omit both to \
+                     prompt), not --key-file"
+                        .to_string(),
+                );
+            }
+            match args.password_file.as_deref() {
+                Some(path) => Some(read_password_file(path)?),
+                None => {
+                    let first = read_password_prompt()?;
+                    if confirm {
+                        let second = read_password_prompt()?;
+                        if first != second {
+                            return Err("passwords do not match".to_string());
+                        }
+                    }
+                    Some(first)
+                }
+            }
+        }
+    };
+    let key = crate::cipher::derive_key(meta, password.as_deref(), args.key_file.as_deref())?;
+    crate::cipher::CliCipher::from_meta(meta, &key)
+}
+
+/// Build the manifest block for a new encrypted image.
+#[cfg(feature = "cipher")]
+fn crypt_manifest(size: u64, meta: CipherMeta) -> Result<Vec<u8>, String> {
+    let bundle = BundleMeta {
+        kind: BundleKind::Image { size },
+        cipher: Some(meta),
+        has_crc: true,
+    };
+    bundle
+        .encode()
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| format!("cannot encode the manifest: {e}"))
+}
+
+/// Validate and execute one `snowscsi crypt` invocation.
+#[cfg(feature = "cipher")]
+fn crypt_run(args: CryptArgs) -> Result<String, String> {
+    if args.in_place && args.force {
+        return Err("--force cannot be used with --in-place".to_string());
+    }
+    if args.decrypt {
+        return crypt_decrypt(&args);
+    }
+
+    let Some(name) = args.cipher.as_deref() else {
+        return Err("--cipher is required for encryption (use --decrypt to decrypt)".to_string());
+    };
+    if args.key_file.is_some() && args.password_file.is_some() {
+        return Err("--key-file and --password-file are mutually exclusive".to_string());
+    }
+    if args.key_file.is_some() && args.iterations.is_some() {
+        return Err("--key-file and --iterations are mutually exclusive".to_string());
+    }
+
+    if args.in_place {
+        if args.output.is_some() {
+            return Err("--in-place takes no output path".to_string());
+        }
+        crypt_in_place_input(&args.input)?;
+        let sidecar = crypt_sidecar(&args.input);
+        // An in-place target and its sidecar must be two different files.
+        crypt_reject_aliases(&[("input", &args.input), ("input sidecar", &sidecar)])?;
+        let _lock = crypt_lock(&args.input)?;
+        let input_len = crypt_input_len(&args.input)?;
+        if Path::new(&sidecar).exists() {
+            return Err(format!(
+                "{sidecar} already exists; refusing to replace a sidecar that may describe a \
+                 different nonce (remove it first or use an out-of-place run)"
+            ));
+        }
+
+        let alg = crate::cipher::parse_alg(name)?;
+        crypt_warn_xor(alg);
+        let meta = crate::cipher::build_meta(alg, args.iterations, args.key_file.as_deref())?;
+        let alg_name = crate::cipher::cipher_meta_name(&meta);
+        let cipher = crypt_cipher(&meta, &args, true)?;
+        let manifest = crypt_manifest(input_len, meta)?;
+        // The sidecar goes first: a crash before the image rename leaves the
+        // original plaintext intact with a stale sidecar, which is recoverable
+        // by removing that sidecar.
+        crypt_write_atomic(&sidecar, &manifest)?;
+        let tmp = crypt_tmp(&args.input)?;
+        let encrypted = match crypt_file(&args.input, &tmp, cipher) {
+            Ok(len) => len,
+            Err(e) => {
+                let _ = std::fs::remove_file(&sidecar);
+                return Err(format!("{e}; the original file is untouched"));
+            }
+        };
+        if encrypted != input_len {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&sidecar);
+            return Err(format!(
+                "input '{}' changed size while reading (expected {input_len} bytes, processed \
+                 {encrypted}); the original file is untouched",
+                args.input
+            ));
+        }
+        // Preserve permissions across the replacement; ownership, xattrs and
+        // ACLs are deliberately not copied (the temp belongs to this user).
+        let permissions = std::fs::metadata(&args.input)
+            .map_err(|e| format!("cannot stat '{}': {e}", args.input))?
+            .permissions();
+        if let Err(e) = std::fs::set_permissions(&tmp, permissions) {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&sidecar);
+            return Err(format!(
+                "cannot preserve permissions on '{}': {e}; the original file is untouched",
+                args.input
+            ));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &args.input) {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&sidecar);
+            return Err(format!(
+                "cannot replace '{}': {e}; the original file is untouched",
+                args.input
+            ));
+        }
+        crypt_sync_parent(&args.input);
+        return Ok(format!(
+            "{} {} in place ({encrypted} bytes, {alg_name})",
+            crypt_verb(alg),
+            args.input
+        ));
+    }
+
+    let Some(out) = args.output.as_deref() else {
+        return Err("an output path is required unless --in-place is given".to_string());
+    };
+    let in_sidecar = crypt_sidecar(&args.input);
+    let out_sidecar = crypt_sidecar(out);
+    // Check every path pair before the lock, the cipher or any payload I/O.
+    crypt_reject_aliases(&[
+        ("input", &args.input),
+        ("input sidecar", &in_sidecar),
+        ("output", out),
+        ("output sidecar", &out_sidecar),
+    ])?;
+    let _lock = crypt_lock(out)?;
+    let input_len = crypt_input_len(&args.input)?;
+    if Path::new(&in_sidecar).exists() {
+        return Err(format!(
+            "input '{}' already has '{in_sidecar}' (it looks encrypted); refusing to encrypt it \
+             again",
+            args.input
+        ));
+    }
+
+    let alg = crate::cipher::parse_alg(name)?;
+    crypt_warn_xor(alg);
+    let meta = crate::cipher::build_meta(alg, args.iterations, args.key_file.as_deref())?;
+    let alg_name = crate::cipher::cipher_meta_name(&meta);
+    if !args.force {
+        if Path::new(out).exists() {
+            return Err(format!(
+                "'{out}' already exists (use --force to replace it)"
+            ));
+        }
+        if Path::new(&out_sidecar).exists() {
+            return Err(format!(
+                "'{out_sidecar}' already exists (use --force to replace it)"
+            ));
+        }
+    }
+
+    let cipher = crypt_cipher(&meta, &args, true)?;
+    // Encode the manifest before the image rename: an encode failure must not
+    // leave an orphan ciphertext file.
+    let manifest = crypt_manifest(input_len, meta)?;
+    let tmp = crypt_tmp(out)?;
+    let encrypted = crypt_file(&args.input, &tmp, cipher)?;
+    if encrypted != input_len {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "input '{}' changed size while reading (expected {input_len} bytes, processed \
+             {encrypted}); refusing to commit",
+            args.input
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot rename '{tmp}' to '{out}': {e}"));
+    }
+    crypt_sync_parent(out);
+    // Two files cannot be committed atomically: if the sidecar write fails the
+    // fresh image is removed so no orphan ciphertext is left behind.
+    if let Err(e) = crypt_write_atomic(&out_sidecar, &manifest) {
+        let _ = std::fs::remove_file(out);
+        return Err(format!("{e}; removed the newly written '{out}'"));
+    }
+    Ok(format!(
+        "{} {} -> {} ({encrypted} bytes, {alg_name})",
+        crypt_verb(alg),
+        args.input,
+        out
+    ))
+}
+
+/// Decrypt `<in>` into `<out>` after validating its sidecar.
+#[cfg(feature = "cipher")]
+fn crypt_decrypt(args: &CryptArgs) -> Result<String, String> {
+    if args.cipher.is_some() {
+        return Err("--decrypt does not take --cipher (the sidecar decides)".to_string());
+    }
+    if args.iterations.is_some() {
+        return Err("--decrypt does not take --iterations (the sidecar decides)".to_string());
+    }
+    if args.in_place {
+        return Err("--in-place is encryption-only; decrypt to a separate output".to_string());
+    }
+    if args.key_file.is_some() && args.password_file.is_some() {
+        return Err("--key-file and --password-file are mutually exclusive".to_string());
+    }
+    let Some(out) = args.output.as_deref() else {
+        return Err("an output path is required with --decrypt".to_string());
+    };
+    let sidecar = crypt_sidecar(&args.input);
+    let out_sidecar = crypt_sidecar(out);
+    crypt_reject_aliases(&[
+        ("input", &args.input),
+        ("input sidecar", &sidecar),
+        ("output", out),
+        ("output sidecar", &out_sidecar),
+    ])?;
+    let _lock = crypt_lock(out)?;
+    let input_len = crypt_input_len(&args.input)?;
+    if !Path::new(&sidecar).is_file() {
+        return Err(format!(
+            "missing manifest '{sidecar}' (decryption needs the sidecar written by encryption)"
+        ));
+    }
+    let bytes = read_capped(&sidecar, MAX_MANIFEST + 1)
+        .map_err(|e| format!("cannot read manifest '{sidecar}': {e}"))?;
+    let parsed =
+        BundleMeta::parse(&bytes).map_err(|e| format!("invalid manifest '{sidecar}': {e}"))?;
+    let size = match parsed.kind {
+        BundleKind::Image { size } => size,
+        _ => {
+            return Err(format!(
+                "manifest '{sidecar}' is not a single-file image manifest"
+            ))
+        }
+    };
+    if size != input_len {
+        return Err(format!(
+            "manifest '{sidecar}' declares image size {size}, but '{}' is {input_len} bytes",
+            args.input
+        ));
+    }
+    let Some(meta) = parsed.cipher else {
+        return Err(format!(
+            "manifest '{sidecar}' does not describe a cipher; refusing to write plaintext"
+        ));
+    };
+    if !parsed.has_crc {
+        log::warn!("crypt: manifest '{sidecar}' has no crc line; cipher parameters are unchecked");
+    }
+    if !args.force {
+        if Path::new(out).exists() {
+            return Err(format!(
+                "'{out}' already exists (use --force to replace it)"
+            ));
+        }
+        if Path::new(&out_sidecar).exists() {
+            return Err(format!(
+                "'{out_sidecar}' already exists (use --force to replace it)"
+            ));
+        }
+    }
+    // Build the key/cipher before touching the output: an invalid key or
+    // manifest must never leave plaintext behind.
+    let cipher = crypt_cipher(&meta, args, false)?;
+    let tmp = crypt_tmp(out)?;
+    let decrypted = crypt_file(&args.input, &tmp, cipher)?;
+    if decrypted != input_len {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "input '{}' changed size while reading (expected {input_len} bytes, processed \
+             {decrypted}); no plaintext was written",
+            args.input
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot rename '{tmp}' to '{out}': {e}"));
+    }
+    crypt_sync_parent(out);
+    // A plaintext output must not keep a stale cipher sidecar from an earlier
+    // file at this name. Only --force may reach this point with one present.
+    if args.force && Path::new(&out_sidecar).exists() {
+        std::fs::remove_file(&out_sidecar).map_err(|e| {
+            format!("decrypted '{out}', but cannot remove the stale '{out_sidecar}': {e}")
+        })?;
+        crypt_sync_parent(out);
+    }
+    let verb = if meta.cipher == CipherAlg::Xor {
+        "deobfuscated"
+    } else {
+        "decrypted"
+    };
+    Ok(format!(
+        "{verb} {} -> {} ({decrypted} bytes, {})",
+        args.input,
+        out,
+        crate::cipher::cipher_meta_name(&meta)
+    ))
 }
 
 /// `snowscsi bundle-info <path>` — report the manifest (and CD-R TOC header).
@@ -4526,6 +5435,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: Some("1M".to_string()),
             sector: 512,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let specs = spec::parse_all(&[], &[format!("bundle={}", dir.display())]).unwrap();
@@ -4546,6 +5456,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
 
@@ -4581,6 +5492,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         assert_eq!(
@@ -4615,6 +5527,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: Some("cdr74".to_string()),
             slot: None,
+            ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         assert!(dir.join("SNOWBUNDLE").is_file());
@@ -4647,6 +5560,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let specs = spec::parse_all(&[format!("bundle={}", dir.display())], &[]).unwrap();
@@ -4669,6 +5583,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let specs = spec::parse_all(&[], &[format!("bundle={},ro", dir.display())]).unwrap();
@@ -4684,6 +5599,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         std::fs::remove_file(dir.join("toc.0")).unwrap();
@@ -4710,6 +5626,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         };
         assert_eq!(create_cdr_bundle(args), ExitCode::FAILURE);
         assert!(
@@ -4730,6 +5647,7 @@ mod tests {
             size: "1".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         };
         assert_eq!(create_flat_bundle(args), ExitCode::FAILURE);
         assert!(!dir.exists(), "a bad --size must not create the directory");
@@ -4746,6 +5664,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         };
         assert_eq!(create_flat_bundle(args), ExitCode::FAILURE);
         assert!(dir.join("000000.img").is_file());
@@ -4762,6 +5681,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
 
@@ -4818,6 +5738,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let manifest = std::fs::read(dir.join("SNOWBUNDLE")).unwrap();
@@ -4847,6 +5768,7 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         std::fs::remove_file(dir.join("toc.0")).unwrap();
@@ -4868,6 +5790,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         };
         assert_eq!(create_flat_bundle(flat), ExitCode::SUCCESS);
         let again = CreateFlatArgs {
@@ -4875,6 +5798,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
+            ..CreateFlatArgs::default()
         };
         assert_eq!(create_flat_bundle(again), ExitCode::FAILURE);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4888,12 +5812,14 @@ mod tests {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         };
         assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
         let again = CreateCdrArgs {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
+            ..CreateCdrArgs::default()
         };
         assert_eq!(create_cdr_bundle(again), ExitCode::FAILURE);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5513,6 +6439,7 @@ mod tests {
             size: "8M".to_string(),
             chunk: Some("1M".to_string()),
             sector: 2048,
+            ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
         let meta = BundleMeta {
@@ -5646,11 +6573,69 @@ mod tests {
         std::fs::write(&path, vec![b'x'; MAX_PASSWORD + 2]).unwrap();
         assert!(read_password_file(&path.display().to_string()).is_err());
 
+        // A full-length password followed by CRLF is accepted (the two extra
+        // bytes are read so the CRLF can be stripped), while a line one byte
+        // over the cap is rejected.
+        let mut max_crlf = vec![b'x'; MAX_PASSWORD];
+        max_crlf.extend_from_slice(b"\r\n");
+        std::fs::write(&path, &max_crlf).unwrap();
+        let read = read_password_file(&path.display().to_string()).unwrap();
+        assert_eq!(read.len(), MAX_PASSWORD);
+        let mut one_over = vec![b'x'; MAX_PASSWORD + 1];
+        one_over.push(b'\n');
+        std::fs::write(&path, &one_over).unwrap();
+        assert!(read_password_file(&path.display().to_string()).is_err());
+
         // `--password-file` without an encrypted LUN is a configuration error.
         let specs = spec::parse_all(&["ram=1M".to_string()], &[]).unwrap();
         let args = parse_serve(&["--usb", "--password-file", "/tmp/unused"]);
         assert!(read_serve_password(&args, &specs).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn crypt_file_matches_a_one_shot_cipher_past_two_chunks() {
+        use snowscsi::common::cipher::{CipherKey, StreamCipher as _};
+
+        let dir = temp_dir("cipher_chunks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let len = CRYPT_CHUNK * 2 + 12_345;
+        let plain: Vec<u8> = (0..len)
+            .map(|i| (i as u64).wrapping_mul(31).wrapping_add(7) as u8)
+            .collect();
+        let key = CipherKey::from_bytes(&[0x42u8; 32]).unwrap();
+
+        for alg in [
+            CipherAlg::ChaCha8,
+            CipherAlg::ChaCha12,
+            CipherAlg::ChaCha20,
+            CipherAlg::AesCtr,
+            CipherAlg::Xor,
+        ] {
+            let meta = cipher_meta(alg);
+            let input = dir.join(format!("{alg:?}.in"));
+            let output = dir.join(format!("{alg:?}.out"));
+            std::fs::write(&input, &plain).unwrap();
+
+            let cipher = cipher::CliCipher::from_meta(&meta, &key).unwrap();
+            let processed =
+                crypt_file(input.to_str().unwrap(), output.to_str().unwrap(), cipher).unwrap();
+            assert_eq!(processed as usize, len, "{alg:?} byte count");
+
+            let mut expected = plain.clone();
+            let mut one_shot = cipher::CliCipher::from_meta(&meta, &key).unwrap();
+            one_shot.xor(0, &mut expected).unwrap();
+            assert_eq!(
+                std::fs::read(&output).unwrap(),
+                expected,
+                "{alg:?} must use absolute offsets across chunk boundaries"
+            );
+
+            std::fs::remove_file(&input).unwrap();
+            std::fs::remove_file(&output).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5701,6 +6686,7 @@ mod tests {
                     size: "8M".to_string(),
                     chunk: Some("1M".to_string()),
                     sector: 512,
+                    ..CreateFlatArgs::default()
                 });
                 assert_eq!(created, ExitCode::SUCCESS);
                 let bundle = FlatBundle::open(

@@ -17,7 +17,7 @@ the `snowscsi` binary lives in `snowscsi-cli`.
 | — iSCSI | `snowscsi::iscsi` | iSCSI PDU codec, connection, target state machine driving `core::Target`, TCP transport |
 | — USB MSC | `snowscsi::usb` | Bulk-Only Transport core: CBW/CSW codec, `BotIo`/`Gadget` seams, `BotSession` driving `core::Target` |
 | — DVD-RAM | `snowscsi::dvdram` (feature `dvdram`) | Blank, host-formatted random-writable DVD-RAM media (`cdrom::dvdram::DvdRamMedia`) |
-| **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory; `snowscsi bundle-create` writes a `SNOWBUNDLE` directory manifest (flat or recordable CD + initial TOC) and `snowscsi bundle-info` reports one |
+| **CLI** | `snowscsi-cli` (`src/main.rs`) | `snowscsi serve` runs the iSCSI target or the USB MSC (BOT) gadget; `snowscsi mkisofs` generates an ISO image from a directory; `snowscsi bundle-create` writes a `SNOWBUNDLE` directory manifest (flat or recordable CD + initial TOC) and `snowscsi bundle-info` reports one; `snowscsi crypt` encrypts/decrypts a single image file with a `<file>.SNOWBUNDLE` sidecar |
 | **Tests** | `snowscsi-tests` (`tests/`) | Integration tests (mock + libiscsi whitebox + ISO cross-validation) |
 | **Tools** | `tools/` (not a workspace member) | External Python black-box tests (`ext-test/`) + USB passthrough helper |
 
@@ -43,7 +43,7 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 │       └── dvdram.rs            # feature "dvdram": blank, host-formatted DVD-RAM media
 ├── snowscsi-cli/                 # crate: `snowscsi` binary (src/main.rs)
 │   ├── Cargo.toml                # features: full/std/scsi/dvdram/iscsi/cdrom/livefs/usb/bundle/cdr-bundle/cipher/log/tokio/defmt
-│   └── src/{main,spec,stack,cipher}.rs  # #![forbid(unsafe_code)]; serve + mkisofs + bundle-create/info
+│   └── src/{main,spec,stack,cipher}.rs  # #![forbid(unsafe_code)]; serve + mkisofs + bundle-create/info + crypt
 ├── tests/                         # crate: snowscsi-tests (integration tests)
 │   ├── Cargo.toml
 │   ├── build.rs                  # probes libiscsi (cfg has_libiscsi), compiles c/iscsi_access.c
@@ -106,8 +106,9 @@ Feature maps:
   (→`bundle` in this crate)/`cipher`/`log`/`tokio` plus
   std-only deps (clap/ctrlc/env_logger). `cipher` (→`snowscsi/cipher` +
   `snowscsi/cipher-kdf`) adds the `cipher`/`key=` serve options for `img=` and
-  flat `bundle=` LUNs, the AES-256 CTR backend and `--password-file`; it does
-  not wire CD-R `CipherStore` yet. Builds against `snowscsi` with
+  flat `bundle=` LUNs, the `crypt` verb, `bundle-create ... --cipher`, the
+  AES-256 CTR backend and `--password-file`; it does not wire CD-R
+  `CipherStore` yet. Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
@@ -126,6 +127,7 @@ A directory-chunked flat bundle is created once with
 
 ```bash
 snowscsi bundle-create flat --dir <dir> --size <n> [--chunk <n>] [--sector 512|2048]
+    [--cipher <alg>] [--iterations <n>] [--key-file <k>] [--password-file <f>]
 ```
 
 which writes the canonical `SNOWBUNDLE` (`kind = flat`) through a checked
@@ -143,6 +145,93 @@ chunk files on the first host write. `bundle-info <dir>` prints the parsed
 kind, geometry, cipher description and CRC presence. An image file with a
 `<file>.SNOWBUNDLE` sidecar is inspected by passing the image path (or the
 sidecar path itself) to `bundle-info`.
+
+### Encrypted images and bundles
+
+`snowscsi crypt` encrypts or decrypts one regular image file and keeps the
+cipher description beside it in `<file>.SNOWBUNDLE`:
+
+```bash
+# out-of-place encryption (password from --password-file, or stdin twice)
+snowscsi crypt --cipher chacha20 --password-file pw image.img image.enc
+# out-of-place decryption reads image.enc.SNOWBUNDLE; it writes no sidecar
+snowscsi crypt --decrypt --password-file pw image.enc restored.img
+# raw key (exactly 32 bytes), no password/salt; --iterations is rejected
+snowscsi crypt --cipher aes-ctr --key-file key.bin --in-place disk.img
+```
+
+**There is no payload authentication.** The stream ciphers only transform
+bytes; there is no MAC or AEAD tag. A wrong password or a tampered ciphertext
+therefore exits **0** and writes garbage. Keep the input until the result has
+been verified, and never delete the only copy before checking it. For
+`--decrypt` the manifest's `kdf` chooses the credential: `kdf = none` requires
+`--key-file` (it never prompts), while PBKDF2 reads `--password-file` or
+prompts on stdin.
+
+- Algorithms: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`; `xor` is
+  obfuscation, not encryption (it logs a warning and the success line says
+  `obfuscated with xor`).
+- Encryption requires `--cipher`. Without `--key-file`/`--password-file` the
+  password is read from stdin twice (confirmation); a terminal prompt echoes
+  because there is no termios dependency, so use `--password-file` in scripts.
+- `--key-file` selects `kdf = none`; otherwise PBKDF2-HMAC-SHA256 with a fresh
+  salt and `--iterations` (default 600000, accepted 1000..=2000000). Every
+  manifest gets a fresh nonce.
+- `--decrypt` rejects `--cipher`/`--iterations` (the sidecar decides), requires
+  `<in>.SNOWBUNDLE`, and validates `kind = image` and its `size` against the
+  input before writing anything. A CRC-less manifest is accepted (the CRC is
+  deliberately optional), but the CLI warns that the cipher parameters are
+  unchecked.
+- Path safety runs **before** the lock or payload I/O: `in`, `in.SNOWBUNDLE`,
+  `out` and `out.SNOWBUNDLE` must all be distinct files. Symlinks, hard links,
+  and `.`/`..` spellings are resolved so that an output equal to the input (or
+  to the input sidecar) is rejected. Out-of-place encryption also refuses an
+  input that already has `<in>.SNOWBUNDLE` rather than silently double-encrypt.
+- Refuse an existing `<out>` or `<out>.SNOWBUNDLE` unless `--force`.
+  `--force` overwrites and, after a successful forced decryption, removes a
+  stale `<out>.SNOWBUNDLE`. `--force` cannot be combined with `--in-place`.
+  `--in-place` has no `<out>`, refuses an existing `<in>.SNOWBUNDLE` (it may
+  describe a different nonce), refuses symlink and multi-hard-link inputs,
+  copies the input's permissions onto the replacement (owner, xattrs and ACLs
+  are **not** preserved), and writes the sidecar **first**, then replaces the
+  image through a temp; a crash leaves recoverable plaintext plus a stale
+  sidecar (remove it).
+- Every run holds an exclusive `<canonical target>.lock` file (`create_new`)
+  next to the target for its whole duration; the lock is removed on every
+  ordinary exit path. Contention is a hard error. A crash/SIGKILL can leave the
+  lock behind: remove it once no crypt process is running.
+- Streaming is one 1 MiB buffer and the number of bytes processed must equal
+  the input size captured before reading; a file that changes size mid-run is
+  an error and the temp/sidecar are removed. Out-of-place encryption writes a
+  random-suffixed `<out>.tmp.<random>` (fsync + rename), then
+  `<out>.SNOWBUNDLE.tmp.<random>` (fsync + rename), then fsyncs the directory.
+  The two files are not committed atomically: if the manifest write fails the
+  fresh image is removed. Decryption writes plaintext to a temp file and
+  renames it; it never writes a sidecar, and removes a stale `<out>.SNOWBUNDLE`
+  when forced. All crypt temps are created with `create_new` and mode `0600`
+  on Unix; a SIGKILL can leave such a temp file behind.
+
+`bundle-create flat|cdr ... --cipher <alg>` writes the cipher block into the
+directory manifest instead of an image sidecar:
+
+```bash
+snowscsi bundle-create flat --dir ./disk --size 64M \
+    --cipher chacha12 --iterations 1000 --password-file pw
+snowscsi bundle-create cdr --dir ./cdr --cipher aes-ctr --key-file key.bin
+snowscsi bundle-info ./disk       # prints cipher/kdf/iterations and CRC presence
+```
+
+`--cipher` absent keeps the manifest plaintext and rejects the other cipher
+flags. `--key-file` implies `kdf = none`; `--password-file` is only validated
+(one line) — the password is never stored. `serve --block bundle=<dir>,cipher`
+and `--cdrom bundle=<flat>,cipher` derive the key from `--password-file`,
+stdin, or `key=<path>`.
+
+The CD-R TOC (`toc.0`/`toc.1`) is deliberately **plaintext**: capacity,
+session and track geometry must be readable without a key. Only track payload
+resources would be encrypted by a resource-addressed store, and that wiring is
+a later milestone; serving a `kind = cdr` bundle with `cipher` is a hard error
+today, never a plaintext fallback.
 
 ### CD-R/CD-RW storage resource contract
 

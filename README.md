@@ -86,6 +86,14 @@ from a directory with:
 snowscsi mkisofs src_dir out.iso --label MYDISC
 ```
 
+Encrypt or decrypt a single image file (`<file>.SNOWBUNDLE` carries the
+cipher description), and create an encrypted flat or CD-R bundle with
+`bundle-create ... --cipher`:
+
+```bash
+snowscsi crypt --cipher chacha20 --password-file pw image.img image.enc
+```
+
 ## Embedded example
 
 [`examples/esp32s3-pocket-dongle`](examples/esp32s3-pocket-dongle) is a
@@ -165,7 +173,7 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 ├── snowscsi-iso9660/               # ISO9660/Joliet live-generation algorithms
 ├── snowscsi/                       # SCSI core + iSCSI + USB MSC + CD-ROM + DVD-RAM
 │   └── src/{scsi, cdrom, iscsi, usb}
-├── snowscsi-cli/                   # `snowscsi` binary (serve + mkisofs + bundle-create/info)
+├── snowscsi-cli/                   # `snowscsi` binary (serve + mkisofs + bundle-create/info + crypt)
 ├── snowscsi-tests/                 # non-published test harness (integration + whitebox)
 ├── tools/                          # NOT a cargo member: ext-test/ + USB helpers
 ├── examples/esp32s3-pocket-dongle/ # ESP32-S3 firmware: SD card as a DVD-RAM USB drive
