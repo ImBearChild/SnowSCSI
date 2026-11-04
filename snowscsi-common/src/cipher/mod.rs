@@ -51,6 +51,17 @@
 //! touched. The cipher is stateless per call — `xor(off, buf)` is a pure
 //! function of the key, nonce, offset and buffer — so the same range always
 //! decrypts to the same bytes no matter how it is split across calls.
+//!
+//! # Why not XTS
+//!
+//! XTS needs the inverse of a 128-bit block cipher (ChaCha has none) and a
+//! whole-data-unit alignment: a partial-unit write would need a
+//! read-modify-write round trip or an `Unsupported` result, while the byte
+//! seams deliberately allow arbitrary offsets and short transfers. It also
+//! provides no authentication, so against an attacker who can copy or restore
+//! media it buys little over CTR. CTR keeps position-only addressing, which is
+//! what the storage seams need; integrity, if required, belongs in a layer
+//! above this one.
 
 use crate::seekable_storage::{FlatData, StorageError, WritableFlatData};
 

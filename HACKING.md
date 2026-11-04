@@ -228,6 +228,16 @@ flags. `--key-file` implies `kdf = none`; `--password-file` is only validated
 `--cdrom bundle=<flat>,cipher` and `--cdrom bundle=<cdr>,cipher` derive the key
 from `--password-file`, stdin, or `key=<path>`.
 
+Carrier × protection (v1):
+
+| carrier | manifest | payload encryption |
+|---|---|---|
+| `img=<file>` | `<file>.SNOWBUNDLE` (sidecar) | `CipherPlane` over the image |
+| `bundle=<dir>` `kind = flat` | `<dir>/SNOWBUNDLE` | `CipherPlane` over `FlatBundle` (virtual offsets, across chunks) |
+| `bundle=<dir>` `kind = cdr` | `<dir>/SNOWBUNDLE` | `CipherStore` over track resources; TOC plaintext |
+| `ram=`, `live=`, `dvdram=`, `empty` | — | `cipher` is rejected |
+| `removable` (`--block img=`) | — | `cipher` is rejected (v1: the card-insert path has no password) |
+
 A recordable bundle encrypts only its **track** resources (`track_<n>.bin`,
 resource `16 + n`) with the manifest's `nonce XOR resource` domain; the CD-R
 TOC (`toc.0`/`toc.1`, resources 1/2) is deliberately **plaintext**, so
