@@ -375,10 +375,8 @@ async fn sd_read_test(
     let mut off: u64 = 0;
     let t0 = Instant::now();
     while off < total {
-        let blocks = core::cmp::min(
-            batch.len() as u64,
-            (total - off) / SD_BLOCK_SIZE as u64,
-        ) as usize;
+        let blocks =
+            core::cmp::min(batch.len() as u64, (total - off) / SD_BLOCK_SIZE as u64) as usize;
         let block = (off / SD_BLOCK_SIZE as u64) as u32;
         if let Err(e) = dev.read(block, &mut batch[..blocks]).await {
             esp_println::println!("SD read: ERR at {} B: {}", off, err_tag(&e));

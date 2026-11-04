@@ -571,6 +571,97 @@ then backed by `Backing::zero` (an
 are discarded), which measures the USB + BOT path with no SD I/O at all. That
 is how the 14.2 / 7.2 MB/s ceilings above were measured.
 
+## 10. Hardware AES-CTR on the SD plane
+
+`CIPHER_KEY = Some((key, nonce))` in `src/main.rs` moves the card behind
+`store::Backing::SdCipher`. The data path becomes:
+
+```
+read:  SD cmd -> caller buffer (ciphertext) -> AES-CTR XOR in place -> host
+write: host buffer (plaintext) -> AES-CTR XOR -> SD cmd (ciphertext)
+```
+
+`src/aes.rs` implements the two library hooks over `esp_hal::aes::dma`:
+
+| Hook | Hardware mode | Used for |
+|---|---|---|
+| `BlockCipher16::encrypt_block` | ECB, one block | unaligned head/tail of a range |
+| `CtrAccel::ctr_xor_aligned` | CTR, whole blocks | the aligned middle |
+
+The counter layout (`nonce || BE64(off / 16)`) and the head/tail split stay in
+`snowscsi_common::cipher::AesCtr`; the hardware layer only ever receives a
+prepared counter block.
+
+The vendored esp-hal clears `inc_sel` for CTR (`set_cipher_mode`), so the
+peripheral is really **INC_32**: it carries only `counter[12..16]` and wraps the
+low word back to zero. `ctr_xor_aligned` therefore caps each DMA run at the next
+32-bit boundary and advances the full 128-bit counter itself after every run.
+Without that, any range crossing `0xFFFF_FFFF` reuses counters and produces a
+keystream that no other `AesCtr` implementation reproduces.
+
+### What it costs
+
+- **Two static DMA buffers** (`dma_tx_buffer!` / `dma_rx_buffer!`, 2 KiB each,
+  `.bss`). They are moved into `AesDma::process` and recovered from
+  `AesTransfer::wait()` on every transfer. The statics are linked even with
+  `CIPHER_KEY = None`.
+- **A peripheral reset per transfer.** esp-hal's `AesDma::process` resets the
+  AES block before arming DMA, so the fixed cost scales with the number of
+  chunks, not bytes. An **aligned** 16 KiB read reaches `AesCtr::xor` in one
+  call and the hardware layer chunks it at `AES_BUF`: 8 DMA transfers. An
+  **unaligned** range adds one ECB transfer for the partial head block and one
+  for the partial tail, and a range crossing a 32-bit counter boundary is split
+  again, so it is *not* exactly `len / AES_BUF` transfers. The write path is
+  additionally chunked by `AsyncCipherPlane::SCRATCH` (`CIPHER_SCRATCH`, also
+  2 KiB), so an aligned 16 KiB write is 8 encrypt transfers plus 8 SD writes.
+- **Bounded busy-wait.** `AesTransfer::wait()` polls the AES and DMA status
+  registers. This runs inside the single `join4` future, so it is CPU time
+  removed from the USB/BOT executor — the same accounting as §8, not
+  background work. The engine first polls `is_done()` against a 100 ms deadline;
+  on timeout the transfer is dropped, the primitive is poisoned, and every
+  later cipher call returns `CipherError::Backend`. The RX byte count is also
+  checked against the requested length.
+- **Stack.** `AsyncCipherPlane`'s scratch buffer lives in the `Backing` value on
+  the main-task stack. That is why `CIPHER_SCRATCH` is 2 KiB rather than the
+  full 16 KiB work buffer: larger chunks amortise the reset but need a static
+  wrapper.
+
+`ZERO_BACKEND = true` stays plaintext, so the USB ceiling measurements above
+still isolate the transport.
+
+### Correctness gate
+
+`P4Aes::self_test` runs once at boot and compares hardware output against:
+
+1. the NIST SP 800-38A F.5.5 AES-256-CTR keystream (counter
+   `f0f1…feff`, 64 bytes),
+2. the counter block `00000000000000ff || BE64(1)` (the block `AesCtr` feeds at
+   image offset 16), 64 bytes,
+3. `AesCtr::xor(17, buf[..33])`, which exercises the ECB head, the DMA middle
+   and the partial tail against the precomputed keystream,
+4. a four-block vector starting at `00000000000000ff || BE64(0xFFFF_FFFE)`,
+   which crosses the low-32-bit counter wrap (the old INC_128 assumption fails
+   this),
+5. `AES_BUF + 16` zero bytes from `… || BE64(0xFFFF_FFFF)`: 129 blocks, one
+   wrap inside, checked at the wrap-adjacent blocks and the last block.
+
+A mismatch parks the firmware at `BOOT FAIL AES`; it never serves encrypted
+media that has not passed the KAT.
+
+### Not measured yet
+
+No end-to-end encrypted throughput number is recorded here. The expected cost
+is one AES-DMA pass per chunk (about 8 per **aligned** 16 KiB operation, more
+for unaligned or counter-crossing ranges) on top of the SD time,
+with the SRAM-to-AES bandwidth and the per-transfer reset as the only new
+bottlenecks — comfortably below the USB ceiling in §1, but the P4 AES-DMA rate
+should be measured (and `AES_BUF`/`CIPHER_SCRATCH` retuned) before quoting a
+figure.
+
+`XorMix` is not encryption. It is an offset-mixed fixed pattern used to exercise
+the cipher plumbing; it provides no confidentiality and must not be chosen for
+media that is meant to be secret.
+
 ## Knobs that matter
 
 | Constant / config | Where | Value | Why |
@@ -588,6 +679,9 @@ is how the 14.2 / 7.2 MB/s ceilings above were measured.
 | panel cadence | `src/main.rs` | every tick (1 s) | product surface, §8 |
 | log cadence | `src/main.rs` | every 4th tick (2 s) | UART costs ~17 ms/line, §8 |
 | SPI clock / band | `src/display.rs` | 40 MHz / `TEXT_BAND_H` | keep the panel off the USB path |
+| `CIPHER_KEY` | `src/main.rs` | `None` | `Some((key, nonce))` enables hardware AES-CTR, §10 |
+| `AES_BUF` | `src/aes.rs` | 2048 | DMA chunk; two static buffers, one reset per chunk, §10 |
+| `CIPHER_SCRATCH` | `src/store.rs` | `AES_BUF` | encrypting-plane write chunk; stack vs. transfer count, §10 |
 
 ## Do not repeat these
 

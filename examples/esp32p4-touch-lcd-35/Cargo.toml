@@ -58,8 +58,8 @@ heapless = "0.9"             # stack string formatting for the LCD
 # --- SnowSCSI workspace seams (no_std) ---
 # `async-io` enables the asynchronous storage seams and the `serve_async` shell;
 # `embassy` adds the `embassy-usb` endpoint/gadget adapters.
-snowscsi = { path = "../../snowscsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "defmt", "async-io", "embassy"] }
-snowscsi-common = { path = "../../snowscsi-common", default-features = false, features = ["defmt", "async-io"] }
+snowscsi = { path = "../../snowscsi", default-features = false, features = ["scsi", "cdrom", "dvdram", "usb", "cipher", "defmt", "async-io", "embassy"] }
+snowscsi-common = { path = "../../snowscsi-common", default-features = false, features = ["defmt", "async-io", "cipher"] }
 
 # --- Local driver patch (measurement) ---
 # Vendor embassy-usb-synopsys-otg 0.4.0 with multi-packet bulk IN transfers

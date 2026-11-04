@@ -309,8 +309,9 @@ impl<'d> Display<'d> {
                 (r >> 24) & 1,
                 (r >> 31) & 1
             );
-            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 60), style, Baseline::Top)
-                .draw(&mut self.panel);
+            let _ =
+                Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 60), style, Baseline::Top)
+                    .draw(&mut self.panel);
 
             l.clear();
             let _ = write!(
@@ -320,8 +321,9 @@ impl<'d> Display<'d> {
                 diag::get(&diag::CMD6_FG1_SELECTED),
                 diag::get(&diag::CMD11)
             );
-            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 48), style, Baseline::Top)
-                .draw(&mut self.panel);
+            let _ =
+                Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 48), style, Baseline::Top)
+                    .draw(&mut self.panel);
 
             l.clear();
             let _ = write!(
@@ -330,8 +332,9 @@ impl<'d> Display<'d> {
                 diag::get(&diag::LAST_CMD),
                 diag::get(&diag::LAST_CMD_ARG)
             );
-            let _ = Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 36), style, Baseline::Top)
-                .draw(&mut self.panel);
+            let _ =
+                Text::with_baseline(&l, Point::new(8, HEIGHT as i32 - 36), style, Baseline::Top)
+                    .draw(&mut self.panel);
         }
 
         // Title.

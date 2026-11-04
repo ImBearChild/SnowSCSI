@@ -47,7 +47,7 @@ use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::driver::{EndpointIn, EndpointOut};
 use static_cell::StaticCell;
 
-use defmt::{info, warn};
+use defmt::{error, info, warn};
 
 use snowscsi::core::{Lu, RuntimeSet, Target};
 use snowscsi::usb::{BotSession, EmbassyBot, ShortfallPolicy};
@@ -60,6 +60,7 @@ use esp_backtrace as _;
 // keeps the logger linked in even though we never name the crate.
 use esp_println as _;
 
+mod aes;
 mod display;
 mod drive;
 mod msc;
@@ -109,6 +110,28 @@ static SD_POOL: StaticCell<SdPool> = StaticCell::new();
 /// exists because the shell requires an explicit stop signal alongside the
 /// future.
 static FLOW: Flow = Flow::new();
+
+/// Hardware-AES media key, as `(key, nonce)`.
+///
+/// Replace with the key/nonce from the host-side
+/// `image.enc.SNOWBUNDLE` sidecar of the **raw ciphertext image** on the
+/// card. `None` serves the card plaintext (the default).
+///
+/// This example deliberately has **no manifest reader**: it does not parse the
+/// card, find a `SNOWBUNDLE` file or derive a key. The card must hold a raw
+/// ciphertext image (produced by `snowscsi crypt --cipher aes-ctr --key-file
+/// key.bin image.img image.enc` and written raw to the card), not a
+/// `bundle-create` directory; the sidecar's `nonce = <hex>` line is the nonce
+/// and `key.bin` (`kdf = none`) is the key.
+///
+/// The SD plane is encrypted with AES-256-CTR in the same
+/// `nonce || BE64(offset / 16)` layout `snowscsi` uses for encrypted image and
+/// bundle LUNs, so a host that knows the key/nonce reads the medium exactly as
+/// if it had been served by the CLI.
+///
+/// This is a `const`: the key bytes live in `.rodata` and in a RAM copy, with
+/// no zeroize. Protect the flash readout; do not treat this as a secret store.
+const CIPHER_KEY: Option<([u8; 32], [u8; 8])> = None;
 
 /// Run the whole DVD-RAM gadget concurrently: USB stack, BOT loop, async SD
 /// worker, status LCD.
@@ -266,6 +289,20 @@ where
 /// Seconds since `boot`, truncated to u32 (wraps after ~136 years of uptime).
 fn uptime_s(boot: Instant) -> u32 {
     boot.elapsed().as_secs() as u32
+}
+
+/// Report a fatal boot failure on the panel (if one came up) and park.
+///
+/// Used when the encrypted plane cannot be brought up: enumerating a card
+/// whose bytes would decrypt to garbage is worse than not enumerating at all.
+async fn boot_fail(display: Option<&mut display::Display<'_>>, stage: &str) -> ! {
+    if let Some(display) = display {
+        display.boot_stage(stage);
+    }
+    error!("boot halted: {}", stage);
+    loop {
+        Timer::after(Duration::from_secs(5)).await;
+    }
 }
 
 #[allow(
@@ -443,7 +480,16 @@ async fn main(_spawner: Spawner) -> ! {
     const ZERO_BACKEND: bool = false;
     // Size of the all-zero measurement plane.
     const ZERO_CAPACITY: u64 = 64 * 1024 * 1024 * 1024;
-    esp_println::println!("plane: {}", if ZERO_BACKEND { "zero" } else { "sd" });
+    esp_println::println!(
+        "plane: {}",
+        if ZERO_BACKEND {
+            "zero"
+        } else if CIPHER_KEY.is_some() {
+            "sd+cipher"
+        } else {
+            "sd"
+        }
+    );
 
     let capacity = if ZERO_BACKEND {
         ZERO_CAPACITY
@@ -459,9 +505,35 @@ async fn main(_spawner: Spawner) -> ! {
     // of it lives for the rest of `main`.
     let mut table: [&mut dyn Lu<Pair = drive::DvdRamPair>; 1] = [&mut drive];
     let mut target = Target::new(&mut table[..]);
+
+    // ── Backing plane (plaintext, encrypted, or all-zero measurement) ─────
+    //
+    // Encryption is opt-in through `CIPHER_KEY`. When it is set, the AES-DMA
+    // engine is brought up here and its known-answer self-test runs **before**
+    // the gadget is built: a mismatch parks the firmware instead of serving
+    // bytes that would decrypt to garbage on the host. The all-zero
+    // measurement plane is never encrypted (it is a pipe measurement).
     let mut backing = if ZERO_BACKEND {
         Backing::zero(ZERO_CAPACITY)
+    } else if let Some((key, nonce)) = CIPHER_KEY {
+        // On the P4 the AES peripheral is wired to the AXI GDMA engine;
+        // `DMA_CH0` is the AHB engine and cannot serve AES here.
+        let mut aes = match aes::P4Aes::new(peripherals.AES, peripherals.DMA_AXI_CH0, key) {
+            Ok(aes) => aes,
+            Err(e) => {
+                error!("AES init failed: {}", e);
+                esp_println::println!("AES init failed");
+                boot_fail(display.as_mut(), "BOOT FAIL AES").await
+            }
+        };
+        if !aes.self_test() {
+            esp_println::println!("AES hardware self-test FAILED");
+            boot_fail(display.as_mut(), "BOOT FAIL AES").await
+        }
+        info!("SD plane: encrypted (AES-256-CTR, hardware)");
+        Backing::sd_encrypted(card, aes, nonce)
     } else {
+        info!("SD plane: plaintext");
         Backing::sd(card)
     };
     // One staging buffer for the async SD worker. Parked in `.bss` like
