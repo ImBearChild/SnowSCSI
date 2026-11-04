@@ -788,6 +788,133 @@ fn read_larger_than_the_bank_streams_with_prefetch() {
     );
 }
 
+/// The read-ahead for chunk N+1 is submitted *before* the send of chunk N,
+/// not after it: the runner starts the companion storage operation first and
+/// only then hands the staged chunk to the host seam.
+#[test]
+fn the_companion_read_is_submitted_before_the_send() {
+    use snowscsi::core::storage::{
+        HostBuf, HostReq, HostToken, HostTransport, IoBuf, IoReq, IoToken, Storage, StorageReceipt,
+    };
+    use snowscsi::core::{DataPlan, DriveStep, Lu};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::task::Poll;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProbeOp {
+        Io(Direction, u64),
+        Send(u32),
+    }
+
+    /// Records the runner's storage submissions.
+    struct StoreProbe {
+        inner: BlockingStorage<Plane>,
+        log: Rc<RefCell<Vec<ProbeOp>>>,
+    }
+
+    impl Storage for StoreProbe {
+        fn begin_exec(&mut self, req: IoReq) -> IoToken {
+            self.log.borrow_mut().push(ProbeOp::Io(req.dir, req.offset));
+            self.inner.begin_exec(req)
+        }
+
+        fn poll_exec(&mut self, token: IoToken, buf: IoBuf<'_>) -> Poll<StorageReceipt> {
+            self.inner.poll_exec(token, buf)
+        }
+
+        fn cancel(&mut self, token: IoToken) {
+            self.inner.cancel(token)
+        }
+    }
+
+    /// Records the runner's host phase starts.
+    struct HostProbe {
+        inner: BlockingHost<TestHost>,
+        log: Rc<RefCell<Vec<ProbeOp>>>,
+    }
+
+    impl HostTransport for HostProbe {
+        fn publish(&mut self, plan: DataPlan) -> Result<(), Fault> {
+            self.inner.publish(plan)
+        }
+
+        fn begin_recv(&mut self, req: HostReq) -> HostToken {
+            self.inner.begin_recv(req)
+        }
+
+        fn begin_send(&mut self, req: HostReq) -> HostToken {
+            self.log.borrow_mut().push(ProbeOp::Send(req.len));
+            self.inner.begin_send(req)
+        }
+
+        fn poll_host(&mut self, token: HostToken, buf: HostBuf<'_>) -> Poll<HostReceipt> {
+            self.inner.poll_host(token, buf)
+        }
+
+        fn cancel(&mut self, token: HostToken) {
+            self.inner.cancel(token)
+        }
+
+        fn delivery(&self) -> Delivery {
+            self.inner.delivery()
+        }
+    }
+
+    let mut slots = [slot(1)];
+    let table: [&mut dyn Lu<Pair = snowscsi::core::Pair<NoMedium, u8>>; 1] = [&mut slots[0]];
+    let mut target = Target::new(table);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut storage = StoreProbe {
+        inner: BlockingStorage::new(Plane::new()),
+        log: Rc::clone(&log),
+    };
+    let mut host = HostProbe {
+        inner: BlockingHost::new(TestHost::new()),
+        log: Rc::clone(&log),
+    };
+    let mut work = [0u8; 512];
+    let mut alt = [0u8; 512];
+    let mut scratch = [0u8; 512];
+
+    target
+        .drive_start_rt(0, ctx(0, Direction::ToHost, 2048), &read_cdb(0, 4))
+        .expect("start");
+    loop {
+        match target.drive_step_rt(
+            0,
+            &mut storage,
+            &mut host,
+            &mut work,
+            &mut alt,
+            &mut scratch,
+        ) {
+            Ok(DriveStep::Pending) => {}
+            Ok(DriveStep::Done(completion)) => {
+                assert_eq!(completion, Completion::Good);
+                break;
+            }
+            other => panic!("unexpected step {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        &log.borrow()[..],
+        &[
+            ProbeOp::Io(Direction::ToHost, 0),
+            ProbeOp::Io(Direction::ToHost, 512),
+            ProbeOp::Send(512),
+            ProbeOp::Io(Direction::ToHost, 1024),
+            ProbeOp::Send(512),
+            ProbeOp::Io(Direction::ToHost, 1536),
+            ProbeOp::Send(512),
+            // The last chunk has nothing to read ahead: its send is plain.
+            ProbeOp::Send(512),
+        ],
+        "the read for chunk N+1 precedes the send of chunk N"
+    );
+}
+
 /// A failed speculative read falls back to a normal read of the same range;
 /// the completion stays GOOD and the data is complete.
 #[test]
