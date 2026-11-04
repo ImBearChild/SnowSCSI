@@ -12,14 +12,14 @@
 //! nonce:
 //!
 //! ```text
-//! domain(lun, resource) = LE64(base_nonce) XOR resource XOR (lun << 48)
+//! domain(resource) = LE64(base_nonce) XOR resource
 //! ```
 //!
-//! The same offset in two tracks (or on two LUNs of one multi-LUN adapter)
-//! therefore never reuses a keystream. The price is one 64-bit XOR per
-//! operation; the key itself is never rebuilt.
+//! The same offset in two tracks therefore never reuses a keystream. The
+//! price is one 64-bit XOR per operation; the key itself is never rebuilt.
 //!
-//! One instance must still be used for exactly one medium generation: a fresh
+//! One instance must be used for exactly one medium/LUN generation: never
+//! share a `CipherStore` across LUNs or medium generations. A fresh
 //! `(key, nonce)` is required whenever a medium is replaced or re-created
 //! (the manifest owns that nonce).
 //!
@@ -32,6 +32,16 @@
 //! authenticates a resource, and a modified track simply decrypts to wrong
 //! bytes. A caller that needs integrity must add an authenticated layer
 //! above this one.
+//!
+//! # Short reads
+//!
+//! The decorator decrypts exactly the bytes the inner store confirms, so a
+//! full read is a pure XOR round trip. If a track file is truncated or
+//! missing, the CD-R store zero-fills the unavailable tail; those zero bytes
+//! are then decrypted as keystream instead of real ciphertext. The CD-R
+//! medium normally bounds every read by its recorded length, so a healthy
+//! disc never reaches that path. Treat a short track as damaged data, not as
+//! an error the cipher layer can detect.
 //!
 //! # Token/buffer contract
 //!
@@ -47,9 +57,11 @@
 use ::core::task::Poll;
 
 use crate::common::cipher::NonceCipher;
+use crate::common::seekable_storage::StorageError;
 
 use super::async_wake::AsyncWake;
 use super::device::Direction;
+use super::errors::Fault;
 use super::storage::{
     buf_matches, contract_receipt, IoBuf, IoReq, IoToken, Storage, StorageReceipt,
 };
@@ -79,7 +91,6 @@ pub struct CipherStore<S, C> {
     cipher: C,
     nonce: [u8; 8],
     encrypt_from: u16,
-    lun: usize,
     slots: [Option<Slot>; SLOTS],
     next_tag: u32,
 }
@@ -88,14 +99,15 @@ impl<S, C: NonceCipher> CipherStore<S, C> {
     /// `encrypt_from` is the lowest resource id that is encrypted; lower
     /// resources pass through untouched (CD-R TOC slots 1/2). Use `0` for a
     /// medium where every resource is payload (for example DVD-RAM) and
-    /// [`crate::mmc::cdr_bundle::TRACK_RESOURCE_BASE`] (`16`) for CD-R tracks.
+    /// `TRACK_RESOURCE_BASE + 1` (`17`) for CD-R tracks: resource `16` is not
+    /// a track and the backend rejects it, so it must never be transformed
+    /// first.
     pub fn new(inner: S, cipher: C, nonce: [u8; 8], encrypt_from: u16) -> Self {
         Self {
             inner,
             cipher,
             nonce,
             encrypt_from,
-            lun: 0,
             slots: ::core::array::from_fn(|_| None),
             next_tag: 1,
         }
@@ -121,10 +133,9 @@ impl<S, C: NonceCipher> CipherStore<S, C> {
         resource >= self.encrypt_from
     }
 
-    /// Nonce domain of `resource` on the currently selected LUN.
+    /// Nonce domain of `resource`.
     fn domain(&self, resource: u16) -> [u8; 8] {
-        (u64::from_le_bytes(self.nonce) ^ u64::from(resource) ^ ((self.lun as u64) << 48))
-            .to_le_bytes()
+        (u64::from_le_bytes(self.nonce) ^ u64::from(resource)).to_le_bytes()
     }
 
     /// Slot index for a token minted by this decorator.
@@ -135,9 +146,40 @@ impl<S, C: NonceCipher> CipherStore<S, C> {
     }
 }
 
+impl<S: Storage, C: NonceCipher> CipherStore<S, C> {
+    /// Execute one request to completion through the poll seam.
+    ///
+    /// Returns `Unsupported` for a pool-exhausted token and for a `Pending`
+    /// inner operation (the synchronous callers below use a
+    /// [`BlockingStorage`](super::storage::BlockingStorage), which never
+    /// pends).
+    pub fn exec_now(&mut self, req: IoReq, buf: IoBuf<'_>) -> Result<usize, StorageError> {
+        let token = self.begin_exec(req);
+        if !token.is_valid() {
+            return Err(StorageError::Unsupported);
+        }
+        match self.poll_exec(token, buf) {
+            Poll::Ready(receipt) => match receipt.error {
+                None => Ok(receipt.confirmed),
+                Some(Fault::OutOfBounds) => Err(StorageError::OutOfBounds),
+                Some(Fault::NotWritable) => Err(StorageError::NotWritable),
+                Some(Fault::Unsupported) => Err(StorageError::Unsupported),
+                Some(_) => Err(StorageError::Io(embedded_io::ErrorKind::Other)),
+            },
+            Poll::Pending => {
+                // The caller has no way to resume a synchronous request; drop
+                // the operation and free both slot tables.
+                self.cancel(token);
+                Err(StorageError::Unsupported)
+            }
+        }
+    }
+}
+
 impl<S: Storage, C: NonceCipher> Storage for CipherStore<S, C> {
     fn select_lun(&mut self, lun: usize) {
-        self.lun = lun;
+        // LUN selection is routing only; it must not change the cipher domain
+        // (one instance per medium/LUN, never shared).
         self.inner.select_lun(lun);
     }
 
@@ -664,6 +706,22 @@ mod tests {
         assert_eq!(store.inner().released, Some(2));
     }
 
+    #[test]
+    fn select_lun_is_routing_only_and_never_changes_the_domain() {
+        let mut store = store();
+        let plain = [0x77u8; 8];
+        let mut first = plain;
+        write(&mut store, 16, 0, &mut first);
+        let at_rest = store.inner().region(16).to_vec();
+
+        // The decorator instance is bound to one medium/LUN; a later
+        // `select_lun` for the runner must not perturb the keystream.
+        store.select_lun(7);
+        let mut again = plain;
+        write(&mut store, 16, 0, &mut again);
+        assert_eq!(store.inner().region(16), at_rest);
+    }
+
     /// Cipher that fails before changing the buffer.
     struct FailingCipher;
 
@@ -817,5 +875,207 @@ mod tests {
             dir: Direction::None,
         });
         assert!(again.is_valid());
+    }
+
+    // -----------------------------------------------------------------
+    // Synchronous execution
+    // -----------------------------------------------------------------
+
+    use crate::core::storage::{BlockingStorage, SyncStorage};
+
+    /// Byte-plane mock with a configurable receipt fault.
+    #[derive(Default)]
+    struct SyncMock {
+        data: Vec<u8>,
+        writes: usize,
+        fault: Option<Fault>,
+    }
+
+    impl SyncStorage for SyncMock {
+        fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+            if let Some(fault) = self.fault {
+                return StorageReceipt::failed(fault, 0, Effect::Known);
+            }
+            match (req.dir, buf) {
+                (Direction::ToHost, IoBuf::Read(out)) => {
+                    let start = req.offset as usize;
+                    let end = start + out.len();
+                    if self.data.len() < end {
+                        self.data.resize(end, 0);
+                    }
+                    out.copy_from_slice(&self.data[start..end]);
+                    StorageReceipt::ok(out.len())
+                }
+                (Direction::FromHost, IoBuf::Write(bytes)) => {
+                    self.writes += 1;
+                    let start = req.offset as usize;
+                    let end = start + bytes.len();
+                    if self.data.len() < end {
+                        self.data.resize(end, 0);
+                    }
+                    self.data[start..end].copy_from_slice(bytes);
+                    StorageReceipt::ok(bytes.len())
+                }
+                (Direction::None, IoBuf::None) => StorageReceipt::ok(0),
+                _ => contract_receipt(),
+            }
+        }
+    }
+
+    fn sync_store() -> CipherStore<BlockingStorage<SyncMock>, XorMix> {
+        CipherStore::new(
+            BlockingStorage::new(SyncMock::default()),
+            cipher(),
+            BASE_NONCE,
+            ENCRYPT_FROM,
+        )
+    }
+
+    #[test]
+    fn exec_now_round_trips_through_blocking_storage() {
+        let mut store = sync_store();
+        let plain = [0x1Au8, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70, 0x81];
+        let mut input = plain;
+        assert_eq!(
+            store.exec_now(
+                IoReq {
+                    resource: 16,
+                    offset: 100,
+                    len: plain.len() as u32,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut input),
+            ),
+            Ok(plain.len())
+        );
+        let at_rest = &store.inner().inner().data[100..108];
+        assert_ne!(at_rest, &plain, "the backing must hold ciphertext");
+        assert_eq!(store.inner().inner().writes, 1, "encrypt exactly once");
+
+        let mut out = [0u8; 8];
+        assert_eq!(
+            store.exec_now(
+                IoReq {
+                    resource: 16,
+                    offset: 100,
+                    len: out.len() as u32,
+                    dir: Direction::ToHost,
+                },
+                IoBuf::Read(&mut out),
+            ),
+            Ok(out.len())
+        );
+        assert_eq!(out, plain, "the read must decrypt exactly once");
+
+        // TOC resources stay plaintext.
+        let mut toc = *b"toc0";
+        assert_eq!(
+            store.exec_now(
+                IoReq {
+                    resource: 1,
+                    offset: 0,
+                    len: 4,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut toc),
+            ),
+            Ok(4)
+        );
+        assert_eq!(&store.inner().inner().data[..4], b"toc0");
+    }
+
+    #[test]
+    fn exec_now_maps_receipt_faults() {
+        let cases = [
+            (Fault::OutOfBounds, StorageError::OutOfBounds),
+            (Fault::NotWritable, StorageError::NotWritable),
+            (Fault::Unsupported, StorageError::Unsupported),
+            (Fault::Io, StorageError::Io(embedded_io::ErrorKind::Other)),
+            (
+                Fault::Contract,
+                StorageError::Io(embedded_io::ErrorKind::Other),
+            ),
+        ];
+        for (fault, expected) in cases {
+            let mut store = sync_store();
+            store.inner_mut().inner_mut().fault = Some(fault);
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                store.exec_now(
+                    IoReq {
+                        resource: 16,
+                        offset: 0,
+                        len: 4,
+                        dir: Direction::FromHost,
+                    },
+                    IoBuf::Write(&mut buf),
+                ),
+                Err(expected),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_now_reports_pending_and_leaks_no_slot() {
+        let mut store = store();
+        store.inner_mut().pending_once = true;
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            store.exec_now(
+                IoReq {
+                    resource: 16,
+                    offset: 0,
+                    len: 4,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut buf),
+            ),
+            Err(StorageError::Unsupported)
+        );
+        // Both the decorator slot and the inner mock slot were cancelled.
+        assert!(store.slots.iter().all(Option::is_none));
+        assert!(store.inner().slots.iter().all(Option::is_none));
+
+        // Every slot is usable again.
+        for _ in 0..SLOTS {
+            let token = store.begin_exec(IoReq {
+                resource: 0,
+                offset: 0,
+                len: 0,
+                dir: Direction::None,
+            });
+            assert!(token.is_valid());
+            store.cancel(token);
+        }
+    }
+
+    #[test]
+    fn exec_now_reports_a_pool_exhausted_token() {
+        let mut store = store();
+        let mut tokens = [IoToken::invalid(); SLOTS];
+        for token in &mut tokens {
+            *token = store.begin_exec(IoReq {
+                resource: 0,
+                offset: 0,
+                len: 0,
+                dir: Direction::None,
+            });
+        }
+        assert_eq!(
+            store.exec_now(
+                IoReq {
+                    resource: 0,
+                    offset: 0,
+                    len: 0,
+                    dir: Direction::None,
+                },
+                IoBuf::None,
+            ),
+            Err(StorageError::Unsupported)
+        );
+        for token in tokens {
+            store.cancel(token);
+        }
     }
 }

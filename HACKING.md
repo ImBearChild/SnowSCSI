@@ -105,10 +105,11 @@ Feature maps:
   `scsi`/`dvdram`/`iscsi`/`cdrom`/`livefs`/`usb`/`bundle`/`cdr-bundle`
   (→`bundle` in this crate)/`cipher`/`log`/`tokio` plus
   std-only deps (clap/ctrlc/env_logger). `cipher` (→`snowscsi/cipher` +
-  `snowscsi/cipher-kdf`) adds the `cipher`/`key=` serve options for `img=` and
-  flat `bundle=` LUNs, the `crypt` verb, `bundle-create ... --cipher`, the
-  AES-256 CTR backend and `--password-file`; it does not wire CD-R
-  `CipherStore` yet. Builds against `snowscsi` with
+  `snowscsi/cipher-kdf`) adds the `cipher`/`key=` serve options for `img=`,
+  flat `bundle=` and recordable-CD `bundle=` LUNs (a recordable bundle wraps
+  its track resources in `CipherStore`), the `crypt` verb,
+  `bundle-create ... --cipher`, the AES-256 CTR backend and `--password-file`.
+  Builds against `snowscsi` with
   `default-features = false`. The `serve --usb` FunctionFS bridge pulls in the
   Linux-only `usb-gadget` (>= 1.1) and `bytes` crates via
   `[target.'cfg(target_os = "linux")'.dependencies]` — never compiled on other
@@ -223,15 +224,28 @@ snowscsi bundle-info ./disk       # prints cipher/kdf/iterations and CRC presenc
 
 `--cipher` absent keeps the manifest plaintext and rejects the other cipher
 flags. `--key-file` implies `kdf = none`; `--password-file` is only validated
-(one line) — the password is never stored. `serve --block bundle=<dir>,cipher`
-and `--cdrom bundle=<flat>,cipher` derive the key from `--password-file`,
-stdin, or `key=<path>`.
+(one line) — the password is never stored. `serve --block bundle=<dir>,cipher`,
+`--cdrom bundle=<flat>,cipher` and `--cdrom bundle=<cdr>,cipher` derive the key
+from `--password-file`, stdin, or `key=<path>`.
 
-The CD-R TOC (`toc.0`/`toc.1`) is deliberately **plaintext**: capacity,
-session and track geometry must be readable without a key. Only track payload
-resources would be encrypted by a resource-addressed store, and that wiring is
-a later milestone; serving a `kind = cdr` bundle with `cipher` is a hard error
-today, never a plaintext fallback.
+A recordable bundle encrypts only its **track** resources (`track_<n>.bin`,
+resource `16 + n`) with the manifest's `nonce XOR resource` domain; the CD-R
+TOC (`toc.0`/`toc.1`, resources 1/2) is deliberately **plaintext**, so
+capacity, session and track geometry are readable without a key. A manifest
+without a cipher block, missing key material, or a wrong-length key file is a
+hard error, never a plaintext fallback.
+
+Encrypted recordable bundles require a **write-once CD-R**. A CD-RW can be
+blanked and then re-record track 1 at resource 17 offset 0 under the same
+`(key, nonce)`, which would repeat the keystream. For v1,
+`bundle-create cdr --cipher` rejects `--medium cdrw*`, and `serve` refuses a
+stored CD-RW medium with a cipher after opening its TOC (both are hard errors,
+never a silent plaintext fallback).
+
+```bash
+snowscsi bundle-create cdr --dir ./cdr --cipher chacha12 --password-file pw
+snowscsi serve --cdrom bundle=./cdr --password-file pw --iscsi 127.0.0.1:3260
+```
 
 ### CD-R/CD-RW storage resource contract
 

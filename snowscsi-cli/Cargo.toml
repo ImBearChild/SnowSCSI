@@ -36,9 +36,11 @@ bundle = ["snowscsi/bundle"]
 # sequential write-once medium with its alternating `toc.0`/`toc.1` slots.
 # `bundle` supplies the canonical `SNOWBUNDLE` manifest and identification.
 cdr-bundle = ["snowscsi/cdr-bundle", "bundle"]
-# Cipher-bearing image and flat-bundle LUNs (`serve ... ,cipher`). Pulls the
-# library cipher plane + KDF seams and the AES backend used by `aes-ctr`; the
-# CLI owns key derivation, password reading and the async cipher path.
+# Cipher-bearing image, flat-bundle and recordable-CD track LUNs
+# (`serve ... ,cipher`). A recordable bundle encrypts only `track_<n>.bin`;
+# encrypted recordable bundles are write-once CD-R only. Pulls the library
+# cipher plane + KDF seams and the AES backend used by `aes-ctr`; the CLI owns
+# key derivation, password reading and the async cipher path.
 cipher = ["std", "scsi", "snowscsi/cipher", "snowscsi/cipher-kdf", "dep:aes", "dep:getrandom"]
 log = ["snowscsi/log", "dep:log"]
 defmt = ["snowscsi/defmt"]

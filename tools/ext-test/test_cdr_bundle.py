@@ -807,5 +807,60 @@ class CdrBundleEjectTest(_SelfServedMixin, unittest.TestCase):
         self.assertIn("disc_state = finalized", _newest_slot(final)["body"])
 
 
+class CdrBundleCipherCreateTest(unittest.TestCase):
+    """Non-root: an encrypted CD-R bundle keeps a plaintext TOC.
+
+    No device or burn is involved: this only checks what `bundle-create cdr
+    --cipher` writes. Skipped when the binary was built without `cipher`.
+    """
+
+    def test_cipher_block_and_plaintext_toc(self):
+        help_text = sh(find_binary(), "bundle-create", "cdr", "--help").stdout
+        if "--cipher" not in help_text:
+            self.skipTest("binary built without the cipher feature")
+
+        tmp = tempfile.mkdtemp(prefix="snowscsi-cdr-cipher-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bundle = os.path.join(tmp, "bundle")
+        password = os.path.join(tmp, "pw")
+        with open(password, "w", encoding="utf-8") as handle:
+            handle.write("secret\n")
+
+        created = sh(
+            find_binary(),
+            "bundle-create",
+            "cdr",
+            "--dir",
+            bundle,
+            "--cipher",
+            "chacha12",
+            "--password-file",
+            password,
+            timeout=300,
+            check=False,
+        )
+        if created.returncode != 0:
+            if "requires the `cdr-bundle` feature" in created.stderr:
+                self.skipTest("binary built without the cdr-bundle feature")
+            self.fail(
+                "bundle-create cdr --cipher failed:\n"
+                f"{created.stdout}\n{created.stderr}"
+            )
+
+        with open(os.path.join(bundle, "SNOWBUNDLE"), encoding="ascii") as handle:
+            manifest = handle.read()
+        self.assertIn("kind = cdr", manifest)
+        self.assertIn("cipher = chacha12", manifest)
+        self.assertIn("kdf = pbkdf2-hmac-sha256", manifest)
+        self.assertIn("nonce = ", manifest)
+
+        with open(os.path.join(bundle, "toc.0"), "rb") as handle:
+            toc = handle.read()
+        self.assertIn(TOC_MAGIC.encode("ascii"), toc, "the TOC must stay plaintext")
+
+        leftovers = sorted(name for name in os.listdir(bundle) if name.endswith(".tmp"))
+        self.assertEqual(leftovers, [], f"temporary files left behind: {leftovers}")
+
+
 if __name__ == "__main__":
     unittest.main()

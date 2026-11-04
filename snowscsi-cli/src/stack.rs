@@ -29,6 +29,8 @@ use snowscsi::common::fs_plane::{FsPlane, FsPlaneAdapter};
 use snowscsi::common::fs_storage::{DirEntry, FsError};
 use snowscsi::common::seekable_storage::{FlatData, StorageError, WritableFlatData};
 use snowscsi::common::store::{StoreOp, StorePlane};
+#[cfg(feature = "cdr-bundle")]
+use snowscsi::core::storage::SyncStorage;
 use snowscsi::core::storage::{IoBuf, IoReq, IoToken, Storage, StorageReceipt};
 use snowscsi::core::{
     Admission, BoundaryPermit, Change, ChangeResult, CommandContext, CommandPermit, Completion,
@@ -51,6 +53,10 @@ use snowscsi::scsi::fs_backend::StdFsBackend;
 
 #[cfg(feature = "cipher")]
 use crate::cipher::CliCipher;
+#[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
+use snowscsi::core::cipher_store::CipherStore;
+#[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
+use snowscsi::core::storage::BlockingStorage;
 
 #[cfg(feature = "tokio")]
 pub mod tokio_conn;
@@ -84,9 +90,9 @@ pub enum OwnedPlane {
     #[cfg(feature = "bundle")]
     Bundle(FlatBundle<StdFsBackend>),
     /// Persistent CD-R bundle directory: resource-addressed TOC slots and
-    /// track files (see [`BundleStore`]).
+    /// track files (see [`BundleStore`]), optionally encrypted per resource.
     #[cfg(feature = "cdr-bundle")]
-    CdrBundle(BundleStore),
+    CdrBundle(CdrStore),
     /// Encrypting view over another owned plane.
     #[cfg(feature = "cipher")]
     Cipher(Box<CipherPlane<OwnedPlane, CliCipher>>),
@@ -654,6 +660,128 @@ impl BundleStore {
             }
         }
         Ok(medium)
+    }
+}
+
+#[cfg(feature = "cdr-bundle")]
+impl SyncStorage for BundleStore {
+    fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> StorageReceipt {
+        match BundleStore::exec(self, req, buf) {
+            Ok(n) => StorageReceipt::ok(n),
+            Err(e) => StorageReceipt::failed_for(req.dir, e),
+        }
+    }
+}
+
+/// CD-R resource store: plaintext, or encrypted per track resource.
+///
+/// The cipher wraps the same [`BundleStore`] resources. Its `encrypt_from`
+/// is [`snowscsi::mmc::cdr_bundle::TRACK_RESOURCE_BASE`] + 1 (`17`), so
+/// `toc.0`/`toc.1` (resources 1/2) stay plaintext and resource `16` passes
+/// through untouched (it is not a track, so the backend rejects it) while
+/// every `track_<n>.bin` resource is encrypted with the manifest nonce XOR its
+/// resource id.
+///
+/// A truncated or missing track file is zero-filled by [`BundleStore`] before
+/// the cipher sees it, so its unavailable tail decrypts as keystream. The CD-R
+/// medium normally bounds reads by the recorded length, so a healthy disc
+/// never reaches that path; treat a short track as damaged data.
+// The plain store is large; one CdrStore is built per LUN, not per operation
+// (same rationale as `OwnedPlane` above).
+#[allow(clippy::large_enum_variant)]
+#[cfg(feature = "cdr-bundle")]
+pub enum CdrStore {
+    /// Plaintext CD-R resources.
+    Plain(BundleStore),
+    /// Track resources encrypted through the library cipher decorator.
+    #[cfg(feature = "cipher")]
+    Cipher(Box<CipherStore<BlockingStorage<BundleStore>, CliCipher>>),
+}
+
+#[cfg(feature = "cdr-bundle")]
+impl CdrStore {
+    /// Wrap a plaintext CD-R store.
+    pub fn new(store: BundleStore) -> Self {
+        Self::Plain(store)
+    }
+
+    /// Wrap a CD-R store whose track resources are encrypted.
+    ///
+    /// `nonce` is the manifest's 8-byte nonce; the decorator derives each
+    /// resource's domain from it, so the TOC resources never change.
+    #[cfg(feature = "cipher")]
+    pub fn new_cipher(store: BundleStore, cipher: CliCipher, nonce: [u8; 8]) -> Self {
+        Self::Cipher(Box::new(CipherStore::new(
+            BlockingStorage::new(store),
+            cipher,
+            nonce,
+            snowscsi::mmc::cdr_bundle::TRACK_RESOURCE_BASE + 1,
+        )))
+    }
+
+    /// Whether track resources are encrypted by this store.
+    ///
+    /// An encrypted recordable bundle must stay write-once: a CD-RW BLANK
+    /// would let track 1 reuse resource 17 at offset 0 under the same
+    /// `(key, nonce)` and therefore repeat a keystream.
+    pub fn is_ciphered(&self) -> bool {
+        #[cfg(feature = "cipher")]
+        {
+            matches!(self, Self::Cipher(_))
+        }
+        #[cfg(not(feature = "cipher"))]
+        {
+            false
+        }
+    }
+
+    /// Restore (or create) the medium from the two alternating TOC slots.
+    pub fn open_medium(
+        &mut self,
+        capacity_sectors: u64,
+        kind: Option<DiscKind>,
+        recovery: Recovery,
+    ) -> Result<CdrBundleMedium, String> {
+        match self {
+            Self::Plain(store) => store.open_medium(capacity_sectors, kind, recovery),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(store) => {
+                store
+                    .inner_mut()
+                    .inner_mut()
+                    .open_medium(capacity_sectors, kind, recovery)
+            }
+        }
+    }
+
+    /// Execute one resource-addressed request.
+    pub fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> Result<usize, StorageError> {
+        match self {
+            Self::Plain(store) => store.exec(req, buf),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(store) => store.exec_now(req, buf),
+        }
+    }
+
+    /// Nominal capacity in bytes.
+    pub fn capacity_bytes(&self) -> u64 {
+        match self {
+            Self::Plain(store) => store.capacity_bytes(),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(store) => store.inner().inner().capacity_bytes(),
+        }
+    }
+
+    /// Aggregate flush (`Sync { resource: 0 }`).
+    ///
+    /// The cipher never touches TOC or sync bookkeeping, so this always
+    /// delegates to the wrapped [`BundleStore`].
+    pub fn sync(&mut self) -> Result<usize, StorageError> {
+        match self {
+            Self::Plain(store) => store.sync(),
+            #[cfg(feature = "cipher")]
+            Self::Cipher(store) => store.inner_mut().inner_mut().sync(),
+        }
     }
 }
 
@@ -1753,7 +1881,7 @@ mod tests {
         slot: Option<u32>,
     ) -> OwnedPlane {
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
-        OwnedPlane::CdrBundle(BundleStore::new(fs, capacity_sectors, slot))
+        OwnedPlane::CdrBundle(CdrStore::new(BundleStore::new(fs, capacity_sectors, slot)))
     }
 
     #[cfg(feature = "cdr-bundle")]
@@ -2888,7 +3016,8 @@ mod tests {
     fn cdr_bundle_slot_size_only_applies_to_a_new_bundle() {
         let dir = temp_dir("cdr_slot");
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
-        let mut plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, Some(8192)));
+        let mut plane =
+            OwnedPlane::CdrBundle(CdrStore::new(BundleStore::new(fs, 359_849, Some(8192))));
         let medium = plane
             .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .unwrap();
@@ -2897,7 +3026,11 @@ mod tests {
 
         // A different slot= on the reopen is a hint for a new disc only.
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
-        let mut plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, Some(32 * 1024)));
+        let mut plane = OwnedPlane::CdrBundle(CdrStore::new(BundleStore::new(
+            fs,
+            359_849,
+            Some(32 * 1024),
+        )));
         let reopened = plane
             .open_cdr_medium(359_849, Some(DiscKind::Cdr), Recovery::Delete)
             .expect("stored slot wins");
@@ -3091,6 +3224,59 @@ mod tests {
             Poll::Pending => panic!("a dropped plane must fail immediately"),
         }
         assert!(storage.sync().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cipher wrapper must leave capacity and sync bookkeeping to the
+    /// wrapped [`BundleStore`] while encrypting only track resources.
+    #[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
+    #[test]
+    fn cdr_store_cipher_wrapper_reports_capacity_and_syncs() {
+        use snowscsi::common::bundle::{CipherAlg, CipherMeta, KdfKind};
+        use snowscsi::common::cipher::CipherKey;
+
+        let dir = temp_dir("cdr_cipher_wrapper");
+        let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
+        let store = BundleStore::new(fs, 359_849, None);
+        let meta = CipherMeta {
+            cipher: CipherAlg::Xor,
+            kdf: KdfKind::None,
+            iterations: None,
+            salt: None,
+            nonce: [0x5Au8; 8],
+        };
+        let key = CipherKey::from_bytes(&[0x42u8; 32]).unwrap();
+        let cipher = CliCipher::from_meta(&meta, &key).unwrap();
+        let mut store = CdrStore::new_cipher(store, cipher, [0x5Au8; 8]);
+
+        assert!(store.is_ciphered());
+        assert_eq!(store.capacity_bytes(), 359_849 * 2048);
+
+        // Resource 17 travels through the cipher; the file at rest is not the
+        // plaintext and an aggregate sync still succeeds.
+        let plain = [0xA5u8; 32];
+        let mut input = plain;
+        assert_eq!(
+            store.exec(
+                io_req(17, 0, 32, snowscsi::core::Direction::FromHost),
+                IoBuf::Write(&mut input),
+            ),
+            Ok(32)
+        );
+        let at_rest = std::fs::read(dir.join("track_1.bin")).expect("track file");
+        assert_ne!(&at_rest[..32], &plain);
+        assert_eq!(store.sync(), Ok(0));
+
+        let mut out = [0u8; 32];
+        assert_eq!(
+            store.exec(
+                io_req(17, 0, 32, snowscsi::core::Direction::ToHost),
+                IoBuf::Read(&mut out),
+            ),
+            Ok(32)
+        );
+        assert_eq!(out, plain);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

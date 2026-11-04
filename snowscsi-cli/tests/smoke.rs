@@ -1461,6 +1461,171 @@ fn serve_starts_with_cdr_bundle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An encrypted recordable bundle keeps the manifest cipher block and a
+/// plaintext TOC, and `--print-config` never reads the password.
+#[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
+#[test]
+fn encrypted_cdr_bundle_info_and_print_config() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cdrcipher_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    let password = std::path::PathBuf::from(format!("{path}.pw"));
+    std::fs::write(&password, b"secret\n").unwrap();
+
+    let created = run(&[
+        "bundle-create",
+        "cdr",
+        "--dir",
+        &path,
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &password.display().to_string(),
+    ]);
+    assert!(
+        created.status.success(),
+        "bundle-create cdr --cipher failed:\n{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let manifest = std::fs::read_to_string(dir.join("SNOWBUNDLE")).unwrap();
+    assert!(manifest.contains("kind = cdr"), "{manifest}");
+    assert!(manifest.contains("cipher = chacha12"), "{manifest}");
+    assert!(manifest.contains("kdf = pbkdf2-hmac-sha256"), "{manifest}");
+    let toc = std::fs::read(dir.join("toc.0")).unwrap();
+    assert!(
+        toc.windows(b"snow_cdr_bnd".len())
+            .any(|w| w == b"snow_cdr_bnd"),
+        "the TOC slot must stay plaintext"
+    );
+
+    let info = run(&["bundle-info", &path]);
+    assert!(info.status.success());
+    let text = String::from_utf8_lossy(&info.stdout);
+    assert!(text.contains("kind = cdr"), "info:\n{text}");
+    assert!(text.contains("cipher = chacha12"), "info:\n{text}");
+    assert!(text.contains("kdf = pbkdf2-hmac-sha256"), "info:\n{text}");
+    assert!(text.contains("seq = "), "missing TOC summary:\n{text}");
+    assert!(
+        text.contains("slot_size = "),
+        "missing TOC summary:\n{text}"
+    );
+
+    // `--print-config` identifies the bundle but never derives the key; it
+    // therefore works with or without a password file and never prompts.
+    let cfg = run(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path},cipher"),
+        "--password-file",
+        &password.display().to_string(),
+        "--usb",
+        "--print-config",
+    ]);
+    assert!(
+        cfg.status.success(),
+        "print-config failed:\n{}",
+        String::from_utf8_lossy(&cfg.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&cfg.stdout);
+    assert!(
+        stdout.trim_end().ends_with("backing=bundle"),
+        "print-config line:\n{stdout}"
+    );
+    let cfg = run(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path},cipher"),
+        "--usb",
+        "--print-config",
+    ]);
+    assert!(cfg.status.success());
+    let stderr = String::from_utf8_lossy(&cfg.stderr);
+    assert!(
+        !stderr.contains("password:"),
+        "print-config must not prompt:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&password);
+}
+
+/// An encrypted recordable bundle serves: the TOC is read from the plaintext
+/// slots while the track store is wrapped by the cipher.
+#[cfg(all(unix, feature = "cdr-bundle", feature = "cipher"))]
+#[test]
+fn encrypted_cdr_bundle_serve_starts() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cdrserve_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    let password = std::path::PathBuf::from(format!("{path}.pw"));
+    std::fs::write(&password, b"secret\n").unwrap();
+    let created = run(&[
+        "bundle-create",
+        "cdr",
+        "--dir",
+        &path,
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &password.display().to_string(),
+    ]);
+    assert!(created.status.success());
+
+    run_serve_until_ready_then_sigint(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path},cipher"),
+        "--password-file",
+        &password.display().to_string(),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&password);
+}
+
+/// An encrypted recordable bundle refuses to serve without the password (no
+/// plaintext fallback), failing before any listener is bound.
+#[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
+#[test]
+fn encrypted_cdr_bundle_serve_requires_the_password() {
+    let dir = std::env::temp_dir().join(format!("snowscsi_cdrnopw_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().to_string();
+    let password = std::path::PathBuf::from(format!("{path}.pw"));
+    std::fs::write(&password, b"secret\n").unwrap();
+    let created = run(&[
+        "bundle-create",
+        "cdr",
+        "--dir",
+        &path,
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &password.display().to_string(),
+    ]);
+    assert!(created.status.success());
+
+    // `run` gives the child an empty stdin: PBKDF2 has no password.
+    let out = run(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={path},cipher"),
+        "--iscsi",
+        "127.0.0.1:0",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("password"),
+        "expected a missing-password error, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&password);
+}
+
 /// A `kind = cdr` directory without any TOC slot is not a blank disc: serve
 /// fails with a create hint and writes no TOC.
 #[cfg(feature = "cdr-bundle")]

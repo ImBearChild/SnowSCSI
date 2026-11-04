@@ -989,7 +989,7 @@ fn bundle_create_rejects_bad_cipher_flags() {
 
 #[cfg(feature = "cdr-bundle")]
 #[test]
-fn cdr_cipher_manifest_is_created_but_serve_still_refuses_it() {
+fn cdr_cipher_manifest_is_created_and_serves_with_its_key() {
     let dir = TempDir::new("cdr_cipher");
     let bundle = dir.str("cdr");
     let key = dir.write("key.bin", &[0x44u8; 32]);
@@ -1014,8 +1014,94 @@ fn cdr_cipher_manifest_is_created_but_serve_still_refuses_it() {
     assert_eq!(manifest_value(&text, "cipher"), Some("xor"));
     assert_eq!(manifest_value(&text, "kdf"), Some("none"));
 
-    // The CD-R cipher store is a later milestone: serving must stay a hard
-    // error, never a plaintext fallback.
+    // The recordable bundle is now servable with its key: `--print-config`
+    // identifies it without deriving the key, and a real serve without the
+    // key material is a hard error, never a plaintext fallback.
+    let out = run_ok(&[
+        "serve",
+        "--cdrom",
+        &format!("bundle={bundle},cipher,key={key}"),
+        "--usb",
+        "--print-config",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("backing=bundle"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    run_fail(
+        &[
+            "serve",
+            "--cdrom",
+            &format!("bundle={bundle},cipher"),
+            "--password-file",
+            &dir.write("pw", b"secret\n"),
+            "--iscsi",
+            "127.0.0.1:0",
+        ],
+        "key=<path>",
+    );
+    assert_no_temps(&dir.0);
+}
+
+#[cfg(feature = "cdr-bundle")]
+#[test]
+fn cdr_create_refuses_an_encrypted_cdrw() {
+    let dir = TempDir::new("cdr_cdrw_create");
+    let key = dir.write("key.bin", &[0x55u8; 32]);
+    let bundle = dir.str("cdrw");
+
+    run_fail(
+        &[
+            "bundle-create",
+            "cdr",
+            "--dir",
+            &bundle,
+            "--medium",
+            "cdrw80",
+            "--cipher",
+            "xor",
+            "--key-file",
+            &key,
+        ],
+        "write-once CD-R",
+    );
+    assert!(
+        !Path::new(&bundle).exists(),
+        "a refused encrypted CD-RW must not create the bundle directory"
+    );
+    assert_no_temps(&dir.0);
+}
+
+#[cfg(feature = "cdr-bundle")]
+#[test]
+fn cdr_serve_refuses_a_stored_cdrw_with_a_cipher() {
+    let dir = TempDir::new("cdr_cdrw_serve");
+    let bundle = dir.str("cdrw");
+    let key = dir.write("key.bin", &[0x66u8; 32]);
+
+    // Create a plaintext CD-RW, then add a cipher block to its manifest. The
+    // stored TOC (not the manifest) says cdrw; the refusal happens after the
+    // medium is opened.
+    run_ok(&[
+        "bundle-create",
+        "cdr",
+        "--dir",
+        &bundle,
+        "--medium",
+        "cdrw80",
+    ]);
+    std::fs::write(
+        Path::new(&bundle).join("SNOWBUNDLE"),
+        "magic = snow_bundle\n\
+         version = 1\n\
+         kind = cdr\n\
+         cipher = xor\n\
+         kdf = none\n\
+         nonce = 5a5a5a5a5a5a5a5a\n",
+    )
+    .unwrap();
+
     run_fail(
         &[
             "serve",
@@ -1024,7 +1110,7 @@ fn cdr_cipher_manifest_is_created_but_serve_still_refuses_it() {
             "--iscsi",
             "127.0.0.1:0",
         ],
-        "CD-R cipher support not wired yet",
+        "write-once CD-R",
     );
     assert_no_temps(&dir.0);
 }

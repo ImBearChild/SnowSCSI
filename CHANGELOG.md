@@ -85,9 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   garbage, so keep the input and verify the result before deleting anything.
   `bundle-create flat|cdr` gains
   `--cipher`/`--iterations`/`--key-file`/`--password-file`, and `serve`
-  exposes encrypted `img=` and flat `bundle=` LUNs through the cipher plane;
-  a `kind = cdr` bundle with a cipher is still a hard error (the TOC stays
-  plaintext and track `CipherStore` is not wired yet).
+  exposes encrypted `img=`, flat `bundle=` and recordable-CD `bundle=` LUNs;
+  a recordable bundle encrypts its track resources through `CipherStore`
+  (`nonce XOR resource`) while the `toc.0`/`toc.1` TOC slots stay plaintext.
+  Encrypted recordable bundles require write-once CD-R: `bundle-create cdr
+  --cipher` rejects `--medium cdrw*` and serving a stored CD-RW is a hard
+  error, because BLANK would reuse a track resource's keystream.
 - **common**: `cipher` adds offset-addressed stream-cipher plane decorators
   (`CipherPlane`/`AsyncCipherPlane`) over the byte-plane seams, with nonced
   AES-CTR, original DJB ChaCha (8/12/20 rounds) and an obfuscation-only

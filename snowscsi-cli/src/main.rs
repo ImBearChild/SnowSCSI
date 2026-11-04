@@ -34,12 +34,15 @@
 //!   another session) and, on a CD-RW, `wodim blank=fast|all`. SAO/DAO is not
 //!   implemented.
 //!
-//! `cipher` on an `img=` or flat `bundle=` LUN reads the manifest (the
+//! `cipher` on an `img=` or `bundle=` LUN reads the manifest (the
 //! `<file>.SNOWBUNDLE` sidecar, `<dir>/SNOWBUNDLE`, or an explicit
 //! `cipher=<path>`), derives the key from the global password
 //! (`--password-file`, or stdin **with echo**) or `key=<path>`, and serves the
 //! bytes through the cipher plane. It is never a plaintext fallback: a missing,
-//! malformed or cipher-less manifest is a hard error.
+//! malformed or cipher-less manifest is a hard error. A recordable-CD bundle
+//! encrypts only its track resources (`nonce XOR resource`); the
+//! `toc.0`/`toc.1` slots stay plaintext, so capacity and sessions are visible
+//! without a key.
 //!
 //! `serve` never creates the bundle directory or manifest: `snowscsi
 //! bundle-create flat …` or `snowscsi bundle-create cdr …` must create them
@@ -86,12 +89,14 @@ use snowscsi::common::bundle::CipherAlg;
 use snowscsi::common::bundle::CipherMeta;
 #[cfg(any(feature = "bundle", feature = "cipher"))]
 use snowscsi::common::bundle::KdfKind;
-#[cfg(any(feature = "cdr-bundle", feature = "cipher"))]
+#[cfg(feature = "bundle")]
 use snowscsi::common::bundle::MANIFEST_NAME;
 #[cfg(any(feature = "bundle", feature = "cdr-bundle", feature = "cipher"))]
 use snowscsi::common::bundle::{BundleKind, BundleMeta};
 #[cfg(any(feature = "bundle", feature = "cipher"))]
 use snowscsi::common::bundle::{MAX_MANIFEST, SIDECAR_SUFFIX};
+#[cfg(all(feature = "bundle", feature = "cipher"))]
+use snowscsi::common::cipher::CipherPlane;
 #[cfg(feature = "bundle")]
 use snowscsi::common::flat_bundle::{validate_geometry, FlatBundle};
 #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
@@ -131,6 +136,8 @@ use stack::tokio_conn::TokioConn;
 use stack::worker::WorkerStore;
 #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
 use stack::BundleStore;
+#[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
+use stack::CdrStore;
 use stack::{CliLu, CliMedium, CliPair, CliStorage, OwnedPlane};
 #[cfg(feature = "tokio")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -259,7 +266,9 @@ struct ServeArgs {
     /// A recordable bundle is written only in Track-at-Once: `wodim -tao`
     /// (also `-audio` for CD-DA and `-multi` for another session) and, on a
     /// CD-RW, `wodim blank=fast|all`; SAO/DAO is not implemented. Add
-    /// `,cipher` to an `img=` or flat `bundle=` LUN to serve it encrypted.
+    /// `,cipher` to an `img=` or `bundle=` LUN to serve it encrypted; on a
+    /// recordable bundle only the track resources are encrypted (the
+    /// `toc.0`/`toc.1` slots stay readable without a key).
     /// Repeatable; these LUNs follow the `--block` LUNs.
     #[arg(long = "cdrom", value_name = "SPEC")]
     cdrom: Vec<String>,
@@ -464,8 +473,9 @@ struct CreateCdrArgs {
     #[arg(long, value_name = "BYTES")]
     slot: Option<String>,
     /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
-    /// `xor` (obfuscation only). The CD-R TOC stays plaintext; track payload
-    /// encryption is not wired yet, so serving such a bundle is an error.
+    /// `xor` (obfuscation only). The CD-R TOC stays plaintext; track payloads
+    /// are encrypted per resource. Serve it with `--password-file` (or
+    /// `key=<path>` for `kdf = none`).
     #[cfg(feature = "cipher")]
     #[arg(long, value_name = "ALG")]
     cipher: Option<String>,
@@ -1048,6 +1058,18 @@ fn build_core_slots(
                         return Err(());
                     }
                 };
+                // An encrypted CD-RW would reuse the track-1 keystream after
+                // BLANK (resource 17 at offset 0 under the same key/nonce).
+                // v1 therefore refuses encrypted erasable media entirely.
+                if let OwnedPlane::CdrBundle(store) = &plane {
+                    if store.is_ciphered() && medium.kind() == DiscKind::Cdrw {
+                        eprintln!(
+                            "snowscsi: bundle: LUN {lun}: encrypted recordable bundles require \
+                             write-once CD-R (the stored medium is CD-RW)"
+                        );
+                        return Err(());
+                    }
+                }
                 let sectors = medium.capacity_sectors();
                 planes.push(Some(plane));
                 slots.push(CliLu::Mmc(snowscsi::core::LuImpl::new(
@@ -2283,7 +2305,7 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                     );
                     return Err(());
                 }
-                Identified::Flat { .. } => {
+                Identified::Flat { meta } => {
                     // No overrides: the manifest owns the whole geometry.
                     // A flat bundle under `--cdrom` is optical media and
                     // must open read-only; `--block` honours an explicit
@@ -2295,9 +2317,23 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                         FlatBundle::open(fs, None, None, None)
                     }
                     .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?;
-                    OwnedPlane::Bundle(bundle)
+                    let manifest_path = format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
+                    #[cfg(feature = "cipher")]
+                    let base = match bundle_cipher(spec, password, &meta, &manifest_path)? {
+                        Some((cipher, _nonce)) => OwnedPlane::Cipher(Box::new(CipherPlane::new(
+                            OwnedPlane::Bundle(bundle),
+                            cipher,
+                        ))),
+                        None => OwnedPlane::Bundle(bundle),
+                    };
+                    #[cfg(not(feature = "cipher"))]
+                    let base = {
+                        let _ = (&meta, &manifest_path);
+                        OwnedPlane::Bundle(bundle)
+                    };
+                    base
                 }
-                Identified::Cdr { toc, .. } => {
+                Identified::Cdr { meta, toc } => {
                     #[cfg(feature = "cdr-bundle")]
                     {
                         // A recordable CD is an MMC medium: report the
@@ -2329,11 +2365,24 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                         let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
                         // Capacity and disc kind come from the stored TOC;
                         // no CLI hints are applied.
-                        OwnedPlane::CdrBundle(BundleStore::new(fs, 0, None))
+                        let store = BundleStore::new(fs, 0, None);
+                        let manifest_path =
+                            format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
+                        #[cfg(feature = "cipher")]
+                        let store = match bundle_cipher(spec, password, &meta, &manifest_path)? {
+                            Some((cipher, nonce)) => CdrStore::new_cipher(store, cipher, nonce),
+                            None => CdrStore::new(store),
+                        };
+                        #[cfg(not(feature = "cipher"))]
+                        let store = {
+                            let _ = (&meta, &manifest_path);
+                            CdrStore::new(store)
+                        };
+                        OwnedPlane::CdrBundle(store)
                     }
                     #[cfg(not(feature = "cdr-bundle"))]
                     {
-                        let _ = toc;
+                        let _ = (meta, toc);
                         eprintln!(
                             "snowscsi: bundle: {dir} is a recordable CD; serving it requires \
                                  the `cdr-bundle` feature"
@@ -2447,15 +2496,22 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
     }
 }
 
-/// Validate the manifest and build the spec's cipher, if any.
+/// Validate the manifest and build the spec's cipher for an `img=` LUN.
 ///
-/// Runs before the base plane is opened so a missing/incorrect manifest never
-/// leaves a half-opened backing (or creates a file) behind.
+/// A `bundle=` LUN resolves its cipher from the already-identified manifest
+/// inside [`open_plane_for`], so this returns `None` for it.
+///
+/// For an `img=` LUN it runs before the image is opened, so a
+/// missing/incorrect sidecar never leaves a half-opened backing (or creates a
+/// file) behind.
 #[cfg(feature = "cipher")]
 fn prepare_cipher(
     spec: &DeviceSpec,
     password: Option<&[u8]>,
 ) -> Result<Option<crate::cipher::CliCipher>, ()> {
+    if let Backing::Bundle { .. } = &spec.backing {
+        return Ok(None);
+    }
     let Some(cipher_spec) = &spec.cipher else {
         return Ok(None);
     };
@@ -2474,7 +2530,20 @@ fn prepare_cipher(
         );
         return Err(());
     };
-    if !meta.has_crc {
+    build_cli_cipher(cipher_meta, spec, password, &manifest_path, meta.has_crc).map(Some)
+}
+
+/// Validate a cipher block and build the CLI cipher from the supplied key
+/// material.
+#[cfg(feature = "cipher")]
+fn build_cli_cipher(
+    cipher_meta: CipherMeta,
+    spec: &DeviceSpec,
+    password: Option<&[u8]>,
+    manifest_path: &str,
+    has_crc: bool,
+) -> Result<crate::cipher::CliCipher, ()> {
+    if !has_crc {
         log::warn!("cipher: {manifest_path} has no crc line; cipher parameters are unchecked");
     }
     if cipher_meta.cipher == CipherAlg::Xor {
@@ -2498,71 +2567,112 @@ fn prepare_cipher(
         "using cipher {} ({manifest_path})",
         crate::cipher::cipher_meta_name(&cipher_meta)
     );
-    Ok(Some(cipher))
+    Ok(cipher)
 }
 
-/// Read and validate the manifest that describes a cipher-bearing LUN.
+/// Resolve a directory bundle's cipher block from its identified manifest.
+///
+/// The identified manifest is authoritative: it must carry a cipher block. A
+/// `cipher=<path>` override may only select an equivalent manifest; its kind
+/// (including flat geometry) and cipher parameters must equal the identified
+/// ones. The returned nonce is the one belonging to the identified cipher
+/// block. Without `cipher` on the spec the bundle stays plaintext.
+#[cfg(all(feature = "bundle", feature = "cipher"))]
+fn bundle_cipher(
+    spec: &DeviceSpec,
+    password: Option<&[u8]>,
+    identified: &BundleMeta,
+    manifest_path: &str,
+) -> Result<Option<(crate::cipher::CliCipher, [u8; 8])>, ()> {
+    let Some(cipher_spec) = &spec.cipher else {
+        return Ok(None);
+    };
+    let Some(identified_cipher) = identified.cipher else {
+        eprintln!(
+            "snowscsi: cipher: {manifest_path}: the identified manifest does not describe a \
+             cipher (refusing to serve plaintext)"
+        );
+        return Err(());
+    };
+    let (meta, cipher_meta, path) = match cipher_spec.meta.as_deref() {
+        Some(explicit) => {
+            let bytes = match read_capped(explicit, MAX_MANIFEST + 1) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("snowscsi: cipher: cannot read manifest '{explicit}': {e}");
+                    return Err(());
+                }
+            };
+            let meta = match BundleMeta::parse(&bytes) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    eprintln!("snowscsi: cipher: invalid manifest '{explicit}': {e}");
+                    return Err(());
+                }
+            };
+            if meta.kind != identified.kind {
+                eprintln!(
+                    "snowscsi: cipher: manifest '{explicit}' does not describe the identified \
+                     bundle kind/geometry (refusing to serve plaintext)"
+                );
+                return Err(());
+            }
+            if meta.cipher != Some(identified_cipher) {
+                eprintln!(
+                    "snowscsi: cipher: manifest '{explicit}' has different cipher parameters \
+                     from the identified manifest (refusing to serve plaintext)"
+                );
+                return Err(());
+            }
+            (meta, identified_cipher, explicit)
+        }
+        None => (*identified, identified_cipher, manifest_path),
+    };
+    let cipher = build_cli_cipher(cipher_meta, spec, password, path, meta.has_crc)?;
+    Ok(Some((cipher, cipher_meta.nonce)))
+}
+
+/// Read and validate the manifest that describes a cipher-bearing `img=` LUN.
+///
+/// `Backing::Bundle` never reaches this function: the bundle path resolves its
+/// cipher from the manifest it already identified ([`bundle_cipher`]).
 #[cfg(feature = "cipher")]
 fn load_cipher_meta(
     spec: &DeviceSpec,
     cipher_spec: &spec::CipherSpec,
 ) -> Result<(BundleMeta, String), String> {
-    match &spec.backing {
-        Backing::Img { path } => {
-            let sidecar = cipher_spec
-                .meta
-                .clone()
-                .unwrap_or_else(|| format!("{path}{SIDECAR_SUFFIX}"));
-            let bytes = read_capped(&sidecar, MAX_MANIFEST + 1)
-                .map_err(|e| format!("cannot read manifest '{sidecar}': {e}"))?;
-            let meta = BundleMeta::parse(&bytes)
-                .map_err(|e| format!("invalid manifest '{sidecar}': {e}"))?;
-            let image_size = std::fs::metadata(path)
-                .map_err(|e| format!("cannot stat image '{path}': {e}"))?
-                .len();
-            match meta.kind {
-                BundleKind::Image { size } if size == image_size => {}
-                BundleKind::Image { size } => {
-                    return Err(format!(
-                        "manifest '{sidecar}' declares image size {size}, but '{path}' is \
-                         {image_size} bytes"
-                    ))
-                }
-                _ => {
-                    return Err(format!(
-                        "manifest '{sidecar}' is not a single-file image manifest"
-                    ))
-                }
-            }
-            Ok((meta, sidecar))
+    let Backing::Img { path } = &spec.backing else {
+        return Err(
+            "cipher metadata is only loaded for img=; a bundle uses its identified manifest"
+                .to_string(),
+        );
+    };
+    let sidecar = cipher_spec
+        .meta
+        .clone()
+        .unwrap_or_else(|| format!("{path}{SIDECAR_SUFFIX}"));
+    let bytes = read_capped(&sidecar, MAX_MANIFEST + 1)
+        .map_err(|e| format!("cannot read manifest '{sidecar}': {e}"))?;
+    let meta =
+        BundleMeta::parse(&bytes).map_err(|e| format!("invalid manifest '{sidecar}': {e}"))?;
+    let image_size = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat image '{path}': {e}"))?
+        .len();
+    match meta.kind {
+        BundleKind::Image { size } if size == image_size => {}
+        BundleKind::Image { size } => {
+            return Err(format!(
+                "manifest '{sidecar}' declares image size {size}, but '{path}' is \
+                 {image_size} bytes"
+            ))
         }
-        Backing::Bundle { dir } => {
-            let manifest = cipher_spec
-                .meta
-                .clone()
-                .unwrap_or_else(|| format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME));
-            let bytes = read_capped(&manifest, MAX_MANIFEST + 1)
-                .map_err(|e| format!("cannot read manifest '{manifest}': {e}"))?;
-            let meta = BundleMeta::parse(&bytes)
-                .map_err(|e| format!("invalid manifest '{manifest}': {e}"))?;
-            match meta.kind {
-                BundleKind::Flat { .. } => {}
-                BundleKind::Cdr => {
-                    return Err(
-                        "CD-R cipher support not wired yet; refusing to serve plaintext"
-                            .to_string(),
-                    )
-                }
-                BundleKind::Image { .. } => {
-                    return Err(format!(
-                        "manifest '{manifest}' is an image manifest, not a directory bundle"
-                    ))
-                }
-            }
-            Ok((meta, manifest))
+        _ => {
+            return Err(format!(
+                "manifest '{sidecar}' is not a single-file image manifest"
+            ))
         }
-        _ => Err("cipher is only valid with img= or bundle=<dir>".to_string()),
     }
+    Ok((meta, sidecar))
 }
 
 fn create_sparse(path: &str, size: u64) -> std::io::Result<()> {
@@ -3848,6 +3958,17 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     };
     #[cfg(not(feature = "cipher"))]
     let cipher = None;
+    // A CD-RW can be blanked and track 1 would reuse resource 17 at offset 0
+    // under the same (key, nonce), repeating a keystream. v1 therefore requires
+    // write-once CD-R for every encrypted recordable bundle.
+    #[cfg(feature = "cipher")]
+    if cipher.is_some() && kind == DiscKind::Cdrw {
+        eprintln!(
+            "snowscsi: bundle-create: encrypted recordable bundles require write-once CD-R \
+             (--medium cdrw* is not supported with --cipher)"
+        );
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
             "snowscsi: bundle-create: failed to create directory {}: {e}",
@@ -6428,6 +6549,374 @@ mod tests {
         let _ = std::fs::remove_file(&image);
         let _ = std::fs::remove_file(format!("{}{SIDECAR_SUFFIX}", image.display()));
         let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    fn create_encrypted_cdr(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = temp_dir(tag);
+        let password = std::path::PathBuf::from(format!("{}.pw", dir.display()));
+        std::fs::write(&password, b"hunter2\n").expect("write password file");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: None,
+            slot: None,
+            cipher: Some("chacha12".to_string()),
+            password_file: Some(password.display().to_string()),
+            ..CreateCdrArgs::default()
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        (dir, password)
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    #[test]
+    fn encrypted_cdr_bundle_encrypts_tracks_and_keeps_the_toc_plaintext() {
+        use snowscsi::core::storage::{IoBuf, IoReq};
+        use snowscsi::core::Direction;
+
+        let (dir, password) = create_encrypted_cdr("cdr_cipher");
+        let toc0_before = std::fs::read(dir.join("toc.0")).expect("initial TOC slot");
+        let toc1_before = std::fs::read(dir.join("toc.1")).ok();
+        assert!(
+            toc0_before
+                .windows(b"snow_cdr_bnd".len())
+                .any(|w| w == b"snow_cdr_bnd"),
+            "the TOC slot must stay a readable plaintext TOC"
+        );
+
+        let specs = spec::parse_all(&[], &[format!("bundle={},cipher", dir.display())]).unwrap();
+        let mut plane = open_plane_for(&specs[0], Some(b"hunter2")).expect("encrypted CD-R plane");
+        assert!(plane.is_cdr_bundle());
+
+        let plain: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let mut input = plain.clone();
+        assert_eq!(
+            plane.exec(
+                IoReq {
+                    resource: 17,
+                    offset: 0,
+                    len: 2048,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut input),
+            ),
+            Ok(2048)
+        );
+        let track_1 = std::fs::read(dir.join("track_1.bin")).expect("track file");
+        assert_ne!(&track_1[..2048], &plain[..], "track must be ciphertext");
+
+        let mut out = vec![0u8; 2048];
+        assert_eq!(
+            plane.exec(
+                IoReq {
+                    resource: 17,
+                    offset: 0,
+                    len: 2048,
+                    dir: Direction::ToHost,
+                },
+                IoBuf::Read(&mut out),
+            ),
+            Ok(2048)
+        );
+        assert_eq!(out, plain, "the read must decrypt back to plaintext");
+
+        // The TOC resources were never touched, byte for byte.
+        assert_eq!(std::fs::read(dir.join("toc.0")).unwrap(), toc0_before);
+        assert_eq!(std::fs::read(dir.join("toc.1")).ok(), toc1_before);
+
+        // A second track at the same offset uses its own nonce domain.
+        let mut second = plain.clone();
+        assert_eq!(
+            plane.exec(
+                IoReq {
+                    resource: 18,
+                    offset: 0,
+                    len: 2048,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut second),
+            ),
+            Ok(2048)
+        );
+        let track_2 = std::fs::read(dir.join("track_2.bin")).expect("second track file");
+        assert_ne!(
+            &track_2[..2048],
+            &track_1[..2048],
+            "two tracks at the same offset must not reuse the keystream"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("toc.0")).unwrap(),
+            toc0_before,
+            "a track write must not rewrite the TOC"
+        );
+
+        drop(plane);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&password);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    #[test]
+    fn encrypted_cdr_bundle_reopens_after_a_track_write() {
+        use snowscsi::core::storage::{IoBuf, IoReq};
+        use snowscsi::core::Direction;
+
+        let (dir, password) = create_encrypted_cdr("cdr_cipher_reopen");
+        let specs = spec::parse_all(&[], &[format!("bundle={},cipher", dir.display())]).unwrap();
+        let plain: Vec<u8> = (0..4096).map(|i| (i % 241) as u8).collect();
+
+        let mut plane = open_plane_for(&specs[0], Some(b"hunter2")).expect("encrypted CD-R plane");
+        let mut input = plain.clone();
+        assert_eq!(
+            plane.exec(
+                IoReq {
+                    resource: 17,
+                    offset: 0,
+                    len: plain.len() as u32,
+                    dir: Direction::FromHost,
+                },
+                IoBuf::Write(&mut input),
+            ),
+            Ok(plain.len())
+        );
+        drop(plane);
+
+        let at_rest = std::fs::read(dir.join("track_1.bin")).expect("track file");
+        assert_ne!(&at_rest[..plain.len()], &plain[..]);
+
+        // Reopening through the real spec path resolves the manifest again
+        // and must use the same key/nonce domain.
+        let mut reopened =
+            open_plane_for(&specs[0], Some(b"hunter2")).expect("reopened encrypted CD-R plane");
+        let mut out = vec![0u8; plain.len()];
+        assert_eq!(
+            reopened.exec(
+                IoReq {
+                    resource: 17,
+                    offset: 0,
+                    len: plain.len() as u32,
+                    dir: Direction::ToHost,
+                },
+                IoBuf::Read(&mut out),
+            ),
+            Ok(plain.len())
+        );
+        assert_eq!(out, plain);
+        assert!(
+            dir.join("toc.0").is_file(),
+            "the TOC slot survives the reopen"
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&password);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "bundle"))]
+    #[test]
+    fn cipher_override_must_match_the_identified_bundle() {
+        let dir = temp_dir("cipher_override");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = cipher_key_file("override");
+        let identified = BundleMeta {
+            kind: BundleKind::Flat {
+                virtual_size: 8 << 20,
+                chunk_size: 1 << 20,
+                sector_size: 512,
+            },
+            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            has_crc: false,
+        };
+        let spec_for = |explicit: &Path| {
+            spec::parse_all(
+                &[format!(
+                    "bundle={},cipher={},key={}",
+                    dir.display(),
+                    explicit.display(),
+                    key.display()
+                )],
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let write = |name: &str, meta: &BundleMeta| {
+            let path = dir.join(name);
+            std::fs::write(&path, meta.encode().unwrap()).unwrap();
+            path
+        };
+
+        // An equivalent manifest is accepted.
+        let matching = write("matching", &identified);
+        assert!(bundle_cipher(&spec_for(&matching), None, &identified, "identified").is_ok());
+
+        // Geometry is part of the kind: a different flat size is refused.
+        let mut geometry = identified;
+        if let BundleKind::Flat { virtual_size, .. } = &mut geometry.kind {
+            *virtual_size += 1;
+        }
+        let geometry_path = write("geometry", &geometry);
+        assert!(bundle_cipher(&spec_for(&geometry_path), None, &identified, "identified").is_err());
+
+        // A different kind (cdr instead of flat) is refused.
+        let kind = BundleMeta {
+            kind: BundleKind::Cdr,
+            cipher: identified.cipher,
+            has_crc: false,
+        };
+        let kind_path = write("kind", &kind);
+        assert!(bundle_cipher(&spec_for(&kind_path), None, &identified, "identified").is_err());
+
+        // A different nonce repeats a keystream on the same resources.
+        let mut nonce = identified;
+        if let Some(cipher) = nonce.cipher.as_mut() {
+            cipher.nonce[0] ^= 0x01;
+        }
+        let nonce_path = write("nonce", &nonce);
+        assert!(bundle_cipher(&spec_for(&nonce_path), None, &identified, "identified").is_err());
+
+        // The identified manifest is authoritative: a cipher-less one cannot
+        // be rescued by an explicit cipher-bearing override.
+        let plain = BundleMeta {
+            cipher: None,
+            ..identified
+        };
+        let plain_path = write("plain", &identified);
+        assert!(bundle_cipher(&spec_for(&plain_path), None, &plain, "identified").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    #[test]
+    fn encrypted_cdrw_bundle_is_refused_at_create_and_serve() {
+        let key = cipher_key_file("cdrw");
+
+        // Creation refuses a CD-RW preset with --cipher before making the
+        // directory.
+        let create_dir = temp_dir("cdrw_create");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: create_dir.display().to_string(),
+            medium: Some("cdrw80".to_string()),
+            slot: None,
+            cipher: Some("xor".to_string()),
+            key_file: Some(key.display().to_string()),
+            ..CreateCdrArgs::default()
+        });
+        assert_eq!(created, ExitCode::FAILURE);
+        assert!(
+            !create_dir.exists(),
+            "a refused encrypted CD-RW must not create the directory"
+        );
+
+        // Serving a stored CD-RW with a cipher manifest is refused after the
+        // medium is opened (the TOC says cdrw, not cdr).
+        let dir = temp_dir("cdrw_serve");
+        let created = create_cdr_bundle(CreateCdrArgs {
+            dir: dir.display().to_string(),
+            medium: Some("cdrw80".to_string()),
+            slot: None,
+            ..CreateCdrArgs::default()
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        let meta = BundleMeta {
+            kind: BundleKind::Cdr,
+            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            has_crc: false,
+        };
+        std::fs::write(dir.join(MANIFEST_NAME), meta.encode().unwrap()).unwrap();
+        let specs = spec::parse_all(
+            &[],
+            &[format!(
+                "bundle={},cipher,key={}",
+                dir.display(),
+                key.display()
+            )],
+        )
+        .unwrap();
+        assert!(
+            run_with_large_stack(move || {
+                let mut planes = Vec::new();
+                let mut slots = Vec::new();
+                build_core_slots(&specs, &mut planes, &mut slots, None).is_err()
+            }),
+            "encrypted CD-RW must be refused by the CD-R slot builder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    #[test]
+    fn encrypted_cdr_bundle_requires_the_key_material() {
+        let (dir, password) = create_encrypted_cdr("cdr_cipher_keys");
+        let specs = spec::parse_all(&[], &[format!("bundle={},cipher", dir.display())]).unwrap();
+
+        // PBKDF2 without a password is a hard error, never a plaintext fallback.
+        assert!(open_plane_for(&specs[0], None).is_err());
+
+        // kdf = none requires an explicit key= file.
+        let meta = BundleMeta {
+            kind: BundleKind::Cdr,
+            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::ChaCha12)),
+            has_crc: false,
+        };
+        std::fs::write(dir.join(MANIFEST_NAME), meta.encode().unwrap()).unwrap();
+        let specs = spec::parse_all(&[], &[format!("bundle={},cipher", dir.display())]).unwrap();
+        assert!(open_plane_for(&specs[0], Some(b"hunter2")).is_err());
+
+        // A wrong-length key file is rejected.
+        let key = cipher_key_file("cdr_none");
+        std::fs::write(&key, [0u8; 31]).unwrap();
+        let specs = spec::parse_all(
+            &[],
+            &[format!(
+                "bundle={},cipher,key={}",
+                dir.display(),
+                key.display()
+            )],
+        )
+        .unwrap();
+        assert!(open_plane_for(&specs[0], None).is_err());
+
+        // A cipher-less manifest is never served plaintext.
+        std::fs::write(
+            dir.join(MANIFEST_NAME),
+            BundleMeta {
+                kind: BundleKind::Cdr,
+                cipher: None,
+                has_crc: false,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(open_plane_for(&specs[0], None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&password);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "cdr-bundle"))]
+    #[test]
+    fn encrypted_cdr_bundle_info_reports_cipher_and_toc() {
+        let (dir, password) = create_encrypted_cdr("cdr_cipher_info");
+        let manifest = std::fs::read_to_string(dir.join(MANIFEST_NAME)).unwrap();
+        assert!(manifest.contains("cipher = chacha12"), "{manifest}");
+        assert!(manifest.contains("kdf = pbkdf2-hmac-sha256"), "{manifest}");
+        assert!(dir.join("toc.0").is_file(), "the TOC summary needs a slot");
+        assert_eq!(
+            run_bundle_info(BundleInfoArgs {
+                path: dir.display().to_string()
+            }),
+            ExitCode::SUCCESS
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&password);
     }
 
     #[cfg(all(feature = "cipher", feature = "bundle"))]

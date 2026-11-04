@@ -867,7 +867,7 @@ mod tests {
 
     #[cfg(feature = "cdr-bundle")]
     fn bundle_plane(tag: &str) -> (std::path::PathBuf, OwnedPlane) {
-        use crate::stack::BundleStore;
+        use crate::stack::{BundleStore, CdrStore};
         use snowscsi::common::fs_plane::FsPlaneAdapter;
         use snowscsi::scsi::fs_backend::StdFsBackend;
 
@@ -883,7 +883,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fs = FsPlaneAdapter::new(StdFsBackend::new(&dir.to_string_lossy()));
-        let plane = OwnedPlane::CdrBundle(BundleStore::new(fs, 359_849, None));
+        let plane = OwnedPlane::CdrBundle(CdrStore::new(BundleStore::new(fs, 359_849, None)));
         (dir, plane)
     }
 
