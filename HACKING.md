@@ -67,18 +67,27 @@ snowscsi ──▶ snowscsi-common              │
 
 Feature maps:
 
-- **`snowscsi-common`** — `std` (default), `log`, `defmt`, `async-io`. The
-  core seams are always compiled (no feature gate). `async-io` adds the
-  asynchronous storage seams (`async fn` in trait, no runtime). `defmt` forwards
-  to `embedded-io/defmt` so `embedded_io::ErrorKind` implements `defmt::Format`;
-  `std` + `defmt` is rejected at compile time (see below).
+- **`snowscsi-common`** — `std` (default), `log`, `defmt`, `async-io`,
+  `cipher`, `cipher-kdf`. The core seams are always compiled (no feature
+  gate). `async-io` adds the asynchronous storage seams (`async fn` in trait,
+  no runtime). `cipher` adds the offset-addressed, length-preserving
+  stream-cipher plane decorators (`cipher::CipherPlane` /
+  `AsyncCipherPlane` over `FlatData`/`WritableFlatData`) and its ciphers; the
+  feature is empty (no runtime dependency) and the ciphers are
+  allocation-free and `no_std`. `cipher-kdf` (→`cipher`) adds the
+  password-to-key derivation seam (`cipher::Kdf`/`cipher::SoftKdf`) and an
+  in-crate PBKDF2-HMAC-SHA256 implementation, also dependency-free and
+  `no_std`. `defmt` forwards to `embedded-io/defmt` so `embedded_io::ErrorKind`
+  implements `defmt::Format`; `std` + `defmt` is rejected at compile time
+  (see below).
 - **`snowscsi-iso9660`** — `std` (default).
 - **`snowscsi`** — `std` (default), `scsi`, `dvdram`,
   `iscsi` (→`scsi`), `cdrom` (→`scsi`),
   `livefs` (→`cdrom`), `usb` (→`scsi`),
   `bundle` (→`snowscsi-common/bundle`), `cdr-bundle` (sequential CD-R/CD-RW
   medium with TAO data/CD-DA audio, multi-session append, BLANK and an
-  alternating persistent TOC), `async-io` (→`usb` +
+  alternating persistent TOC), `cipher` (→`snowscsi-common/cipher`),
+  `cipher-kdf` (→`cipher` + `snowscsi-common/cipher-kdf`), `async-io` (→`usb` +
   `snowscsi-common/async-io`), `embassy`
   (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
   `defmt` forwards to `embedded-io/defmt` and

@@ -13,8 +13,10 @@ categories = ["embedded", "no-std"]
 
 [package.metadata.docs.rs]
 # `log` and `defmt` are mutually exclusive (see `logging.rs`), so no
-# `all-features`; `bundle` enables the ini-based flat-bundle backend.
-features = ["std", "log", "bundle", "async-io"]
+# `all-features`; `bundle` enables the ini-based flat-bundle backend;
+# `cipher` adds the offset-addressed stream-cipher plane decorators and
+# `cipher-kdf` the password-based key derivation seam.
+features = ["std", "log", "bundle", "async-io", "cipher", "cipher-kdf"]
 
 [features]
 default = ["std"]
@@ -24,6 +26,12 @@ defmt = ["dep:defmt", "embedded-io/defmt"]
 bundle = ["dep:ini_core"]
 # Async storage seams (model-agnostic, no runtime).
 async-io = []
+# Offset-addressed, length-preserving stream-cipher plane decorators. The
+# feature is deliberately empty: the ciphers are in-crate and allocation-free.
+cipher = []
+# Password -> key derivation (PBKDF2-HMAC-SHA256). In-crate and
+# allocation-free: no dependency is added.
+cipher-kdf = ["cipher"]
 
 [dependencies]
 embedded-io.workspace = true
@@ -31,3 +39,7 @@ heapless.workspace = true
 ini_core = { version = "0.2", default-features = false, optional = true }
 log = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Only the `cipher` tests use it (NIST AES-CTR known-answer vectors).
+aes.workspace = true

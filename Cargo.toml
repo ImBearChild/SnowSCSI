@@ -29,6 +29,9 @@ embedded-io = "0.7"
 heapless = "0.8"
 log = { version = "0.4", default-features = false }
 defmt = "1"
+# Test-only for `snowscsi-common/cipher` (NIST SP 800-38A AES-CTR vectors).
+# Never a runtime dependency of the library crates.
+aes = "0.8"
 # Async facade (`snowscsi/async-io`, `snowscsi/embassy`). Versions match the
 # in-repo examples and embassy-usb 0.6's transitive requirements.
 embassy-usb = { version = "0.6", default-features = false }

@@ -14,7 +14,7 @@ categories = ["embedded", "no-std", "hardware-support"]
 [package.metadata.docs.rs]
 # `log` and `defmt` are mutually exclusive, so no `all-features`: build every
 # transport/media feature with the `log` backend.
-features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle", "log", "async-io"]
+features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle", "cipher", "cipher-kdf", "log", "async-io"]
 
 [features]
 default = ["std"]
@@ -26,6 +26,10 @@ cdrom = ["scsi"]
 livefs = ["cdrom"]
 usb = ["scsi"]
 bundle = ["snowscsi-common/bundle"]
+# Offset-addressed stream-cipher plane decorators (available as
+# `snowscsi::common::cipher`) and the PBKDF2-HMAC-SHA256 key derivation seam.
+cipher = ["snowscsi-common/cipher"]
+cipher-kdf = ["cipher", "snowscsi-common/cipher-kdf"]
 # Recordable CD-R medium with a persistent TOC.
 cdr-bundle = ["dep:ini_core"]
 log = ["dep:log", "snowscsi-common/log"]

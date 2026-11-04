@@ -10,6 +10,9 @@ pub mod async_seekable_storage;
 #[cfg(feature = "async-io")]
 pub mod async_store;
 
+#[cfg(feature = "cipher")]
+pub mod cipher;
+
 pub mod flat_bundle;
 pub mod fs_plane;
 pub mod fs_storage;
