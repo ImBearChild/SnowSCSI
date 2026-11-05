@@ -219,7 +219,10 @@ class CipherMissingSidecarTest(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="snowscsi-nosidecar-")
         try:
             img = os.path.join(d, "disk.img")
+            password = os.path.join(d, "pw")
             _write_pattern(img, 1 << 20)
+            with open(password, "wb") as f:
+                f.write(b"pw\n")
             r = subprocess.run(
                 [
                     find_binary(),
@@ -228,10 +231,13 @@ class CipherMissingSidecarTest(unittest.TestCase):
                     "127.0.0.1:0",
                     "--block",
                     f"img={img},cipher",
+                    "--password-file",
+                    password,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                stdin=subprocess.DEVNULL,
             )
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("SNOWBUNDLE", r.stderr)

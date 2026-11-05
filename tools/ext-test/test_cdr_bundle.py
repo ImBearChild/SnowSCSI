@@ -273,8 +273,8 @@ def _newest_slot(slots):
 
 # ── raw SCSI / device helpers ───────────────────────────────────────
 
-def _sg_raw(dev, cdb, reply=0, infile=None, readonly=None, check=True):
-    """Send one raw command; return stdout (binary for a data-in command)."""
+def _sg_raw_proc(dev, cdb, reply=0, infile=None, readonly=None, check=True):
+    """Send one raw command; return the `CompletedProcess`."""
     if readonly is None:
         # A data-in command only reads, so open the device read-only: the
         # kernel marks a finalized CD-R read-only and would reject O_RDWR.
@@ -301,11 +301,16 @@ def _sg_raw(dev, cdb, reply=0, infile=None, readonly=None, check=True):
     return proc
 
 
+def _sg_raw(dev, cdb, reply=0, infile=None, readonly=None, check=True):
+    """Send one raw command; return stdout (binary for a data-in command)."""
+    return _sg_raw_proc(dev, cdb, reply, infile, readonly, check).stdout
+
+
 def _consume_unit_attention(dev):
     """Retry TEST UNIT READY until a pending unit attention is consumed."""
     for _ in range(3):
         if (
-            _sg_raw(
+            _sg_raw_proc(
                 dev,
                 [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 readonly=True,
