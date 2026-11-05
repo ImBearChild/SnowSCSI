@@ -92,12 +92,15 @@ cipher description), and create an encrypted flat or CD-R bundle with
 
 ```bash
 snowscsi crypt --cipher chacha20 --password-file pw image.img image.enc
+# change the password/key without re-encrypting
+snowscsi rekey image.enc --current-password-file old.pw --new-password-file new.pw
 ```
 
 The cipher is **at-rest protection, not a security boundary**: it does not
-protect a running machine or a compromised host, and there is no integrity
-authentication (a wrong password or tampered bytes produce garbage, not an
-error). See `HACKING.md` for the explicit threat model.
+protect a running machine or a compromised host. A wrong password or a
+tampered keyslot/manifest is rejected before any output, but the payload
+itself has no integrity authentication (tampered bytes decrypt to garbage,
+not an error). See `HACKING.md` for the explicit threat model.
 
 ## Embedded example
 

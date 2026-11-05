@@ -935,7 +935,9 @@ class CdrBundleCipherCreateTest(unittest.TestCase):
         self.assertIn("kind = cdr", manifest)
         self.assertIn("cipher = chacha12", manifest)
         self.assertIn("kdf = pbkdf2-hmac-sha256", manifest)
-        self.assertIn("nonce = ", manifest)
+        self.assertIn("iterations = ", manifest)
+        for field in ("nonce", "key_id", "salt", "wrap_nonce", "wrapped_key", "tag"):
+            self.assertIn(f"{field} = ", manifest, f"missing keyslot field {field}")
 
         with open(os.path.join(bundle, "toc.0"), "rb") as handle:
             toc = handle.read()

@@ -19,11 +19,14 @@
 //! although serving does create chunk/track files and write TOC snapshots.
 //! `snowscsi bundle-info` reports what a directory or sidecar describes.
 //!
-//! `cipher` marks an `img=` or `bundle=` LUN as encrypted; its key material
-//! comes from the manifest (KDF + salt + nonce) and either a password or a
-//! `key=<path>` file. `cipher=<path>` overrides the manifest location (the
+//! `cipher` marks an `img=` or `bundle=` LUN as encrypted; the manifest carries
+//! a wrapped volume master key (VMK), and either a password or a
+//! `key=<path>` file supplies the **KEK** that unwraps it (it is never the
+//! data key itself). `cipher=<path>` overrides the manifest location (the
 //! default is `<dir>/SNOWBUNDLE` for a bundle and `<file>.SNOWBUNDLE` for an
-//! image). `removable` and the non-file backings cannot carry a cipher.
+//! image); an override must wrap the same VMK identity, so a rekeyed copy is
+//! accepted while a different cipher/nonce/key id is refused. `removable` and
+//! the non-file backings cannot carry a cipher.
 //!
 //! Parsing is a pure function (no filesystem access): whether an `img=` path
 //! exists, or which `kind` a `bundle=` manifest carries, is decided when the
@@ -111,8 +114,9 @@ pub struct DeviceSpec {
     pub removable: bool,
     /// The LUN is encrypted (`cipher` / `cipher=<path>`).
     pub cipher: Option<CipherSpec>,
-    /// Raw key file (`key=<path>`); only meaningful with [`Self::cipher`].
-    /// The password is never stored here.
+    /// Raw 32-byte key file (`key=<path>`); only meaningful with
+    /// [`Self::cipher`]. It is the KEK for a `kdf = none` keyslot, not the
+    /// payload data key; the password is never stored here.
     pub key: Option<String>,
 }
 

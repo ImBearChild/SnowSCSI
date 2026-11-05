@@ -13,8 +13,9 @@ Two layers:
   mounted device works, and that `crypt --decrypt` restores an image that
   still passes `fsck`.
 
-The stream ciphers are unauthenticated: a wrong password produces garbage
-with exit 0 (documented), so this test always keeps the plaintext image for
+The keyslot tag rejects a wrong password before any output is written, but the
+stream ciphers remain unauthenticated: a tampered ciphertext still produces
+garbage with exit 0, so this test always keeps the plaintext image for
 comparison.
 """
 
@@ -92,6 +93,10 @@ class CryptRoundTripTest(unittest.TestCase):
         self.assertIn("kind = image", manifest)
         self.assertIn("size = 65537", manifest)
         self.assertIn("cipher = chacha12", manifest)
+        self.assertIn("kdf = pbkdf2-hmac-sha256", manifest)
+        self.assertIn("iterations = ", manifest)
+        for field in ("nonce", "key_id", "salt", "wrap_nonce", "wrapped_key", "tag"):
+            self.assertIn(f"{field} = ", manifest, f"missing keyslot field {field}")
         self.assertIn("crc = ", manifest)
 
         with open(self.plain, "rb") as f:
@@ -118,7 +123,14 @@ class CryptRoundTripTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isfile(self.plain + ".SNOWBUNDLE"))
         with open(self.plain + ".SNOWBUNDLE", encoding="utf-8") as f:
-            self.assertIn("kdf = none", f.read())
+            manifest = f.read()
+        self.assertIn("kdf = none", manifest)
+        # `kdf = none` still carries a salt: it diversifies the keyslot
+        # subkeys even when the same key file is reused across bundles.
+        self.assertIn("salt = ", manifest)
+        self.assertNotIn("iterations = ", manifest)
+        for field in ("wrap_nonce", "wrapped_key", "tag", "key_id"):
+            self.assertIn(f"{field} = ", manifest)
         r = _crypt("--decrypt", "--key-file", key, self.plain, self.dec)
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(self.dec, "rb") as f:
@@ -128,6 +140,56 @@ class CryptRoundTripTest(unittest.TestCase):
         r = _crypt("--decrypt", "--password-file", self.password, self.plain, self.dec)
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(os.path.exists(self.dec))
+
+    def test_wrong_password_fails_before_output(self):
+        wrong = os.path.join(self.dir, "wrong.txt")
+        with open(wrong, "wb") as f:
+            f.write(b"not-the-password\n")
+        r = _crypt(
+            "--cipher",
+            "chacha20",
+            "--iterations",
+            "1000",
+            "--password-file",
+            self.password,
+            self.plain,
+            self.enc,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = _crypt("--decrypt", "--password-file", wrong, self.enc, self.dec)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("wrong password", r.stderr)
+        self.assertFalse(
+            os.path.exists(self.dec), "a wrong password must not create output"
+        )
+        self.assertTrue(
+            os.path.isfile(self.enc + ".SNOWBUNDLE"),
+            "decryption never touches the encrypted input's sidecar",
+        )
+
+    def test_force_refuses_to_overwrite_a_sidecar(self):
+        r = _crypt(
+            "--cipher",
+            "xor",
+            "--password-file",
+            self.password,
+            self.plain,
+            self.enc,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A second encryption must not replace the sidecar (the only copy of
+        # that image's VMK), even with --force.
+        r = _crypt(
+            "--cipher",
+            "xor",
+            "--password-file",
+            self.password,
+            "--force",
+            self.plain,
+            self.enc,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("sidecar", r.stderr)
 
 
 @unittest.skipUnless(

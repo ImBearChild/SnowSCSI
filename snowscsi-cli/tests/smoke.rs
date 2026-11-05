@@ -1769,13 +1769,41 @@ fn cipher_serve_rejects_missing_sidecar_and_bad_key() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot read manifest"), "got: {err}");
 
+    use snowscsi::common::bundle::{
+        BundleKind, BundleMeta, CipherAlg, CipherMeta, KdfKind, KeySlot,
+    };
+    use snowscsi::common::cipher::keyslot::{key_id, wrap_slot};
+    use snowscsi::common::cipher::CipherKey;
+
+    let kind = BundleKind::Image { size: 4096 };
+    let vmk = CipherKey::from_bytes(&[0x99u8; 32]).unwrap();
+    let kek = CipherKey::from_bytes(&[0x11u8; 32]).unwrap();
+    let mut cipher = CipherMeta {
+        cipher: CipherAlg::Xor,
+        nonce: [0u8; 8],
+        key_id: key_id(&vmk),
+        slot: KeySlot {
+            kdf: KdfKind::None,
+            iterations: None,
+            salt: [0x11u8; 16],
+            wrap_nonce: [0x22u8; 8],
+            wrapped_key: [0u8; 32],
+            tag: [0u8; 16],
+        },
+    };
+    wrap_slot(&kind, &mut cipher, &kek, &vmk).unwrap();
+    let meta = BundleMeta {
+        kind,
+        cipher: Some(cipher),
+        has_crc: true,
+    };
     std::fs::write(
         format!("{}.SNOWBUNDLE", image.display()),
-        b"magic = snow_bundle\nversion = 1\nkind = image\nsize = 4096\ncipher = xor\nkdf = none\nnonce = 0000000000000000\n",
+        meta.encode().unwrap(),
     )
     .unwrap();
     let key = dir.join("key.bin");
-    std::fs::write(&key, [0u8; 31]).unwrap();
+    std::fs::write(&key, [0x11u8; 31]).unwrap();
     let out = run(&[
         "serve",
         "--block",

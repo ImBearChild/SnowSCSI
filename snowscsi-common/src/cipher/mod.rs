@@ -69,12 +69,16 @@ pub mod chacha;
 pub mod ctr;
 #[cfg(feature = "cipher-kdf")]
 pub mod kdf;
+#[cfg(feature = "cipher-kdf")]
+pub mod keyslot;
 pub mod xor;
 
 pub use chacha::{ChaCha, ChaCha12, ChaCha20, ChaCha8};
 pub use ctr::{AesCtr, BlockCipher16, CtrAccel};
 #[cfg(feature = "cipher-kdf")]
 pub use kdf::{pbkdf2_hmac_sha256, Kdf, SoftKdf};
+#[cfg(feature = "cipher-kdf")]
+pub use keyslot::{derive_kek, key_id, unwrap_slot, wrap_slot, KeyslotError};
 pub use xor::XorMix;
 
 /// Offset-addressed stream cipher.

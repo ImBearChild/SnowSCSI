@@ -135,15 +135,15 @@ It is off by default: `CIPHER_KEY` in `src/main.rs` is `None`, and the card is
 served byte-for-byte as stored.
 
 ```rust
-/// Replace with the key/nonce from the host-side `image.enc.SNOWBUNDLE`.
+/// The 32-byte volume master key (VMK) and the 8-byte data nonce.
 /// `None` serves the card plaintext (the default).
 const CIPHER_KEY: Option<([u8; 32], [u8; 8])> = None;
 ```
 
-Setting it to `Some((key, nonce))` switches the backing to
+Setting it to `Some((vmk, nonce))` switches the backing to
 `store::Backing::SdCipher`, which wraps the card in
 `common::cipher::AsyncCipherPlane` exactly the way the CLI serves an encrypted
-image/bundle LUN. The cipher layer is length-preserving: no header, trailer or
+image LUN. The cipher layer is length-preserving: no header, trailer or
 reserved sector is added, and the medium's geometry is unchanged.
 
 ### Where the key and nonce come from
@@ -153,23 +153,31 @@ contain a raw ciphertext image, not a bundle directory: a `snowscsi` flat or
 CD-R bundle (`bundle-create`) is a directory/chunk layout that only the CLI
 knows how to interpret, so it is **not usable** by this firmware.
 
-Encrypt a plaintext image with a raw-key manifest and write the ciphertext to
-the card as-is:
+The CLI's `SNOWBUNDLE` stores a random VMK **wrapped** by a password/key-file
+KEK; it deliberately does not print the VMK. This example therefore treats
+`CIPHER_KEY` as a provisioning input: obtain the VMK and data nonce from your
+key-management step (or use a fixed test vector for a lab run), encrypt the
+image with that VMK, and keep the sidecar on the host. The firmware does not
+parse the keyslot and does not run PBKDF2.
+
+For a lab test, generate a VMK yourself and use it both in the host-side
+encryption and in `CIPHER_KEY`; label it as a known-key/test vector, never as
+production data.
 
 ```bash
-snowscsi crypt --cipher aes-ctr --key-file key.bin image.img image.enc
+# Host-side: this generates a random VMK internally; the sidecar wraps it.
+snowscsi crypt --cipher aes-ctr --key-file kek.bin image.img image.enc
 sudo dd if=image.enc of=/dev/sdX bs=1M oflag=direct status=progress
 ```
 
 `snowscsi crypt` writes the sidecar `image.enc.SNOWBUNDLE` next to the output.
-It is plain text: its `nonce = <16 hex digits>` line is the 8-byte nonce, and
-`key.bin` (32 raw bytes, `kdf = none`) is the key. Copy both values into
-`CIPHER_KEY`. The sidecar is host-side metadata and is not needed on the card;
-without it the key/nonce cannot be recovered. A password-based sidecar
-(`--password-file`) records a salt and iteration count instead of a raw key, so
-it cannot fill `CIPHER_KEY` directly — use `--key-file` for this firmware.
+It is plain text: its `nonce = <16 hex digits>` line is the 8-byte data nonce;
+`wrapped_key` is the VMK encrypted under the KEK. The sidecar is host-side
+metadata and is not needed on the card, but without it (or the VMK) the data
+cannot be recovered. A production firmware needs the VMK from the same
+key-management source that created the sidecar; the CLI does not expose it.
 
-`const CIPHER_KEY` puts the key in the firmware image: the bytes are linked
+`const CIPHER_KEY` puts the VMK in the firmware image: the bytes are linked
 into `.rodata` (and copied into ordinary RAM by `P4Aes`), visible in the flashed
 ESP32-P4 image and in a RAM dump. There is no zeroize; protect the flash and
 do not treat this constant as a secret store.

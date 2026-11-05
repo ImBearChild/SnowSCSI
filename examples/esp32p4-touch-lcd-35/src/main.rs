@@ -126,8 +126,13 @@ static FLOW: Flow = Flow::new();
 ///
 /// The SD plane is encrypted with AES-256-CTR in the same
 /// `nonce || BE64(offset / 16)` layout `snowscsi` uses for encrypted image and
-/// bundle LUNs, so a host that knows the key/nonce reads the medium exactly as
+/// bundle LUNs, so a host that knows the VMK/nonce reads the medium exactly as
 /// if it had been served by the CLI.
+///
+/// The CLI stores a random volume master key wrapped by a password/key-file
+/// KEK; this firmware does not parse the keyslot. `CIPHER_KEY` is that VMK plus
+/// the data nonce, provisioned from the host's key-management step (or a fixed
+/// test vector for a lab run).
 ///
 /// This is a `const`: the key bytes live in `.rodata` and in a RAM copy, with
 /// no zeroize. Protect the flash readout; do not treat this as a secret store.

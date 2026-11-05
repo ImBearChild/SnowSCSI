@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage decorator can transform them before the backing sees them. Adapters
   that only read the buffer are unaffected; every constructor of those
   variants needs a mutable buffer.
+- **common / cli**: the encrypted manifest is now the first and only format
+  (`version = 1`): a random volume master key wrapped by a keyslot
+  (`kdf`/`iterations`/`salt`/`wrap_nonce`/`wrapped_key`/`tag`) plus a data
+  `nonce` and `key_id`. `cipher` is mandatory (`none` for plaintext), the
+  manifest cap is 768 bytes, and the old direct-password-derived-key layout is
+  rejected. A wrong password or tampered keyslot now fails before output
+  instead of producing garbage (the payload is still unauthenticated).
+  `bundle-create --cipher` now requires a credential, `bundle-create --force`
+  is removed, and `crypt --force` cannot overwrite an existing sidecar. New
+  `snowscsi rekey` changes the keyslot without re-encrypting the data.
 - **core**: transport loops return `Result<ServeExit, _>`; `Flow` replaces the
   `&AtomicBool` stop flag on USB; `Target::settle_transport_end` is replaced by
   `link_lost`; `RunEnd::TransportEnded` is removed.
@@ -72,18 +82,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **cli**: `snowscsi crypt` encrypts/decrypts a single regular image file and
   its `<file>.SNOWBUNDLE` sidecar (`chacha8`/`chacha12`/`chacha20`/`aes-ctr`/
-  `xor`, PBKDF2-HMAC-SHA256 or a raw 32-byte key, `--in-place`, `--force`, a
+  `xor`, a random volume master key wrapped by a password-derived KEK or a raw
+  32-byte key, a 16-byte HMAC-SHA256 keyslot tag, `--in-place`, `--force`, a
   streaming 1 MiB path, fsynced temp+rename commits, and a `kind = image`
-  size check before any plaintext is written). Path alias/hard-link/symlink
-  checks run before I/O; out-of-place encryption refuses an already-encrypted
-  input; `--in-place` refuses symlinks and multi-hard-link inputs and preserves
-  the file's permissions; `--force` cannot be combined with `--in-place` and a
-  forced decryption removes a stale `<out>.SNOWBUNDLE`. Runs take an exclusive
-  `<target>.lock`, temps are random-suffixed and mode `0600` on Unix, and the
-  byte count is checked against the pre-read size. **There is no payload
-  authentication**: a wrong password or tampered ciphertext exits 0 and writes
-  garbage, so keep the input and verify the result before deleting anything.
-  `bundle-create flat|cdr` gains
+  size check before any plaintext is written). The tag covers the keyslot and
+  the bundle identity: a wrong password or a tampered keyslot/manifest fails
+  before output. **The payload is still unauthenticated**: tampered ciphertext
+  exits 0 and writes garbage, so keep the input and verify the result before
+  deleting anything. Path alias/hard-link/symlink checks run before I/O;
+  out-of-place encryption refuses an already-encrypted input; `--in-place`
+  refuses symlinks and multi-hard-link inputs and preserves the file's
+  permissions; `--force` cannot be combined with `--in-place` and never
+  overwrites an existing `<out>.SNOWBUNDLE` (the only copy of that image's
+  VMK). Runs take an exclusive `<target>.lock`, temps are random-suffixed and
+  mode `0600` on Unix, and the byte count is checked against the pre-read size.
+  `snowscsi rekey` re-wraps the VMK under a new password/key file without
+  touching the data nonce, cipher, geometry or image bytes; it verifies the
+  new keyslot before publishing and holds the same lock. `bundle-create
+  flat|cdr` gains
   `--cipher`/`--iterations`/`--key-file`/`--password-file`, and `serve`
   exposes encrypted `img=`, flat `bundle=` and recordable-CD `bundle=` LUNs;
   a recordable bundle encrypts its track resources through `CipherStore`

@@ -707,8 +707,9 @@ impl CdrStore {
 
     /// Wrap a CD-R store whose track resources are encrypted.
     ///
-    /// `nonce` is the manifest's 8-byte nonce; the decorator derives each
-    /// resource's domain from it, so the TOC resources never change.
+    /// `nonce` is the manifest's 8-byte **data** nonce; the decorator derives
+    /// each resource's domain from it, so the TOC resources never change.
+    /// `rekey` changes only the keyslot, never this nonce.
     #[cfg(feature = "cipher")]
     pub fn new_cipher(store: BundleStore, cipher: CliCipher, nonce: [u8; 8]) -> Self {
         Self::Cipher(Box::new(CipherStore::new(
@@ -3235,7 +3236,7 @@ mod tests {
     #[cfg(all(feature = "cdr-bundle", feature = "cipher"))]
     #[test]
     fn cdr_store_cipher_wrapper_reports_capacity_and_syncs() {
-        use snowscsi::common::bundle::{CipherAlg, CipherMeta, KdfKind};
+        use snowscsi::common::bundle::{CipherAlg, CipherMeta, KdfKind, KeySlot};
         use snowscsi::common::cipher::CipherKey;
 
         let dir = temp_dir("cdr_cipher_wrapper");
@@ -3243,10 +3244,16 @@ mod tests {
         let store = BundleStore::new(fs, 359_849, None);
         let meta = CipherMeta {
             cipher: CipherAlg::Xor,
-            kdf: KdfKind::None,
-            iterations: None,
-            salt: None,
             nonce: [0x5Au8; 8],
+            key_id: [0u8; 8],
+            slot: KeySlot {
+                kdf: KdfKind::None,
+                iterations: None,
+                salt: [0u8; 16],
+                wrap_nonce: [0u8; 8],
+                wrapped_key: [0u8; 32],
+                tag: [0u8; 16],
+            },
         };
         let key = CipherKey::from_bytes(&[0x42u8; 32]).unwrap();
         let cipher = CliCipher::from_meta(&meta, &key).unwrap();

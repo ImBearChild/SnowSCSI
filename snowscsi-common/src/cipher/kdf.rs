@@ -159,10 +159,9 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 /// HMAC-SHA256 (crate-internal).
 ///
 /// PBKDF2 uses the keyed-prefix [`HmacSha256`] state directly (to avoid
-/// re-processing the pads per round), so this one-shot form is currently used
-/// by the unit tests only; it stays crate-internal so a future caller has an
-/// obvious entry point.
-#[allow(dead_code)]
+/// re-processing the pads per round), so this one-shot form is used by the
+/// keyslot module and the unit tests. It stays crate-internal rather than
+/// becoming part of the public API.
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new(key);
     mac.update(data);

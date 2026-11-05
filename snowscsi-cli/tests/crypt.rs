@@ -131,6 +131,10 @@ fn assert_manifest(text: &str, size: u64, cipher: &str) {
     assert!(manifest_value(text, "iterations").is_some(), "{text}");
     assert!(manifest_value(text, "salt").is_some(), "{text}");
     assert!(manifest_value(text, "nonce").is_some(), "{text}");
+    assert!(manifest_value(text, "key_id").is_some(), "{text}");
+    assert!(manifest_value(text, "wrap_nonce").is_some(), "{text}");
+    assert!(manifest_value(text, "wrapped_key").is_some(), "{text}");
+    assert!(manifest_value(text, "tag").is_some(), "{text}");
 
     let crc_start = text.find("crc = ").expect("crc line");
     let crc = &text[crc_start + "crc = ".len()..];
@@ -194,6 +198,10 @@ fn crypt_roundtrip_with_password_file() {
         &dec,
     ]);
     assert_eq!(std::fs::read(&dec).expect("read plaintext"), plain);
+    assert!(
+        Path::new(&sidecar).is_file(),
+        "decryption never deletes the encrypted input's sidecar"
+    );
     assert!(
         !Path::new(&format!("{dec}.SNOWBUNDLE")).exists(),
         "decryption never writes a sidecar"
@@ -277,7 +285,13 @@ fn key_file_roundtrip_uses_kdf_none() {
     assert_eq!(manifest_value(&text, "cipher"), Some("aes-ctr"));
     assert_eq!(manifest_value(&text, "kdf"), Some("none"));
     assert_eq!(manifest_value(&text, "iterations"), None);
-    assert_eq!(manifest_value(&text, "salt"), None);
+    // `salt` is always present: it diversifies the keyslot subkeys even when
+    // the key file is reused across bundles.
+    assert!(manifest_value(&text, "salt").is_some());
+    assert!(manifest_value(&text, "wrap_nonce").is_some());
+    assert!(manifest_value(&text, "wrapped_key").is_some());
+    assert!(manifest_value(&text, "tag").is_some());
+    assert!(manifest_value(&text, "key_id").is_some());
     assert!(manifest_value(&text, "nonce").is_some());
     let crc_start = text.find("crc = ").unwrap();
     assert_eq!(
@@ -712,7 +726,7 @@ fn in_place_refuses_symlink_and_hard_link() {
 }
 
 #[test]
-fn forced_decrypt_removes_a_stale_output_sidecar() {
+fn forced_decrypt_refuses_an_existing_output_sidecar() {
     let dir = TempDir::new("stale_decrypt_sidecar");
     let plain = pseudo_random(65_537, 0x0BAD_F00D);
     let input = dir.write("in.img", &plain);
@@ -727,25 +741,33 @@ fn forced_decrypt_removes_a_stale_output_sidecar() {
         "aes-ctr",
         "--key-file",
         &key,
-        "--force",
         &input,
         &enc,
     ]);
     std::fs::write(&out_sidecar, b"stale cipher parameters").unwrap();
 
-    run_ok(&[
-        "crypt",
-        "--decrypt",
-        "--key-file",
-        &key,
-        "--force",
-        &enc,
-        &out,
-    ]);
-    assert_eq!(std::fs::read(&out).unwrap(), plain);
+    // The sidecar is the only copy of a different VMK; even --force never
+    // overwrites it, and no plaintext is written.
+    run_fail(
+        &[
+            "crypt",
+            "--decrypt",
+            "--key-file",
+            &key,
+            "--force",
+            &enc,
+            &out,
+        ],
+        "refusing to overwrite a sidecar",
+    );
     assert!(
-        !Path::new(&out_sidecar).exists(),
-        "a forced decrypt must remove a stale output sidecar"
+        !Path::new(&out).exists(),
+        "no plaintext on a sidecar refusal"
+    );
+    assert_eq!(
+        std::fs::read(&out_sidecar).unwrap(),
+        b"stale cipher parameters",
+        "the existing sidecar is untouched"
     );
     assert_no_temps(&dir.0);
 }
@@ -780,7 +802,7 @@ fn encryption_refuses_an_input_that_already_has_a_sidecar() {
 }
 
 #[test]
-fn wrong_password_produces_garbage_not_an_error() {
+fn wrong_password_fails_before_any_output() {
     let dir = TempDir::new("wrong_password");
     let plain = pseudo_random(65_537, 0xDEAD_BEEF);
     let input = dir.write("in.img", &plain);
@@ -797,26 +819,57 @@ fn wrong_password_produces_garbage_not_an_error() {
         "1000",
         "--password-file",
         &right,
-        "--force",
         &input,
         &enc,
     ]);
-    // There is no payload authentication: this succeeds and writes garbage.
+    run_fail(
+        &[
+            "crypt",
+            "--decrypt",
+            "--password-file",
+            &wrong,
+            "--force",
+            &enc,
+            &out,
+        ],
+        "wrong password",
+    );
+    assert!(
+        !Path::new(&out).exists(),
+        "a wrong password must fail before creating output"
+    );
+    assert_no_temps(&dir.0);
+}
+
+#[test]
+fn tampered_ciphertext_still_yields_garbage() {
+    let dir = TempDir::new("tampered_payload");
+    let plain = pseudo_random(65_537, 0xDEAD_BEE1);
+    let input = dir.write("in.img", &plain);
+    let enc = dir.str("enc.img");
+    let out = dir.str("out.img");
+    let key = dir.write("key.bin", &[0x6Au8; 32]);
+
     run_ok(&[
         "crypt",
-        "--decrypt",
-        "--password-file",
-        &wrong,
-        "--force",
+        "--cipher",
+        "chacha20",
+        "--key-file",
+        &key,
+        &input,
         &enc,
-        &out,
     ]);
+    let mut ciphertext = std::fs::read(&enc).unwrap();
+    ciphertext[1234] ^= 0x01;
+    std::fs::write(&enc, &ciphertext).unwrap();
+
+    // No payload authentication: the keyslot still unlocks, the ciphertext
+    // decrypts to garbage, and the process succeeds.
+    run_ok(&["crypt", "--decrypt", "--key-file", &key, &enc, &out]);
     let garbage = std::fs::read(&out).unwrap();
     assert_eq!(garbage.len(), plain.len());
-    assert_ne!(
-        garbage, plain,
-        "a wrong password must not recover plaintext"
-    );
+    assert_ne!(garbage, plain);
+    assert_eq!(garbage[1234], plain[1234] ^ 0x01);
     assert_no_temps(&dir.0);
 }
 
@@ -900,6 +953,10 @@ fn bundle_create_flat_with_cipher_writes_and_reports_it() {
     assert_eq!(manifest_value(&text, "iterations"), Some("1000"));
     assert!(manifest_value(&text, "salt").is_some());
     assert!(manifest_value(&text, "nonce").is_some());
+    assert!(manifest_value(&text, "key_id").is_some());
+    assert!(manifest_value(&text, "wrap_nonce").is_some());
+    assert!(manifest_value(&text, "wrapped_key").is_some());
+    assert!(manifest_value(&text, "tag").is_some());
     let crc_start = text.find("crc = ").unwrap();
     assert_eq!(
         u32::from_str_radix(text[crc_start + 6..].trim_end(), 16).unwrap(),
@@ -912,7 +969,18 @@ fn bundle_create_flat_with_cipher_writes_and_reports_it() {
     assert!(info.contains("cipher = chacha12"), "{info}");
     assert!(info.contains("kdf = pbkdf2-hmac-sha256"), "{info}");
     assert!(info.contains("iterations = 1000"), "{info}");
+    assert!(info.contains("keyslot = wrapped"), "{info}");
+    assert!(info.contains("tag = present"), "{info}");
+    assert!(info.contains("key_id = present"), "{info}");
     assert!(info.contains("crc = present"), "{info}");
+    // No key material or fingerprints: not the salt, nonce, wrapped key or
+    // tag bytes.
+    for secret in ["salt = ", "nonce = ", "wrapped_key = ", "tag = 0"] {
+        assert!(
+            !info.contains(secret),
+            "bundle-info leaked {secret:?}: {info}"
+        );
+    }
 
     // A key-file bundle carries no salt/iterations.
     let keyed = dir.str("keyed");
@@ -933,9 +1001,16 @@ fn bundle_create_flat_with_cipher_writes_and_reports_it() {
     assert_eq!(manifest_value(&text, "cipher"), Some("aes-ctr"));
     assert_eq!(manifest_value(&text, "kdf"), Some("none"));
     assert_eq!(manifest_value(&text, "iterations"), None);
-    assert_eq!(manifest_value(&text, "salt"), None);
+    assert!(manifest_value(&text, "salt").is_some());
+    assert!(manifest_value(&text, "wrap_nonce").is_some());
+    assert!(manifest_value(&text, "wrapped_key").is_some());
+    assert!(manifest_value(&text, "tag").is_some());
     let info = run_ok(&["bundle-info", &keyed]);
-    assert!(String::from_utf8_lossy(&info.stdout).contains("cipher = aes-ctr"));
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains("cipher = aes-ctr"), "{info}");
+    assert!(info.contains("kdf = none"), "{info}");
+    assert!(!info.contains("iterations = "), "{info}");
+    assert!(info.contains("keyslot = wrapped"), "{info}");
     assert_no_temps(&dir.0);
 }
 
@@ -945,6 +1020,40 @@ fn bundle_create_rejects_bad_cipher_flags() {
     let dir = TempDir::new("bundle_bad");
     let pw = password_file(&dir);
     let key = dir.write("key.bin", &[0x22u8; 32]);
+
+    // An encrypted bundle needs a credential; stdin is /dev/null here.
+    let no_credential = dir.str("no_credential");
+    run_fail(
+        &[
+            "bundle-create",
+            "flat",
+            "--dir",
+            &no_credential,
+            "--size",
+            "8M",
+            "--cipher",
+            "xor",
+        ],
+        "password",
+    );
+    assert!(
+        !Path::new(&no_credential).exists(),
+        "a refused credential must not create the bundle directory"
+    );
+
+    // `--force` is gone: a rebuild means deleting the directory.
+    run_fail(
+        &[
+            "bundle-create",
+            "flat",
+            "--dir",
+            &dir.str("force"),
+            "--size",
+            "8M",
+            "--force",
+        ],
+        "--force",
+    );
 
     for target in [dir.str("a"), dir.str("b")] {
         run_fail(
@@ -1108,9 +1217,9 @@ fn cdr_serve_refuses_a_stored_cdrw_with_a_cipher() {
     let bundle = dir.str("cdrw");
     let key = dir.write("key.bin", &[0x66u8; 32]);
 
-    // Create a plaintext CD-RW, then add a cipher block to its manifest. The
-    // stored TOC (not the manifest) says cdrw; the refusal happens after the
-    // medium is opened.
+    // Create a plaintext CD-RW, then add a valid cipher block to its manifest.
+    // The stored TOC (not the manifest) says cdrw; the refusal happens after
+    // the medium is opened.
     run_ok(&[
         "bundle-create",
         "cdr",
@@ -1119,14 +1228,38 @@ fn cdr_serve_refuses_a_stored_cdrw_with_a_cipher() {
         "--medium",
         "cdrw80",
     ]);
+    use snowscsi::common::bundle::{
+        BundleKind, BundleMeta, CipherAlg, CipherMeta, KdfKind, KeySlot,
+    };
+    use snowscsi::common::cipher::keyslot::{key_id, wrap_slot};
+    use snowscsi::common::cipher::CipherKey;
+
+    let kind = BundleKind::Cdr;
+    let key_bytes = [0x66u8; 32];
+    let vmk = CipherKey::from_bytes(&[0x99u8; 32]).unwrap();
+    let kek = CipherKey::from_bytes(&key_bytes).unwrap();
+    let mut cipher = CipherMeta {
+        cipher: CipherAlg::Xor,
+        nonce: [0x5Au8; 8],
+        key_id: key_id(&vmk),
+        slot: KeySlot {
+            kdf: KdfKind::None,
+            iterations: None,
+            salt: [0x11u8; 16],
+            wrap_nonce: [0x22u8; 8],
+            wrapped_key: [0u8; 32],
+            tag: [0u8; 16],
+        },
+    };
+    wrap_slot(&kind, &mut cipher, &kek, &vmk).unwrap();
+    let meta = BundleMeta {
+        kind,
+        cipher: Some(cipher),
+        has_crc: true,
+    };
     std::fs::write(
         Path::new(&bundle).join("SNOWBUNDLE"),
-        "magic = snow_bundle\n\
-         version = 1\n\
-         kind = cdr\n\
-         cipher = xor\n\
-         kdf = none\n\
-         nonce = 5a5a5a5a5a5a5a5a\n",
+        meta.encode().unwrap(),
     )
     .unwrap();
 
@@ -1139,6 +1272,232 @@ fn cdr_serve_refuses_a_stored_cdrw_with_a_cipher() {
             "127.0.0.1:0",
         ],
         "write-once CD-R",
+    );
+    assert_no_temps(&dir.0);
+}
+
+#[test]
+fn rekey_changes_only_the_keyslot() {
+    let dir = TempDir::new("rekey");
+    let plain = pseudo_random(65_537, 0x1234_5678);
+    let input = dir.write("in.img", &plain);
+    let enc = dir.str("enc.img");
+    let dec = dir.str("dec.img");
+    let old = dir.write("old.pw", b"old password\n");
+    let new = dir.write("new.pw", b"new password\n");
+
+    run_ok(&[
+        "crypt",
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &old,
+        &input,
+        &enc,
+    ]);
+    let before_image = std::fs::read(&enc).expect("read ciphertext");
+    let sidecar = format!("{enc}.SNOWBUNDLE");
+    let before_manifest = read_manifest(&sidecar);
+    let key_id_before = manifest_value(&before_manifest, "key_id")
+        .expect("key_id")
+        .to_string();
+    let nonce_before = manifest_value(&before_manifest, "nonce")
+        .expect("nonce")
+        .to_string();
+
+    let out = run_ok(&[
+        "rekey",
+        &enc,
+        "--current-password-file",
+        &old,
+        "--new-password-file",
+        &new,
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("keyslot only"), "{text}");
+
+    // The data bytes and the identity fields did not move.
+    assert_eq!(std::fs::read(&enc).unwrap(), before_image);
+    let after_manifest = read_manifest(&sidecar);
+    assert_eq!(
+        manifest_value(&after_manifest, "key_id"),
+        Some(key_id_before.as_str())
+    );
+    assert_eq!(
+        manifest_value(&after_manifest, "nonce"),
+        Some(nonce_before.as_str())
+    );
+    assert_ne!(
+        before_manifest, after_manifest,
+        "the keyslot must be rewrapped"
+    );
+
+    // The old password no longer unlocks this manifest; the new one does.
+    run_fail(
+        &["crypt", "--decrypt", "--password-file", &old, &enc, &dec],
+        "wrong password",
+    );
+    run_ok(&["crypt", "--decrypt", "--password-file", &new, &enc, &dec]);
+    assert_eq!(std::fs::read(&dec).unwrap(), plain);
+    assert_no_temps(&dir.0);
+}
+
+#[test]
+fn rekey_can_switch_between_password_and_key_file() {
+    let dir = TempDir::new("rekey_key");
+    let plain = pseudo_random(4096, 0xABCD_EF01);
+    let input = dir.write("in.img", &plain);
+    let enc = dir.str("enc.img");
+    let dec = dir.str("dec.img");
+    let pw = dir.write("pw", b"password\n");
+    let key = dir.write("new.key", &[0x5Au8; 32]);
+
+    run_ok(&[
+        "crypt",
+        "--cipher",
+        "chacha20",
+        "--password-file",
+        &pw,
+        &input,
+        &enc,
+    ]);
+    run_ok(&[
+        "rekey",
+        &enc,
+        "--current-password-file",
+        &pw,
+        "--new-key-file",
+        &key,
+    ]);
+    let manifest = read_manifest(&format!("{enc}.SNOWBUNDLE"));
+    assert_eq!(manifest_value(&manifest, "kdf"), Some("none"));
+    assert!(
+        manifest_value(&manifest, "iterations").is_none(),
+        "{manifest}"
+    );
+    run_ok(&["crypt", "--decrypt", "--key-file", &key, &enc, &dec]);
+    assert_eq!(std::fs::read(&dec).unwrap(), plain);
+    assert_no_temps(&dir.0);
+}
+
+#[cfg(feature = "bundle")]
+#[test]
+fn rekey_flat_bundle_and_direct_manifest() {
+    let dir = TempDir::new("rekey_flat");
+    let bundle = dir.str("disc");
+    let pw = dir.write("old.pw", b"old password\n");
+    let new = dir.write("new.pw", b"new password\n");
+    run_ok(&[
+        "bundle-create",
+        "flat",
+        "--dir",
+        &bundle,
+        "--size",
+        "1M",
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &pw,
+    ]);
+    let manifest = Path::new(&bundle).join("SNOWBUNDLE");
+    let manifest = manifest.to_string_lossy().into_owned();
+    let before = read_manifest(&manifest);
+    let key_id = manifest_value(&before, "key_id")
+        .expect("key_id")
+        .to_string();
+    let nonce = manifest_value(&before, "nonce").expect("nonce").to_string();
+
+    run_ok(&[
+        "rekey",
+        &bundle,
+        "--current-password-file",
+        &pw,
+        "--new-password-file",
+        &new,
+    ]);
+    let after = read_manifest(&manifest);
+    assert_eq!(manifest_value(&after, "key_id"), Some(key_id.as_str()));
+    assert_eq!(manifest_value(&after, "nonce"), Some(nonce.as_str()));
+    assert_ne!(before, after);
+
+    // A direct `*.SNOWBUNDLE` path works too, and switching back succeeds.
+    run_ok(&[
+        "rekey",
+        &manifest,
+        "--current-password-file",
+        &new,
+        "--new-password-file",
+        &pw,
+    ]);
+    let restored = read_manifest(&manifest);
+    assert_eq!(manifest_value(&restored, "key_id"), Some(key_id.as_str()));
+    assert_eq!(manifest_value(&restored, "nonce"), Some(nonce.as_str()));
+
+    // The old credential no longer opens the current manifest.
+    run_fail(
+        &[
+            "rekey",
+            &bundle,
+            "--current-password-file",
+            &new,
+            "--new-password-file",
+            &pw,
+        ],
+        "wrong password",
+    );
+    assert_no_temps(&dir.0);
+}
+
+#[cfg(feature = "bundle")]
+#[test]
+fn rekey_recordable_bundle_leaves_the_toc_untouched() {
+    let dir = TempDir::new("rekey_cdr");
+    let bundle = dir.str("cdr");
+    let pw = dir.write("old.pw", b"old password\n");
+    let new = dir.write("new.pw", b"new password\n");
+    run_ok(&[
+        "bundle-create",
+        "cdr",
+        "--dir",
+        &bundle,
+        "--cipher",
+        "chacha12",
+        "--password-file",
+        &pw,
+    ]);
+    let toc = Path::new(&bundle).join("toc.0");
+    let toc_before = std::fs::read(&toc).expect("toc.0");
+    let manifest = Path::new(&bundle).join("SNOWBUNDLE");
+    let before = std::fs::read_to_string(&manifest).expect("manifest");
+    let key_id = manifest_value(&before, "key_id")
+        .expect("key_id")
+        .to_string();
+
+    run_ok(&[
+        "rekey",
+        &bundle,
+        "--current-password-file",
+        &pw,
+        "--new-password-file",
+        &new,
+    ]);
+    assert_eq!(
+        std::fs::read(&toc).unwrap(),
+        toc_before,
+        "TOC must not move"
+    );
+    let after = std::fs::read_to_string(&manifest).expect("manifest");
+    assert_eq!(manifest_value(&after, "key_id"), Some(key_id.as_str()));
+    run_fail(
+        &[
+            "rekey",
+            &bundle,
+            "--current-password-file",
+            &pw,
+            "--new-password-file",
+            &new,
+        ],
+        "wrong password",
     );
     assert_no_temps(&dir.0);
 }

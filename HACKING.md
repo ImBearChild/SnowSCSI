@@ -129,25 +129,25 @@ A directory-chunked flat bundle is created once with
 ```bash
 snowscsi bundle-create flat --dir <dir> --size <n> [--chunk <n>] [--sector 512|2048]
     [--cipher <alg>] [--iterations <n>] [--key-file <k>] [--password-file <f>]
-    [--force]
 ```
 
-which writes the canonical `SNOWBUNDLE` (`kind = flat`) through a checked
-create. Without `--force`, an existing `SNOWBUNDLE` or legacy `BUNDLE` is
-refused; with `--force`, an existing `SNOWBUNDLE`/legacy `BUNDLE` is
-overwritten and the chunk files are left untouched (the new geometry is
-**not** migrated to them).
+which writes the canonical `SNOWBUNDLE` (`kind = flat`) atomically: a random
+`0600` `create_new` temp in the same directory, fsync, rename, checked parent
+fsync (a failed write removes the temp). An existing `SNOWBUNDLE`, legacy
+`BUNDLE` or chunk file is always refused; `--force` no longer exists. Change
+credentials with `rekey`; rebuild a bundle by deleting its directory.
 Geometry is validated before the directory is created, and `bundle-create`
-removes a directory it created if the manifest write then fails. The flat
-manifest write itself is **not** atomic yet (single create/truncate + sync);
-`bundle-create` is the only creator. `bundle-create` never writes chunk data.
+removes a directory it created if the manifest write then fails.
+`bundle-create` is the only creator and never writes chunk data.
 Chunk files are created on demand by the first host write. `--block
 bundle=<dir>` serves it as a writable or read-only block disk (`ro` opens every
 chunk read-only), and `--cdrom bundle=<dir>` presents the same manifest as a
 read-only flat CD (the MMC role always opens a flat bundle read-only).
 `serve` never creates the directory or manifest; it does create and write
 chunk files on the first host write. `bundle-info <dir>` prints the parsed
-kind, geometry, cipher description and CRC presence. An image file with a
+kind, geometry, cipher, kdf/iterations, `keyslot = wrapped`, `tag = present`,
+`key_id = present` and CRC presence (never the nonce/salt/key/tag bytes). An
+image file with a
 `<file>.SNOWBUNDLE` sidecar is inspected by passing the image path (or the
 sidecar path itself) to `bundle-info`; a regular file without a sidecar prints
 `not a bundle` and exits 2. For `kind = cdr`, `bundle-info` also reports the
@@ -157,7 +157,7 @@ corrupt body simply reports `toc = missing`).
 ### `SNOWBUNDLE` manifest fields
 
 The manifest is a strict, canonical text file (fixed order, single spaces
-around `=`, `\n` line endings, at most 512 bytes). `bundle-create` and
+around `=`, `\n` line endings, at most 768 bytes). `bundle-create` and
 `serve` share the parser; the parser validates the format only, never the
 medium geometry (that belongs to the caller installing the medium).
 
@@ -169,7 +169,8 @@ medium geometry (that belongs to the caller installing the medium).
 | geometry (`kind = image`) | `size = <u64>` bytes. |
 | geometry (`kind = flat`) | `virtual_size`, `chunk_size`, `sector_size` (`512`/`2048`). |
 | geometry (`kind = cdr`) | none; the plaintext TOC owns capacity/session/track geometry. |
-| cipher block (optional) | `cipher` (`chacha8`/`chacha12`/`chacha20`/`aes-ctr`/`xor`), `kdf` (`pbkdf2-hmac-sha256`/`none`), `iterations` + `salt` (PBKDF2 only), `nonce` (8 bytes as 16 hex digits). |
+| `cipher` (mandatory) | `none` (plaintext; no keyslot fields) or `chacha8`/`chacha12`/`chacha20`/`aes-ctr`/`xor`. |
+| keyslot (`cipher != none`, fixed order) | `nonce` (8 B data nonce), `key_id` (8 B VMK fingerprint), `kdf` (`pbkdf2-hmac-sha256`/`none`), `iterations` (PBKDF2 only), `salt` (16 B, always), `wrap_nonce` (8 B), `wrapped_key` (32 B), `tag` (16 B). All lowercase hex. |
 | `crc` (optional on read, always written) | `crc = <8 lowercase hex>`: CRC-32 over every preceding byte, newlines included. It detects accidental damage only. |
 
 `kind = cdr` keeps the TOC (`toc.0`/`toc.1`) **outside** the manifest and
@@ -185,17 +186,46 @@ cipher description beside it in `<file>.SNOWBUNDLE`:
 snowscsi crypt --cipher chacha20 --password-file pw image.img image.enc
 # out-of-place decryption reads image.enc.SNOWBUNDLE; it writes no sidecar
 snowscsi crypt --decrypt --password-file pw image.enc restored.img
-# raw key (exactly 32 bytes), no password/salt; --iterations is rejected
+# raw 32-byte KEK, no password prompt; --iterations is rejected
 snowscsi crypt --cipher aes-ctr --key-file key.bin --in-place disk.img
 ```
 
-**There is no payload authentication.** The stream ciphers only transform
-bytes; there is no MAC or AEAD tag. A wrong password or a tampered ciphertext
-therefore exits **0** and writes garbage. Keep the input until the result has
-been verified, and never delete the only copy before checking it. For
-`--decrypt` the manifest's `kdf` chooses the credential: `kdf = none` requires
-`--key-file` (it never prompts), while PBKDF2 reads `--password-file` or
-prompts on stdin.
+Change the credential without touching the payload:
+
+```bash
+# old password -> new password (new salt/wrap nonce; same VMK and data nonce)
+snowscsi rekey image.enc --current-password-file old.pw --new-password-file new.pw
+# password -> raw key file, or key file -> password
+snowscsi rekey ./disk --current-password-file old.pw --new-key-file new.key
+snowscsi rekey ./disk --current-key-file old.key --new-password-file new.pw
+```
+
+`rekey` only rewrites the keyslot (`kdf`/`iterations`/`salt`/`wrap_nonce`/
+`wrapped_key`/`tag`); the data cipher, data nonce, geometry, image bytes,
+chunks, tracks and TOC are untouched. The new keyslot is decoded and unlocked
+again before the atomic rename, so a mistyped new password cannot replace the
+old one. `rekey` is not re-encryption: a leaked VMK (or a copied old manifest,
+which is an alternate keyslot for the same VMK) is not revoked; destroy old
+manifest copies and re-encrypt the payload if the VMK itself leaked. A running
+`serve` keeps its already-unlocked VMK; a restart or card re-insert needs the
+new credential.
+
+Each encrypted image has one random 32-byte **volume master key (VMK)** that
+the stream cipher uses. The manifest stores one **keyslot**: the password or
+key file derives a KEK, which wraps the VMK, and a 16-byte HMAC-SHA256 tag
+covers the keyslot plus the bundle identity (kind, geometry, cipher, data
+nonce, key id, KDF parameters). The tag is verified **before** the VMK is
+unwrapped, so a wrong credential or a tampered keyslot/manifest is a hard
+error before any output is written.
+
+**The payload has no authentication.** The stream ciphers only transform
+bytes; the tag does not cover the ciphertext. A tampered ciphertext therefore
+still exits **0** and writes garbage. Keep the input until the result has been
+verified, and never delete the only copy before checking it. The
+`<file>.SNOWBUNDLE` manifest is the only copy of the VMK: back it up with the
+image. For `--decrypt` the manifest's `kdf` chooses the credential:
+`kdf = none` requires `--key-file` (it never prompts), while PBKDF2 reads
+`--password-file` or prompts on stdin.
 
 - Algorithms: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`; `xor` is
   obfuscation, not encryption (it logs a warning and the success line says
@@ -204,31 +234,32 @@ prompts on stdin.
   password is read from stdin twice (confirmation); a terminal prompt echoes
   because there is no termios dependency, so use `--password-file` in scripts.
 - `--key-file` selects `kdf = none`; otherwise PBKDF2-HMAC-SHA256 with a fresh
-  salt and `--iterations` (default 600000, accepted 1000..=2000000). Every
-  manifest gets a fresh nonce.
+  salt, `--iterations` (default 600000, accepted 1000..=2000000), a fresh data
+  nonce and a fresh wrap nonce. A `kdf = none` keyslot still stores a random
+  salt (it diversifies the keyslot subkeys, not the password).
 - `--decrypt` rejects `--cipher`/`--iterations` (the sidecar decides), requires
-  `<in>.SNOWBUNDLE`, and validates `kind = image` and its `size` against the
-  input before writing anything. A CRC-less manifest is accepted (the CRC is
-  deliberately optional), but the CLI warns that the cipher parameters are
-  unchecked.
+  `<in>.SNOWBUNDLE`, validates `kind = image` and its `size` against the input,
+  and unlocks the VMK before writing anything. A CRC-less manifest is accepted
+  (the CRC is deliberately optional and only detects damage).
 - Path safety runs **before** the lock or payload I/O: `in`, `in.SNOWBUNDLE`,
   `out` and `out.SNOWBUNDLE` must all be distinct files. Symlinks, hard links,
   and `.`/`..` spellings are resolved so that an output equal to the input (or
   to the input sidecar) is rejected. Out-of-place encryption also refuses an
   input that already has `<in>.SNOWBUNDLE` rather than silently double-encrypt.
-- Refuse an existing `<out>` or `<out>.SNOWBUNDLE` unless `--force`.
-  `--force` overwrites and, after a successful forced decryption, removes a
-  stale `<out>.SNOWBUNDLE`. `--force` cannot be combined with `--in-place`.
-  `--in-place` has no `<out>`, refuses an existing `<in>.SNOWBUNDLE` (it may
-  describe a different nonce), refuses symlink and multi-hard-link inputs,
-  copies the input's permissions onto the replacement (owner, xattrs and ACLs
-  are **not** preserved), and writes the sidecar **first**, then replaces the
-  image through a temp; a crash leaves recoverable plaintext plus a stale
-  sidecar (remove it).
+- Out-of-place encryption writes the image first (temp + fsync + rename), then
+  the sidecar; if the sidecar write fails the fresh image is removed. An
+  existing `<out>.SNOWBUNDLE` is always refused, even with `--force`: it is the
+  only copy of that image's VMK. `--force` may replace an existing `<out>` only
+  when it has no sidecar. `--in-place` has no `<out>`, refuses an existing
+  `<in>.SNOWBUNDLE`, refuses symlink and multi-hard-link inputs, copies the
+  input's permissions onto the replacement (owner, xattrs and ACLs are **not**
+  preserved), and writes the sidecar **first**, then replaces the image through
+  a temp; a crash leaves recoverable plaintext plus a stale sidecar (remove
+  it). `--decrypt` never writes or deletes a sidecar.
 - Passwords and raw derived-key buffers are overwritten **best effort** once
   the cipher/planes have copied what they need. This is not `zeroize`: copies
   made by the allocator or runtime, the OS page cache and swap are out of
-  scope.
+  scope. The VMK itself is not scrubbed.
 - Every run holds an exclusive `<canonical target>.lock` file (`create_new`)
   next to the target for its whole duration; the lock is removed on every
   ordinary exit path. Contention is a hard error. A crash/SIGKILL can leave the
@@ -240,9 +271,10 @@ prompts on stdin.
   `<out>.SNOWBUNDLE.tmp.<random>` (fsync + rename), then fsyncs the directory.
   The two files are not committed atomically: if the manifest write fails the
   fresh image is removed. Decryption writes plaintext to a temp file and
-  renames it; it never writes a sidecar, and removes a stale `<out>.SNOWBUNDLE`
-  when forced. All crypt temps are created with `create_new` and mode `0600`
-  on Unix; a SIGKILL can leave such a temp file behind.
+  renames it; it never writes or deletes a sidecar, and refuses an existing
+  `<out>.SNOWBUNDLE` even with `--force`. All crypt temps are created with
+  `create_new` and mode `0600` on Unix; a SIGKILL can leave such a temp file
+  behind.
 
 `bundle-create flat|cdr ... --cipher <alg>` writes the cipher block into the
 directory manifest instead of an image sidecar:
@@ -286,21 +318,25 @@ security boundary against a live machine or a determined offline attacker:
   Once the key or password is present on the machine (or the bundle is served),
   an attacker with the same access can read the plaintext.
 - **Weak passwords.** PBKDF2 slows guessing but cannot rescue a low-entropy
-  password; the iteration count is in the manifest and the salt is per
-  manifest, so all manifests can be attacked independently. Use a strong
-  password or a raw key file.
-- **`kdf = none` key-file sensitivity.** The key is the only secret and is
-  stored outside the bundle. Anyone who copies `key.bin` can decrypt every
-  bundle that used it; a leaked key and a leaked image are equivalent.
-- **Swapped sidecar and writable corruption.** The manifest/TOC is not
-  authenticated and the cipher is malleable. A swapped sidecar changes the
-  parameters (wrong plaintext, never a clean error), and anyone who can write
-  the medium can flip ciphertext bits or rewrite `toc.0`/`toc.1`; neither is
-  detected.
-- **No integrity.** There is no MAC/AEAD tag: a wrong password, swapped
-  sidecar, truncated file and deliberate modification all decrypt to garbage
-  with exit status 0. Keep the source and verify the result before deleting
-  anything.
+  password; the keyslot tag is an offline oracle. The iteration count is in the
+  manifest and the salt is per manifest, so all manifests can be attacked
+  independently. Use a strong password or a raw key file.
+- **`kdf = none` key-file sensitivity.** The key file is a KEK, stored outside
+  the bundle. Anyone who copies `key.bin` can unwrap the VMK of every bundle
+  that used it; a leaked key and a leaked image are equivalent.
+- **Swapped/corrupted manifest.** The keyslot tag covers the keyslot and the
+  bundle identity, so a swapped manifest, wrong password or edited keyslot
+  fails cleanly before output. The tag does **not** cover the ciphertext, and
+  the TOC stays plaintext: anyone who can write the medium can flip ciphertext
+  bits or rewrite `toc.0`/`toc.1`, and that is not detected.
+- **No payload integrity.** There is no MAC/AEAD over the payload: a truncated
+  or deliberately modified ciphertext decrypts to garbage with exit status 0.
+  Keep the source and verify the result before deleting anything.
+- **Single keyslot.** The manifest holds one keyslot and no recovery key.
+  Losing the manifest loses the VMK; `rekey` changes only the KEK and does not
+  protect a leaked VMK (re-encrypt the payload instead). Old manifest copies
+  are effectively recovery keys for the same VMK; destroy them to revoke an
+  old credential.
 
 Encrypted recordable bundles require a **write-once CD-R**. A CD-RW can be
 blanked and then re-record track 1 at resource 17 offset 0 under the same
@@ -831,16 +867,13 @@ Troubleshooting:
   TOC; create the bundle with `bundle-create cdr` first. A TOC-less
   `kind = cdr` directory is rejected (`no recordable-CD TOC …`) and is never
   opened as a blank disc.
-- **`bundle-create cdr` failures** — without `--force` it refuses to overwrite
-  an existing `SNOWBUNDLE`, legacy `BUNDLE`, or `toc.0`/`toc.1`. `--force`
-  removes those files and writes a fresh manifest plus the initial TOC (both
-  slots are cleared, so an old `toc.1` cannot win the newest-slot probe), but
-  it still refuses a directory that already contains canonical
-  `track_<n>.bin` data (recorded tracks cannot be migrated). The manifest is
-  written before the initial TOC; the TOC is written through a fsynced
-  temporary file renamed into place (a failed write removes the temporary).
-  If the TOC write still fails the error says the manifest was already
-  written, so remove the directory before retrying.
+- **`bundle-create cdr` failures** — it always refuses an existing
+  `SNOWBUNDLE`, legacy `BUNDLE`, `toc.0`/`toc.1`, or canonical
+  `track_<n>.bin` data (recorded tracks cannot be migrated). `--force` no
+  longer exists; change credentials with `rekey` or delete the directory to
+  rebuild. The manifest is written atomically before the initial TOC, and the
+  TOC is written through the same atomic helper; if the TOC write fails the
+  fresh manifest is removed so the directory can be retried.
 - **Geometry presets** — `bundle-create cdr --medium
   cdr74|cdr80|cdr90|cdr99` (write-once CD-R) or `cdrw74|cdrw80|cdrw90|cdrw99`
   (erasable CD-RW), and `--slot <bytes>` (4 KiB..64 KiB), only describe the

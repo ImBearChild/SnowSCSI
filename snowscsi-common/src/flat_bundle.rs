@@ -29,7 +29,7 @@
 //! `no_std`-clean). The manifest handling ([`FlatBundle::create`],
 //! [`FlatBundle::create_with_meta`], [`FlatBundle::open`]) is gated behind the
 //! `bundle` feature. The manifest itself is the shared canonical
-//! [`crate::bundle`] format (`SNOWBUNDLE`, `kind = flat`); an optional cipher
+//! [`crate::bundle`] format (`SNOWBUNDLE`, `kind = flat`); the cipher/keyslot
 //! block is preserved but not interpreted here — the cipher decorator owns
 //! it.
 
@@ -76,6 +76,9 @@ pub enum BundleError {
     /// Geometry rejected (`chunk_size`/`virtual_size`/`sector_size` alignment,
     /// zero, or chunk-count overflow). See `validate_geometry`.
     InvalidGeometry,
+    /// A keyslot-bearing manifest cannot be written through this
+    /// non-atomic library path; the application must write it atomically.
+    CipherRequiresAtomicManifest,
 }
 
 impl core::fmt::Display for BundleError {
@@ -93,6 +96,10 @@ impl core::fmt::Display for BundleError {
                 write!(f, "virtual_size required (no SNOWBUNDLE manifest)")
             }
             Self::InvalidGeometry => write!(f, "invalid bundle geometry"),
+            Self::CipherRequiresAtomicManifest => write!(
+                f,
+                "keyslot-bearing manifests must be written atomically by the application"
+            ),
         }
     }
 }
@@ -246,6 +253,13 @@ impl<F: FsStorage> FlatBundle<F> {
     /// already present (prevents accidental overwrite). The manifest is
     /// written with `create_or_truncate`, flushed, closed and the filesystem
     /// synced. Chunk 0 is not pre-allocated; the first write creates it.
+    ///
+    /// The manifest is written directly through [`FsStorage`], which has no
+    /// rename/atomic-replace operation. This is suitable for plaintext
+    /// manifests and library tests; an application that stores a keyslot
+    /// (the CLI, for example) must write the manifest atomically itself and
+    /// then open the bundle with [`Self::open`], because a torn keyslot
+    /// manifest is the only copy of the volume master key.
     #[cfg(feature = "bundle")]
     pub fn create_with_meta(mut fs: F, meta: &BundleMeta) -> Result<Self, BundleError> {
         let (chunk_size, virtual_size, sector_size) = match meta.kind {
@@ -257,6 +271,9 @@ impl<F: FsStorage> FlatBundle<F> {
             _ => return Err(BundleError::WrongKind),
         };
         validate_geometry(chunk_size, virtual_size, sector_size)?;
+        if meta.cipher.is_some() {
+            return Err(BundleError::CipherRequiresAtomicManifest);
+        }
         match fs.open(MANIFEST_NAME, OpenOptions::read_only()) {
             Ok(file) => {
                 fs.close(file);
@@ -1014,7 +1031,7 @@ mod tests {
     #[test]
     fn opens_manifest_without_crc() {
         let (fs, store) = MockFs::new();
-        let body = "magic = snow_bundle\nversion = 1\nkind = flat\nvirtual_size = 8388608\nchunk_size = 1048576\nsector_size = 512\n";
+        let body = "magic = snow_bundle\nversion = 1\nkind = flat\nvirtual_size = 8388608\nchunk_size = 1048576\nsector_size = 512\ncipher = none\n";
         store.borrow_mut().insert(
             MANIFEST_NAME.to_string(),
             Rc::new(RefCell::new(body.as_bytes().to_vec())),
@@ -1027,14 +1044,20 @@ mod tests {
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn create_with_meta_preserves_cipher() {
+    fn create_with_meta_rejects_a_keyslot_manifest() {
         let (fs, store) = MockFs::new();
         let cipher = crate::bundle::CipherMeta {
             cipher: crate::bundle::CipherAlg::Xor,
-            kdf: crate::bundle::KdfKind::None,
-            iterations: None,
-            salt: None,
             nonce: [7; 8],
+            key_id: [8; 8],
+            slot: crate::bundle::KeySlot {
+                kdf: crate::bundle::KdfKind::None,
+                iterations: None,
+                salt: [9; 16],
+                wrap_nonce: [10; 8],
+                wrapped_key: [11; 32],
+                tag: [12; 16],
+            },
         };
         let meta = BundleMeta {
             kind: BundleKind::Flat {
@@ -1045,14 +1068,15 @@ mod tests {
             cipher: Some(cipher),
             has_crc: false,
         };
-        let b = FlatBundle::create_with_meta(fs, &meta).unwrap();
-        let mut stored = meta;
-        stored.has_crc = true;
-        assert_eq!(b.meta(), Some(&stored));
-        let raw = store.borrow()[MANIFEST_NAME].borrow().clone();
-        let parsed = BundleMeta::parse(&raw).unwrap();
-        assert_eq!(parsed.cipher, Some(cipher));
-        assert!(parsed.has_crc);
+        assert_eq!(
+            FlatBundle::create_with_meta(fs, &meta).err(),
+            Some(BundleError::CipherRequiresAtomicManifest)
+        );
+        // The refused write left no manifest behind.
+        assert!(!store.borrow().contains_key(MANIFEST_NAME));
+        // The format itself still round-trips the keyslot block.
+        let encoded = meta.encode().unwrap();
+        assert_eq!(BundleMeta::parse(&encoded).unwrap().cipher, Some(cipher));
     }
 
     #[cfg(feature = "bundle")]

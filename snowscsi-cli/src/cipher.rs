@@ -1,16 +1,18 @@
-//! CLI cipher selection and key derivation.
+//! CLI cipher selection and keyslot handling.
 //!
-//! The library supplies the length-preserving plane decorators and the
-//! ciphers; this module only chooses one from a manifest's [`CipherMeta`] and
-//! turns a password or a raw key file into a [`CipherKey`]. It never logs key
+//! The library supplies the length-preserving plane decorators, the ciphers and
+//! the keyslot primitives; this module only chooses a cipher from a manifest's
+//! [`CipherMeta`] and turns a credential (a password or a raw 32-byte key file)
+//! into a keyslot or an unlocked volume master key (VMK). It never logs key
 //! material and does not keep a password.
 
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
-use snowscsi::common::bundle::{CipherAlg, CipherMeta, KdfKind};
+use snowscsi::common::bundle::{BundleKind, CipherAlg, CipherMeta, KdfKind, KeySlot};
+use snowscsi::common::cipher::keyslot::{derive_kek, key_id, unwrap_slot, wrap_slot, KeyslotError};
 use snowscsi::common::cipher::{
-    AesCtr, BlockCipher16, ChaCha12, ChaCha20, ChaCha8, CipherError, CipherKey, CtrAccel, Kdf,
-    NonceCipher, SoftKdf, StreamCipher, XorMix,
+    AesCtr, BlockCipher16, ChaCha12, ChaCha20, ChaCha8, CipherError, CipherKey, CtrAccel,
+    NonceCipher, StreamCipher, XorMix,
 };
 
 /// AES-256 as a [`BlockCipher16`] for `AesCtr`.
@@ -52,23 +54,23 @@ pub enum CliCipher {
 }
 
 impl CliCipher {
-    /// Build the manifest's stream cipher from an already-derived key.
-    pub fn from_meta(meta: &CipherMeta, key: &CipherKey) -> Result<Self, String> {
+    /// Build the manifest's stream cipher from an unlocked VMK.
+    pub fn from_meta(meta: &CipherMeta, vmk: &CipherKey) -> Result<Self, String> {
         let nonce = meta.nonce;
         Ok(match meta.cipher {
             CipherAlg::ChaCha8 => Self::ChaCha8(
-                ChaCha8::new(key, nonce).map_err(|e| format!("{}: {e}", cipher_meta_name(meta)))?,
+                ChaCha8::new(vmk, nonce).map_err(|e| format!("{}: {e}", cipher_meta_name(meta)))?,
             ),
             CipherAlg::ChaCha12 => Self::ChaCha12(
-                ChaCha12::new(key, nonce)
+                ChaCha12::new(vmk, nonce)
                     .map_err(|e| format!("{}: {e}", cipher_meta_name(meta)))?,
             ),
             CipherAlg::ChaCha20 => Self::ChaCha20(
-                ChaCha20::new(key, nonce)
+                ChaCha20::new(vmk, nonce)
                     .map_err(|e| format!("{}: {e}", cipher_meta_name(meta)))?,
             ),
-            CipherAlg::AesCtr => Self::Aes(Box::new(AesCtr::new(SoftAes256::new(key), nonce))),
-            CipherAlg::Xor => Self::Xor(XorMix::new(key, nonce)),
+            CipherAlg::AesCtr => Self::Aes(Box::new(AesCtr::new(SoftAes256::new(vmk), nonce))),
+            CipherAlg::Xor => Self::Xor(XorMix::new(vmk, nonce)),
         })
     }
 }
@@ -97,55 +99,71 @@ impl NonceCipher for CliCipher {
     }
 }
 
-/// Derive the manifest's key from the supplied material.
+/// One credential for a keyslot.
 ///
-/// PBKDF2 needs a password (`--password-file` or the stdin prompt); `kdf =
-/// none` needs an explicit 32-byte key file (`key=<path>`).
-pub fn derive_key(
-    meta: &CipherMeta,
-    password: Option<&[u8]>,
-    key_path: Option<&str>,
-) -> Result<CipherKey, String> {
-    match meta.kdf {
-        KdfKind::Pbkdf2HmacSha256 => {
-            if key_path.is_some() {
-                return Err(format!(
-                    "{} manifest uses PBKDF2; key= is only valid with kdf = none",
-                    cipher_meta_name(meta)
-                ));
-            }
-            let password = password.ok_or_else(|| {
-                format!(
-                    "{} manifest uses PBKDF2; pass --password-file <path>",
-                    cipher_meta_name(meta)
-                )
-            })?;
-            let iterations = meta
-                .iterations
-                .ok_or_else(|| "manifest cipher block is missing `iterations`".to_string())?;
-            let salt = meta
-                .salt
-                .ok_or_else(|| "manifest cipher block is missing `salt`".to_string())?;
-            let mut key = [0u8; 32];
-            let result = (|| {
-                SoftKdf
-                    .derive(password, &salt, iterations, &mut key)
-                    .map_err(|e| format!("PBKDF2 key derivation failed: {e}"))?;
-                CipherKey::from_bytes(&key).map_err(|e| e.to_string())
-            })();
-            // Best effort (not zeroize): the raw derivation buffer must not
-            // linger after the key schedule has copied it.
-            crate::wipe(&mut key);
-            result
+/// Exactly one of the two variants is present. There is deliberately no
+/// [`Debug`] implementation: it would make a password or key easy to leak into
+/// a log line.
+pub enum Credential {
+    /// A password for a PBKDF2 keyslot.
+    Password(Vec<u8>),
+    /// A raw 32-byte key for a `kdf = none` keyslot.
+    Key(CipherKey),
+}
+
+impl Credential {
+    /// Borrow the password, when this is a password credential.
+    pub fn password(&self) -> Option<&[u8]> {
+        match self {
+            Self::Password(password) => Some(password),
+            Self::Key(_) => None,
         }
-        KdfKind::None => {
-            let path = key_path.ok_or_else(|| {
-                format!(
-                    "{} manifest uses kdf = none; pass key=<path> on the LUN spec",
-                    cipher_meta_name(meta)
-                )
-            })?;
-            read_key_file(path)
+    }
+
+    /// Borrow the raw key, when this is a key-file credential.
+    pub fn key(&self) -> Option<&CipherKey> {
+        match self {
+            Self::Key(key) => Some(key),
+            Self::Password(_) => None,
+        }
+    }
+
+    /// Best-effort wipe of the stored password (not `zeroize`).
+    pub fn wipe(&mut self) {
+        if let Self::Password(password) = self {
+            crate::wipe(password);
+        }
+    }
+}
+
+/// Read the user-supplied credential.
+///
+/// `--password-file` supplies one password line, `--key-file` an exact 32-byte
+/// key; the two are mutually exclusive. Without either flag the password is
+/// read from stdin; `confirm` reads a second line and requires a match (a pipe
+/// works, an EOF without a TTY is an error).
+pub fn read_credential(
+    password_file: Option<&str>,
+    key_file: Option<&str>,
+    confirm: bool,
+) -> Result<Credential, String> {
+    match (password_file, key_file) {
+        (Some(_), Some(_)) => {
+            Err("--password-file and --key-file are mutually exclusive".to_string())
+        }
+        (Some(path), None) => crate::read_password_file(path).map(Credential::Password),
+        (None, Some(path)) => read_key_file(path).map(Credential::Key),
+        (None, None) => {
+            let mut first = crate::read_password_prompt()?;
+            if confirm {
+                let mut second = crate::read_password_prompt()?;
+                if first != second {
+                    crate::wipe(&mut first);
+                    crate::wipe(&mut second);
+                    return Err("passwords do not match".to_string());
+                }
+            }
+            Ok(Credential::Password(first))
         }
     }
 }
@@ -206,58 +224,144 @@ pub fn random_nonce() -> Result<[u8; 8], String> {
     Ok(nonce)
 }
 
-/// Generate a fresh 16-byte PBKDF2 salt.
+/// Generate a fresh 16-byte keyslot salt.
 pub fn random_salt() -> Result<[u8; 16], String> {
     let mut salt = [0u8; 16];
     random_bytes(&mut salt)?;
     Ok(salt)
 }
 
-/// Build the cipher block a new manifest should carry.
+/// Build a fresh random VMK wrapped for `credential`.
 ///
-/// `key_file` selects `kdf = none` (the key is supplied directly, so there is
-/// no password, iteration count or salt) and must name an exact 32-byte file.
-/// Without it the block uses PBKDF2-HMAC-SHA256 with `iterations` (default
-/// 600 000, within the manifest's `1 000..=2 000 000` window) and a fresh
-/// random salt. Every block gets a fresh random nonce.
-pub fn build_meta(
-    alg: CipherAlg,
+/// `nonce` is the payload data nonce (the caller generates it separately);
+/// `salt` and `wrap_nonce` are always fresh. `iterations` is required for
+/// PBKDF2 and rejected for `kdf = none`. Returns the manifest block plus the
+/// VMK for the immediate encryption/decryption caller.
+pub fn new_keyslot(
+    cipher: CipherAlg,
+    nonce: [u8; 8],
+    kdf: KdfKind,
     iterations: Option<u32>,
-    key_file: Option<&str>,
-) -> Result<CipherMeta, String> {
-    let nonce = random_nonce()?;
-    match key_file {
-        Some(path) => {
-            if iterations.is_some() {
-                return Err("--key-file and --iterations are mutually exclusive".to_string());
-            }
-            // Validate the key material now; the key itself is never stored.
-            read_key_file(path)?;
-            Ok(CipherMeta {
-                cipher: alg,
-                kdf: KdfKind::None,
-                iterations: None,
-                salt: None,
-                nonce,
-            })
-        }
-        None => {
-            let iterations = iterations.unwrap_or(600_000);
+    credential: &Credential,
+    kind: &BundleKind,
+) -> Result<(CipherMeta, CipherKey), String> {
+    let iterations = match kdf {
+        KdfKind::Pbkdf2HmacSha256 => {
+            let iterations =
+                iterations.ok_or_else(|| "PBKDF2 requires an iteration count".to_string())?;
             if !(1_000..=2_000_000).contains(&iterations) {
                 return Err(format!(
                     "invalid PBKDF2 iteration count {iterations} (1000..=2000000)"
                 ));
             }
-            let salt = random_salt()?;
-            Ok(CipherMeta {
-                cipher: alg,
-                kdf: KdfKind::Pbkdf2HmacSha256,
-                iterations: Some(iterations),
-                salt: Some(salt),
-                nonce,
-            })
+            Some(iterations)
         }
-    }
+        KdfKind::None => {
+            if iterations.is_some() {
+                return Err("kdf = none does not take an iteration count".to_string());
+            }
+            None
+        }
+    };
+
+    let mut vmk_bytes = [0u8; 32];
+    random_bytes(&mut vmk_bytes)?;
+    let vmk = CipherKey::from_bytes(&vmk_bytes).map_err(|e| e.to_string())?;
+    crate::wipe(&mut vmk_bytes);
+
+    let salt = random_salt()?;
+    let wrap_nonce = random_nonce()?;
+    let key_id = key_id(&vmk);
+    let mut meta = CipherMeta {
+        cipher,
+        nonce,
+        key_id,
+        slot: KeySlot {
+            kdf,
+            iterations,
+            salt,
+            wrap_nonce,
+            wrapped_key: [0u8; 32],
+            tag: [0u8; 16],
+        },
+    };
+    let kek = derive_kek(&meta.slot, credential.password(), credential.key())
+        .map_err(|e| format!("cannot derive the keyslot key: {e}"))?;
+    wrap_slot(kind, &mut meta, &kek, &vmk).map_err(|e| format!("cannot wrap the keyslot: {e}"))?;
+    Ok((meta, vmk))
+}
+
+/// Unlock a manifest's VMK with `credential`.
+///
+/// The tag is verified before the key is unwrapped: a wrong password or a
+/// tampered keyslot/identity fails here instead of yielding a wrong VMK.
+pub fn unlock(
+    meta: &CipherMeta,
+    kind: &BundleKind,
+    credential: &Credential,
+) -> Result<CipherKey, String> {
+    let kek = derive_kek(&meta.slot, credential.password(), credential.key())
+        .map_err(|e| format!("cannot derive the keyslot key: {e}"))?;
+    unwrap_slot(kind, meta, &kek).map_err(|e| match e {
+        KeyslotError::WrongPasswordOrCorruptKeyslot => {
+            "wrong password or corrupt keyslot".to_string()
+        }
+        other => format!("cannot unwrap the keyslot: {other}"),
+    })
+}
+
+/// Re-wrap an existing VMK under a new credential, changing only the keyslot.
+///
+/// The data cipher, data nonce and key id are copied from `old`; only
+/// `kdf`/`iterations`/`salt`/`wrap_nonce`/`wrapped_key`/`tag` change. The
+/// caller must verify the result with [`unlock`] before publishing it.
+pub fn rewrap_keyslot(
+    kind: &BundleKind,
+    old: &CipherMeta,
+    old_credential: &Credential,
+    new_kdf: KdfKind,
+    new_iterations: Option<u32>,
+    new_credential: &Credential,
+) -> Result<(CipherMeta, CipherKey), String> {
+    let iterations = match new_kdf {
+        KdfKind::Pbkdf2HmacSha256 => {
+            let iterations =
+                new_iterations.ok_or_else(|| "PBKDF2 requires an iteration count".to_string())?;
+            if !(1_000..=2_000_000).contains(&iterations) {
+                return Err(format!(
+                    "invalid PBKDF2 iteration count {iterations} (1000..=2000000)"
+                ));
+            }
+            Some(iterations)
+        }
+        KdfKind::None => {
+            if new_iterations.is_some() {
+                return Err("kdf = none does not take an iteration count".to_string());
+            }
+            None
+        }
+    };
+    let vmk = unlock(old, kind, old_credential)?;
+    let salt = random_salt()?;
+    let wrap_nonce = random_nonce()?;
+    let mut new = CipherMeta {
+        cipher: old.cipher,
+        nonce: old.nonce,
+        key_id: old.key_id,
+        slot: KeySlot {
+            kdf: new_kdf,
+            iterations,
+            salt,
+            wrap_nonce,
+            wrapped_key: [0u8; 32],
+            tag: [0u8; 16],
+        },
+    };
+    let kek = derive_kek(&new.slot, new_credential.password(), new_credential.key())
+        .map_err(|e| format!("cannot derive the new keyslot key: {e}"))?;
+    wrap_slot(kind, &mut new, &kek, &vmk)
+        .map_err(|e| format!("cannot wrap the new keyslot: {e}"))?;
+    Ok((new, vmk))
 }
 
 /// Manifest spelling of the cipher algorithm, for messages.
@@ -285,15 +389,25 @@ mod tests {
     fn meta(cipher: CipherAlg) -> CipherMeta {
         CipherMeta {
             cipher,
-            kdf: KdfKind::None,
-            iterations: None,
-            salt: None,
             nonce: [0x5Au8; 8],
+            key_id: [0x33u8; 8],
+            slot: KeySlot {
+                kdf: KdfKind::None,
+                iterations: None,
+                salt: [0x11u8; 16],
+                wrap_nonce: [0x22u8; 8],
+                wrapped_key: [0x44u8; 32],
+                tag: [0x55u8; 16],
+            },
         }
     }
 
     fn key() -> CipherKey {
         CipherKey::from_bytes(&[0x42u8; 32]).unwrap()
+    }
+
+    fn image_kind() -> BundleKind {
+        BundleKind::Image { size: 65_537 }
     }
 
     #[test]
@@ -345,10 +459,9 @@ mod tests {
         .unwrap();
         let meta = CipherMeta {
             cipher: CipherAlg::AesCtr,
-            kdf: KdfKind::None,
-            iterations: None,
-            salt: None,
             nonce: unhex::<8>("f0f1f2f3f4f5f6f7"),
+            key_id: [0u8; 8],
+            slot: meta(CipherAlg::AesCtr).slot,
         };
         let at3: [u8; 32] =
             unhex("4fbf3694c871e1d290c5ba13a7125f28bc6d2414dde799a2f216cf5f827aefda");
@@ -376,62 +489,111 @@ mod tests {
     }
 
     #[test]
-    fn derive_key_pbkdf2_requires_a_password() {
-        let meta = CipherMeta {
-            cipher: CipherAlg::ChaCha20,
-            kdf: KdfKind::Pbkdf2HmacSha256,
-            iterations: Some(1_000),
-            salt: Some([0x11; 16]),
-            nonce: [0x22; 8],
-        };
-        let err = derive_key(&meta, None, None).unwrap_err();
-        assert!(err.contains("--password-file"), "{err}");
+    fn keyslot_round_trips_with_a_password_and_with_a_key_file() {
+        // A password keyslot: PBKDF2 (low iteration count for the test).
+        let credential = Credential::Password(b"correct horse".to_vec());
+        let (meta, vmk) = new_keyslot(
+            CipherAlg::ChaCha20,
+            [0x5Au8; 8],
+            KdfKind::Pbkdf2HmacSha256,
+            Some(1_000),
+            &credential,
+            &image_kind(),
+        )
+        .unwrap();
+        assert_eq!(meta.key_id, key_id(&vmk));
+        assert_eq!(meta.slot.kdf, KdfKind::Pbkdf2HmacSha256);
+        assert_eq!(meta.slot.iterations, Some(1_000));
+        // The VMK is not stored in the clear.
+        assert_ne!(meta.slot.wrapped_key, *vmk.as_bytes());
+        let unlocked = unlock(&meta, &image_kind(), &credential).unwrap();
+        assert_eq!(unlocked.as_bytes(), vmk.as_bytes());
 
-        let a = derive_key(&meta, Some(b"secret"), None).unwrap();
-        let b = derive_key(&meta, Some(b"secret"), None).unwrap();
-        assert_eq!(a.as_bytes(), b.as_bytes());
-        let other = derive_key(&meta, Some(b"other"), None).unwrap();
-        assert_ne!(a.as_bytes(), other.as_bytes());
-    }
+        let wrong = Credential::Password(b"wrong".to_vec());
+        let err = unlock(&meta, &image_kind(), &wrong).unwrap_err();
+        assert!(err.contains("wrong password"), "{err}");
 
-    #[test]
-    fn derive_key_pbkdf2_rejects_a_key_file() {
-        let meta = CipherMeta {
-            cipher: CipherAlg::ChaCha12,
-            kdf: KdfKind::Pbkdf2HmacSha256,
-            iterations: Some(1_000),
-            salt: Some([0x11; 16]),
-            nonce: [0x22; 8],
-        };
-        let path = temp_file("pbkdf2_keyfile", &[0x7Au8; 32]);
-        let err = derive_key(&meta, Some(b"secret"), Some(path.to_str().unwrap())).unwrap_err();
-        assert!(err.contains("key= is only valid with kdf = none"), "{err}");
+        // A key-file keyslot reuses `salt` even though the KDF is `none`.
+        let path = temp_file("keyslot", &[0x7Au8; 32]);
+        let credential = read_credential(None, Some(path.to_str().unwrap()), false).unwrap();
+        let (meta, vmk) = new_keyslot(
+            CipherAlg::AesCtr,
+            [0x11u8; 8],
+            KdfKind::None,
+            None,
+            &credential,
+            &image_kind(),
+        )
+        .unwrap();
+        assert_eq!(meta.slot.kdf, KdfKind::None);
+        assert_eq!(meta.slot.iterations, None);
+        assert_eq!(meta.key_id, key_id(&vmk));
+        let unlocked = unlock(&meta, &image_kind(), &credential).unwrap();
+        assert_eq!(unlocked.as_bytes(), vmk.as_bytes());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn derive_key_none_requires_a_key_file() {
-        let meta = meta(CipherAlg::Xor);
-        let err = derive_key(&meta, Some(b"unused"), None).unwrap_err();
-        assert!(err.contains("key=<path>"), "{err}");
+    fn new_keyslot_rejects_bad_iterations_and_missing_credentials() {
+        let credential = Credential::Password(b"pw".to_vec());
+        assert!(new_keyslot(
+            CipherAlg::Xor,
+            [0u8; 8],
+            KdfKind::Pbkdf2HmacSha256,
+            None,
+            &credential,
+            &image_kind(),
+        )
+        .is_err());
+        assert!(new_keyslot(
+            CipherAlg::Xor,
+            [0u8; 8],
+            KdfKind::Pbkdf2HmacSha256,
+            Some(999),
+            &credential,
+            &image_kind(),
+        )
+        .is_err());
+        assert!(new_keyslot(
+            CipherAlg::Xor,
+            [0u8; 8],
+            KdfKind::None,
+            Some(1_000),
+            &credential,
+            &image_kind(),
+        )
+        .is_err());
+        // PBKDF2 without a password is a hard error.
+        assert!(new_keyslot(
+            CipherAlg::Xor,
+            [0u8; 8],
+            KdfKind::Pbkdf2HmacSha256,
+            Some(1_000),
+            &Credential::Key(key()),
+            &image_kind(),
+        )
+        .is_err());
+    }
 
-        let path = temp_file("key32", &[0x7Au8; 32]);
-        let key = derive_key(&meta, None, Some(path.to_str().unwrap())).unwrap();
-        assert_eq!(key.as_bytes(), &[0x7Au8; 32]);
+    #[test]
+    fn unlock_rejects_a_changed_kind_or_cipher() {
+        let credential = Credential::Key(key());
+        let kind = BundleKind::Image { size: 4_096 };
+        let (meta, _vmk) = new_keyslot(
+            CipherAlg::ChaCha12,
+            [0u8; 8],
+            KdfKind::None,
+            None,
+            &credential,
+            &kind,
+        )
+        .unwrap();
 
-        // A key file is exact: no trailing-newline tolerance.
-        let short = temp_file("key31", &[0u8; 31]);
-        assert!(derive_key(&meta, None, Some(short.to_str().unwrap())).is_err());
-        let newline = {
-            let mut bytes = vec![0u8; 32];
-            bytes.push(b'\n');
-            temp_file("key33", &bytes)
-        };
-        assert!(derive_key(&meta, None, Some(newline.to_str().unwrap())).is_err());
-
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(short);
-        let _ = std::fs::remove_file(newline);
+        assert!(unlock(&meta, &kind, &credential).is_ok());
+        assert!(unlock(&meta, &BundleKind::Image { size: 4_097 }, &credential).is_err());
+        let mut changed = meta;
+        changed.cipher = CipherAlg::ChaCha20;
+        assert!(unlock(&changed, &kind, &credential).is_err());
     }
 
     #[test]
@@ -457,59 +619,26 @@ mod tests {
     }
 
     #[test]
-    fn build_meta_defaults_to_pbkdf2_with_a_random_salt_and_nonce() {
-        let meta = build_meta(CipherAlg::ChaCha12, None, None).unwrap();
-        assert_eq!(meta.cipher, CipherAlg::ChaCha12);
-        assert_eq!(meta.kdf, KdfKind::Pbkdf2HmacSha256);
-        assert_eq!(meta.iterations, Some(600_000));
-        assert!(meta.salt.is_some());
-        assert_ne!(meta.nonce, [0u8; 8]);
-
-        let other = build_meta(CipherAlg::ChaCha12, Some(1_000), None).unwrap();
-        assert_eq!(other.iterations, Some(1_000));
-        assert_ne!(meta.salt, other.salt, "each block gets a fresh salt");
-        assert_ne!(meta.nonce, other.nonce, "each block gets a fresh nonce");
-    }
-
-    #[test]
-    fn build_meta_enforces_the_iteration_window() {
-        assert!(build_meta(CipherAlg::Xor, Some(999), None).is_err());
-        assert!(build_meta(CipherAlg::Xor, Some(2_000_001), None).is_err());
-        assert!(build_meta(CipherAlg::Xor, Some(1_000), None).is_ok());
-        assert!(build_meta(CipherAlg::Xor, Some(2_000_000), None).is_ok());
-    }
-
-    #[test]
-    fn build_meta_key_file_selects_an_unsalted_none_kdf() {
-        let path = temp_file("build_meta_key", &[0x7Au8; 32]);
-        let meta = build_meta(CipherAlg::AesCtr, None, Some(path.to_str().unwrap())).unwrap();
-        assert_eq!(meta.kdf, KdfKind::None);
-        assert_eq!(meta.iterations, None);
-        assert_eq!(meta.salt, None);
-        assert_ne!(meta.nonce, [0u8; 8]);
-
-        // The key file is validated now, not when the manifest is used.
-        let short = temp_file("build_meta_short", &[0u8; 31]);
-        assert!(build_meta(CipherAlg::AesCtr, None, Some(short.to_str().unwrap())).is_err());
-        assert!(
-            build_meta(CipherAlg::AesCtr, Some(1_000), Some(path.to_str().unwrap())).is_err(),
-            "key-file and iterations are mutually exclusive"
-        );
-
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(short);
-    }
-
-    #[test]
-    fn build_meta_round_trips_through_the_manifest_encoder() {
-        for (alg, key_file) in [
-            (CipherAlg::ChaCha20, None),
-            (CipherAlg::AesCtr, None),
-            (CipherAlg::Xor, None),
+    fn created_keyslot_round_trips_through_the_manifest_encoder() {
+        for alg in [
+            CipherAlg::ChaCha8,
+            CipherAlg::ChaCha12,
+            CipherAlg::ChaCha20,
+            CipherAlg::AesCtr,
+            CipherAlg::Xor,
         ] {
-            let meta = build_meta(alg, Some(1_000), key_file).unwrap();
+            let credential = Credential::Password(b"pw".to_vec());
+            let (meta, _vmk) = new_keyslot(
+                alg,
+                [0x5Au8; 8],
+                KdfKind::Pbkdf2HmacSha256,
+                Some(1_000),
+                &credential,
+                &image_kind(),
+            )
+            .unwrap();
             let bundle = snowscsi::common::bundle::BundleMeta {
-                kind: snowscsi::common::bundle::BundleKind::Image { size: 65_537 },
+                kind: image_kind(),
                 cipher: Some(meta),
                 has_crc: true,
             };
@@ -518,5 +647,10 @@ mod tests {
             assert_eq!(parsed.cipher, Some(meta));
             assert!(parsed.has_crc);
         }
+    }
+
+    #[test]
+    fn manifest_bound_is_still_768() {
+        assert_eq!(snowscsi::common::bundle::MAX_MANIFEST, 768);
     }
 }

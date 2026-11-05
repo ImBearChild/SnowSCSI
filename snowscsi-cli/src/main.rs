@@ -36,9 +36,10 @@
 //!
 //! `cipher` on an `img=` or `bundle=` LUN reads the manifest (the
 //! `<file>.SNOWBUNDLE` sidecar, `<dir>/SNOWBUNDLE`, or an explicit
-//! `cipher=<path>`), derives the key from the global password
-//! (`--password-file`, or stdin **with echo**) or `key=<path>`, and serves the
-//! bytes through the cipher plane. It is never a plaintext fallback: a missing,
+//! `cipher=<path>`), turns the global password (`--password-file`, or stdin
+//! **with echo**) or `key=<path>` into the KEK that unwraps the manifest's
+//! volume master key, and serves the bytes through the cipher plane. It is
+//! never a plaintext fallback: a missing,
 //! malformed or cipher-less manifest is a hard error. A recordable-CD bundle
 //! encrypts only its track resources (`nonce XOR resource`); the
 //! `toc.0`/`toc.1` slots stay plaintext, so capacity and sessions are visible
@@ -199,6 +200,9 @@ enum Cli {
     /// Encrypt or decrypt a single image file and its `SNOWBUNDLE` sidecar
     #[cfg(feature = "cipher")]
     Crypt(CryptArgs),
+    /// Re-wrap the volume master key under a new password/key file
+    #[cfg(feature = "cipher")]
+    Rekey(RekeyArgs),
 }
 
 /// Host transport execution model.
@@ -440,12 +444,11 @@ struct CreateFlatArgs {
     /// Logical sector size (512 or 2048; default 512).
     #[arg(long, value_name = "512|2048", default_value = "512")]
     sector: u32,
-    /// Overwrite an existing `SNOWBUNDLE` manifest. Chunk files are left in
-    /// place (only the manifest is rewritten), so their data is not migrated.
-    #[arg(long)]
-    force: bool,
     /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
     /// `xor` (obfuscation only). Without this flag the manifest is plaintext.
+    /// An encrypted bundle needs `--password-file`, `--key-file`, or a
+    /// two-line password prompt. Change credentials later with `rekey`;
+    /// rebuilding a bundle means deleting its directory.
     #[cfg(feature = "cipher")]
     #[arg(long, value_name = "ALG")]
     cipher: Option<String>,
@@ -453,12 +456,13 @@ struct CreateFlatArgs {
     #[cfg(feature = "cipher")]
     #[arg(long, value_name = "N")]
     iterations: Option<u32>,
-    /// Raw 32-byte key file; selects `kdf = none` (no password or salt).
+    /// Raw 32-byte key file; selects `kdf = none` (no password; the keyslot
+    /// still gets a fresh salt).
     #[cfg(feature = "cipher")]
     #[arg(long = "key-file", value_name = "PATH")]
     key_file: Option<String>,
-    /// Validate this password file (one line) for the encrypted manifest; the
-    /// password itself is never stored in the bundle.
+    /// Encrypt the bundle under this password file (one line). The password
+    /// is used to wrap the volume master key; it is never stored.
     #[cfg(feature = "cipher")]
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<String>,
@@ -476,14 +480,11 @@ struct CreateCdrArgs {
     /// TOC slot size in bytes (accepts K/M/G suffixes; default 64 KiB).
     #[arg(long, value_name = "BYTES")]
     slot: Option<String>,
-    /// Overwrite an existing `SNOWBUNDLE` manifest and initial TOC. Leftover
-    /// `track_*.bin` data is still refused (it would be lost).
-    #[arg(long)]
-    force: bool,
     /// Encrypt the bundle: `chacha8`, `chacha12`, `chacha20`, `aes-ctr`, or
     /// `xor` (obfuscation only). The CD-R TOC stays plaintext; track payloads
-    /// are encrypted per resource. Serve it with `--password-file` (or
-    /// `key=<path>` for `kdf = none`).
+    /// are encrypted per resource. Needs `--password-file`, `--key-file`, or a
+    /// two-line password prompt; serve it with the same credential. Change
+    /// credentials later with `rekey`; rebuilding means deleting the directory.
     #[cfg(feature = "cipher")]
     #[arg(long, value_name = "ALG")]
     cipher: Option<String>,
@@ -491,12 +492,13 @@ struct CreateCdrArgs {
     #[cfg(feature = "cipher")]
     #[arg(long, value_name = "N")]
     iterations: Option<u32>,
-    /// Raw 32-byte key file; selects `kdf = none` (no password or salt).
+    /// Raw 32-byte key file; selects `kdf = none` (no password; the keyslot
+    /// still gets a fresh salt).
     #[cfg(feature = "cipher")]
     #[arg(long = "key-file", value_name = "PATH")]
     key_file: Option<String>,
-    /// Validate this password file (one line) for the encrypted manifest; the
-    /// password itself is never stored in the bundle.
+    /// Encrypt the bundle under this password file (one line). The password
+    /// is used to wrap the volume master key; it is never stored.
     #[cfg(feature = "cipher")]
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<String>,
@@ -507,30 +509,30 @@ struct CreateCdrArgs {
 /// Encryption writes `<out>` plus `<out>.SNOWBUNDLE`; `--in-place` writes the
 /// sidecar first and then replaces `<in>`. Decryption reads `<in>.SNOWBUNDLE`,
 /// validates its image size, and writes plaintext to `<out>` (never a
-/// sidecar). The two files are separate fsynced renames, so a crash between
-/// them can leave a ciphertext image with a missing or stale sidecar; that is
-/// recoverable because the sidecar carries the only copy of the cipher
-/// parameters (remove it and re-encrypt from the plaintext source).
+/// sidecar). The manifest carries the only copy of the keyslot that unwraps
+/// the volume master key: keep it with the data and back it up.
 ///
-/// There is **no payload authentication**: a wrong password or a tampered
-/// ciphertext still exits 0 and writes garbage plaintext. Keep the input until
-/// the result is verified.
+/// The keyslot tag detects a wrong credential before any output is written.
+/// There is **no payload authentication**: a tampered ciphertext still exits 0
+/// and writes garbage plaintext. Keep the input until the result is verified.
 #[cfg(feature = "cipher")]
 #[derive(Args, Debug)]
 #[command(
-    after_help = "SECURITY: there is no payload authentication. A wrong password or a tampered \
-ciphertext produces garbage output with exit status 0. Keep the input and verify the result before \
-deleting anything. Crypt operations take an exclusive `<target>.lock` file next to the target; a \
+    after_help = "SECURITY: the keyslot tag rejects a wrong password/key or a tampered manifest \
+before any output is written, but the payload itself is unauthenticated: a tampered ciphertext \
+still produces garbage output with exit status 0. Keep the input and verify the result before \
+deleting anything. The <out>.SNOWBUNDLE manifest is the only copy of the key material; back it up \
+with the image. Crypt operations take an exclusive `<target>.lock` file next to the target; a \
 crash can leave a stale lock (remove it if no process is running). Temporary files are created with \
-mode 0600 where the platform supports it; SIGKILL can leave one behind. --force overwrites an \
-existing output (and removes a stale <out>.SNOWBUNDLE after decryption)."
+mode 0600 where the platform supports it; SIGKILL can leave one behind. --force may replace an \
+existing output only when it has no <out>.SNOWBUNDLE sidecar."
 )]
 struct CryptArgs {
     /// Decrypt `<in>` using its required `<in>.SNOWBUNDLE` sidecar. The
     /// manifest, not a flag, selects the cipher; its `kind = image` size must
-    /// match `<in>` before any plaintext is written. There is no payload
-    /// authentication: a wrong password or tampered ciphertext still exits 0
-    /// and writes garbage.
+    /// match `<in>` before any plaintext is written. A wrong password or a
+    /// tampered keyslot fails before output; a tampered ciphertext still exits
+    /// 0 and writes garbage (the payload is not authenticated).
     #[arg(long)]
     decrypt: bool,
     /// Cipher for encryption (`chacha8`, `chacha12`, `chacha20`, `aes-ctr`,
@@ -546,6 +548,8 @@ struct CryptArgs {
     password_file: Option<String>,
     /// Use a raw 32-byte key file instead of a password (`kdf = none`). This
     /// is required (never prompted for) when the manifest's `kdf` is `none`.
+    /// For encryption a wrong-length or missing file is rejected before any
+    /// output is written.
     #[arg(long = "key-file", value_name = "PATH")]
     key_file: Option<String>,
     /// PBKDF2-HMAC-SHA256 iteration count (1000..=2000000; default 600000).
@@ -559,9 +563,10 @@ struct CryptArgs {
     /// not preserved. Cannot be combined with `--force`.
     #[arg(long = "in-place")]
     in_place: bool,
-    /// Overwrite an existing `<out>` or `<out>.SNOWBUNDLE`. After a forced
-    /// decryption a stale `<out>.SNOWBUNDLE` is removed. Cannot be combined
-    /// with `--in-place`.
+    /// Overwrite an existing `<out>` **only** when it has no
+    /// `<out>.SNOWBUNDLE`. An existing sidecar is always refused (it is the
+    /// only copy of that image's key material). Cannot be combined with
+    /// `--in-place`.
     #[arg(long)]
     force: bool,
     /// Input image file (must be a regular file).
@@ -572,6 +577,37 @@ struct CryptArgs {
     output: Option<String>,
 }
 
+/// `snowscsi rekey` — re-wrap the VMK under a new password/key file.
+///
+/// Only the keyslot changes: the data cipher, data nonce, geometry and image
+/// bytes are untouched. A wrong old credential fails before writing. Old
+/// manifest copies remain alternate keyslots for the same VMK; destroy them to
+/// revoke a credential, or re-encrypt if the VMK itself leaked.
+#[cfg(feature = "cipher")]
+#[derive(Args, Debug)]
+struct RekeyArgs {
+    /// Image file (`<path>.SNOWBUNDLE`), bundle directory (`SNOWBUNDLE`), or a
+    /// direct `*.SNOWBUNDLE` path.
+    #[arg(value_name = "PATH")]
+    path: String,
+    /// Password file for the current keyslot (PBKDF2 only).
+    #[arg(long = "current-password-file", value_name = "PATH")]
+    current_password_file: Option<String>,
+    /// Password file for the new keyslot (PBKDF2 only).
+    #[arg(long = "new-password-file", value_name = "PATH")]
+    new_password_file: Option<String>,
+    /// 32-byte key file for the current keyslot (`kdf = none` only).
+    #[arg(long = "current-key-file", value_name = "PATH")]
+    current_key_file: Option<String>,
+    /// 32-byte key file for the new keyslot (selects `kdf = none`).
+    #[arg(long = "new-key-file", value_name = "PATH")]
+    new_key_file: Option<String>,
+    /// PBKDF2 iteration count for the new keyslot (1000..=2000000; default
+    /// 600000). Rejected with `--new-key-file`.
+    #[arg(long = "new-iterations", value_name = "N")]
+    new_iterations: Option<u32>,
+}
+
 fn main() -> ExitCode {
     match Cli::parse() {
         Cli::Serve(args) => run_serve(args),
@@ -580,6 +616,8 @@ fn main() -> ExitCode {
         Cli::BundleCreate(args) => run_bundle_create(args),
         #[cfg(feature = "cipher")]
         Cli::Crypt(args) => run_crypt(args),
+        #[cfg(feature = "cipher")]
+        Cli::Rekey(args) => run_rekey(args),
     }
 }
 
@@ -2143,11 +2181,49 @@ fn teardown_iscsi_auto(bound: SocketAddr) {
     }
 }
 
+/// Reject an encrypted manifest when the CLI was built without `cipher`.
+///
+/// A missing manifest is plaintext; a `cipher = none` manifest is plaintext.
+/// Anything with a keyslot must not be served by a build that cannot unlock
+/// it: the raw ciphertext would be exposed as a writable block device.
+#[cfg(not(feature = "cipher"))]
+fn reject_encrypted_manifest_file(path: &str) -> Result<(), ()> {
+    use snowscsi::common::bundle::{BundleMeta, MAX_MANIFEST};
+
+    if !Path::new(path).is_file() {
+        return Ok(());
+    }
+    let bytes = match read_capped(path, MAX_MANIFEST + 1) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("snowscsi: cipher: cannot read manifest '{path}': {e}");
+            return Err(());
+        }
+    };
+    let meta = match BundleMeta::parse(&bytes) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("snowscsi: cipher: invalid manifest '{path}': {e}");
+            return Err(());
+        }
+    };
+    if meta.cipher.is_some() {
+        eprintln!(
+            "snowscsi: cipher: '{path}' describes an encrypted image, but this binary was \
+             built without the `cipher` feature; refusing to serve the raw ciphertext"
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Open one flat image file as an owned plane.
 ///
 /// `writable` selects `Rw`; a read-only image is opened `rb` so it also works
 /// on read-only media. The caller has already decided the role's policy.
 fn open_img_plane(path: &str, writable: bool) -> Result<OwnedPlane, ()> {
+    #[cfg(not(feature = "cipher"))]
+    reject_encrypted_manifest_file(&format!("{path}.SNOWBUNDLE"))?;
     if !Path::new(path).is_file() {
         eprintln!("snowscsi: file not found: {path}");
         return Err(());
@@ -2204,8 +2280,31 @@ fn validate_bundle_specs(specs: &[DeviceSpec]) -> Result<(), ()> {
                 );
                 return Err(());
             }
-            Identified::Flat { .. } => {}
-            Identified::Cdr { toc, .. } => {
+            Identified::Flat { meta } => {
+                #[cfg(feature = "cipher")]
+                let _ = meta;
+                #[cfg(not(feature = "cipher"))]
+                if meta.cipher.is_some() {
+                    eprintln!(
+                        "snowscsi: cipher: {dir}/SNOWBUNDLE describes an encrypted bundle, but \
+                         this binary was built without the `cipher` feature; refusing to serve \
+                         the raw ciphertext"
+                    );
+                    return Err(());
+                }
+            }
+            Identified::Cdr { meta, toc } => {
+                #[cfg(feature = "cipher")]
+                let _ = meta;
+                #[cfg(not(feature = "cipher"))]
+                if meta.cipher.is_some() {
+                    eprintln!(
+                        "snowscsi: cipher: {dir}/SNOWBUNDLE describes an encrypted recordable \
+                         bundle, but this binary was built without the `cipher` feature; \
+                         refusing to serve the raw ciphertext"
+                    );
+                    return Err(());
+                }
                 #[cfg(feature = "cdr-bundle")]
                 {
                     if matches!(spec.role, DeviceRole::BlockDisk | DeviceRole::BlockCd) {
@@ -2338,6 +2437,23 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                     // A flat bundle under `--cdrom` is optical media and
                     // must open read-only; `--block` honours an explicit
                     // `ro`, otherwise it stays writable.
+                    let manifest_path = format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
+                    // Unlock before the flat store is opened: a wrong password
+                    // must not create or touch a chunk file.
+                    #[cfg(feature = "cipher")]
+                    let cipher = bundle_cipher(spec, password, &meta, &manifest_path)?;
+                    #[cfg(not(feature = "cipher"))]
+                    {
+                        let _ = &manifest_path;
+                        if meta.cipher.is_some() {
+                            eprintln!(
+                                "snowscsi: cipher: {manifest_path} describes an encrypted \
+                                 bundle, but this binary was built without the `cipher` \
+                                 feature; refusing to serve the raw ciphertext"
+                            );
+                            return Err(());
+                        }
+                    }
                     let read_only = spec.plane.read_only || spec.role == DeviceRole::MmcCd;
                     let bundle = if read_only {
                         FlatBundle::open_read_only(fs, None, None, None)
@@ -2345,9 +2461,8 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                         FlatBundle::open(fs, None, None, None)
                     }
                     .map_err(|e| eprintln!("snowscsi: bundle: failed to open {dir}: {e}"))?;
-                    let manifest_path = format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
                     #[cfg(feature = "cipher")]
-                    let base = match bundle_cipher(spec, password, &meta, &manifest_path)? {
+                    let base = match cipher {
                         Some((cipher, _nonce)) => OwnedPlane::Cipher(Box::new(CipherPlane::new(
                             OwnedPlane::Bundle(bundle),
                             cipher,
@@ -2355,10 +2470,7 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                         None => OwnedPlane::Bundle(bundle),
                     };
                     #[cfg(not(feature = "cipher"))]
-                    let base = {
-                        let _ = (&meta, &manifest_path);
-                        OwnedPlane::Bundle(bundle)
-                    };
+                    let base = OwnedPlane::Bundle(bundle);
                     base
                 }
                 Identified::Cdr { meta, toc } => {
@@ -2390,22 +2502,35 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
                             );
                             return Err(());
                         }
+                        let manifest_path =
+                            format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
+                        // Unlock before any backing store is built, so a wrong
+                        // password cannot create a chunk or TOC write.
+                        #[cfg(feature = "cipher")]
+                        let cipher = bundle_cipher(spec, password, &meta, &manifest_path)?;
+                        #[cfg(not(feature = "cipher"))]
+                        {
+                            let _ = &manifest_path;
+                            if meta.cipher.is_some() {
+                                eprintln!(
+                                    "snowscsi: cipher: {manifest_path} describes an encrypted \
+                                     recordable bundle, but this binary was built without the \
+                                     `cipher` feature; refusing to serve the raw ciphertext"
+                                );
+                                return Err(());
+                            }
+                        }
                         let fs = FsPlaneAdapter::new(StdFsBackend::new(dir));
                         // Capacity and disc kind come from the stored TOC;
                         // no CLI hints are applied.
                         let store = BundleStore::new(fs, 0, None);
-                        let manifest_path =
-                            format!("{}/{}", dir.trim_end_matches('/'), MANIFEST_NAME);
                         #[cfg(feature = "cipher")]
-                        let store = match bundle_cipher(spec, password, &meta, &manifest_path)? {
+                        let store = match cipher {
                             Some((cipher, nonce)) => CdrStore::new_cipher(store, cipher, nonce),
                             None => CdrStore::new(store),
                         };
                         #[cfg(not(feature = "cipher"))]
-                        let store = {
-                            let _ = (&meta, &manifest_path);
-                            CdrStore::new(store)
-                        };
+                        let store = CdrStore::new(store);
                         OwnedPlane::CdrBundle(store)
                     }
                     #[cfg(not(feature = "cdr-bundle"))]
@@ -2531,17 +2656,42 @@ fn open_plane_for(spec: &DeviceSpec, password: Option<&[u8]>) -> Result<OwnedPla
 ///
 /// For an `img=` LUN it runs before the image is opened, so a
 /// missing/incorrect sidecar never leaves a half-opened backing (or creates a
-/// file) behind.
+/// file) behind. Without `,cipher` an encrypted sidecar is a hard error, never
+/// a plaintext fallback.
 #[cfg(feature = "cipher")]
 fn prepare_cipher(
     spec: &DeviceSpec,
     password: Option<&[u8]>,
 ) -> Result<Option<crate::cipher::CliCipher>, ()> {
-    if let Backing::Bundle { .. } = &spec.backing {
+    let Backing::Img { path } = &spec.backing else {
         return Ok(None);
-    }
+    };
     let Some(cipher_spec) = &spec.cipher else {
-        return Ok(None);
+        let sidecar = format!("{path}{SIDECAR_SUFFIX}");
+        return match read_capped(&sidecar, MAX_MANIFEST + 1) {
+            Ok(bytes) => {
+                let meta = match BundleMeta::parse(&bytes) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        eprintln!("snowscsi: cipher: invalid manifest '{sidecar}': {e}");
+                        return Err(());
+                    }
+                };
+                if meta.cipher.is_some() {
+                    eprintln!(
+                        "snowscsi: cipher: EncryptedManifest: '{sidecar}' is encrypted; add \
+                         `,cipher` to the LUN spec"
+                    );
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                eprintln!("snowscsi: cipher: cannot read manifest '{sidecar}': {e}");
+                Err(())
+            }
+        };
     };
 
     let (meta, manifest_path) = match load_cipher_meta(spec, cipher_spec) {
@@ -2553,38 +2703,83 @@ fn prepare_cipher(
     };
     let Some(cipher_meta) = meta.cipher else {
         eprintln!(
-            "snowscsi: cipher: {manifest_path}: the manifest does not describe a cipher \
-             (refusing to serve plaintext)"
+            "snowscsi: cipher: NotEncrypted: '{manifest_path}' does not describe a cipher; \
+             remove `,cipher` from the LUN spec"
         );
         return Err(());
     };
-    build_cli_cipher(cipher_meta, spec, password, &manifest_path, meta.has_crc).map(Some)
+    build_cli_cipher(
+        cipher_meta,
+        &meta.kind,
+        spec,
+        password,
+        &manifest_path,
+        meta.has_crc,
+    )
+    .map(Some)
 }
 
-/// Validate a cipher block and build the CLI cipher from the supplied key
-/// material.
+/// Validate a cipher block and unlock the CLI cipher from the supplied
+/// credential.
 #[cfg(feature = "cipher")]
 fn build_cli_cipher(
     cipher_meta: CipherMeta,
+    kind: &BundleKind,
     spec: &DeviceSpec,
     password: Option<&[u8]>,
     manifest_path: &str,
     has_crc: bool,
 ) -> Result<crate::cipher::CliCipher, ()> {
     if !has_crc {
-        log::warn!("cipher: {manifest_path} has no crc line; cipher parameters are unchecked");
+        log::debug!("cipher: {manifest_path} has no crc line; it detects damage only");
     }
     if cipher_meta.cipher == CipherAlg::Xor {
         log::warn!("cipher: xor is obfuscation, not encryption");
     }
-    let key = match crate::cipher::derive_key(&cipher_meta, password, spec.key.as_deref()) {
-        Ok(key) => key,
+    let mut credential = match cipher_meta.slot.kdf {
+        KdfKind::Pbkdf2HmacSha256 => {
+            if spec.key.is_some() {
+                eprintln!(
+                    "snowscsi: cipher: {manifest_path} uses PBKDF2; key= is only valid with \
+                     kdf = none"
+                );
+                return Err(());
+            }
+            let Some(password) = password else {
+                eprintln!(
+                    "snowscsi: cipher: {manifest_path} uses PBKDF2; pass --password-file <path>"
+                );
+                return Err(());
+            };
+            crate::cipher::Credential::Password(password.to_vec())
+        }
+        KdfKind::None => {
+            let Some(path) = spec.key.as_deref() else {
+                eprintln!(
+                    "snowscsi: cipher: {manifest_path} uses kdf = none; pass key=<path> on the \
+                     LUN spec"
+                );
+                return Err(());
+            };
+            match crate::cipher::read_key_file(path) {
+                Ok(key) => crate::cipher::Credential::Key(key),
+                Err(e) => {
+                    eprintln!("snowscsi: cipher: {e}");
+                    return Err(());
+                }
+            }
+        }
+    };
+    let unlocked = crate::cipher::unlock(&cipher_meta, kind, &credential);
+    credential.wipe();
+    let vmk = match unlocked {
+        Ok(vmk) => vmk,
         Err(e) => {
-            eprintln!("snowscsi: cipher: {e}");
+            eprintln!("snowscsi: cipher: {manifest_path}: {e}");
             return Err(());
         }
     };
-    let cipher = match crate::cipher::CliCipher::from_meta(&cipher_meta, &key) {
+    let cipher = match crate::cipher::CliCipher::from_meta(&cipher_meta, &vmk) {
         Ok(cipher) => cipher,
         Err(e) => {
             eprintln!("snowscsi: cipher: {e}");
@@ -2600,11 +2795,12 @@ fn build_cli_cipher(
 
 /// Resolve a directory bundle's cipher block from its identified manifest.
 ///
-/// The identified manifest is authoritative: it must carry a cipher block. A
-/// `cipher=<path>` override may only select an equivalent manifest; its kind
-/// (including flat geometry) and cipher parameters must equal the identified
-/// ones. The returned nonce is the one belonging to the identified cipher
-/// block. Without `cipher` on the spec the bundle stays plaintext.
+/// The identified manifest is authoritative. With `,cipher` an encrypted
+/// manifest is required; without it a plaintext manifest is required. A
+/// `cipher=<path>` override may only select an equivalent manifest: same kind
+/// (including geometry), cipher, data nonce and key id, but its keyslot may
+/// differ (a rekeyed copy). The override's keyslot unlocks the VMK and its
+/// cipher block supplies the data nonce.
 #[cfg(all(feature = "bundle", feature = "cipher"))]
 fn bundle_cipher(
     spec: &DeviceSpec,
@@ -2613,16 +2809,23 @@ fn bundle_cipher(
     manifest_path: &str,
 ) -> Result<Option<(crate::cipher::CliCipher, [u8; 8])>, ()> {
     let Some(cipher_spec) = &spec.cipher else {
+        if identified.cipher.is_some() {
+            eprintln!(
+                "snowscsi: cipher: EncryptedManifest: '{manifest_path}' is encrypted; add \
+                 `,cipher` to the LUN spec"
+            );
+            return Err(());
+        }
         return Ok(None);
     };
     let Some(identified_cipher) = identified.cipher else {
         eprintln!(
-            "snowscsi: cipher: {manifest_path}: the identified manifest does not describe a \
-             cipher (refusing to serve plaintext)"
+            "snowscsi: cipher: NotEncrypted: '{manifest_path}' does not describe a cipher; \
+             remove `,cipher` from the LUN spec"
         );
         return Err(());
     };
-    let (meta, cipher_meta, path) = match cipher_spec.meta.as_deref() {
+    let (cipher_meta, path, has_crc) = match cipher_spec.meta.as_deref() {
         Some(explicit) => {
             let bytes = match read_capped(explicit, MAX_MANIFEST + 1) {
                 Ok(bytes) => bytes,
@@ -2641,22 +2844,32 @@ fn bundle_cipher(
             if meta.kind != identified.kind {
                 eprintln!(
                     "snowscsi: cipher: manifest '{explicit}' does not describe the identified \
-                     bundle kind/geometry (refusing to serve plaintext)"
+                     bundle kind/geometry (refusing to serve)"
                 );
                 return Err(());
             }
-            if meta.cipher != Some(identified_cipher) {
+            let Some(override_meta) = meta.cipher else {
                 eprintln!(
-                    "snowscsi: cipher: manifest '{explicit}' has different cipher parameters \
-                     from the identified manifest (refusing to serve plaintext)"
+                    "snowscsi: cipher: manifest '{explicit}' does not describe a cipher \
+                     (refusing to serve)"
+                );
+                return Err(());
+            };
+            if override_meta.cipher != identified_cipher.cipher
+                || override_meta.nonce != identified_cipher.nonce
+                || override_meta.key_id != identified_cipher.key_id
+            {
+                eprintln!(
+                    "snowscsi: cipher: manifest '{explicit}' wraps a different cipher/nonce/key \
+                     id than the identified manifest (refusing to serve)"
                 );
                 return Err(());
             }
-            (meta, identified_cipher, explicit)
+            (override_meta, explicit, meta.has_crc)
         }
-        None => (*identified, identified_cipher, manifest_path),
+        None => (identified_cipher, manifest_path, identified.has_crc),
     };
-    let cipher = build_cli_cipher(cipher_meta, spec, password, path, meta.has_crc)?;
+    let cipher = build_cli_cipher(cipher_meta, &identified.kind, spec, password, path, has_crc)?;
     Ok(Some((cipher, cipher_meta.nonce)))
 }
 
@@ -2683,6 +2896,34 @@ fn load_cipher_meta(
         .map_err(|e| format!("cannot read manifest '{sidecar}': {e}"))?;
     let meta =
         BundleMeta::parse(&bytes).map_err(|e| format!("invalid manifest '{sidecar}': {e}"))?;
+    // If the image's own sidecar exists, an explicit `cipher=<path>` must
+    // describe the same image identity. The keyslot may differ (a rekeyed
+    // copy), but kind/size, cipher, data nonce and key id must match.
+    let default_sidecar = format!("{path}{SIDECAR_SUFFIX}");
+    if cipher_spec.meta.is_some() && Path::new(&default_sidecar).is_file() {
+        let default_bytes = read_capped(&default_sidecar, MAX_MANIFEST + 1)
+            .map_err(|e| format!("cannot read manifest '{default_sidecar}': {e}"))?;
+        let default_meta = BundleMeta::parse(&default_bytes)
+            .map_err(|e| format!("invalid manifest '{default_sidecar}': {e}"))?;
+        if default_meta.kind != meta.kind {
+            return Err(format!(
+                "manifest '{sidecar}' does not describe the same image as '{default_sidecar}' \
+                 (kind/size mismatch)"
+            ));
+        }
+        match (default_meta.cipher, meta.cipher) {
+            (Some(default_cipher), Some(chosen))
+                if default_cipher.cipher == chosen.cipher
+                    && default_cipher.nonce == chosen.nonce
+                    && default_cipher.key_id == chosen.key_id => {}
+            _ => {
+                return Err(format!(
+                    "manifest '{sidecar}' wraps a different cipher/nonce/key id than \
+                     '{default_sidecar}' (refusing to serve)"
+                ))
+            }
+        }
+    }
     let image_size = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat image '{path}': {e}"))?
         .len();
@@ -3734,15 +3975,17 @@ fn run_bundle_create(args: BundleCreateArgs) -> ExitCode {
 /// Resolve `bundle-create`'s optional cipher flags.
 ///
 /// Without `--cipher` every other cipher flag is rejected (a plaintext
-/// manifest carries no cipher block). With it, `--key-file` selects
-/// `kdf = none` and `--password-file` is only validated: the password is never
-/// needed to write the manifest and is never stored.
+/// manifest carries no cipher block). With it a credential is required:
+/// `--key-file` selects `kdf = none`, `--password-file` selects PBKDF2, and
+/// without either the password is prompted twice. The credential wraps a fresh
+/// random VMK; only the keyslot is stored, never the password or the key.
 #[cfg(all(feature = "cipher", feature = "bundle"))]
 fn create_bundle_cipher(
     cipher: Option<&str>,
     iterations: Option<u32>,
     key_file: Option<&str>,
     password_file: Option<&str>,
+    kind: &BundleKind,
 ) -> Result<Option<CipherMeta>, String> {
     let Some(name) = cipher else {
         for (flag, present) in [
@@ -3756,21 +3999,24 @@ fn create_bundle_cipher(
         }
         return Ok(None);
     };
-    if key_file.is_some() && password_file.is_some() {
-        return Err("--key-file and --password-file are mutually exclusive".to_string());
-    }
     if key_file.is_some() && iterations.is_some() {
         return Err("--key-file and --iterations are mutually exclusive".to_string());
     }
-    if let Some(path) = password_file {
-        // One readable line is all the manifest needs; the password itself is
-        // not used (the host supplies it when it serves the bundle). Wipe the
-        // read buffer best effort.
-        let mut password = read_password_file(path)?;
-        crate::wipe(&mut password);
-    }
     let alg = crate::cipher::parse_alg(name)?;
-    crate::cipher::build_meta(alg, iterations, key_file).map(Some)
+    let kdf = if key_file.is_some() {
+        KdfKind::None
+    } else {
+        KdfKind::Pbkdf2HmacSha256
+    };
+    let iterations = match kdf {
+        KdfKind::None => None,
+        KdfKind::Pbkdf2HmacSha256 => Some(iterations.unwrap_or(600_000)),
+    };
+    let mut credential = crate::cipher::read_credential(password_file, key_file, true)?;
+    let nonce = crate::cipher::random_nonce()?;
+    let created = crate::cipher::new_keyslot(alg, nonce, kdf, iterations, &credential, kind);
+    credential.wipe();
+    created.map(|(meta, _vmk)| Some(meta))
 }
 
 /// Short success suffix: the cipher name, or `plaintext`.
@@ -3815,12 +4061,22 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
     }
     let dir = Path::new(&args.dir);
     let existed = dir.exists();
-    if existed && !args.force {
+    if existed {
+        for existing in [MANIFEST_NAME, "BUNDLE"] {
+            if dir.join(existing).exists() {
+                eprintln!(
+                    "snowscsi: bundle-create: {} already contains {existing}; refusing to \
+                     overwrite it (rekey changes credentials in place; delete the directory to \
+                     rebuild the bundle)",
+                    args.dir
+                );
+                return ExitCode::FAILURE;
+            }
+        }
         if let Some(name) = first_chunk_file(dir) {
             eprintln!(
                 "snowscsi: bundle-create: {} already contains chunk {name}; a flat bundle \
-                 requires an empty directory or a manifest-only directory (move the chunks \
-                 away, use --force to rewrite only the manifest, or use a new directory)",
+                 requires an empty directory (delete the directory or use a new one)",
                 args.dir
             );
             return ExitCode::FAILURE;
@@ -3836,12 +4092,18 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    let kind = BundleKind::Flat {
+        virtual_size: size,
+        chunk_size: chunk,
+        sector_size: args.sector,
+    };
     #[cfg(feature = "cipher")]
     let cipher = match create_bundle_cipher(
         args.cipher.as_deref(),
         args.iterations,
         args.key_file.as_deref(),
         args.password_file.as_deref(),
+        &kind,
     ) {
         Ok(cipher) => cipher,
         Err(e) => {
@@ -3851,33 +4113,8 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
     };
     #[cfg(not(feature = "cipher"))]
     let cipher = None;
-    if existed && args.force {
-        // `--force` rewrites only the manifest (the legacy header too):
-        // existing chunk data stays untouched and is interpreted with the new
-        // geometry.
-        for existing in [MANIFEST_NAME, "BUNDLE"] {
-            if let Err(e) = remove_if_present(&dir.join(existing)) {
-                eprintln!(
-                    "snowscsi: bundle-create: cannot remove the existing {}/{existing}: {e}",
-                    args.dir
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    if let Err(e) = std::fs::create_dir_all(&args.dir) {
-        eprintln!(
-            "snowscsi: bundle-create: failed to create directory {}: {e}",
-            args.dir
-        );
-        return ExitCode::FAILURE;
-    }
     let meta = BundleMeta {
-        kind: BundleKind::Flat {
-            virtual_size: size,
-            chunk_size: chunk,
-            sector_size: args.sector,
-        },
+        kind,
         cipher,
         has_crc: false,
     };
@@ -3885,7 +4122,38 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
     let security = cipher_summary(meta.cipher.as_ref());
     #[cfg(not(feature = "cipher"))]
     let security = "plaintext";
-    match FlatBundle::create_with_meta(StdFsBackend::new(&args.dir), &meta) {
+    if let Err(e) = std::fs::create_dir_all(&args.dir) {
+        eprintln!(
+            "snowscsi: bundle-create: failed to create directory {}: {e}",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+    // The CLI writes the manifest atomically itself: `create_with_meta` writes
+    // through the filesystem seam, which has no rename, and a torn keyslot
+    // manifest is the only copy of the VMK.
+    let manifest = match meta.encode() {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&args.dir);
+            }
+            eprintln!("snowscsi: bundle-create: cannot encode the manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = write_manifest_atomic(&dir.join(MANIFEST_NAME), &manifest) {
+        let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
+        if !existed {
+            let _ = std::fs::remove_dir_all(&args.dir);
+        }
+        eprintln!(
+            "snowscsi: bundle-create: failed to write {}/SNOWBUNDLE: {e}",
+            args.dir
+        );
+        return ExitCode::FAILURE;
+    }
+    match FlatBundle::open(StdFsBackend::new(&args.dir), None, None, None) {
         Ok(_) => {
             println!(
                 "snowscsi: created flat bundle {} ({} bytes, {} byte chunks, {} byte sectors, \
@@ -3895,6 +4163,7 @@ fn create_flat_bundle(args: CreateFlatArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
             if !existed {
                 let _ = std::fs::remove_dir_all(&args.dir);
             }
@@ -3917,16 +4186,6 @@ fn first_chunk_file(dir: &Path) -> Option<String> {
         }
     }
     None
-}
-
-/// Remove `path` when it exists; a missing file is success.
-#[cfg(feature = "bundle")]
-fn remove_if_present(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// The first canonical track file (`track_<n>.bin`) in `dir`, if any.
@@ -3980,22 +4239,19 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     let dir = Path::new(&args.dir);
     let existed = dir.exists();
     if existed {
-        if !args.force {
-            for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
-                if dir.join(existing).exists() {
-                    eprintln!(
-                        "snowscsi: bundle-create: {} already contains {existing}; refusing to \
-                         overwrite (use --force to rewrite the manifest and initial TOC, or a \
-                         new directory)",
-                        args.dir
-                    );
-                    return ExitCode::FAILURE;
-                }
+        for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
+            if dir.join(existing).exists() {
+                eprintln!(
+                    "snowscsi: bundle-create: {} already contains {existing}; refusing to \
+                     overwrite it (rekey changes credentials in place; delete the directory to \
+                     rebuild the disc)",
+                    args.dir
+                );
+                return ExitCode::FAILURE;
             }
         }
         // Leftover track data cannot be reconciled without a TOC, so refuse
         // before writing a manifest that would make it look authoritative.
-        // `--force` never bypasses this: it would silently lose recorded data.
         if let Some(name) = first_track_file(dir) {
             eprintln!(
                 "snowscsi: bundle-create: {} already contains track data ({name}); a \
@@ -4006,12 +4262,14 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    let bundle_kind = BundleKind::Cdr;
     #[cfg(feature = "cipher")]
     let cipher = match create_bundle_cipher(
         args.cipher.as_deref(),
         args.iterations,
         args.key_file.as_deref(),
         args.password_file.as_deref(),
+        &bundle_kind,
     ) {
         Ok(cipher) => cipher,
         Err(e) => {
@@ -4032,19 +4290,6 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    if existed && args.force {
-        // Rewrite the manifest and the initial TOC; both slots are removed so
-        // an older `toc.1` cannot win the newest-slot probe.
-        for existing in [MANIFEST_NAME, "BUNDLE", "toc.0", "toc.1"] {
-            if let Err(e) = remove_if_present(&dir.join(existing)) {
-                eprintln!(
-                    "snowscsi: bundle-create: cannot remove the existing {}/{existing}: {e}",
-                    args.dir
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    }
     if let Err(e) = std::fs::create_dir_all(&args.dir) {
         eprintln!(
             "snowscsi: bundle-create: failed to create directory {}: {e}",
@@ -4054,7 +4299,7 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     }
 
     let meta = BundleMeta {
-        kind: BundleKind::Cdr,
+        kind: bundle_kind,
         cipher,
         has_crc: false,
     };
@@ -4069,7 +4314,8 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = write_manifest_atomic(dir, &manifest) {
+    if let Err(e) = write_manifest_atomic(&dir.join(MANIFEST_NAME), &manifest) {
+        let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
         if !existed {
             let _ = std::fs::remove_dir_all(&args.dir);
         }
@@ -4083,6 +4329,7 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     let mut medium = match CdrBundleMedium::with_disc(capacity.sectors(), kind, slot) {
         Ok(medium) => medium,
         Err(e) => {
+            let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
             if !existed {
                 let _ = std::fs::remove_dir_all(&args.dir);
             }
@@ -4094,6 +4341,7 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
     let slot_index = match medium.toc_image(&mut image) {
         Ok(slot) => slot,
         Err(e) => {
+            let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
             if !existed {
                 let _ = std::fs::remove_dir_all(&args.dir);
             }
@@ -4102,13 +4350,16 @@ fn create_cdr_bundle(args: CreateCdrArgs) -> ExitCode {
         }
     };
     let name = toc_file(slot_index);
-    if let Err(e) = stack::write_toc_snapshot(&args.dir, slot_index, &image) {
+    if let Err(e) = write_manifest_atomic(&dir.join(name), &image) {
+        // Do not leave a manifest that points at a missing TOC: a retry with
+        // the same directory must start clean.
+        let _ = std::fs::remove_file(dir.join(MANIFEST_NAME));
         if !existed {
             let _ = std::fs::remove_dir_all(&args.dir);
         }
         eprintln!(
-            "snowscsi: bundle-create: manifest written, but writing {}/{name} failed: {e}; \
-             remove the directory to retry",
+            "snowscsi: bundle-create: writing {}/{name} failed: {e}; removed the manifest so \
+             the directory can be retried",
             args.dir
         );
         return ExitCode::FAILURE;
@@ -4127,31 +4378,74 @@ fn create_cdr_bundle(_args: CreateCdrArgs) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Write the manifest through a temporary file and rename it into place.
-#[cfg(feature = "cdr-bundle")]
-fn write_manifest_atomic(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write one file through a random `0600` temp in the same directory, fsync
+/// it, rename it into place and fsync the parent.
+///
+/// Used for both the manifest and the initial CD-R TOC. The temp is
+/// mispredicted (`create_new`), so two concurrent writers can never share it,
+/// and a failure removes it so a retry starts clean.
+#[cfg(feature = "bundle")]
+fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let tmp = dir.join(format!("{MANIFEST_NAME}.tmp"));
-    let write = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, dir.join(MANIFEST_NAME))?;
-        if let Ok(dir) = std::fs::File::open(dir) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-    if write.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn suffix() -> u64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut value =
+            nanos ^ ((std::process::id() as u64) << 32) ^ count.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        value ^= value >> 29;
+        value
     }
-    write
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file name"))?
+        .to_string_lossy();
+    let mut attempt = 0u32;
+    loop {
+        let tmp = parent.join(format!(".{name}.tmp.{:016x}", suffix()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(mut file) => {
+                let write = (|| {
+                    file.write_all(bytes)?;
+                    file.sync_all()?;
+                    drop(file);
+                    std::fs::rename(&tmp, path)?;
+                    // Checked: a manifest that is not durable is not a
+                    // successful manifest write.
+                    std::fs::File::open(parent)?.sync_all()?;
+                    Ok(())
+                })();
+                if write.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return write;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(feature = "cdr-bundle")]
@@ -4204,6 +4498,221 @@ fn run_crypt(args: CryptArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolve the manifest a `rekey` path names.
+#[cfg(feature = "cipher")]
+fn rekey_manifest_path(path: &str) -> Result<String, String> {
+    if Path::new(path).is_dir() {
+        return Ok(format!("{}/SNOWBUNDLE", path.trim_end_matches('/')));
+    }
+    if path.ends_with(".SNOWBUNDLE")
+        || Path::new(path).file_name().and_then(|name| name.to_str()) == Some("SNOWBUNDLE")
+    {
+        if !Path::new(path).is_file() {
+            return Err(format!("manifest '{path}' not found"));
+        }
+        return Ok(path.to_string());
+    }
+    let sidecar = format!("{path}{SIDECAR_SUFFIX}");
+    if !Path::new(&sidecar).is_file() {
+        return Err(format!(
+            "manifest '{sidecar}' not found (not an encrypted image or bundle)"
+        ));
+    }
+    Ok(sidecar)
+}
+
+/// Read the credential for one side of a rekey, honoring the keyslot's KDF.
+#[cfg(feature = "cipher")]
+fn rekey_read_credential(
+    kdf: KdfKind,
+    password_file: Option<&str>,
+    key_file: Option<&str>,
+    confirm: bool,
+    which: &str,
+) -> Result<crate::cipher::Credential, String> {
+    match kdf {
+        KdfKind::None => {
+            if password_file.is_some() {
+                return Err(format!(
+                    "{which} keyslot uses kdf = none; pass --{which}-key-file, not a password"
+                ));
+            }
+            let key_file = key_file.ok_or_else(|| {
+                format!("{which} keyslot uses kdf = none; pass --{which}-key-file")
+            })?;
+            crate::cipher::read_credential(None, Some(key_file), confirm)
+        }
+        KdfKind::Pbkdf2HmacSha256 => {
+            if key_file.is_some() {
+                return Err(format!(
+                    "{which} keyslot uses PBKDF2; pass --{which}-password-file or omit it \
+                     to prompt"
+                ));
+            }
+            crate::cipher::read_credential(password_file, None, confirm)
+        }
+    }
+}
+
+/// `snowscsi rekey`: re-wrap the VMK; data bytes and identity stay unchanged.
+#[cfg(feature = "cipher")]
+fn run_rekey(args: RekeyArgs) -> ExitCode {
+    init_logging(0);
+    match rekey_run(args) {
+        Ok(line) => {
+            println!("snowscsi: {line}");
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprintln!("snowscsi: rekey: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "cipher")]
+fn rekey_run(args: RekeyArgs) -> Result<String, String> {
+    let manifest = rekey_manifest_path(&args.path)?;
+    let metadata = std::fs::symlink_metadata(&manifest)
+        .map_err(|e| format!("cannot stat manifest '{manifest}': {e}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "manifest '{manifest}' is a symlink; refusing to rewrite it"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() > 1 {
+            return Err(format!(
+                "manifest '{manifest}' has multiple hard links; refusing to rewrite it"
+            ));
+        }
+    }
+    let bytes = read_capped(&manifest, MAX_MANIFEST + 1)
+        .map_err(|e| format!("cannot read manifest '{manifest}': {e}"))?;
+    let parsed = BundleMeta::parse(&bytes).map_err(|e| format!("invalid manifest: {e}"))?;
+    let Some(old_cipher) = parsed.cipher else {
+        return Err(format!(
+            "NotEncrypted: manifest '{manifest}' has no keyslot (cipher = none); \
+             encryption is a data operation"
+        ));
+    };
+    if !args.path.ends_with(".SNOWBUNDLE")
+        && Path::new(&args.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("SNOWBUNDLE")
+    {
+        if Path::new(&args.path).is_dir() && matches!(parsed.kind, BundleKind::Image { .. }) {
+            return Err(format!(
+                "manifest '{manifest}' describes a single-file image, but '{}' is a directory",
+                args.path
+            ));
+        }
+        if !Path::new(&args.path).is_dir() && !matches!(parsed.kind, BundleKind::Image { .. }) {
+            return Err(format!(
+                "manifest '{manifest}' describes a directory bundle, not an image"
+            ));
+        }
+    }
+
+    let mut old_credential = rekey_read_credential(
+        old_cipher.slot.kdf,
+        args.current_password_file.as_deref(),
+        args.current_key_file.as_deref(),
+        false,
+        "current",
+    )?;
+
+    let (new_kdf, new_iterations, mut new_credential) =
+        if let Some(key_file) = args.new_key_file.as_deref() {
+            if args.new_password_file.is_some() {
+                return Err(
+                    "--new-password-file and --new-key-file are mutually exclusive".to_string(),
+                );
+            }
+            if args.new_iterations.is_some() {
+                return Err("--new-iterations is not valid with --new-key-file".to_string());
+            }
+            (
+                KdfKind::None,
+                None,
+                crate::cipher::read_credential(None, Some(key_file), false)?,
+            )
+        } else {
+            let iterations = args.new_iterations.unwrap_or(600_000);
+            if !(1_000..=2_000_000).contains(&iterations) {
+                return Err(format!(
+                    "invalid PBKDF2 iteration count {iterations} (1000..=2000000)"
+                ));
+            }
+            (
+                KdfKind::Pbkdf2HmacSha256,
+                Some(iterations),
+                crate::cipher::read_credential(args.new_password_file.as_deref(), None, true)?,
+            )
+        };
+
+    let (new_cipher, vmk) = crate::cipher::rewrap_keyslot(
+        &parsed.kind,
+        &old_cipher,
+        &old_credential,
+        new_kdf,
+        new_iterations,
+        &new_credential,
+    )?;
+    let new_manifest = BundleMeta {
+        kind: parsed.kind,
+        cipher: Some(new_cipher),
+        has_crc: true,
+    };
+    let encoded = new_manifest
+        .encode()
+        .map_err(|e| format!("cannot encode the new manifest: {e}"))?;
+
+    // Re-parse and unlock with the new credential before publishing: a bug or
+    // a mistyped new password must never replace the old keyslot.
+    let reparsed =
+        BundleMeta::parse(&encoded).map_err(|e| format!("cannot parse the new manifest: {e}"))?;
+    let Some(reparsed_cipher) = reparsed.cipher else {
+        return Err("internal: the new manifest lost its keyslot".to_string());
+    };
+    if reparsed.kind != parsed.kind
+        || reparsed_cipher.cipher != old_cipher.cipher
+        || reparsed_cipher.nonce != old_cipher.nonce
+        || reparsed_cipher.key_id != old_cipher.key_id
+    {
+        return Err(
+            "internal: the new keyslot changed the data cipher/nonce/key id or geometry"
+                .to_string(),
+        );
+    }
+    let checked_vmk = crate::cipher::unlock(&reparsed_cipher, &reparsed.kind, &new_credential)?;
+    if checked_vmk.as_bytes() != vmk.as_bytes() {
+        return Err("internal: the new keyslot does not unwrap to the same VMK".to_string());
+    }
+
+    let lock = crypt_lock(&manifest)?;
+    let permissions = std::fs::metadata(&manifest).ok().map(|m| m.permissions());
+    crypt_write_atomic(&manifest, &encoded)?;
+    if let Some(permissions) = permissions {
+        let _ = std::fs::set_permissions(&manifest, permissions);
+    }
+    drop(lock);
+
+    old_credential.wipe();
+    new_credential.wipe();
+    let kind = match parsed.kind {
+        BundleKind::Image { .. } => "image",
+        BundleKind::Flat { .. } => "flat bundle",
+        BundleKind::Cdr => "recordable bundle",
+    };
+    Ok(format!(
+        "rekeyed {kind} '{manifest}' (keyslot only; data unchanged)"
+    ))
 }
 
 /// Stream chunk size for `crypt` (one MiB; no whole-file allocation).
@@ -4470,6 +4979,20 @@ fn crypt_write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+/// Write the sidecar after the image, removing the image if the sidecar fails.
+///
+/// The sidecar carries the only keyslot that can unwrap the image's VMK, so a
+/// ciphertext image without one is useless: a failed sidecar write removes the
+/// newly written image and reports the cleanup.
+#[cfg(feature = "cipher")]
+fn crypt_commit_sidecar(out: &str, sidecar: &str, manifest: &[u8]) -> Result<(), String> {
+    if let Err(e) = crypt_write_atomic(sidecar, manifest) {
+        let _ = std::fs::remove_file(out);
+        return Err(format!("{e}; removed the newly written '{out}'"));
+    }
+    Ok(())
+}
+
 /// Stream `input` through `cipher` into `output`, deleting `output` on failure.
 ///
 /// The cipher is length-preserving and symmetric: encryption and decryption
@@ -4544,14 +5067,18 @@ fn crypt_verb(alg: CipherAlg) -> &'static str {
     }
 }
 
-/// Read the password/key material and build the manifest's stream cipher.
+/// Read the credential for an existing manifest and unlock its VMK.
+///
+/// `kdf = pbkdf2` needs a password (file or prompt); `kdf = none` needs an
+/// explicit key file and never prompts. A wrong credential fails here, before
+/// any output is created.
 #[cfg(feature = "cipher")]
-fn crypt_cipher(
+fn crypt_unlock_cipher(
     meta: &CipherMeta,
+    kind: &BundleKind,
     args: &CryptArgs,
-    confirm: bool,
 ) -> Result<crate::cipher::CliCipher, String> {
-    let password = match meta.kdf {
+    let (password_file, key_file) = match meta.slot.kdf {
         KdfKind::None => {
             if args.password_file.is_some() {
                 return Err(
@@ -4567,7 +5094,7 @@ fn crypt_cipher(
                         .to_string(),
                 );
             }
-            None
+            (None, args.key_file.as_deref())
         }
         KdfKind::Pbkdf2HmacSha256 => {
             if args.key_file.is_some() {
@@ -4577,29 +5104,53 @@ fn crypt_cipher(
                         .to_string(),
                 );
             }
-            match args.password_file.as_deref() {
-                Some(path) => Some(read_password_file(path)?),
-                None => {
-                    let first = read_password_prompt()?;
-                    if confirm {
-                        let second = read_password_prompt()?;
-                        if first != second {
-                            return Err("passwords do not match".to_string());
-                        }
-                    }
-                    Some(first)
-                }
-            }
+            (args.password_file.as_deref(), None)
         }
     };
-    let key = crate::cipher::derive_key(meta, password.as_deref(), args.key_file.as_deref())?;
-    let cipher = crate::cipher::CliCipher::from_meta(meta, &key);
-    // Best effort (not zeroize): the cipher has copied the key schedule, so
-    // the password buffer can be wiped before the payload starts streaming.
-    if let Some(mut password) = password {
-        crate::wipe(&mut password);
+    let mut credential = crate::cipher::read_credential(password_file, key_file, false)?;
+    let unlocked = crate::cipher::unlock(meta, kind, &credential);
+    credential.wipe();
+    let vmk = unlocked?;
+    crate::cipher::CliCipher::from_meta(meta, &vmk)
+}
+
+/// Build the keyslot and stream cipher for a new encrypted image.
+///
+/// `--key-file` selects `kdf = none`; otherwise the password (file or
+/// two-line prompt) selects PBKDF2. Fresh VMK, data nonce, salt and wrap nonce
+/// are generated here.
+#[cfg(feature = "cipher")]
+fn crypt_encrypt_cipher(
+    args: &CryptArgs,
+    alg: CipherAlg,
+    kind: &BundleKind,
+) -> Result<(CipherMeta, crate::cipher::CliCipher), String> {
+    let kdf = if args.key_file.is_some() {
+        KdfKind::None
+    } else {
+        KdfKind::Pbkdf2HmacSha256
+    };
+    if kdf == KdfKind::None && args.iterations.is_some() {
+        return Err("--key-file and --iterations are mutually exclusive".to_string());
     }
-    cipher
+    let iterations = match kdf {
+        KdfKind::None => None,
+        KdfKind::Pbkdf2HmacSha256 => Some(args.iterations.unwrap_or(600_000)),
+    };
+    let mut credential = crate::cipher::read_credential(
+        args.password_file.as_deref(),
+        args.key_file.as_deref(),
+        true,
+    )?;
+    let nonce = crate::cipher::random_nonce()?;
+    let created = (|| {
+        let (meta, vmk) =
+            crate::cipher::new_keyslot(alg, nonce, kdf, iterations, &credential, kind)?;
+        let cipher = crate::cipher::CliCipher::from_meta(&meta, &vmk)?;
+        Ok((meta, cipher))
+    })();
+    credential.wipe();
+    created
 }
 
 /// Build the manifest block for a new encrypted image.
@@ -4655,9 +5206,9 @@ fn crypt_run(args: CryptArgs) -> Result<String, String> {
 
         let alg = crate::cipher::parse_alg(name)?;
         crypt_warn_xor(alg);
-        let meta = crate::cipher::build_meta(alg, args.iterations, args.key_file.as_deref())?;
+        let kind = BundleKind::Image { size: input_len };
+        let (meta, cipher) = crypt_encrypt_cipher(&args, alg, &kind)?;
         let alg_name = crate::cipher::cipher_meta_name(&meta);
-        let cipher = crypt_cipher(&meta, &args, true)?;
         let manifest = crypt_manifest(input_len, meta)?;
         // The sidecar goes first: a crash before the image rename leaves the
         // original plaintext intact with a stale sidecar, which is recoverable
@@ -4733,22 +5284,23 @@ fn crypt_run(args: CryptArgs) -> Result<String, String> {
 
     let alg = crate::cipher::parse_alg(name)?;
     crypt_warn_xor(alg);
-    let meta = crate::cipher::build_meta(alg, args.iterations, args.key_file.as_deref())?;
-    let alg_name = crate::cipher::cipher_meta_name(&meta);
-    if !args.force {
-        if Path::new(out).exists() {
-            return Err(format!(
-                "'{out}' already exists (use --force to replace it)"
-            ));
-        }
-        if Path::new(&out_sidecar).exists() {
-            return Err(format!(
-                "'{out_sidecar}' already exists (use --force to replace it)"
-            ));
-        }
+    // The output sidecar is the only copy of the new VMK; never overwrite a
+    // different keyslot, not even with --force.
+    if Path::new(&out_sidecar).exists() {
+        return Err(format!(
+            "'{out_sidecar}' already exists; refusing to overwrite a sidecar (it is the only \
+             copy of that image's key material), even with --force"
+        ));
+    }
+    if Path::new(out).exists() && !args.force {
+        return Err(format!(
+            "'{out}' already exists (use --force to replace it when it has no sidecar)"
+        ));
     }
 
-    let cipher = crypt_cipher(&meta, &args, true)?;
+    let kind = BundleKind::Image { size: input_len };
+    let (meta, cipher) = crypt_encrypt_cipher(&args, alg, &kind)?;
+    let alg_name = crate::cipher::cipher_meta_name(&meta);
     // Encode the manifest before the image rename: an encode failure must not
     // leave an orphan ciphertext file.
     let manifest = crypt_manifest(input_len, meta)?;
@@ -4767,12 +5319,9 @@ fn crypt_run(args: CryptArgs) -> Result<String, String> {
         return Err(format!("cannot rename '{tmp}' to '{out}': {e}"));
     }
     crypt_sync_parent(out);
-    // Two files cannot be committed atomically: if the sidecar write fails the
-    // fresh image is removed so no orphan ciphertext is left behind.
-    if let Err(e) = crypt_write_atomic(&out_sidecar, &manifest) {
-        let _ = std::fs::remove_file(out);
-        return Err(format!("{e}; removed the newly written '{out}'"));
-    }
+    // The image goes first; a failed sidecar write removes it again, so an
+    // orphan ciphertext is never left behind.
+    crypt_commit_sidecar(out, &out_sidecar, &manifest)?;
     Ok(format!(
         "{} {} -> {} ({encrypted} bytes, {alg_name})",
         crypt_verb(alg),
@@ -4834,27 +5383,28 @@ fn crypt_decrypt(args: &CryptArgs) -> Result<String, String> {
     }
     let Some(meta) = parsed.cipher else {
         return Err(format!(
-            "manifest '{sidecar}' does not describe a cipher; refusing to write plaintext"
+            "NotEncrypted: manifest '{sidecar}' does not describe a cipher; nothing to decrypt"
         ));
     };
     if !parsed.has_crc {
-        log::warn!("crypt: manifest '{sidecar}' has no crc line; cipher parameters are unchecked");
+        log::debug!("crypt: manifest '{sidecar}' has no crc line; it detects damage only");
     }
-    if !args.force {
-        if Path::new(out).exists() {
-            return Err(format!(
-                "'{out}' already exists (use --force to replace it)"
-            ));
-        }
-        if Path::new(&out_sidecar).exists() {
-            return Err(format!(
-                "'{out_sidecar}' already exists (use --force to replace it)"
-            ));
-        }
+    // A plaintext output must not sit next to another image's keyslot: that
+    // sidecar is the only copy of a different VMK.
+    if Path::new(&out_sidecar).exists() {
+        return Err(format!(
+            "'{out_sidecar}' already exists; refusing to overwrite a sidecar (it is the only \
+             copy of that image's key material), even with --force"
+        ));
+    }
+    if Path::new(out).exists() && !args.force {
+        return Err(format!(
+            "'{out}' already exists (use --force to replace it when it has no sidecar)"
+        ));
     }
     // Build the key/cipher before touching the output: an invalid key or
     // manifest must never leave plaintext behind.
-    let cipher = crypt_cipher(&meta, args, false)?;
+    let cipher = crypt_unlock_cipher(&meta, &parsed.kind, args)?;
     let tmp = crypt_tmp(out)?;
     let decrypted = crypt_file(&args.input, &tmp, cipher)?;
     if decrypted != input_len {
@@ -4870,14 +5420,8 @@ fn crypt_decrypt(args: &CryptArgs) -> Result<String, String> {
         return Err(format!("cannot rename '{tmp}' to '{out}': {e}"));
     }
     crypt_sync_parent(out);
-    // A plaintext output must not keep a stale cipher sidecar from an earlier
-    // file at this name. Only --force may reach this point with one present.
-    if args.force && Path::new(&out_sidecar).exists() {
-        std::fs::remove_file(&out_sidecar).map_err(|e| {
-            format!("decrypted '{out}', but cannot remove the stale '{out_sidecar}': {e}")
-        })?;
-        crypt_sync_parent(out);
-    }
+    // `--decrypt` never writes or deletes a sidecar; the encrypted input keeps
+    // its manifest.
     let verb = if meta.cipher == CipherAlg::Xor {
         "deobfuscated"
     } else {
@@ -4976,7 +5520,6 @@ fn run_bundle_info(args: BundleInfoArgs) -> ExitCode {
 }
 
 /// Read at most `limit` bytes, so a sidecar cannot be slurped whole.
-#[cfg(any(feature = "bundle", feature = "cipher"))]
 fn read_capped(path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
@@ -5013,10 +5556,17 @@ fn print_bundle_meta(meta: &BundleMeta) {
     }
     if let Some(cipher) = meta.cipher {
         println!("cipher = {}", cipher_text(cipher.cipher));
-        println!("kdf = {}", kdf_text(cipher.kdf));
-        if let Some(iterations) = cipher.iterations {
+        println!("kdf = {}", kdf_text(cipher.slot.kdf));
+        if let Some(iterations) = cipher.slot.iterations {
             println!("iterations = {iterations}");
         }
+        // Never print the nonce, salt, wrapped key, tag or key-id bytes: they
+        // are key material or a fingerprint of it.
+        println!("keyslot = wrapped");
+        println!("tag = present");
+        println!("key_id = present");
+    } else {
+        println!("cipher = none");
     }
     println!("crc = {}", if meta.has_crc { "present" } else { "absent" });
 }
@@ -5302,6 +5852,8 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_update)]
+
     use super::*;
 
     #[cfg(target_os = "linux")]
@@ -5546,6 +6098,7 @@ mod tests {
 
     /// The CLI's `CdrBundleMedium` is large (fixed track/session tables), so a
     /// debug-build call graph can exceed the default 2 MiB test-thread stack.
+    #[allow(dead_code)]
     fn run_with_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
@@ -5852,52 +6405,51 @@ mod tests {
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn flat_bundle_create_force_allows_leftover_chunks() {
-        let dir = temp_dir("flat_force_chunk");
+    fn flat_bundle_create_refuses_a_legacy_header() {
+        let dir = temp_dir("flat_legacy");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("000000.img"), b"leftover").unwrap();
+        std::fs::write(dir.join("BUNDLE"), b"legacy").unwrap();
         let args = CreateFlatArgs {
             dir: dir.display().to_string(),
             size: "8M".to_string(),
             chunk: None,
             sector: 512,
-            force: true,
             ..CreateFlatArgs::default()
         };
-        assert_eq!(create_flat_bundle(args), ExitCode::SUCCESS);
-        assert_eq!(
-            std::fs::read(dir.join("000000.img")).unwrap(),
-            b"leftover",
-            "--force rewrites only the manifest, not the chunk data"
-        );
-        assert!(dir.join("SNOWBUNDLE").is_file());
+        assert_eq!(create_flat_bundle(args), ExitCode::FAILURE);
+        assert!(!dir.join("SNOWBUNDLE").exists());
+        assert_eq!(std::fs::read(dir.join("BUNDLE")).unwrap(), b"legacy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "bundle")]
     #[test]
-    fn flat_bundle_create_force_overwrites_the_manifest() {
-        let dir = temp_dir("flat_force_manifest");
-        let first = CreateFlatArgs {
-            dir: dir.display().to_string(),
-            size: "8M".to_string(),
-            chunk: None,
-            sector: 512,
-            ..CreateFlatArgs::default()
-        };
-        assert_eq!(create_flat_bundle(first), ExitCode::SUCCESS);
-        let again = CreateFlatArgs {
-            dir: dir.display().to_string(),
-            size: "16M".to_string(),
-            chunk: None,
-            sector: 512,
-            force: true,
-            ..CreateFlatArgs::default()
-        };
-        assert_eq!(create_flat_bundle(again), ExitCode::SUCCESS);
-        let manifest = std::fs::read_to_string(dir.join("SNOWBUNDLE")).unwrap();
-        assert!(manifest.contains("virtual_size = 16777216"), "{manifest}");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn bundle_create_force_flag_is_gone() {
+        for args in [
+            vec![
+                "snowscsi",
+                "bundle-create",
+                "flat",
+                "--dir",
+                "/tmp/disc",
+                "--size",
+                "8M",
+                "--force",
+            ],
+            vec![
+                "snowscsi",
+                "bundle-create",
+                "cdr",
+                "--dir",
+                "/tmp/cdr",
+                "--force",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "bundle-create must no longer accept --force"
+            );
+        }
     }
 
     #[cfg(feature = "bundle")]
@@ -6045,8 +6597,8 @@ mod tests {
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
-    fn cdr_bundle_create_force_rewrites_manifest_and_toc() {
-        let dir = temp_dir("cdr_force");
+    fn cdr_bundle_create_refuses_an_existing_manifest_and_toc() {
+        let dir = temp_dir("cdr_existing");
         let first = CreateCdrArgs {
             dir: dir.display().to_string(),
             medium: Some("cdr74".to_string()),
@@ -6054,26 +6606,27 @@ mod tests {
             ..CreateCdrArgs::default()
         };
         assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
-        let toc_before = std::fs::read(dir.join("toc.0")).ok();
+        let manifest_before = std::fs::read(dir.join("SNOWBUNDLE")).unwrap();
+        let toc_before = std::fs::read(dir.join("toc.0")).unwrap();
         let again = CreateCdrArgs {
             dir: dir.display().to_string(),
             medium: Some("cdr90".to_string()),
             slot: None,
-            force: true,
             ..CreateCdrArgs::default()
         };
-        assert_eq!(create_cdr_bundle(again), ExitCode::SUCCESS);
-        // The old `toc.1` never survives as the newest slot.
-        assert!(!dir.join("toc.1").exists());
-        let toc_after = std::fs::read(dir.join("toc.0")).expect("initial TOC");
-        assert_ne!(toc_before.as_deref(), Some(toc_after.as_slice()));
+        assert_eq!(create_cdr_bundle(again), ExitCode::FAILURE);
+        assert_eq!(
+            std::fs::read(dir.join("SNOWBUNDLE")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(std::fs::read(dir.join("toc.0")).unwrap(), toc_before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "cdr-bundle")]
     #[test]
-    fn cdr_bundle_create_force_still_refuses_leftover_tracks() {
-        let dir = temp_dir("cdr_force_track");
+    fn cdr_bundle_create_refuses_recorded_tracks_without_destroying_them() {
+        let dir = temp_dir("cdr_recorded_refusal");
         let first = CreateCdrArgs {
             dir: dir.display().to_string(),
             medium: None,
@@ -6082,11 +6635,11 @@ mod tests {
         };
         assert_eq!(create_cdr_bundle(first), ExitCode::SUCCESS);
         std::fs::write(dir.join("track_1.bin"), b"recorded").unwrap();
+        let manifest_before = std::fs::read(dir.join("SNOWBUNDLE")).unwrap();
         let again = CreateCdrArgs {
             dir: dir.display().to_string(),
             medium: None,
             slot: None,
-            force: true,
             ..CreateCdrArgs::default()
         };
         assert_eq!(create_cdr_bundle(again), ExitCode::FAILURE);
@@ -6094,6 +6647,10 @@ mod tests {
             std::fs::read(dir.join("track_1.bin")).unwrap(),
             b"recorded",
             "recorded data must survive the refusal"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("SNOWBUNDLE")).unwrap(),
+            manifest_before
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6703,26 +7260,57 @@ mod tests {
         path
     }
 
+    /// A keyslot-free cipher block, enough for `CliCipher::from_meta` tests
+    /// that only exercise the stream cipher.
     #[cfg(feature = "cipher")]
     fn cipher_meta(
         alg: snowscsi::common::bundle::CipherAlg,
     ) -> snowscsi::common::bundle::CipherMeta {
         snowscsi::common::bundle::CipherMeta {
             cipher: alg,
-            kdf: snowscsi::common::bundle::KdfKind::None,
-            iterations: None,
-            salt: None,
             nonce: [0x5Au8; 8],
+            key_id: [0u8; 8],
+            slot: snowscsi::common::bundle::KeySlot {
+                kdf: snowscsi::common::bundle::KdfKind::None,
+                iterations: None,
+                salt: [0u8; 16],
+                wrap_nonce: [0u8; 8],
+                wrapped_key: [0u8; 32],
+                tag: [0u8; 16],
+            },
         }
     }
 
+    /// Build a real `kdf = none` keyslot for `key_bytes` and `kind`.
     #[cfg(feature = "cipher")]
-    fn write_image_manifest(path: &Path, cipher: snowscsi::common::bundle::CipherMeta) {
+    fn none_keyslot(
+        alg: snowscsi::common::bundle::CipherAlg,
+        kind: BundleKind,
+        key_bytes: [u8; 32],
+    ) -> snowscsi::common::bundle::CipherMeta {
+        let credential = cipher::Credential::Key(
+            snowscsi::common::cipher::CipherKey::from_bytes(&key_bytes).unwrap(),
+        );
+        let (meta, _vmk) = cipher::new_keyslot(
+            alg,
+            [0x5Au8; 8],
+            snowscsi::common::bundle::KdfKind::None,
+            None,
+            &credential,
+            &kind,
+        )
+        .unwrap();
+        meta
+    }
+
+    #[cfg(feature = "cipher")]
+    fn write_image_manifest(path: &Path, alg: snowscsi::common::bundle::CipherAlg) {
+        let kind = BundleKind::Image {
+            size: std::fs::metadata(path).unwrap().len(),
+        };
         let meta = BundleMeta {
-            kind: BundleKind::Image {
-                size: std::fs::metadata(path).unwrap().len(),
-            },
-            cipher: Some(cipher),
+            kind,
+            cipher: Some(none_keyslot(alg, kind, [0x11u8; 32])),
             has_crc: false,
         };
         std::fs::write(
@@ -6741,10 +7329,7 @@ mod tests {
         std::fs::create_dir_all(&image).unwrap();
         let image = image.join("disk.img");
         std::fs::write(&image, vec![0u8; 4096]).unwrap();
-        write_image_manifest(
-            &image,
-            cipher_meta(snowscsi::common::bundle::CipherAlg::ChaCha20),
-        );
+        write_image_manifest(&image, snowscsi::common::bundle::CipherAlg::ChaCha20);
         let key = cipher_key_file("image");
         let key_arg = key.display().to_string();
         let specs = spec::parse_all(
@@ -6799,6 +7384,7 @@ mod tests {
             medium: None,
             slot: None,
             cipher: Some("chacha12".to_string()),
+            iterations: Some(1_000),
             password_file: Some(password.display().to_string()),
             ..CreateCdrArgs::default()
         });
@@ -6953,16 +7539,32 @@ mod tests {
     #[cfg(all(feature = "cipher", feature = "bundle"))]
     #[test]
     fn cipher_override_must_match_the_identified_bundle() {
+        use snowscsi::common::bundle::KdfKind;
+        use snowscsi::common::cipher::keyslot::{derive_kek, wrap_slot};
+        use snowscsi::common::cipher::CipherKey;
+
         let dir = temp_dir("cipher_override");
         std::fs::create_dir_all(&dir).unwrap();
         let key = cipher_key_file("override");
+        let key_bytes = [0x11u8; 32];
+        let credential = cipher::Credential::Key(CipherKey::from_bytes(&key_bytes).unwrap());
+        let kind = BundleKind::Flat {
+            virtual_size: 8 << 20,
+            chunk_size: 1 << 20,
+            sector_size: 512,
+        };
+        let (identified_cipher, vmk) = cipher::new_keyslot(
+            snowscsi::common::bundle::CipherAlg::Xor,
+            [0x5Au8; 8],
+            KdfKind::None,
+            None,
+            &credential,
+            &kind,
+        )
+        .unwrap();
         let identified = BundleMeta {
-            kind: BundleKind::Flat {
-                virtual_size: 8 << 20,
-                chunk_size: 1 << 20,
-                sector_size: 512,
-            },
-            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            kind,
+            cipher: Some(identified_cipher),
             has_crc: false,
         };
         let spec_for = |explicit: &Path| {
@@ -6988,6 +7590,23 @@ mod tests {
         let matching = write("matching", &identified);
         assert!(bundle_cipher(&spec_for(&matching), None, &identified, "identified").is_ok());
 
+        // A rekeyed copy (same identity, fresh salt/wrap nonce/tag) is
+        // accepted: the override owns the keyslot.
+        let mut rekeyed_cipher = identified_cipher;
+        rekeyed_cipher.slot.salt = [0xA1u8; 16];
+        rekeyed_cipher.slot.wrap_nonce = [0xB2u8; 8];
+        let kek = derive_kek(&rekeyed_cipher.slot, None, credential.key()).unwrap();
+        wrap_slot(&kind, &mut rekeyed_cipher, &kek, &vmk).unwrap();
+        let rekeyed = BundleMeta {
+            cipher: Some(rekeyed_cipher),
+            ..identified
+        };
+        let rekeyed_path = write("rekeyed", &rekeyed);
+        assert!(
+            bundle_cipher(&spec_for(&rekeyed_path), None, &identified, "identified").is_ok(),
+            "a different keyslot wrapping the same VMK must be accepted"
+        );
+
         // Geometry is part of the kind: a different flat size is refused.
         let mut geometry = identified;
         if let BundleKind::Flat { virtual_size, .. } = &mut geometry.kind {
@@ -6997,12 +7616,12 @@ mod tests {
         assert!(bundle_cipher(&spec_for(&geometry_path), None, &identified, "identified").is_err());
 
         // A different kind (cdr instead of flat) is refused.
-        let kind = BundleMeta {
+        let other_kind = BundleMeta {
             kind: BundleKind::Cdr,
             cipher: identified.cipher,
             has_crc: false,
         };
-        let kind_path = write("kind", &kind);
+        let kind_path = write("kind", &other_kind);
         assert!(bundle_cipher(&spec_for(&kind_path), None, &identified, "identified").is_err());
 
         // A different nonce repeats a keystream on the same resources.
@@ -7013,14 +7632,42 @@ mod tests {
         let nonce_path = write("nonce", &nonce);
         assert!(bundle_cipher(&spec_for(&nonce_path), None, &identified, "identified").is_err());
 
-        // The identified manifest is authoritative: a cipher-less one cannot
-        // be rescued by an explicit cipher-bearing override.
+        // A different key id wraps a different VMK.
+        let mut key_id = identified;
+        if let Some(cipher) = key_id.cipher.as_mut() {
+            cipher.key_id[0] ^= 0x01;
+        }
+        let key_id_path = write("key_id", &key_id);
+        assert!(bundle_cipher(&spec_for(&key_id_path), None, &identified, "identified").is_err());
+
+        // The identified manifest is authoritative: a cipher-less override
+        // cannot rescue an encrypted one.
         let plain = BundleMeta {
+            kind,
             cipher: None,
-            ..identified
+            has_crc: false,
         };
-        let plain_path = write("plain", &identified);
-        assert!(bundle_cipher(&spec_for(&plain_path), None, &plain, "identified").is_err());
+        let plain_path = write("plain", &plain);
+        assert!(bundle_cipher(&spec_for(&plain_path), None, &identified, "identified").is_err());
+
+        // An encrypted manifest without `,cipher` is never served plaintext.
+        let no_cipher = spec::parse_all(&[format!("bundle={}", dir.display())], &[])
+            .unwrap()
+            .remove(0);
+        assert!(bundle_cipher(&no_cipher, None, &identified, "identified").is_err());
+
+        // A plaintext manifest with `,cipher` is refused too.
+        let encrypted_spec = spec::parse_all(
+            &[format!(
+                "bundle={},cipher,key={}",
+                dir.display(),
+                key.display()
+            )],
+            &[],
+        )
+        .unwrap()
+        .remove(0);
+        assert!(bundle_cipher(&encrypted_spec, None, &plain, "identified").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&key);
@@ -7058,9 +7705,14 @@ mod tests {
             ..CreateCdrArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
+        let kind = BundleKind::Cdr;
         let meta = BundleMeta {
-            kind: BundleKind::Cdr,
-            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            kind,
+            cipher: Some(none_keyslot(
+                snowscsi::common::bundle::CipherAlg::Xor,
+                kind,
+                [0x11u8; 32],
+            )),
             has_crc: false,
         };
         std::fs::write(dir.join(MANIFEST_NAME), meta.encode().unwrap()).unwrap();
@@ -7169,13 +7821,18 @@ mod tests {
             ..CreateFlatArgs::default()
         });
         assert_eq!(created, ExitCode::SUCCESS);
+        let kind = BundleKind::Flat {
+            virtual_size: 8 << 20,
+            chunk_size: 1 << 20,
+            sector_size: 2048,
+        };
         let meta = BundleMeta {
-            kind: BundleKind::Flat {
-                virtual_size: 8 << 20,
-                chunk_size: 1 << 20,
-                sector_size: 2048,
-            },
-            cipher: Some(cipher_meta(snowscsi::common::bundle::CipherAlg::Xor)),
+            kind,
+            cipher: Some(none_keyslot(
+                snowscsi::common::bundle::CipherAlg::Xor,
+                kind,
+                [0x11u8; 32],
+            )),
             has_crc: false,
         };
         std::fs::write(dir.join(MANIFEST_NAME), meta.encode().unwrap()).unwrap();
@@ -7272,10 +7929,7 @@ mod tests {
         assert!(build_planes(&specs, None).is_err());
 
         // A wrong-length key file is an error, not a truncated key.
-        write_image_manifest(
-            &image,
-            cipher_meta(snowscsi::common::bundle::CipherAlg::Xor),
-        );
+        write_image_manifest(&image, snowscsi::common::bundle::CipherAlg::Xor);
         std::fs::write(&key, [0u8; 31]).unwrap();
         assert!(build_planes(&specs, None).is_err());
 
@@ -7295,6 +7949,163 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn prepare_cipher_requires_matching_encryption_state() {
+        let dir = temp_dir("cipher_state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("disk.img");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let key = cipher_key_file("state");
+        write_image_manifest(&image, snowscsi::common::bundle::CipherAlg::ChaCha20);
+
+        // Encrypted manifest without `,cipher` is a hard error.
+        let plain_spec = spec::parse_all(&[format!("img={}", image.display())], &[])
+            .unwrap()
+            .remove(0);
+        assert!(prepare_cipher(&plain_spec, None).is_err());
+
+        // With `,cipher` and the key file it unlocks.
+        let encrypted_spec = spec::parse_all(
+            &[format!(
+                "img={},cipher,key={}",
+                image.display(),
+                key.display()
+            )],
+            &[],
+        )
+        .unwrap()
+        .remove(0);
+        assert!(prepare_cipher(&encrypted_spec, None).is_ok());
+
+        // A plaintext manifest with `,cipher` is refused, not served plaintext.
+        let plain = BundleMeta {
+            kind: BundleKind::Image { size: 4096 },
+            cipher: None,
+            has_crc: true,
+        };
+        std::fs::write(
+            format!("{}{SIDECAR_SUFFIX}", image.display()),
+            plain.encode().unwrap(),
+        )
+        .unwrap();
+        assert!(prepare_cipher(&encrypted_spec, None).is_err());
+
+        // A plaintext manifest without `,cipher` serves plaintext.
+        assert!(prepare_cipher(&plain_spec, None).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[cfg(all(feature = "cipher", feature = "bundle"))]
+    #[test]
+    fn wrong_password_fails_before_creating_flat_chunks() {
+        let root = temp_dir("cipher_wrong_flat");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("bundle");
+        let password = root.join("pw");
+        std::fs::write(&password, b"hunter2\n").unwrap();
+        let created = create_flat_bundle(CreateFlatArgs {
+            dir: bundle.display().to_string(),
+            size: "8M".to_string(),
+            chunk: Some("1M".to_string()),
+            sector: 512,
+            cipher: Some("chacha12".to_string()),
+            iterations: Some(1_000),
+            password_file: Some(password.display().to_string()),
+            ..CreateFlatArgs::default()
+        });
+        assert_eq!(created, ExitCode::SUCCESS);
+        assert!(!bundle.join("000000.img").exists());
+
+        let specs = spec::parse_all(&[format!("bundle={},cipher", bundle.display())], &[]).unwrap();
+        assert!(
+            open_plane_for(&specs[0], Some(b"wrong password")).is_err(),
+            "a wrong password must fail before the flat store opens any chunk"
+        );
+        assert!(
+            !bundle.join("000000.img").exists(),
+            "a failed unlock must not create chunk files"
+        );
+        assert!(open_plane_for(&specs[0], Some(b"hunter2")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn failed_sidecar_write_removes_the_new_image() {
+        let dir = temp_dir("cipher_sidecar_fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.img");
+        std::fs::write(&out, b"ciphertext").unwrap();
+        let sidecar = dir.join(format!("out.img{SIDECAR_SUFFIX}"));
+        // A directory at the sidecar path makes the final rename fail after
+        // the temp was written.
+        std::fs::create_dir_all(&sidecar).unwrap();
+
+        let err = crypt_commit_sidecar(
+            &out.display().to_string(),
+            &sidecar.display().to_string(),
+            b"manifest",
+        )
+        .unwrap_err();
+        assert!(err.contains("removed the newly written"), "{err}");
+        assert!(!out.exists(), "the orphan ciphertext must be removed");
+        assert!(sidecar.is_dir(), "the pre-existing path is not replaced");
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp.")),
+            "no temporary file is left behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "cipher")]
+    #[test]
+    fn cipher_manifest_bound_is_768() {
+        assert_eq!(MAX_MANIFEST, 768);
+        let kind = BundleKind::Flat {
+            virtual_size: u64::MAX,
+            chunk_size: u64::MAX,
+            sector_size: 2048,
+        };
+        // The longest legal block: PBKDF2, maximum iterations and every
+        // field at its widest. No derivation is needed to test the bound.
+        let cipher_meta = CipherMeta {
+            cipher: CipherAlg::ChaCha12,
+            nonce: [0xFFu8; 8],
+            key_id: [0xFFu8; 8],
+            slot: snowscsi::common::bundle::KeySlot {
+                kdf: KdfKind::Pbkdf2HmacSha256,
+                iterations: Some(2_000_000),
+                salt: [0xFFu8; 16],
+                wrap_nonce: [0xFFu8; 8],
+                wrapped_key: [0xFFu8; 32],
+                tag: [0xFFu8; 16],
+            },
+        };
+        let meta = BundleMeta {
+            kind,
+            cipher: Some(cipher_meta),
+            has_crc: false,
+        };
+        let encoded = meta.encode().unwrap();
+        assert!(encoded.len() <= MAX_MANIFEST);
+        assert!(BundleMeta::parse(&encoded).is_ok());
+
+        let mut too_large = vec![b' '; MAX_MANIFEST];
+        too_large.push(b'\n');
+        assert_eq!(
+            BundleMeta::parse(&too_large),
+            Err(snowscsi::common::bundle::ManifestError::TooLarge)
+        );
     }
 
     #[cfg(feature = "cipher")]
