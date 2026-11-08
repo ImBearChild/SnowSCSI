@@ -137,7 +137,7 @@ snowscsi = { version = "0.2", default-features = false, features = ["std", "scsi
 snowscsi = { version = "0.2", default-features = false, features = ["std", "cdrom", "livefs"] }
 
 # Full feature set (`log` / `defmt` select the logging backend instead)
-snowscsi = { version = "0.2", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle"] }
+snowscsi = { version = "0.2", features = ["std", "scsi", "iscsi", "usb", "cdrom", "livefs", "dvdram", "bundle", "cdr-bundle", "async-io"] }
 ```
 
 A minimal embedded block device needs a backend and a work buffer:
@@ -170,6 +170,7 @@ Both transports drive any `impl ScsiDevice` through
 - [x] Writable DVD-RAM (`--cdrom dvdram=`, feature `dvdram`): a blank random-writable medium that the *host* formats (FORMAT UNIT + its own UDF `mkfs`)
 - [x] Flat directory-chunked bundles (`snowscsi bundle-create flat`, served with `--block bundle=<dir>` / `--cdrom bundle=<dir>`): a canonical `SNOWBUNDLE` manifest, on-demand chunk files, optional read-only media, and `snowscsi bundle-info` to inspect a directory or image sidecar. `serve` never creates the directory or manifest (chunk files appear on the first host write), and `--cdrom` always opens a flat bundle read-only. Bundle directories are canonicalized, so aliases count as one writer.
 - [x] Persistent CD-R/CD-RW bundle (`snowscsi bundle-create cdr`, served with `--cdrom bundle=<dir>`, feature `cdr-bundle`): a sequential write-once or erasable disc for Track-at-Once burning (`wodim`/`cdrecord`), with CD-RW BLANK (`blank=fast`/`blank=all`), multi-session append, CD-DA audio (data/audio/mixed-mode tracks), the TOC surviving restarts, `-dummy` (Test Write) simulation, ATIP/disc information, and TOC snapshotting on eject. `bundle-create cdr` writes the manifest and initial TOC; `serve` never creates either, but does create track files and write TOC snapshots while serving. The TAO path is exercised by an in-process cdrkit trace plus the external burn/mount/blank/eject test and the manual `wodim` recipe in `HACKING.md`. See the [CD-R/CD-RW storage resource contract](HACKING.md#cd-rcd-rw-storage-resource-contract) for the directory layout and durability rules.
+- [x] Async bundle storage (`async-io`): `AsyncFsStorage`/`AsyncFsPlane`, `AsyncFlatBundle` (same chunk/manifest format, on-demand chunk handles, explicit `shutdown`) and `AsyncCdrStore`/`AsyncCipherCdrStore` for recordable bundles
 - [x] Embedded reference firmware (`examples/esp32s3-pocket-dongle`)
 
 ## Project structure
@@ -177,7 +178,7 @@ Both transports drive any `impl ScsiDevice` through
 ```
 SnowSCSI/                          # cargo workspace (resolver = "2")
 ├── Cargo.toml                      # workspace members
-├── snowscsi-common/                # storage seams + logging macros (always no_std)
+├── snowscsi-common/                # sync/async storage seams + logging macros (always no_std)
 ├── snowscsi-iso9660/               # ISO9660/Joliet live-generation algorithms
 ├── snowscsi/                       # SCSI core + iSCSI + USB MSC + CD-ROM + DVD-RAM
 │   └── src/{scsi, cdrom, iscsi, usb}

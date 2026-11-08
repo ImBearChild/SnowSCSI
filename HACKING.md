@@ -26,7 +26,9 @@ SnowSCSI/                          # cargo workspace (resolver = "2")
 ├── Cargo.toml                      # workspace: members listed below
 ├── snowscsi-common/               # crate: storage seams + logging macros
 │   ├── Cargo.toml
-│   └── src/{lib.rs, seekable_storage.rs, fs_storage.rs, logging.rs}
+│   └── src/{lib.rs, seekable_storage.rs, fs_storage.rs, flat_bundle.rs,
+│            async_seekable_storage.rs, async_fs_storage.rs,
+│            async_flat_bundle.rs, async_fs_plane.rs, logging.rs}
 ├── snowscsi-iso9660/                 # crate: ISO9660/Joliet live-generation algorithms
 │   ├── Cargo.toml
 │   └── src/{lib.rs, mod.rs, live.rs}
@@ -71,9 +73,12 @@ Feature maps:
   `async-io`, `cipher`, `cipher-kdf`. The core seams are always compiled (no
   feature gate). `bundle` enables the `FlatBundle` manifest/chunk I/O (the
   canonical `SNOWBUNDLE` parser itself is always available). `async-io` adds
-  the asynchronous storage seams (`async fn` in trait, no runtime). `cipher`
-  adds the offset-addressed, length-preserving stream-cipher plane decorators
-  (`cipher::CipherPlane` / `AsyncCipherPlane` over
+  the asynchronous storage seams (`async fn` in trait, no runtime), the
+  asynchronous filesystem seams (`AsyncFsStorage` / `AsyncFsPlane`) and
+  `AsyncFlatBundle`, the directory-chunked twin of `FlatBundle`; its chunk
+  handles open on demand and are closed by an explicit `shutdown`, not by
+  `Drop`. `cipher` adds the offset-addressed, length-preserving stream-cipher
+  plane decorators (`cipher::CipherPlane` / `AsyncCipherPlane` over
   `FlatData`/`WritableFlatData`) and its ciphers; the feature is empty (no
   runtime dependency) and the ciphers are allocation-free and `no_std`.
   `cipher-kdf` (→`cipher`) adds the password-to-key derivation seam
@@ -89,7 +94,8 @@ Feature maps:
   medium with TAO data/CD-DA audio, multi-session append, BLANK and an
   alternating persistent TOC), `cipher` (→`snowscsi-common/cipher`),
   `cipher-kdf` (→`cipher` + `snowscsi-common/cipher-kdf`), `async-io` (→`usb` +
-  `snowscsi-common/async-io`), `embassy`
+  `snowscsi-common/async-io`; adds `AsyncFlatBundle` and, with
+  `cdr-bundle`, `AsyncCdrStore`/`AsyncCipherCdrStore`), `embassy`
   (→`async-io` plus the embassy-usb/embassy-time adapters), `log`, `defmt`.
   `defmt` forwards to `embedded-io/defmt` and
   `snowscsi-common/defmt` (no `snowscsi-iso9660` propagation: that crate has
@@ -153,6 +159,24 @@ sidecar path itself) to `bundle-info`; a regular file without a sidecar prints
 `not a bundle` and exits 2. For `kind = cdr`, `bundle-info` also reports the
 newest valid TOC slot's capacity, sessions, tracks and profile (a header with a
 corrupt body simply reports `toc = missing`).
+
+### Asynchronous bundle storage
+
+With the `async-io` feature, `snowscsi-common` provides `AsyncFsStorage`
+(offset-addressed files; async `open`/`close`/`sync`) and
+`AsyncFlatBundle`, which mirrors `FlatBundle`'s chunk naming, hole semantics
+and eight-handle LRU over that seam. Chunk handles are opened on demand; the
+type has no destructor, so call `AsyncFlatBundle::shutdown` (or at least
+`sync` for writable media) before dropping it. `AsyncFsPlane` is the
+path-addressed mirror of `FsPlane` and `AsyncFsPlaneAdapter` implements it over
+`AsyncFsStorage`.
+
+For a recordable bundle, `mmc::cdr_bundle::AsyncCdrStore` routes the same
+resource ids as the synchronous store and needs a caller-supplied reusable TOC
+slot buffer for `open_medium` (no allocation). `AsyncCipherCdrStore` (feature
+`cipher`) encrypts track resources with the same per-resource nonce domain as
+`CipherStore`; TOC slots stay plaintext. Both stores expose an explicit
+`shutdown` because async close cannot run from `Drop`.
 
 ### `SNOWBUNDLE` manifest fields
 
