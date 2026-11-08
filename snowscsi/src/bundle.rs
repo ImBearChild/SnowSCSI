@@ -55,6 +55,62 @@ pub struct TocSummary {
     pub profile: u16,
 }
 
+#[cfg(feature = "cdr-bundle")]
+impl TocSummary {
+    /// Validate one full TOC slot read from physical position `slot` and
+    /// summarize it.
+    ///
+    /// The 256-byte header is parsed first; its declared `slot_size` bounds the
+    /// document that [`CdrBundleMedium::open_at`] then validates. A slot that
+    /// was copied from the other position, a short or oversized document, or a
+    /// body that fails its length/checksum check is rejected.
+    pub fn parse_slot(
+        slot: u8,
+        bytes: &[u8],
+    ) -> Result<TocSummary, crate::mmc::cdr_bundle::TocError> {
+        use crate::mmc::cdr_bundle::{
+            CdrBundleMedium, Recovery, TocError, TocHeader, TOC_SLOT_MAX,
+        };
+        use crate::mmc::MmcMedium as _;
+
+        let header = TocHeader::parse(bytes)?;
+        if header.slot != slot {
+            return Err(TocError::Invalid);
+        }
+        let total = header.slot_size as usize;
+        if header.slot_size > TOC_SLOT_MAX || bytes.len() < total {
+            return Err(TocError::Invalid);
+        }
+        let medium = CdrBundleMedium::open_at(slot, &bytes[..total], 0, Recovery::ReadOnly)?;
+        let attrs = medium.attrs();
+        Ok(TocSummary {
+            seq: header.seq,
+            slot_size: header.slot_size,
+            max_tracks: header.max_tracks,
+            capacity_sectors: attrs.sectors,
+            sessions: attrs.sessions,
+            tracks: attrs.tracks,
+            profile: attrs.profile,
+        })
+    }
+
+    /// Summarize the newest valid slot among the two raw slot images.
+    ///
+    /// Each slot is parsed independently; a missing or damaged slot is
+    /// ignored. Selection follows the TOC policy: the higher `seq` wins, and
+    /// an equal `seq` selects the higher slot index. `None` is returned only
+    /// when neither slot is usable.
+    pub fn newest(toc0: Option<&[u8]>, toc1: Option<&[u8]>) -> Option<TocSummary> {
+        let first = toc0.and_then(|bytes| Self::parse_slot(0, bytes).ok());
+        let second = toc1.and_then(|bytes| Self::parse_slot(1, bytes).ok());
+        match (first, second) {
+            (Some(a), Some(b)) => Some(if newer(&b, 1, &a, 0) { b } else { a }),
+            (Some(summary), None) | (None, Some(summary)) => Some(summary),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Result of classifying a bundle directory or sidecar manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identified {
@@ -152,6 +208,33 @@ pub fn identify_manifest(bytes: &[u8]) -> Result<Identified, IdentifyError> {
     Ok(classify(meta, None))
 }
 
+/// Classify already-read manifest bytes together with the two raw TOC slot
+/// images (`toc.0`/`toc.1`).
+///
+/// A `kind = cdr` manifest reports the newest valid slot; a non-CDR kind
+/// ignores the TOC bytes. Without `cdr-bundle`, no slot is parsed and
+/// [`Identified::Cdr`] carries `toc: None`.
+#[cfg(feature = "bundle")]
+pub fn identify_manifest_with_toc(
+    manifest: &[u8],
+    toc0: Option<&[u8]>,
+    toc1: Option<&[u8]>,
+) -> Result<Identified, IdentifyError> {
+    let meta = BundleMeta::parse(manifest)?;
+    if meta.kind == BundleKind::Cdr {
+        #[cfg(feature = "cdr-bundle")]
+        let toc = TocSummary::newest(toc0, toc1);
+        #[cfg(not(feature = "cdr-bundle"))]
+        let toc = {
+            let _ = (toc0, toc1);
+            None
+        };
+        Ok(Identified::Cdr { meta, toc })
+    } else {
+        Ok(classify(meta, None))
+    }
+}
+
 /// Map a parsed manifest to its [`Identified`] variant.
 #[cfg(feature = "bundle")]
 fn classify(meta: BundleMeta, toc: Option<TocSummary>) -> Identified {
@@ -208,48 +291,45 @@ fn probe_names<F: FsStorage>(fs: &mut F) -> heapless::Vec<&'static str, 8> {
     found
 }
 
+/// Bounded buffer size for one raw TOC slot.
+#[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
+const TOC_SLOT_BYTES: usize = crate::mmc::cdr_bundle::TOC_SLOT_MAX as usize;
+
 /// Read both TOC slots and keep the newest valid summary.
 #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
 fn probe_toc<F: FsStorage>(fs: &mut F) -> Result<Option<TocSummary>, IdentifyError> {
-    let first = read_toc_summary(fs, 0);
-    let second = read_toc_summary(fs, 1);
-    Ok(match (first, second) {
-        // Same policy as `TocHeader::newer_than`: higher `seq`, then the
-        // higher slot index.
-        (Ok(Some(a)), Ok(Some(b))) => Some(if newer(&b, 1, &a, 0) { b } else { a }),
-        (Ok(Some(summary)), Ok(None)) | (Ok(None), Ok(Some(summary))) => Some(summary),
-        (Ok(None), Ok(None)) => None,
+    let first = read_toc_slot(fs, 0);
+    let second = read_toc_slot(fs, 1);
+    match (first, second) {
+        (Ok(first), Ok(second)) => Ok(TocSummary::newest(first.as_deref(), second.as_deref())),
         // A read error on one slot must not hide a usable other slot.
-        (Ok(summary), Err(_)) => summary,
-        (Err(_), Ok(summary)) => summary,
-        (Err(error), Err(_)) => return Err(error),
-    })
+        (Ok(first), Err(_)) => Ok(TocSummary::newest(first.as_deref(), None)),
+        (Err(_), Ok(second)) => Ok(TocSummary::newest(None, second.as_deref())),
+        (Err(error), Err(_)) => Err(error),
+    }
 }
 
 /// `true` when `(a, a_slot)` is newer than `(b, b_slot)`.
-#[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
+#[cfg(feature = "cdr-bundle")]
 fn newer(a: &TocSummary, a_slot: u8, b: &TocSummary, b_slot: u8) -> bool {
     a.seq > b.seq || (a.seq == b.seq && a_slot > b_slot)
 }
 
-/// Read one full TOC slot and summarize it.
+/// Read one full TOC slot into a bounded buffer.
 ///
 /// The 256-byte header is parsed first to learn `slot_size`; the rest of the
-/// slot is then read (capped at [`crate::mmc::cdr_bundle::TOC_SLOT_MAX`]) and
-/// validated by [`crate::mmc::cdr_bundle::CdrBundleMedium::open_at`]. A
+/// slot is then read (capped at [`crate::mmc::cdr_bundle::TOC_SLOT_MAX`]). A
 /// missing, short, oversized or malformed slot is `None`, never a fatal error:
-/// one damaged slot must not hide the other one.
+/// one damaged slot must not hide the other one. Only a non-`NotFound` open
+/// failure is an error.
 #[cfg(all(feature = "bundle", feature = "cdr-bundle"))]
-fn read_toc_summary<F: FsStorage>(
+fn read_toc_slot<F: FsStorage>(
     fs: &mut F,
     slot: u8,
-) -> Result<Option<TocSummary>, IdentifyError> {
-    use crate::mmc::cdr_bundle::{
-        toc_file, CdrBundleMedium, Recovery, TocHeader, TOC_HEADER_LEN, TOC_SLOT_MAX,
-    };
-    use crate::mmc::MmcMedium as _;
+) -> Result<Option<heapless::Vec<u8, TOC_SLOT_BYTES>>, IdentifyError> {
+    use crate::mmc::cdr_bundle::{toc_file, TocHeader, TOC_HEADER_LEN};
 
-    const SLOT_MAX: usize = TOC_SLOT_MAX as usize;
+    const SLOT_MAX: usize = TOC_SLOT_BYTES;
 
     let path = toc_file(slot);
     let mut file = match fs.open(path, OpenOptions::read_only()) {
@@ -308,27 +388,14 @@ fn read_toc_summary<F: FsStorage>(
     if failed || got < total {
         return Ok(None);
     }
-    let medium = match CdrBundleMedium::open_at(slot, &bytes, 0, Recovery::ReadOnly) {
-        Ok(medium) => medium,
-        // A valid header with a corrupt body is a damaged slot, not an
-        // identification failure.
-        Err(_) => return Ok(None),
-    };
-    let attrs = medium.attrs();
-    Ok(Some(TocSummary {
-        seq: parsed.seq,
-        slot_size: parsed.slot_size,
-        max_tracks: parsed.max_tracks,
-        capacity_sectors: attrs.sectors,
-        sessions: attrs.sessions,
-        tracks: attrs.tracks,
-        profile: attrs.profile,
-    }))
+    Ok(Some(bytes))
 }
 
 #[cfg(all(test, feature = "bundle", feature = "std"))]
 mod tests {
     use super::*;
+    #[cfg(feature = "cdr-bundle")]
+    use crate::mmc::cdr_bundle::{max_tracks_for_slot, TocError, TOC_HEADER_LEN, TOC_SLOT_DEFAULT};
     use crate::scsi::fs_backend::StdFsBackend;
 
     /// Unique temporary directory, removed on drop.
@@ -527,8 +594,6 @@ mod tests {
     #[cfg(feature = "cdr-bundle")]
     #[test]
     fn cdr_toc_ignores_a_corrupt_body() {
-        use crate::mmc::cdr_bundle::TOC_HEADER_LEN;
-
         let dir = TempDir::new("cdr_corrupt_body");
         let cdr = meta(BundleKind::Cdr);
         dir.write(MANIFEST_NAME, &cdr.encode().unwrap());
@@ -541,6 +606,120 @@ mod tests {
         match identify_dir(&mut backend(&dir)).unwrap() {
             Identified::Cdr { toc, .. } => assert!(toc.is_none()),
             other => panic!("expected a CD-R bundle, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn toc_summary_parses_a_valid_slot() {
+        let slot = toc_slot(0, 5, 1_000);
+        let summary = TocSummary::parse_slot(0, &slot).unwrap();
+        assert_eq!(summary.seq, 5);
+        assert_eq!(summary.slot_size, TOC_SLOT_DEFAULT);
+        assert_eq!(summary.max_tracks, max_tracks_for_slot(TOC_SLOT_DEFAULT));
+        assert_eq!(summary.capacity_sectors, 1_000);
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.tracks, 1);
+        assert_eq!(summary.profile, 0x0009);
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn toc_summary_rejects_a_copied_slot() {
+        // Slot 1 content read from physical position 0 is not usable.
+        let slot = toc_slot(1, 5, 1_000);
+        assert_eq!(
+            TocSummary::parse_slot(0, &slot).unwrap_err(),
+            TocError::Invalid
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn toc_summary_rejects_a_corrupt_body() {
+        let mut slot = toc_slot(0, 5, 1_000);
+        slot[TOC_HEADER_LEN] ^= 0xFF;
+        assert_eq!(
+            TocSummary::parse_slot(0, &slot).unwrap_err(),
+            TocError::Invalid
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn toc_summary_rejects_short_input() {
+        let slot = toc_slot(0, 5, 1_000);
+        assert_eq!(
+            TocSummary::parse_slot(0, &slot[..TOC_HEADER_LEN]).unwrap_err(),
+            TocError::Invalid
+        );
+    }
+
+    #[cfg(feature = "cdr-bundle")]
+    #[test]
+    fn toc_newest_prefers_higher_seq_then_higher_slot() {
+        let a = toc_slot(0, 5, 1_000);
+        let b = toc_slot(1, 7, 2_000);
+        let newest = TocSummary::newest(Some(&a), Some(&b)).unwrap();
+        assert_eq!(newest.seq, 7);
+        assert_eq!(newest.capacity_sectors, 2_000);
+
+        // Equal seq selects the higher slot index.
+        let a = toc_slot(0, 7, 1_000);
+        let b = toc_slot(1, 7, 2_000);
+        assert_eq!(
+            TocSummary::newest(Some(&a), Some(&b))
+                .unwrap()
+                .capacity_sectors,
+            2_000
+        );
+
+        // A higher seq wins even when it lives in the lower slot.
+        let a = toc_slot(0, 9, 1_000);
+        let b = toc_slot(1, 7, 2_000);
+        assert_eq!(TocSummary::newest(Some(&a), Some(&b)).unwrap().seq, 9);
+
+        // A damaged slot is ignored rather than failing the pair.
+        let mut bad = toc_slot(0, 5, 1_000);
+        bad[TOC_HEADER_LEN] ^= 0xFF;
+        assert_eq!(TocSummary::newest(Some(&bad), Some(&b)).unwrap().seq, 7);
+        assert!(TocSummary::newest(Some(&bad), None).is_none());
+        assert!(TocSummary::newest(None, None).is_none());
+    }
+
+    #[test]
+    fn manifest_with_toc_reports_cdr_and_ignores_non_cdr() {
+        let cdr = meta(BundleKind::Cdr);
+        let cdr_bytes = cdr.encode().unwrap();
+        #[cfg(feature = "cdr-bundle")]
+        let (toc0, toc1) = (toc_slot(0, 4, 1_000), toc_slot(1, 8, 2_000));
+        #[cfg(not(feature = "cdr-bundle"))]
+        let (toc0, toc1) = (vec![0u8; 256], vec![0u8; 256]);
+
+        match identify_manifest_with_toc(&cdr_bytes, Some(&toc0), Some(&toc1)).unwrap() {
+            Identified::Cdr { meta, toc } => {
+                assert_eq!(meta.kind, cdr.kind);
+                #[cfg(feature = "cdr-bundle")]
+                {
+                    let toc = toc.expect("newest slot");
+                    assert_eq!(toc.seq, 8);
+                    assert_eq!(toc.capacity_sectors, 2_000);
+                }
+                #[cfg(not(feature = "cdr-bundle"))]
+                assert!(toc.is_none());
+            }
+            other => panic!("expected a CD-R bundle, got {other:?}"),
+        }
+
+        let flat = meta(BundleKind::Flat {
+            virtual_size: 8 << 20,
+            chunk_size: 1 << 20,
+            sector_size: 512,
+        });
+        let flat_bytes = flat.encode().unwrap();
+        match identify_manifest_with_toc(&flat_bytes, Some(&toc0), Some(&toc1)).unwrap() {
+            Identified::Flat { meta } => assert_eq!(meta.kind, flat.kind),
+            other => panic!("expected a flat bundle, got {other:?}"),
         }
     }
 
