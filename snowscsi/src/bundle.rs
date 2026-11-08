@@ -106,11 +106,7 @@ impl TocSummary {
     pub fn newest(toc0: Option<&[u8]>, toc1: Option<&[u8]>) -> Option<TocSummary> {
         let first = toc0.and_then(|bytes| Self::parse_slot(0, bytes).ok());
         let second = toc1.and_then(|bytes| Self::parse_slot(1, bytes).ok());
-        match (first, second) {
-            (Some(a), Some(b)) => Some(if newer(&b, 1, &a, 0) { b } else { a }),
-            (Some(summary), None) | (None, Some(summary)) => Some(summary),
-            (None, None) => None,
-        }
+        select_newest(first, second)
     }
 }
 
@@ -304,13 +300,21 @@ fn probe_toc<F: FsStorage>(fs: &mut F) -> Result<Option<TocSummary>, IdentifyErr
     let first = read_toc_slot(fs, 0);
     let second = read_toc_slot(fs, 1);
     match (first, second) {
-        (Ok(Some(a)), Ok(Some(b))) => Ok(Some(if newer(&b, 1, &a, 0) { b } else { a })),
-        (Ok(Some(summary)), Ok(None)) | (Ok(None), Ok(Some(summary))) => Ok(Some(summary)),
-        (Ok(None), Ok(None)) => Ok(None),
+        (Ok(first), Ok(second)) => Ok(select_newest(first, second)),
         // A read error on one slot must not hide a usable other slot.
-        (Ok(Some(summary)), Err(_)) | (Err(_), Ok(Some(summary))) => Ok(Some(summary)),
-        (Ok(None), Err(_)) | (Err(_), Ok(None)) => Ok(None),
+        (Ok(first), Err(_)) => Ok(select_newest(first, None)),
+        (Err(_), Ok(second)) => Ok(select_newest(None, second)),
         (Err(error), Err(_)) => Err(error),
+    }
+}
+
+/// Select the newer summary from two already-validated slots.
+#[cfg(feature = "cdr-bundle")]
+fn select_newest(first: Option<TocSummary>, second: Option<TocSummary>) -> Option<TocSummary> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(if newer(&b, 1, &a, 0) { b } else { a }),
+        (Some(summary), None) | (None, Some(summary)) => Some(summary),
+        (None, None) => None,
     }
 }
 
