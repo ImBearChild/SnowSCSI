@@ -51,6 +51,11 @@ pub mod toc;
 #[cfg(feature = "async-io")]
 pub mod async_store;
 
+#[cfg(all(feature = "async-io", feature = "cipher"))]
+pub use self::async_store::AsyncCipherCdrStore;
+#[cfg(feature = "async-io")]
+pub use self::async_store::{AsyncCdrStore, CdrStoreError};
+
 pub use self::toc::{
     max_tracks_for_slot, toc_file, toc_resource, track_file, track_resource, Recovery, TocError,
     TocHeader, TOC_HEADER_LEN, TOC_RESOURCE_0, TOC_RESOURCE_1, TOC_SLOT_DEFAULT, TOC_SLOT_MAX,

@@ -32,7 +32,7 @@
 //! directory and never removes files. A stored TOC may reference a track that
 //! was skipped during recovery, so only the application can decide whether a
 //! `track_<n>.bin` is garbage. It may reconcile with
-//! [`Self::read_dir`](AsyncFsPlane::read_dir) (through the plane) and
+//! [`AsyncCdrStore::read_dir`] / [`AsyncCdrStore::remove`] and
 //! [`CdrBundleMedium::track_numbers`].
 //!
 //! # Explicit lifecycle
@@ -44,7 +44,7 @@
 use crate::common::async_fs_plane::AsyncFsPlane;
 #[cfg(feature = "cipher")]
 use crate::common::cipher::NonceCipher;
-use crate::common::fs_storage::FsError;
+use crate::common::fs_storage::{DirEntry, FsError};
 use crate::common::seekable_storage::StorageError;
 use crate::core::storage::{IoBuf, IoReq};
 use crate::core::Direction;
@@ -166,6 +166,32 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
         self.capacity_sectors.saturating_mul(2048)
     }
 
+    /// Borrow the wrapped filesystem plane.
+    pub fn plane(&self) -> &F {
+        &self.fs
+    }
+
+    /// Mutably borrow the wrapped filesystem plane.
+    pub fn plane_mut(&mut self) -> &mut F {
+        &mut self.fs
+    }
+
+    /// Scan a directory through the wrapped plane.
+    ///
+    /// This is the seam an application uses for optional orphan-track
+    /// reconciliation; the store itself never removes files.
+    pub async fn read_dir(&mut self, path: &str, out: &mut [DirEntry]) -> Result<usize, FsError> {
+        self.fs.read_dir(path, out).await
+    }
+
+    /// Remove a file through the wrapped plane.
+    ///
+    /// The store never calls this itself; it exists so an application can
+    /// reconcile orphan track files without reaching through the plane field.
+    pub async fn remove(&mut self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path).await
+    }
+
     /// Restore (or create) the medium from the two alternating TOC slots.
     ///
     /// The caller supplies a reusable buffer for the slot body (`slot_buf`); it
@@ -221,16 +247,18 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
             .iter()
             .any(|state| matches!(state, SlotState::Corrupt));
         let mut open_error = false;
+        let mut short_buffer = None;
         for slot in order {
             let SlotState::Valid(header) = states[slot as usize] else {
                 continue;
             };
             let size = header.slot_size as usize;
             if slot_buf.len() < size {
-                return Err(CdrStoreError::ShortSlotBuffer {
-                    needed: header.slot_size,
-                    got: slot_buf.len(),
-                });
+                // The other slot may use a smaller document; remember the
+                // contract failure and try it before giving up.
+                short_buffer = Some((header.slot_size, slot_buf.len()));
+                open_error = true;
+                continue;
             }
             if self
                 .fs
@@ -255,6 +283,9 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
         }
 
         if open_error || corrupt {
+            if let Some((needed, got)) = short_buffer {
+                return Err(CdrStoreError::ShortSlotBuffer { needed, got });
+            }
             return Err(CdrStoreError::NoUsableToc);
         }
         if recovery == Recovery::ReadOnly {
@@ -380,6 +411,9 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
     /// through the plane-wide sync, because a slot created by this save has no
     /// durable directory entry before that.
     pub async fn sync_resource(&mut self, resource: u16) -> Result<usize, StorageError> {
+        if !self.valid_resource(resource) {
+            return Err(StorageError::Unsupported);
+        }
         self.sync_path(resource)
             .await
             .map(|_| 0)
@@ -404,12 +438,13 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
             Ok(()) | Err(FsError::NotFound) => {}
             Err(e) => return Err(e),
         }
+        // A newly created slot has no directory entry until the namespace is
+        // settled; the plane-wide sync covers that. Keep the dirty bit until
+        // both steps succeed so a failed plane sync can be retried.
+        self.fs.sync().await?;
         if let Some(slot) = self.dirty.get_mut(index) {
             *slot = false;
         }
-        // A newly created slot has no directory entry until the namespace is
-        // settled; the plane-wide sync covers that.
-        self.fs.sync().await?;
         Ok(true)
     }
 
@@ -462,16 +497,20 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
             let mut scratch = heapless::String::<16>::new();
             let Some(path) = Self::resource_path(&mut scratch, resource) else {
                 // Unreachable: `mark` never sets an invalid id.
-                self.dirty[index] = false;
                 continue;
             };
             match self.fs.sync_file(path).await {
                 Ok(()) | Err(FsError::NotFound) => {}
                 Err(e) => return Err(e),
             }
-            self.dirty[index] = false;
         }
-        self.fs.sync().await
+        // Clear only after the namespace is settled; a failed plane sync keeps
+        // the dirty set for the next aggregate sync.
+        self.fs.sync().await?;
+        for slot in &mut self.dirty {
+            *slot = false;
+        }
+        Ok(())
     }
 
     /// Sync, then shut the plane down (flushing and closing its handles).
@@ -620,7 +659,10 @@ impl<F: AsyncFsPlane, C: NonceCipher> AsyncCipherCdrStore<F, C> {
     /// Write one resource, encrypting a track's buffer before it is stored.
     ///
     /// TOC slots and the aggregate resource pass through untouched. An invalid
-    /// track id is rejected before the buffer is transformed.
+    /// track id is rejected before the buffer is transformed. Like the
+    /// [`Storage`](crate::core::storage::Storage) write seam, a track buffer is
+    /// transformed in place before the inner write; if that write fails, the
+    /// caller must not reuse the buffer as plaintext.
     pub async fn write_resource(
         &mut self,
         resource: u16,
@@ -997,6 +1039,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_too_small_buffer_falls_back_to_the_older_slot() {
+        let (fs, data, _c) = MockPlane::new();
+        let mut store = AsyncCdrStore::new(fs, 1000, None);
+        // Slot 1 is newer (equal seq selects the higher index) but needs the
+        // full-size buffer; slot 0 fits the caller's smaller buffer.
+        store_file(&data, toc_file(0), &slot_image(1000, TOC_SLOT_MIN, 0));
+        store_file(&data, toc_file(1), &slot_image(1000, TOC_SLOT_MAX, 1));
+        let mut buf = vec![0u8; TOC_SLOT_MIN as usize];
+        let medium = block_on(store.open_medium(1000, None, Recovery::ReadOnly, &mut buf)).unwrap();
+        assert_eq!(medium.current_slot(), 0);
+        assert_eq!(medium.slot_size(), TOC_SLOT_MIN);
+        assert_eq!(medium.capacity_sectors(), 1000);
+    }
+
     // ── resource IO ─────────────────────────────────────────────────────
 
     #[test]
@@ -1096,6 +1153,13 @@ mod tests {
             block_on(store.write_resource(18, 0, &mut out)),
             Err(StorageError::Unsupported)
         );
+        for resource in [0u16, 3, 16, 18] {
+            assert_eq!(
+                block_on(store.sync_resource(resource)),
+                Err(StorageError::Unsupported),
+                "resource {resource} must not report a clean sync"
+            );
+        }
     }
 
     #[test]
@@ -1322,6 +1386,23 @@ mod tests {
                 );
                 assert_eq!(out, plain, "a TOC read must not be transformed");
             }
+        }
+
+        #[test]
+        fn non_zero_offset_encrypts_and_decrypts_once() {
+            let (fs, data, _c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            let plain = *b"world";
+            let mut input = plain;
+            block_on(store.write_resource(17, 4, &mut input)).unwrap();
+
+            let raw = raw(&data, track_file(1).as_str());
+            assert_eq!(&raw[..4], &[0; 4], "a non-zero write leaves the prefix");
+            assert_eq!(&raw[4..9], &encrypt(17, 4, &plain)[..]);
+
+            let mut out = [0u8; 5];
+            assert_eq!(block_on(store.read_resource(17, 4, &mut out)).unwrap(), 5);
+            assert_eq!(out, plain);
         }
 
         #[test]
