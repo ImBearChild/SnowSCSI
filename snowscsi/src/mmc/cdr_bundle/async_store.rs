@@ -195,8 +195,11 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
     /// Restore (or create) the medium from the two alternating TOC slots.
     ///
     /// The caller supplies a reusable buffer for the slot body (`slot_buf`); it
-    /// must be at least the slot size declared by the header. Nothing is
-    /// allocated by this function.
+    /// must be at least the slot size declared by the newest valid header.
+    /// Nothing is allocated by this function. A buffer that is too small for
+    /// the newest slot is [`CdrStoreError::ShortSlotBuffer`]; it never falls
+    /// back to an older, smaller slot, because that would silently roll the
+    /// disc back and make the next save overwrite the newer slot.
     ///
     /// Only the 256-byte headers are probed first, because the body length
     /// lives in the header. Valid candidates are then opened newest-first
@@ -247,18 +250,16 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
             .iter()
             .any(|state| matches!(state, SlotState::Corrupt));
         let mut open_error = false;
-        let mut short_buffer = None;
         for slot in order {
             let SlotState::Valid(header) = states[slot as usize] else {
                 continue;
             };
             let size = header.slot_size as usize;
             if slot_buf.len() < size {
-                // The other slot may use a smaller document; remember the
-                // contract failure and try it before giving up.
-                short_buffer = Some((header.slot_size, slot_buf.len()));
-                open_error = true;
-                continue;
+                return Err(CdrStoreError::ShortSlotBuffer {
+                    needed: header.slot_size,
+                    got: slot_buf.len(),
+                });
             }
             if self
                 .fs
@@ -283,9 +284,6 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
         }
 
         if open_error || corrupt {
-            if let Some((needed, got)) = short_buffer {
-                return Err(CdrStoreError::ShortSlotBuffer { needed, got });
-            }
             return Err(CdrStoreError::NoUsableToc);
         }
         if recovery == Recovery::ReadOnly {
@@ -1040,18 +1038,21 @@ mod tests {
     }
 
     #[test]
-    fn a_too_small_buffer_falls_back_to_the_older_slot() {
+    fn a_too_small_buffer_never_falls_back_to_an_older_slot() {
         let (fs, data, _c) = MockPlane::new();
         let mut store = AsyncCdrStore::new(fs, 1000, None);
         // Slot 1 is newer (equal seq selects the higher index) but needs the
-        // full-size buffer; slot 0 fits the caller's smaller buffer.
+        // full-size buffer; an older, smaller slot must not be resurrected.
         store_file(&data, toc_file(0), &slot_image(1000, TOC_SLOT_MIN, 0));
         store_file(&data, toc_file(1), &slot_image(1000, TOC_SLOT_MAX, 1));
         let mut buf = vec![0u8; TOC_SLOT_MIN as usize];
-        let medium = block_on(store.open_medium(1000, None, Recovery::ReadOnly, &mut buf)).unwrap();
-        assert_eq!(medium.current_slot(), 0);
-        assert_eq!(medium.slot_size(), TOC_SLOT_MIN);
-        assert_eq!(medium.capacity_sectors(), 1000);
+        assert_eq!(
+            block_on(store.open_medium(1000, None, Recovery::ReadOnly, &mut buf)).err(),
+            Some(CdrStoreError::ShortSlotBuffer {
+                needed: TOC_SLOT_MAX,
+                got: TOC_SLOT_MIN as usize,
+            })
+        );
     }
 
     // ── resource IO ─────────────────────────────────────────────────────
