@@ -8,6 +8,8 @@
 #[cfg(feature = "async-io")]
 pub mod async_flat_bundle;
 #[cfg(feature = "async-io")]
+pub mod async_fs_plane;
+#[cfg(feature = "async-io")]
 pub mod async_fs_storage;
 #[cfg(feature = "async-io")]
 pub mod async_seekable_storage;
