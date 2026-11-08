@@ -274,6 +274,10 @@ impl<F: AsyncFsStorage> AsyncFlatBundle<F> {
                     if n == 0 {
                         break;
                     }
+                    if n > tmp.len() {
+                        let _ = fs.close(file).await;
+                        return Err(BundleError::Fs(FsError::Io(IoErrorKind::Other)));
+                    }
                     off += n as u64;
                     if data.extend_from_slice(&tmp[..n]).is_err() {
                         let _ = fs.close(file).await;
@@ -334,7 +338,11 @@ impl<F: AsyncFsStorage> AsyncFlatBundle<F> {
             Err(FsError::NotFound) if !create => return Ok(None),
             Err(e) => return Err(e),
         };
-        self.evict_one().await?;
+        if let Err(e) = self.evict_one().await {
+            // A failed eviction must not leak the handle we just opened.
+            let _ = self.fs.close(file).await;
+            return Err(e);
+        }
         let slot = ChunkSlot {
             idx,
             file,
@@ -405,7 +413,7 @@ async fn write_all_at<F: AsyncFsFile>(
 ) -> Result<(), FsError> {
     while !buf.is_empty() {
         let n = file.write_at(off, buf).await?;
-        if n == 0 {
+        if n == 0 || n > buf.len() {
             return Err(FsError::Io(IoErrorKind::Other));
         }
         off += n as u64;
@@ -440,6 +448,9 @@ impl<F: AsyncFsStorage> AsyncFlatData for AsyncFlatBundle<F> {
                         if n == 0 {
                             chunk_dst[done..].fill(0);
                             break;
+                        }
+                        if n > chunk_dst.len() - done {
+                            return Err(StorageError::Io(IoErrorKind::Other));
                         }
                         done += n;
                     }

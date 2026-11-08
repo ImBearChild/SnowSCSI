@@ -305,7 +305,20 @@ impl<F: AsyncFsStorage, const N: usize> AsyncFsPlane for AsyncFsPlaneAdapter<F, 
     }
 
     async fn shutdown(&mut self) -> Result<(), FsError> {
-        let mut first = self.fs.sync().await.err();
+        // Flush buffered writes held by cached handles before the backend-wide
+        // sync, then close every handle. Errors do not stop the remaining
+        // work; the first one is returned.
+        let mut first = None;
+        for slot in self.slots.iter_mut() {
+            if slot.writable {
+                if let Err(e) = slot.file.flush().await {
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if let Err(e) = self.fs.sync().await {
+            first.get_or_insert(e);
+        }
         while let Some(slot) = self.slots.pop() {
             if let Err(e) = self.fs.close(slot.file).await {
                 first.get_or_insert(e);
