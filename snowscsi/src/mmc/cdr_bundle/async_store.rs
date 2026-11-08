@@ -42,6 +42,8 @@
 //! deterministically.
 
 use crate::common::async_fs_plane::AsyncFsPlane;
+#[cfg(feature = "cipher")]
+use crate::common::cipher::NonceCipher;
 use crate::common::fs_storage::FsError;
 use crate::common::seekable_storage::StorageError;
 use crate::core::storage::{IoBuf, IoReq};
@@ -485,6 +487,188 @@ impl<F: AsyncFsPlane> AsyncCdrStore<F> {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+}
+
+/// [`AsyncCdrStore`] decorator that encrypts track payloads in place.
+///
+/// The medium's two TOC slots (`1`/`2`) and the aggregate flush (`0`) stay
+/// plaintext: only resource ids at or above
+/// [`TRACK_RESOURCE_BASE`](crate::mmc::cdr_bundle::toc::TRACK_RESOURCE_BASE) +
+/// 1 (`17`, track `1`) are transformed. Resource `16` is not a track, so it is
+/// never transformed either.
+///
+/// # Per-resource nonce domain
+///
+/// One key covers the whole medium, but every track gets its own nonce:
+///
+/// ```text
+/// domain(resource) = LE64(base_nonce) XOR resource
+/// ```
+///
+/// The same offset in two tracks therefore never reuses a keystream. The
+/// cipher is changed with [`NonceCipher::set_nonce`]; the key itself is never
+/// rebuilt.
+///
+/// # One instance per medium generation
+///
+/// Use exactly one decorator for one medium/LUN generation: never share it
+/// across LUNs or medium generations. A fresh `(key, nonce)` is required
+/// whenever a medium is replaced or re-created (the manifest owns that nonce).
+///
+/// # No authentication, no zeroize
+///
+/// Stream ciphers are **malleable**: an attacker who can modify stored bytes
+/// can flip the corresponding plaintext bits. Nothing here authenticates a
+/// resource, and a modified track simply decrypts to wrong bytes. If integrity
+/// matters, add an authenticated layer above this one. Key material is not
+/// scrubbed on drop; see the cipher module documentation.
+///
+/// # Explicit lifecycle
+///
+/// Async close cannot run from `Drop`. Call [`Self::shutdown`] to sync and
+/// close the wrapped store deterministically.
+#[cfg(feature = "cipher")]
+pub struct AsyncCipherCdrStore<F: AsyncFsPlane, C: NonceCipher> {
+    inner: AsyncCdrStore<F>,
+    cipher: C,
+    nonce: [u8; 8],
+}
+
+#[cfg(feature = "cipher")]
+impl<F: AsyncFsPlane, C: NonceCipher> AsyncCipherCdrStore<F, C> {
+    /// Wrap a resource store, encrypting every track with `cipher` under
+    /// `nonce`.
+    pub fn new(inner: AsyncCdrStore<F>, cipher: C, nonce: [u8; 8]) -> Self {
+        Self {
+            inner,
+            cipher,
+            nonce,
+        }
+    }
+
+    /// Borrow the wrapped store.
+    pub fn inner(&self) -> &AsyncCdrStore<F> {
+        &self.inner
+    }
+
+    /// Mutably borrow the wrapped store (test/probe inspection).
+    pub fn inner_mut(&mut self) -> &mut AsyncCdrStore<F> {
+        &mut self.inner
+    }
+
+    /// Give back the wrapped store.
+    pub fn into_inner(self) -> AsyncCdrStore<F> {
+        self.inner
+    }
+
+    /// Nominal capacity in bytes, from the wrapped store.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.inner.capacity_bytes()
+    }
+
+    /// Restore (or create) the medium, delegating to the wrapped store.
+    pub async fn open_medium(
+        &mut self,
+        capacity_sectors: u64,
+        kind: Option<DiscKind>,
+        recovery: Recovery,
+        slot_buf: &mut [u8],
+    ) -> Result<CdrBundleMedium, CdrStoreError> {
+        self.inner
+            .open_medium(capacity_sectors, kind, recovery, slot_buf)
+            .await
+    }
+
+    /// Whether `resource` is encrypted by this decorator.
+    fn encrypts(resource: u16) -> bool {
+        resource > super::toc::TRACK_RESOURCE_BASE
+    }
+
+    /// Nonce domain of `resource`.
+    fn domain(&self, resource: u16) -> [u8; 8] {
+        (u64::from_le_bytes(self.nonce) ^ u64::from(resource)).to_le_bytes()
+    }
+
+    /// XOR the keystream of `resource` at `off` into `buf`.
+    fn apply(&mut self, resource: u16, off: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        let nonce = self.domain(resource);
+        self.cipher.set_nonce(nonce);
+        self.cipher.xor(off, buf).map_err(StorageError::from)
+    }
+
+    /// Read one resource, decrypting a track's confirmed prefix.
+    ///
+    /// The wrapped store runs first; exactly the returned byte count is
+    /// transformed. A track read returns the full requested length, so the
+    /// whole buffer is decrypted. TOC slots and the aggregate resource pass
+    /// through untouched.
+    pub async fn read_resource(
+        &mut self,
+        resource: u16,
+        off: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, StorageError> {
+        let n = self.inner.read_resource(resource, off, buf).await?;
+        let confirmed = n.min(buf.len());
+        if Self::encrypts(resource) && confirmed > 0 {
+            self.apply(resource, off, &mut buf[..confirmed])?;
+        }
+        Ok(confirmed)
+    }
+
+    /// Write one resource, encrypting a track's buffer before it is stored.
+    ///
+    /// TOC slots and the aggregate resource pass through untouched. An invalid
+    /// track id is rejected before the buffer is transformed.
+    pub async fn write_resource(
+        &mut self,
+        resource: u16,
+        off: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, StorageError> {
+        if Self::encrypts(resource) {
+            if !self.inner.valid_resource(resource) {
+                return Err(StorageError::Unsupported);
+            }
+            self.apply(resource, off, buf)?;
+        }
+        self.inner.write_resource(resource, off, buf).await
+    }
+
+    /// Fsync one resource, delegating to the wrapped store.
+    pub async fn sync_resource(&mut self, resource: u16) -> Result<usize, StorageError> {
+        self.inner.sync_resource(resource).await
+    }
+
+    /// Execute one resource-addressed request.
+    ///
+    /// A track read/write runs through the encrypted helpers; every other
+    /// request (TOC slots, the aggregate flush and resource syncs) is delegated
+    /// unchanged to the wrapped store.
+    pub async fn exec(&mut self, req: IoReq, buf: IoBuf<'_>) -> Result<usize, StorageError> {
+        if Self::encrypts(req.resource) {
+            match (req.dir, buf) {
+                (Direction::ToHost, IoBuf::Read(bytes)) => {
+                    return self.read_resource(req.resource, req.offset, bytes).await;
+                }
+                (Direction::FromHost, IoBuf::Write(bytes)) => {
+                    return self.write_resource(req.resource, req.offset, bytes).await;
+                }
+                (_, buf) => return self.inner.exec(req, buf).await,
+            }
+        }
+        self.inner.exec(req, buf).await
+    }
+
+    /// Aggregate flush, delegating to the wrapped store.
+    pub async fn sync(&mut self) -> Result<usize, StorageError> {
+        self.inner.sync().await
+    }
+
+    /// Sync, then shut the wrapped store down (flushing and closing handles).
+    pub async fn shutdown(self) -> Result<(), CdrStoreError> {
+        self.inner.shutdown().await
     }
 }
 
@@ -1018,5 +1202,249 @@ mod tests {
         )
         .contains("4096"));
         assert!(format!("{}", CdrStoreError::Fs(FsError::NotFound)).contains("not found"));
+    }
+
+    // ── Cipher decorator ────────────────────────────────────────────────
+
+    #[cfg(feature = "cipher")]
+    mod cipher_tests {
+        use super::*;
+        use crate::common::cipher::{CipherError, NonceCipher, StreamCipher};
+
+        const BASE_NONCE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        /// Deterministic offset-addressed cipher with a replaceable nonce.
+        struct TestCipher {
+            nonce: [u8; 8],
+        }
+
+        impl TestCipher {
+            fn new(nonce: [u8; 8]) -> Self {
+                Self { nonce }
+            }
+        }
+
+        fn keystream(nonce: [u8; 8], off: u64) -> u8 {
+            let mut x = u64::from_le_bytes(nonce) ^ off;
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 32) as u8
+        }
+
+        impl StreamCipher for TestCipher {
+            fn xor(&mut self, off: u64, buf: &mut [u8]) -> Result<(), CipherError> {
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    *byte ^= keystream(self.nonce, off.wrapping_add(i as u64));
+                }
+                Ok(())
+            }
+        }
+
+        impl NonceCipher for TestCipher {
+            fn set_nonce(&mut self, nonce: [u8; 8]) {
+                self.nonce = nonce;
+            }
+        }
+
+        fn domain(resource: u16) -> [u8; 8] {
+            (u64::from_le_bytes(BASE_NONCE) ^ u64::from(resource)).to_le_bytes()
+        }
+
+        fn encrypt(resource: u16, off: u64, plain: &[u8]) -> Vec<u8> {
+            let mut cipher = TestCipher::new(domain(resource));
+            let mut out = plain.to_vec();
+            cipher.xor(off, &mut out).unwrap();
+            out
+        }
+
+        fn wrapped(fs: MockPlane) -> (AsyncCipherCdrStore<MockPlane, TestCipher>, CdrBundleMedium) {
+            let (inner, medium) = blank_store(fs);
+            (
+                AsyncCipherCdrStore::new(inner, TestCipher::new(BASE_NONCE), BASE_NONCE),
+                medium,
+            )
+        }
+
+        fn raw(data: &Store, name: &str) -> Vec<u8> {
+            let map = data.borrow();
+            let file = map.get(name).expect("file must exist");
+            let bytes = file.borrow().clone();
+            bytes
+        }
+
+        #[test]
+        fn track_write_is_ciphertext_at_rest_and_read_decrypts() {
+            let (fs, data, _c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            let plain = *b"hello";
+            let expected = encrypt(17, 0, &plain);
+
+            let mut input = plain;
+            assert_eq!(
+                block_on(store.write_resource(17, 0, &mut input)).unwrap(),
+                plain.len()
+            );
+            assert_eq!(
+                &input[..],
+                &expected[..],
+                "the write encrypts the buffer in place"
+            );
+            assert_eq!(raw(&data, track_file(1).as_str()), expected);
+            assert_ne!(raw(&data, track_file(1).as_str()), plain);
+
+            let mut out = [0u8; 5];
+            assert_eq!(
+                block_on(store.read_resource(17, 0, &mut out)).unwrap(),
+                plain.len()
+            );
+            assert_eq!(out, plain, "the read decrypts the confirmed prefix");
+        }
+
+        #[test]
+        fn toc_slots_stay_plaintext() {
+            let (fs, data, _c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            for (resource, file) in [(1u16, toc_file(0)), (2u16, toc_file(1))] {
+                let mut image = slot_image(1000, TOC_SLOT_MAX, (resource - 1) as u8);
+                let plain = image.clone();
+                assert_eq!(
+                    block_on(store.write_resource(resource, 0, &mut image)).unwrap(),
+                    plain.len()
+                );
+                assert_eq!(image, plain, "a TOC write must not be transformed");
+                assert_eq!(raw(&data, file), plain);
+
+                let mut out = vec![0u8; plain.len()];
+                assert_eq!(
+                    block_on(store.read_resource(resource, 0, &mut out)).unwrap(),
+                    plain.len()
+                );
+                assert_eq!(out, plain, "a TOC read must not be transformed");
+            }
+        }
+
+        #[test]
+        fn tracks_use_separate_nonce_domains() {
+            let (fs, data, _c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            let plain = [9u8; 8];
+            for resource in [17u16, 18] {
+                let mut input = plain;
+                block_on(store.write_resource(resource, 0, &mut input)).unwrap();
+            }
+
+            let first = raw(&data, track_file(1).as_str());
+            let second = raw(&data, track_file(2).as_str());
+            assert_eq!(first, encrypt(17, 0, &plain));
+            assert_eq!(second, encrypt(18, 0, &plain));
+            assert_ne!(
+                first, second,
+                "the same offset in two tracks must not reuse the keystream"
+            );
+        }
+
+        #[test]
+        fn exec_encrypts_writes_and_decrypts_reads() {
+            let (fs, data, _c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            let plain = *b"payload";
+            let mut input = plain;
+            assert_eq!(
+                block_on(store.exec(
+                    write_req(17, 0, plain.len() as u32),
+                    IoBuf::Write(&mut input)
+                ))
+                .unwrap(),
+                plain.len()
+            );
+            assert_eq!(raw(&data, track_file(1).as_str()), encrypt(17, 0, &plain));
+
+            let mut out = [0u8; 7];
+            assert_eq!(
+                block_on(store.exec(read_req(17, 0, out.len() as u32), IoBuf::Read(&mut out)))
+                    .unwrap(),
+                out.len()
+            );
+            assert_eq!(&out, &plain);
+
+            let mut toc = *b"toc0";
+            assert_eq!(
+                block_on(store.exec(write_req(1, 0, 4), IoBuf::Write(&mut toc))).unwrap(),
+                4
+            );
+            assert_eq!(&toc, b"toc0", "TOC stays plaintext through exec");
+
+            assert_eq!(block_on(store.exec(sync_req(17), IoBuf::None)).unwrap(), 0);
+        }
+
+        #[test]
+        fn sync_resource_sync_and_shutdown_delegate() {
+            let (fs, _data, c) = MockPlane::new();
+            let (mut store, _medium) = wrapped(fs);
+            let mut payload = *b"x";
+            block_on(store.write_resource(17, 0, &mut payload)).unwrap();
+
+            assert_eq!(block_on(store.sync_resource(17)).unwrap(), 0);
+            assert_eq!(&*c.sync_files.borrow(), &[track_file(1).to_string()]);
+            assert_eq!(c.plane_syncs.get(), 1);
+
+            let mut toc = slot_image(1000, TOC_SLOT_MAX, 0);
+            block_on(store.write_resource(1, 0, &mut toc)).unwrap();
+            assert_eq!(block_on(store.sync()).unwrap(), 0);
+            let mut synced = c.sync_files.borrow().clone();
+            synced.sort();
+            assert_eq!(
+                synced,
+                vec![toc_file(0).to_string(), track_file(1).to_string()]
+            );
+            assert_eq!(c.plane_syncs.get(), 2);
+
+            block_on(store.shutdown()).unwrap();
+            assert_eq!(c.shut_downs.get(), 1);
+        }
+
+        #[test]
+        fn unsupported_and_plain_resources_keep_their_behavior() {
+            let (fs, _data, _c) = MockPlane::new();
+            let mut inner = AsyncCdrStore::new(fs, 1000, Some(TOC_SLOT_MIN));
+            let mut buf = vec![0u8; TOC_SLOT_MIN as usize];
+            block_on(inner.open_medium(1000, None, Recovery::Delete, &mut buf)).unwrap();
+            let mut store =
+                AsyncCipherCdrStore::new(inner, TestCipher::new(BASE_NONCE), BASE_NONCE);
+            assert_eq!(store.inner().max_tracks, 1);
+
+            let mut out = [0xAAu8; 4];
+            for resource in [3u16, 16, 18] {
+                assert_eq!(
+                    block_on(store.read_resource(resource, 0, &mut out)),
+                    Err(StorageError::Unsupported),
+                    "resource {resource} must stay a contract fault"
+                );
+                assert_eq!(out, [0xAAu8; 4], "a rejected read must not transform");
+            }
+
+            for resource in [3u16, 16, 18] {
+                let mut payload = [0xAAu8; 4];
+                assert_eq!(
+                    block_on(store.write_resource(resource, 0, &mut payload)),
+                    Err(StorageError::Unsupported),
+                    "resource {resource} must stay a contract fault"
+                );
+                assert_eq!(payload, [0xAAu8; 4], "a rejected write must not transform");
+            }
+
+            assert_eq!(
+                block_on(store.exec(sync_req(0), IoBuf::None)),
+                Ok(0),
+                "the aggregate flush still delegates"
+            );
+            let mut out = [0u8; 4];
+            assert_eq!(
+                block_on(store.exec(read_req(0, 0, 4), IoBuf::Read(&mut out))),
+                Err(StorageError::Unsupported),
+                "the aggregate resource still rejects a data direction"
+            );
+        }
     }
 }
