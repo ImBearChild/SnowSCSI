@@ -48,8 +48,11 @@ pub const DEFAULT_CHUNK_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Header file name used before the `SNOWBUNDLE` format. Only probed to
 /// refuse a silent reinterpretation of an old directory.
+///
+/// Shared with the asynchronous [`crate::async_flat_bundle`] open/create paths
+/// so both reject a legacy directory identically.
 #[cfg(feature = "bundle")]
-const LEGACY_HEADER_NAME: &str = "BUNDLE";
+pub(crate) const LEGACY_HEADER_NAME: &str = "BUNDLE";
 
 /// Maximum number of simultaneously-open chunk file handles (LRU bound).
 pub const MAX_OPEN_CHUNKS: usize = 8;
@@ -262,18 +265,7 @@ impl<F: FsStorage> FlatBundle<F> {
     /// manifest is the only copy of the volume master key.
     #[cfg(feature = "bundle")]
     pub fn create_with_meta(mut fs: F, meta: &BundleMeta) -> Result<Self, BundleError> {
-        let (chunk_size, virtual_size, sector_size) = match meta.kind {
-            BundleKind::Flat {
-                virtual_size,
-                chunk_size,
-                sector_size,
-            } => (chunk_size, virtual_size, sector_size),
-            _ => return Err(BundleError::WrongKind),
-        };
-        validate_geometry(chunk_size, virtual_size, sector_size)?;
-        if meta.cipher.is_some() {
-            return Err(BundleError::CipherRequiresAtomicManifest);
-        }
+        let (chunk_size, virtual_size, sector_size, manifest) = prepare_create(meta)?;
         match fs.open(MANIFEST_NAME, OpenOptions::read_only()) {
             Ok(file) => {
                 fs.close(file);
@@ -292,7 +284,6 @@ impl<F: FsStorage> FlatBundle<F> {
             Err(FsError::NotFound) => {}
             Err(e) => return Err(BundleError::Fs(e)),
         }
-        let manifest = meta.encode()?;
         let mut file = fs
             .open(MANIFEST_NAME, OpenOptions::create_or_truncate())
             .map_err(BundleError::Fs)?;
@@ -352,7 +343,6 @@ impl<F: FsStorage> FlatBundle<F> {
         read_only: bool,
     ) -> Result<Self, BundleError> {
         let mut meta = None;
-        let mut manifest_geometry = None;
         match fs.open(MANIFEST_NAME, OpenOptions::read_only()) {
             Ok(mut f) => {
                 let mut data = HeaplessVec::<u8, MAX_MANIFEST>::new();
@@ -374,16 +364,7 @@ impl<F: FsStorage> FlatBundle<F> {
                     }
                 }
                 fs.close(f);
-                let parsed = BundleMeta::parse(&data)?;
-                match parsed.kind {
-                    BundleKind::Flat {
-                        virtual_size,
-                        chunk_size,
-                        sector_size,
-                    } => manifest_geometry = Some((chunk_size, virtual_size, sector_size)),
-                    _ => return Err(BundleError::WrongKind),
-                }
-                meta = Some(parsed);
+                meta = Some(BundleMeta::parse(&data)?);
             }
             Err(FsError::NotFound) => {
                 // Never reinterpret an old bundle with new geometry: its
@@ -399,14 +380,12 @@ impl<F: FsStorage> FlatBundle<F> {
             }
             Err(e) => return Err(BundleError::Fs(e)),
         }
-        let (manifest_chunk, manifest_virtual, manifest_sector) =
-            manifest_geometry.unwrap_or((DEFAULT_CHUNK_SIZE, 0, 512));
-        let chunk_size = chunk_override.unwrap_or(manifest_chunk);
-        let virtual_size = size_override.unwrap_or(manifest_virtual);
-        let sector_size = sector_override.unwrap_or(manifest_sector);
-        if virtual_size == 0 {
-            return Err(BundleError::MissingVirtualSize);
-        }
+        let (chunk_size, virtual_size, sector_size) = resolve_geometry(
+            meta.as_ref(),
+            chunk_override,
+            size_override,
+            sector_override,
+        )?;
         let mut bundle = Self::build(fs, chunk_size, virtual_size, sector_size, read_only)?;
         bundle.meta = meta;
         Ok(bundle)
@@ -414,10 +393,7 @@ impl<F: FsStorage> FlatBundle<F> {
 
     /// Relative path of chunk `idx` within the bundle directory.
     fn chunk_path(&self, idx: u64) -> heapless::String<16> {
-        let mut s = heapless::String::<16>::new();
-        use core::fmt::Write as _;
-        let _ = write!(s, "{:06}.img", idx);
-        s
+        chunk_path(idx)
     }
 
     /// Ensure a slot for chunk `idx` is open, returning its index in
@@ -497,17 +473,9 @@ impl<F: FsStorage> FlatData for FlatBundle<F> {
         let mut pos = off;
         let mut dst = buf;
         while !dst.is_empty() {
-            let chunk_off = pos % self.chunk_size;
-            let take = {
-                let remain = self.chunk_size - chunk_off;
-                if remain >= dst.len() as u64 {
-                    dst.len()
-                } else {
-                    remain as usize
-                }
-            };
+            let (idx, chunk_off, take) = chunk_span(pos, dst.len(), self.chunk_size);
             let (chunk_dst, rest) = dst.split_at_mut(take);
-            match self.ensure_chunk(pos / self.chunk_size, false) {
+            match self.ensure_chunk(idx, false) {
                 Ok(Some(i)) => {
                     let file = &mut self.open_chunks[i].file;
                     use embedded_io::{Read, Seek};
@@ -553,18 +521,10 @@ impl<F: FsStorage> WritableFlatData for FlatBundle<F> {
         let mut pos = off;
         let mut src = buf;
         while !src.is_empty() {
-            let chunk_off = pos % self.chunk_size;
-            let take = {
-                let remain = self.chunk_size - chunk_off;
-                if remain >= src.len() as u64 {
-                    src.len()
-                } else {
-                    remain as usize
-                }
-            };
+            let (idx, chunk_off, take) = chunk_span(pos, src.len(), self.chunk_size);
             let (chunk_src, rest) = src.split_at(take);
             let i = self
-                .ensure_chunk(pos / self.chunk_size, true)
+                .ensure_chunk(idx, true)
                 .map_err(StorageError::from)?
                 .ok_or(StorageError::Io(IoErrorKind::Other))?;
             let file = &mut self.open_chunks[i].file;
@@ -625,6 +585,95 @@ pub fn validate_geometry(
         return Err(BundleError::InvalidGeometry);
     }
     Ok(())
+}
+
+/// Relative path of chunk `idx` within a bundle directory (`{:06}.img`).
+///
+/// Shared by the synchronous [`FlatBundle`] and the asynchronous
+/// [`crate::async_flat_bundle::AsyncFlatBundle`].
+pub(crate) fn chunk_path(idx: u64) -> heapless::String<16> {
+    let mut s = heapless::String::<16>::new();
+    use core::fmt::Write as _;
+    let _ = write!(s, "{:06}.img", idx);
+    s
+}
+
+/// Split a logical position into `(chunk index, offset in chunk, take)`.
+///
+/// `take` is the number of bytes in the current chunk starting at `pos`, i.e.
+/// `min(remaining, chunk_size - pos % chunk_size)`. Both bundles use this so a
+/// read/write never spans a chunk file.
+pub(crate) fn chunk_span(pos: u64, remaining: usize, chunk_size: u64) -> (u64, u64, usize) {
+    let chunk_off = pos % chunk_size;
+    let until_end = chunk_size - chunk_off;
+    let take = if until_end >= remaining as u64 {
+        remaining
+    } else {
+        until_end as usize
+    };
+    (pos / chunk_size, chunk_off, take)
+}
+
+/// Resolve bundle geometry from an optional manifest plus caller overrides.
+///
+/// Caller values win per field; a missing manifest falls back to
+/// [`DEFAULT_CHUNK_SIZE`], no virtual size and 512-byte sectors. A present
+/// non-flat manifest is [`BundleError::WrongKind`], and a zero virtual size
+/// after merging is [`BundleError::MissingVirtualSize`].
+///
+/// Shared by the synchronous and asynchronous `open` paths.
+#[cfg(feature = "bundle")]
+pub(crate) fn resolve_geometry(
+    meta: Option<&BundleMeta>,
+    chunk_override: Option<u64>,
+    size_override: Option<u64>,
+    sector_override: Option<u32>,
+) -> Result<(u64, u64, u32), BundleError> {
+    let (manifest_chunk, manifest_virtual, manifest_sector) = match meta.map(|m| m.kind) {
+        Some(BundleKind::Flat {
+            virtual_size,
+            chunk_size,
+            sector_size,
+        }) => (chunk_size, virtual_size, sector_size),
+        Some(_) => return Err(BundleError::WrongKind),
+        None => (DEFAULT_CHUNK_SIZE, 0, 512),
+    };
+    let chunk_size = chunk_override.unwrap_or(manifest_chunk);
+    let virtual_size = size_override.unwrap_or(manifest_virtual);
+    let sector_size = sector_override.unwrap_or(manifest_sector);
+    if virtual_size == 0 {
+        return Err(BundleError::MissingVirtualSize);
+    }
+    Ok((chunk_size, virtual_size, sector_size))
+}
+
+/// Validate and encode a manifest for bundle creation.
+///
+/// Returns `(chunk_size, virtual_size, sector_size, encoded_manifest)`. Only
+/// [`BundleKind::Flat`] is accepted ([`BundleError::WrongKind`]); geometry is
+/// validated with [`validate_geometry`]; a keyslot-bearing manifest is
+/// refused with [`BundleError::CipherRequiresAtomicManifest`] because the
+/// non-atomic library create path must not write the only copy of a VMK.
+///
+/// Shared by the synchronous and asynchronous `create_with_meta` paths.
+#[cfg(feature = "bundle")]
+pub(crate) fn prepare_create(
+    meta: &BundleMeta,
+) -> Result<(u64, u64, u32, HeaplessVec<u8, MAX_MANIFEST>), BundleError> {
+    let (chunk_size, virtual_size, sector_size) = match meta.kind {
+        BundleKind::Flat {
+            virtual_size,
+            chunk_size,
+            sector_size,
+        } => (chunk_size, virtual_size, sector_size),
+        _ => return Err(BundleError::WrongKind),
+    };
+    validate_geometry(chunk_size, virtual_size, sector_size)?;
+    if meta.cipher.is_some() {
+        return Err(BundleError::CipherRequiresAtomicManifest);
+    }
+    let manifest = meta.encode()?;
+    Ok((chunk_size, virtual_size, sector_size, manifest))
 }
 
 #[cfg(test)]
